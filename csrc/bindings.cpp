@@ -443,6 +443,23 @@ PYBIND11_MODULE(_core, m) {
           "Returns [n_angles] gradient in radians.",
           py::arg("volume"), py::arg("grad_sino"), py::arg("angles"), py::arg("N_det") = -1);
 
+    m.def("forward_project_3d_cpu", &py_forward_project_3d_cpu,
+          "3D rotation-matrix forward projection (CPU). "
+          "volume: [Ny,Nz,Nx]. matrices: [n_angles,9] or [n_angles*9] row-major rotation matrices. "
+          "Returns sinogram [n_angles, Ny, N_det].",
+          py::arg("volume"), py::arg("matrices"), py::arg("N_det") = -1);
+
+    m.def("back_project_3d_cpu", &py_back_project_3d_cpu,
+          "3D rotation-matrix back-projection (CPU). "
+          "sinogram: [n_angles,Ny,N_det]. matrices: [n_angles,9] row-major. "
+          "Returns volume [Ny, Nz, Nx].",
+          py::arg("sinogram"), py::arg("matrices"), py::arg("Nz") = -1);
+
+    m.def("grad_rotmat_cpu", &py_grad_rotmat_cpu,
+          "Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CPU). "
+          "Returns [n_angles, 9] gradient.",
+          py::arg("volume"), py::arg("grad_sino"), py::arg("matrices"));
+
     m.def("genfire_gridding_2d_cpu", &py_genfire_gridding_2d_cpu,
           "GENFIRE Fourier gridding (CPU). "
           "fk_real/fk_imag: [n_angles,Ny,bigN] fftshifted 1D FFTs. "

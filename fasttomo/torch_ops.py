@@ -77,15 +77,16 @@ def back_project(
     return _BP2D.apply(sinogram, angles_deg, Nz)
 
 
-# ── 3D rotation-matrix projection (CUDA only) ────────────────────────────
+# ── 3D rotation-matrix projection (CPU + CUDA) ───────────────────────────
 
 def forward_project_3d(
-    volume: torch.Tensor,           # [Ny, Nz, Nx]
-    euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
+    volume: torch.Tensor,                       # [Ny, Nz, Nx]
+    euler_zyz_deg: torch.Tensor,                # [n_angles, 3] — (φ, θ, ψ) degrees
     N_det: int = -1,
+    shifts: torch.Tensor | None = None,         # [n_angles, 2] — optional per-tilt detector-plane shifts (px)
 ) -> torch.Tensor:
     """
-    3D rotation-matrix forward projection (CUDA only).
+    3D rotation-matrix forward projection (CPU + CUDA).
 
     Each projection uses a full 3×3 ZYZ rotation matrix, so rays can cross
     Y-slice boundaries. This is required for general orientations (dual-axis,
@@ -94,18 +95,31 @@ def forward_project_3d(
     euler_zyz_deg columns: (φ, θ, ψ) — ZYZ Euler angles in degrees.
     For a pure single-axis tilt series: φ=0, ψ=0, θ=tilt_angle.
 
-    Returns sinogram [n_angles, Ny, N_det] on CUDA — same shape convention
-    as forward_project so algorithms can swap projectors transparently.
+    If ``shifts`` is provided, a per-tilt sub-pixel translation is applied to
+    the predicted sinogram via :func:`apply_shifts_2d` (bilinear). This makes
+    the operator a full pose model — rotation + detector-plane translation —
+    so a learnable ``[n_angles, 2]`` shifts tensor can be optimized jointly
+    with ``volume`` and ``euler_zyz_deg`` under autograd.
 
-    Differentiable w.r.t. ``volume`` and ``euler_zyz_deg``: backward calls
-    back_project_3d for the volume gradient and a dedicated grad_rotmat
-    kernel for the rotation-matrix gradient. The euler→rotmat conversion
-    lives in pure PyTorch so autograd chains ∂L/∂M into ∂L/∂euler.
+    Returns sinogram [n_angles, Ny, N_det] on the same device as ``volume``.
+    Same shape convention as forward_project so algorithms can swap projectors
+    transparently. The CPU path uses explicit trilinear interpolation and is
+    O(10×) slower than the CUDA texture path — useful for testing on hosts
+    without a GPU.
+
+    Differentiable w.r.t. ``volume``, ``euler_zyz_deg``, and ``shifts`` on
+    both devices: backward calls back_project_3d for the volume gradient and
+    a dedicated grad_rotmat kernel for the rotation-matrix gradient. The
+    euler→rotmat conversion lives in pure PyTorch so autograd chains ∂L/∂M
+    into ∂L/∂euler; ``grid_sample`` handles ∂L/∂shifts.
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
     mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    return _FP3D.apply(volume, mats, N_det)
+    sino = _FP3D.apply(volume, mats, N_det)
+    if shifts is not None:
+        sino = apply_shifts_2d(sino, shifts)
+    return sino
 
 
 def back_project_3d(
@@ -114,12 +128,12 @@ def back_project_3d(
     Nz: int = -1,
 ) -> torch.Tensor:
     """
-    3D rotation-matrix back-projection (CUDA only).
+    3D rotation-matrix back-projection (CPU + CUDA).
 
     Adjoint of forward_project_3d. Voxel-driven gather: each voxel samples
     the sinogram at its rotated detector position for every projection.
 
-    Returns volume [Ny, Nz, Nx].
+    Returns volume [Ny, Nz, Nx] on the same device as ``sinogram``.
 
     Differentiable w.r.t. ``sinogram``: backward calls forward_project_3d.
     """
@@ -237,6 +251,54 @@ def apply_shifts(
     phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
     F = torch.fft.rfft(sinogram.float(), n=N_det, dim=-1)
     return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
+
+
+def apply_shifts_2d(
+    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
+    shifts: torch.Tensor,     # [n_angles, 2] — (det-axis, tilt-axis) pixel shifts
+) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
+    """
+    Per-tilt sub-pixel translation of the sinogram in the detector plane via
+    bilinear ``grid_sample``.  Differentiable w.r.t. both ``sinogram`` and
+    ``shifts`` — autograd flows through ``grid_sample`` natively.
+
+    ``shifts[:, 0]`` shifts along the detector axis (last dim, ``N_det``);
+    ``shifts[:, 1]`` shifts along the tilt axis (``Ny``).  Sign convention
+    matches ``apply_shifts``: positive shift moves the signal toward larger
+    indices (right / down).
+
+    Intended for joint optimization with the volume and pose: drop in after
+    ``forward_project_3d`` (or pass ``shifts=`` to it directly) so per-tilt
+    translational alignment becomes a learnable parameter.
+    """
+    if shifts.ndim != 2 or shifts.shape[-1] != 2:
+        raise ValueError(f"shifts must have shape [n_angles, 2], got {tuple(shifts.shape)}")
+    n_a, Ny, Nd = sinogram.shape
+    if shifts.shape[0] != n_a:
+        raise ValueError(
+            f"shifts has {shifts.shape[0]} entries but sinogram has {n_a} angles"
+        )
+
+    s = shifts.to(device=sinogram.device, dtype=torch.float32)
+
+    ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=torch.float32)
+    xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=torch.float32)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")                  # [Ny, Nd]
+    base = torch.stack((gx, gy), dim=-1)                            # [Ny, Nd, 2]
+    base = base.unsqueeze(0).expand(n_a, -1, -1, -1)                # [n_a, Ny, Nd, 2]
+
+    # Sample from (x - sx, y - sy) so positive shift moves the signal +x / +y.
+    # Normalized coords with align_corners=True: 1 pixel = 2/(N-1).
+    norm_x = 2.0 / max(Nd - 1, 1)
+    norm_y = 2.0 / max(Ny - 1, 1)
+    off = torch.stack((s[:, 0] * norm_x, s[:, 1] * norm_y), dim=-1) # [n_a, 2]
+    grid = base - off.view(n_a, 1, 1, 2)                            # [n_a, Ny, Nd, 2]
+
+    inp = sinogram.unsqueeze(1).float()                             # [n_a, 1, Ny, Nd]
+    out = torch.nn.functional.grid_sample(
+        inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+    )
+    return out.squeeze(1)
 
 
 def estimate_shifts_xcorr(

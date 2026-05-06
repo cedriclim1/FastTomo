@@ -15,7 +15,7 @@ Caveats:
 - 3D rotation-matrix gradient: `_FP3D` takes the [n_angles, 3, 3] rotation
   matrix tensor directly so PyTorch can trace through `_euler_zyz_to_rotmat`
   outside the Function boundary. Backward calls `_grad_rotmat_raw` for ∂L/∂M
-  and lets autograd chain to ∂L/∂euler_zyz_deg automatically (CUDA only).
+  and lets autograd chain to ∂L/∂euler_zyz_deg automatically (CPU + CUDA).
   RESIRE's rotation-matrix gradient is intentionally not exposed — angular
   refinement uses brute-force search (`refine_angles`) rather than autograd
   through the RESIRE inner loop.
@@ -144,30 +144,10 @@ def _forward_project_3d_raw(
     euler_zyz_deg: torch.Tensor,
     N_det: int = -1,
 ) -> torch.Tensor:
-    if not volume.is_cuda:
-        raise RuntimeError(
-            "forward_project_3d requires CUDA — move volume to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
-
-    Ny, Nz, Nx = volume.shape
-    n_angles = euler_zyz_deg.shape[0]
-    if N_det < 0:
-        N_det = Nx
-
-    vol  = volume.contiguous().float()
-    sino = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
-
-    mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=vol.device)
+    mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=volume.device)
+    n_angles  = euler_zyz_deg.shape[0]
     mats_flat = mats.reshape(n_angles, 9).contiguous()
-
-    _core.forward_project_rotmat_cuda(
-        vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(vol.device),
-    )
-    return sino
+    return _forward_project_3d_mats_raw(volume, mats_flat, N_det)
 
 
 def _back_project_3d_raw(
@@ -175,30 +155,10 @@ def _back_project_3d_raw(
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
 ) -> torch.Tensor:
-    if not sinogram.is_cuda:
-        raise RuntimeError(
-            "back_project_3d requires CUDA — move sinogram to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
-
-    n_angles, Ny, N_det = sinogram.shape
-    Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    sino = sinogram.contiguous().float()
-    vol  = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
-
-    mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=sino.device)
+    mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=sinogram.device)
+    n_angles  = euler_zyz_deg.shape[0]
     mats_flat = mats.reshape(n_angles, 9).contiguous()
-
-    _core.back_project_rotmat_cuda(
-        sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(sino.device),
-    )
-    return vol
+    return _back_project_3d_mats_raw(sinogram, mats_flat, Nz)
 
 
 def _forward_project_3d_mats_raw(
@@ -207,28 +167,29 @@ def _forward_project_3d_mats_raw(
     N_det: int = -1,
 ) -> torch.Tensor:
     """3D rotmat FP that bypasses the euler→rotmat step (mats already given).
-    Used by _FP3D's autograd Function so the conversion lives in PyTorch."""
-    if not volume.is_cuda:
-        raise RuntimeError(
-            "forward_project_3d requires CUDA — move volume to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
-
+    Used by _FP3D's autograd Function so the conversion lives in PyTorch.
+    Dispatches to CPU or CUDA based on `volume.device`."""
     Ny, Nz, Nx = volume.shape
     n_angles = mats_flat.shape[0]
     if N_det < 0:
         N_det = Nx
 
-    vol  = volume.contiguous().float()
-    sino = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
+    if volume.is_cuda:
+        if not _core.cuda_available:
+            raise RuntimeError("fasttomo was compiled without CUDA support")
+        vol  = volume.contiguous().float()
+        sino = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
+        _core.forward_project_rotmat_cuda(
+            vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            _stream_ptr(vol.device),
+        )
+        return sino
 
-    _core.forward_project_rotmat_cuda(
-        vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(vol.device),
-    )
-    return sino
+    vol_np  = volume.detach().contiguous().float().numpy()
+    mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
+    sino_np = _core.forward_project_3d_cpu(vol_np, mats_np, N_det)
+    return torch.from_numpy(sino_np)
 
 
 def _back_project_3d_mats_raw(
@@ -236,28 +197,29 @@ def _back_project_3d_mats_raw(
     mats_flat: torch.Tensor,   # [n_angles, 9] float32, on sinogram.device
     Nz: int = -1,
 ) -> torch.Tensor:
-    """Adjoint of _forward_project_3d_mats_raw — used inside _FP3D.backward."""
-    if not sinogram.is_cuda:
-        raise RuntimeError(
-            "back_project_3d requires CUDA — move sinogram to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
-
+    """Adjoint of _forward_project_3d_mats_raw — used inside _FP3D.backward.
+    Dispatches to CPU or CUDA based on `sinogram.device`."""
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
         Nz = N_det
 
-    sino = sinogram.contiguous().float()
-    vol  = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
+    if sinogram.is_cuda:
+        if not _core.cuda_available:
+            raise RuntimeError("fasttomo was compiled without CUDA support")
+        sino = sinogram.contiguous().float()
+        vol  = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
+        _core.back_project_rotmat_cuda(
+            sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            _stream_ptr(sino.device),
+        )
+        return vol
 
-    _core.back_project_rotmat_cuda(
-        sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(sino.device),
-    )
-    return vol
+    sino_np = sinogram.detach().contiguous().float().numpy()
+    mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
+    vol_np  = _core.back_project_3d_cpu(sino_np, mats_np, Nz)
+    return torch.from_numpy(vol_np)
 
 
 def _grad_rotmat_raw(
@@ -267,30 +229,32 @@ def _grad_rotmat_raw(
 ) -> torch.Tensor:
     """
     Returns [n_angles, 9] gradient of the loss w.r.t. the rotation-matrix
-    entries used by forward_project_rotmat_cuda. PyTorch autograd then
-    chains this through `_euler_zyz_to_rotmat` to give ∂L/∂euler_zyz_deg.
+    entries used by forward_project_3d. PyTorch autograd then chains this
+    through `_euler_zyz_to_rotmat` to give ∂L/∂euler_zyz_deg. Dispatches to
+    CPU or CUDA based on `volume.device`.
     """
-    if not volume.is_cuda:
-        raise RuntimeError(
-            "_grad_rotmat_raw requires CUDA — move volume to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
-
     n_angles = mats_flat.shape[0]
     Ny, Nz, Nx = volume.shape
     _, _, N_det = grad_sino.shape
 
-    vol  = volume.contiguous().float()
-    gs   = grad_sino.contiguous().float()
-    grad_mats = torch.zeros(n_angles, 9, dtype=torch.float32, device=vol.device)
+    if volume.is_cuda:
+        if not _core.cuda_available:
+            raise RuntimeError("fasttomo was compiled without CUDA support")
+        vol  = volume.contiguous().float()
+        gs   = grad_sino.contiguous().float()
+        grad_mats = torch.zeros(n_angles, 9, dtype=torch.float32, device=vol.device)
+        _core.grad_rotmat_cuda(
+            vol.data_ptr(), gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            _stream_ptr(vol.device),
+        )
+        return grad_mats
 
-    _core.grad_rotmat_cuda(
-        vol.data_ptr(), gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(vol.device),
-    )
-    return grad_mats
+    vol_np  = volume.detach().contiguous().float().numpy()
+    gs_np   = grad_sino.detach().contiguous().float().numpy()
+    mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
+    grad_np = _core.grad_rotmat_cpu(vol_np, gs_np, mats_np)
+    return torch.from_numpy(grad_np)
 
 
 def _forward_project_resire_raw(

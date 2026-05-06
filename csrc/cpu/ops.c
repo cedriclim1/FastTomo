@@ -185,7 +185,18 @@ void grad_angle_cpu(
  *   y(s) = u*M[1] + v*M[4] + s*M[7]
  *   z(s) = u*M[2] + v*M[5] + s*M[8]
  * Rays may cross all three faces, so ray length covers the full 3D diagonal.
+ *
+ * Border-zero semantics matching CUDA cudaAddressModeBorder + linear filter:
+ * a sample at fx=Nx-1 must still return vol[Nx-1] (the upper neighbour
+ * vol[Nx] is treated as zero, weighted by wx=0). This requires loose bounds
+ * [-1, N) and per-corner safe loads — a strict fx<Nx-1 check would zero the
+ * last slice entirely.
  */
+#define SAMP3(ix, iy, iz)                                                  \
+    (((ix) >= 0 && (ix) < Nx && (iy) >= 0 && (iy) < Ny &&                  \
+      (iz) >= 0 && (iz) < Nz)                                              \
+     ? volume[((size_t)(iy) * Nz + (iz)) * Nx + (ix)] : 0.0f)
+
 void forward_project_3d_cpu(
     const float *volume,     /* [Ny, Nz, Nx] */
     float       *sinogram,   /* [n_angles, Ny, N_det] */
@@ -219,25 +230,30 @@ void forward_project_3d_cpu(
                     float fy = oy + s * dys + half_y;
                     float fz = oz + s * dzs + half_z;
 
-                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                        fy < 0.0f || fy >= (float)(Ny - 1) ||
-                        fz < 0.0f || fz >= (float)(Nz - 1))
+                    /* Loose bounds: skip only when ALL 8 corners are outside.
+                     * fx in (-1, Nx), fy in (-1, Ny), fz in (-1, Nz). */
+                    if (fx <= -1.0f || fx >= (float)Nx ||
+                        fy <= -1.0f || fy >= (float)Ny ||
+                        fz <= -1.0f || fz >= (float)Nz)
                         continue;
 
-                    int ix0 = (int)fx, iy0 = (int)fy, iz0 = (int)fz;
+                    int ix0 = (int)floorf(fx);
+                    int iy0 = (int)floorf(fy);
+                    int iz0 = (int)floorf(fz);
                     int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
-                    float wx = fx - ix0, wy = fy - iy0, wz = fz - iz0;
+                    float wx = fx - (float)ix0;
+                    float wy = fy - (float)iy0;
+                    float wz = fz - (float)iz0;
                     float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
 
-                    size_t r0 = (size_t)iy0 * Nz, r1 = (size_t)iy1 * Nz;
-                    float v000 = volume[(r0 + iz0) * Nx + ix0];
-                    float v001 = volume[(r0 + iz0) * Nx + ix1];
-                    float v010 = volume[(r0 + iz1) * Nx + ix0];
-                    float v011 = volume[(r0 + iz1) * Nx + ix1];
-                    float v100 = volume[(r1 + iz0) * Nx + ix0];
-                    float v101 = volume[(r1 + iz0) * Nx + ix1];
-                    float v110 = volume[(r1 + iz1) * Nx + ix0];
-                    float v111 = volume[(r1 + iz1) * Nx + ix1];
+                    float v000 = SAMP3(ix0, iy0, iz0);
+                    float v001 = SAMP3(ix1, iy0, iz0);
+                    float v010 = SAMP3(ix0, iy0, iz1);
+                    float v011 = SAMP3(ix1, iy0, iz1);
+                    float v100 = SAMP3(ix0, iy1, iz0);
+                    float v101 = SAMP3(ix1, iy1, iz0);
+                    float v110 = SAMP3(ix0, iy1, iz1);
+                    float v111 = SAMP3(ix1, iy1, iz1);
 
                     sum += uy * uz * (ux * v000 + wx * v001)
                          + uy * wz * (ux * v010 + wx * v011)
@@ -256,7 +272,8 @@ void forward_project_3d_cpu(
  * the bilinearly-interpolated sinogram value at its rotated detector position
  * and accumulates over angles. Approximate adjoint of forward_project_3d_cpu
  * — see CLAUDE.md note that CPU/CUDA BP outputs are not expected to match
- * numerically.
+ * numerically. Border-zero semantics: a voxel mapping to u_det == N_det-1
+ * still contributes the last detector column.
  */
 void back_project_3d_cpu(
     const float *sinogram,   /* [n_angles, Ny, N_det] */
@@ -285,19 +302,24 @@ void back_project_3d_cpu(
                     float u_det = M[0]*x + M[1]*y + M[2]*z + half_det;
                     float v_det = M[3]*x + M[4]*y + M[5]*z + half_y;
 
-                    if (u_det < 0.0f || u_det >= (float)(N_det - 1) ||
-                        v_det < 0.0f || v_det >= (float)(Ny    - 1))
+                    if (u_det <= -1.0f || u_det >= (float)N_det ||
+                        v_det <= -1.0f || v_det >= (float)Ny)
                         continue;
 
-                    int iu0 = (int)u_det, iv0 = (int)v_det;
-                    int iu1 = iu0 + 1,    iv1 = iv0 + 1;
-                    float wu = u_det - iu0, wv = v_det - iv0;
+                    int iu0 = (int)floorf(u_det), iv0 = (int)floorf(v_det);
+                    int iu1 = iu0 + 1,            iv1 = iv0 + 1;
+                    float wu = u_det - (float)iu0;
+                    float wv = v_det - (float)iv0;
 
                     const float *layer = sinogram + (size_t)ia * Ny * N_det;
-                    val += (1.0f - wv) * (1.0f - wu) * layer[(size_t)iv0 * N_det + iu0]
-                         + (1.0f - wv) *          wu  * layer[(size_t)iv0 * N_det + iu1]
-                         +          wv  * (1.0f - wu) * layer[(size_t)iv1 * N_det + iu0]
-                         +          wv  *          wu  * layer[(size_t)iv1 * N_det + iu1];
+                    #define SSAMP(iu, iv) \
+                        (((iu) >= 0 && (iu) < N_det && (iv) >= 0 && (iv) < Ny) \
+                         ? layer[(size_t)(iv) * N_det + (iu)] : 0.0f)
+                    val += (1.0f - wv) * (1.0f - wu) * SSAMP(iu0, iv0)
+                         + (1.0f - wv) *          wu  * SSAMP(iu1, iv0)
+                         +          wv  * (1.0f - wu) * SSAMP(iu0, iv1)
+                         +          wv  *          wu  * SSAMP(iu1, iv1);
+                    #undef SSAMP
                 }
 
                 volume[((size_t)iy * Nz + iz) * Nx + ix] = val;
@@ -355,25 +377,28 @@ void grad_rotmat_cpu(
                     float fy = oy + s * dys + half_y;
                     float fz = oz + s * dzs + half_z;
 
-                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                        fy < 0.0f || fy >= (float)(Ny - 1) ||
-                        fz < 0.0f || fz >= (float)(Nz - 1))
+                    if (fx <= -1.0f || fx >= (float)Nx ||
+                        fy <= -1.0f || fy >= (float)Ny ||
+                        fz <= -1.0f || fz >= (float)Nz)
                         continue;
 
-                    int ix0 = (int)fx, iy0 = (int)fy, iz0 = (int)fz;
+                    int ix0 = (int)floorf(fx);
+                    int iy0 = (int)floorf(fy);
+                    int iz0 = (int)floorf(fz);
                     int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
-                    float wx = fx - ix0, wy = fy - iy0, wz = fz - iz0;
+                    float wx = fx - (float)ix0;
+                    float wy = fy - (float)iy0;
+                    float wz = fz - (float)iz0;
                     float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
 
-                    size_t r0 = (size_t)iy0 * Nz, r1 = (size_t)iy1 * Nz;
-                    float v000 = volume[(r0 + iz0) * Nx + ix0];
-                    float v001 = volume[(r0 + iz0) * Nx + ix1];
-                    float v010 = volume[(r0 + iz1) * Nx + ix0];
-                    float v011 = volume[(r0 + iz1) * Nx + ix1];
-                    float v100 = volume[(r1 + iz0) * Nx + ix0];
-                    float v101 = volume[(r1 + iz0) * Nx + ix1];
-                    float v110 = volume[(r1 + iz1) * Nx + ix0];
-                    float v111 = volume[(r1 + iz1) * Nx + ix1];
+                    float v000 = SAMP3(ix0, iy0, iz0);
+                    float v001 = SAMP3(ix1, iy0, iz0);
+                    float v010 = SAMP3(ix0, iy0, iz1);
+                    float v011 = SAMP3(ix1, iy0, iz1);
+                    float v100 = SAMP3(ix0, iy1, iz0);
+                    float v101 = SAMP3(ix1, iy1, iz0);
+                    float v110 = SAMP3(ix0, iy1, iz1);
+                    float v111 = SAMP3(ix1, iy1, iz1);
 
                     float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
                               + uy * wz * (v011 - v010) + wy * wz * (v111 - v110);
@@ -391,6 +416,8 @@ void grad_rotmat_cpu(
         }
     }
 }
+
+#undef SAMP3
 
 void genfire_gridding_2d_cpu(
     const float *fk_real, const float *fk_imag,
