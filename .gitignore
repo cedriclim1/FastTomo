@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code
+CLAUDE.md
+.claude/
+fasttomo-wiki/
+
+Notebooks/

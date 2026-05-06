@@ -1,0 +1,17 @@
+[build-system]
+requires = ["scikit-build-core>=0.3", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "fasttomo"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["torch", "numpy"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["fasttomo"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_CUDA_COMPILER = "/home/cedlim/miniforge3/envs/FastTomo/bin/nvcc"
+pybind11_DIR = "/home/cedlim/miniforge3/envs/FastTomo/lib/python3.14/site-packages/pybind11/share/cmake/pybind11"

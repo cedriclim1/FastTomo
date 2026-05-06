@@ -1,0 +1,480 @@
+#include "ops.h"
+#include <cuda_runtime.h>
+#include <math.h>
+
+/* ── helpers ──────────────────────────────────────────────────────────────
+ * make_vol_texture:  wrap a device [Ny, Nz, Nx] float buffer in a layered
+ *                    2D texture (Ny layers of [Nz, Nx]).
+ * make_sino_texture: wrap a device [n_angles, Ny, N_det] float buffer in a
+ *                    layered 2D texture (n_angles layers of [Ny, N_det]).
+ *
+ * Both use hardware linear filtering (free bilinear interpolation) and
+ * border addressing (returns 0.0 for out-of-bounds coordinates).
+ * Caller must call cudaDestroyTextureObject + cudaFreeArray when done.
+ */
+static cudaTextureObject_t make_vol_texture(
+    const float *d_vol, int Ny, int Nz, int Nx,
+    cudaArray_t &out_array
+) {
+    cudaChannelFormatDesc fmt = cudaCreateChannelDesc<float>();
+    /* Ny layers, each Nx wide × Nz tall */
+    cudaMalloc3DArray(&out_array, &fmt,
+                      make_cudaExtent(Nx, Nz, Ny), cudaArrayLayered);
+
+    cudaMemcpy3DParms cp = {};
+    cp.srcPtr   = make_cudaPitchedPtr((void *)d_vol,
+                                      Nx * sizeof(float), Nx, Nz);
+    cp.dstArray = out_array;
+    cp.extent   = make_cudaExtent(Nx, Nz, Ny);
+    cp.kind     = cudaMemcpyDeviceToDevice;
+    cudaMemcpy3D(&cp);
+
+    cudaResourceDesc rd = {};
+    rd.resType         = cudaResourceTypeArray;
+    rd.res.array.array = out_array;
+
+    cudaTextureDesc td = {};
+    td.addressMode[0]  = cudaAddressModeBorder;
+    td.addressMode[1]  = cudaAddressModeBorder;
+    td.filterMode      = cudaFilterModeLinear;
+    td.readMode        = cudaReadModeElementType;
+    td.normalizedCoords = 0;
+
+    cudaTextureObject_t tex;
+    cudaCreateTextureObject(&tex, &rd, &td, nullptr);
+    return tex;
+}
+
+static cudaTextureObject_t make_sino_texture(
+    const float *d_sino, int n_angles, int Ny, int N_det,
+    cudaArray_t &out_array
+) {
+    cudaChannelFormatDesc fmt = cudaCreateChannelDesc<float>();
+    /* n_angles layers, each N_det wide × Ny tall */
+    cudaMalloc3DArray(&out_array, &fmt,
+                      make_cudaExtent(N_det, Ny, n_angles), cudaArrayLayered);
+
+    cudaMemcpy3DParms cp = {};
+    cp.srcPtr   = make_cudaPitchedPtr((void *)d_sino,
+                                      N_det * sizeof(float), N_det, Ny);
+    cp.dstArray = out_array;
+    cp.extent   = make_cudaExtent(N_det, Ny, n_angles);
+    cp.kind     = cudaMemcpyDeviceToDevice;
+    cudaMemcpy3D(&cp);
+
+    cudaResourceDesc rd = {};
+    rd.resType         = cudaResourceTypeArray;
+    rd.res.array.array = out_array;
+
+    cudaTextureDesc td = {};
+    td.addressMode[0]  = cudaAddressModeBorder;
+    td.addressMode[1]  = cudaAddressModeBorder;
+    td.filterMode      = cudaFilterModeLinear;
+    td.readMode        = cudaReadModeElementType;
+    td.normalizedCoords = 0;
+
+    cudaTextureObject_t tex;
+    cudaCreateTextureObject(&tex, &rd, &td, nullptr);
+    return tex;
+}
+
+/* ── forward projection ───────────────────────────────────────────────────
+ * Grid:  (ceil(N_det/16), ceil(n_angles/16), Ny)   Block: (16, 16, 1)
+ * Each thread owns one (detector, angle) output cell in one Y-slice.
+ * Marches along the ray; tex2DLayered handles bilinear interp and border.
+ */
+__global__ static void forward_project_kernel(
+    cudaTextureObject_t  vol_tex,    /* Ny layers of [Nz, Nx] */
+    float *__restrict__  sinogram,   /* [n_angles, Ny, N_det] */
+    const float *__restrict__ cos_a,
+    const float *__restrict__ sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    float half_det, float half_x, float half_z, int ray_len
+) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;  /* detector pixel */
+    int ia = blockIdx.y * blockDim.y + threadIdx.y;  /* angle index    */
+    int iy = blockIdx.z;                              /* Y-slice / layer */
+
+    if (id >= N_det || ia >= n_angles) return;
+
+    float ca = cos_a[ia], sa = sin_a[ia];
+    float t   = id - half_det;
+    float sum = 0.0f;
+
+    for (int step = -ray_len; step <= ray_len; step++) {
+        float s  = (float)step;
+        float fx = (t * ca - s * sa) + half_x;
+        float fz = (t * sa + s * ca) + half_z;
+        /* tex2DLayered: x→Nx axis, y→Nz axis, layer→iy.
+         * +0.5 maps integer pixel index to texel centre.
+         * Border addressing returns 0 outside the volume automatically. */
+        sum += tex2DLayered<float>(vol_tex, fx + 0.5f, fz + 0.5f, iy);
+    }
+
+    sinogram[((size_t)ia * Ny + iy) * N_det + id] = sum;
+}
+
+void forward_project_cuda(
+    const float *d_volume,
+    float       *d_sinogram,
+    const float *d_cos_a,
+    const float *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx * Nx + Nz * Nz))) + 1;
+
+    cudaArray_t vol_array;
+    cudaTextureObject_t vol_tex = make_vol_texture(d_volume, Ny, Nz, Nx, vol_array);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((N_det    + 15) / 16,
+              (n_angles + 15) / 16,
+              Ny);
+
+    forward_project_kernel<<<grid, block>>>(
+        vol_tex, d_sinogram, d_cos_a, d_sin_a,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, ray_len
+    );
+
+    cudaDestroyTextureObject(vol_tex);
+    cudaFreeArray(vol_array);
+}
+
+/* ── back-projection ──────────────────────────────────────────────────────
+ * Grid:  (ceil(Nx/16), ceil(Nz/16), Ny)   Block: (16, 16, 1)
+ * Each thread owns one (ix, iz) voxel in one Y-slice and loops over angles.
+ * cos_a/sin_a are preloaded into shared memory. tex2DLayered on the
+ * sinogram provides free hardware interpolation along the detector axis.
+ */
+__global__ static void back_project_kernel(
+    cudaTextureObject_t  sino_tex,   /* n_angles layers of [Ny, N_det] */
+    float *__restrict__  volume,     /* [Ny, Nz, Nx] */
+    const float *__restrict__ cos_a,
+    const float *__restrict__ sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    float half_det, float half_x, float half_z
+) {
+    extern __shared__ float sh[];
+    float *sh_cos = sh;
+    float *sh_sin = sh + n_angles;
+
+    for (int i = threadIdx.x + threadIdx.y * blockDim.x; i < n_angles;
+         i += blockDim.x * blockDim.y) {
+        sh_cos[i] = cos_a[i];
+        sh_sin[i] = sin_a[i];
+    }
+    __syncthreads();
+
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iz = blockIdx.y * blockDim.y + threadIdx.y;
+    int iy = blockIdx.z;
+
+    if (ix >= Nx || iz >= Nz) return;
+
+    float x   = ix - half_x;
+    float z   = iz - half_z;
+    float val = 0.0f;
+
+    float iy_tc = (float)iy + 0.5f;  /* Y-slice texel centre — no interpolation in Y */
+
+    for (int ia = 0; ia < n_angles; ia++) {
+        float ft = x * sh_cos[ia] + z * sh_sin[ia] + half_det;
+        /* tex2DLayered: x→N_det axis, y→Ny axis, layer→ia.
+         * Hardware linear filter interpolates along detector (ft fractional).
+         * iy_tc is always at a texel centre so no interpolation in Y. */
+        val += tex2DLayered<float>(sino_tex, ft + 0.5f, iy_tc, ia);
+    }
+
+    volume[((size_t)iy * Nz + iz) * Nx + ix] = val;
+}
+
+void back_project_cuda(
+    const float *d_sinogram,
+    float       *d_volume,
+    const float *d_cos_a,
+    const float *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+
+    cudaArray_t sino_array;
+    cudaTextureObject_t sino_tex =
+        make_sino_texture(d_sinogram, n_angles, Ny, N_det, sino_array);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
+    size_t smem = 2 * (size_t)n_angles * sizeof(float);
+
+    back_project_kernel<<<grid, block, smem>>>(
+        sino_tex, d_volume, d_cos_a, d_sin_a,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z
+    );
+
+    cudaDestroyTextureObject(sino_tex);
+    cudaFreeArray(sino_array);
+}
+
+/* ── 3D rotation-matrix forward projection ───────────────────────────────
+ * Wraps a [Ny, Nz, Nx] volume in a true tex3D (trilinear, border zero).
+ * Unlike make_vol_texture (which uses layered 2D), this allows the ray to
+ * cross Y-slice boundaries — required for general ZYZ Euler rotations.
+ */
+static cudaTextureObject_t make_vol_texture_3d(
+    const float *d_vol, int Ny, int Nz, int Nx,
+    cudaArray_t &out_array
+) {
+    cudaChannelFormatDesc fmt = cudaCreateChannelDesc<float>();
+    /* extent: (width=Nx, height=Nz, depth=Ny) — matches C-order [Ny][Nz][Nx] */
+    cudaMalloc3DArray(&out_array, &fmt,
+                      make_cudaExtent(Nx, Nz, Ny), 0 /* no cudaArrayLayered */);
+
+    cudaMemcpy3DParms cp = {};
+    cp.srcPtr   = make_cudaPitchedPtr((void *)d_vol,
+                                      Nx * sizeof(float), Nx, Nz);
+    cp.dstArray = out_array;
+    cp.extent   = make_cudaExtent(Nx, Nz, Ny);
+    cp.kind     = cudaMemcpyDeviceToDevice;
+    cudaMemcpy3D(&cp);
+
+    cudaResourceDesc rd = {};
+    rd.resType         = cudaResourceTypeArray;
+    rd.res.array.array = out_array;
+
+    cudaTextureDesc td = {};
+    td.addressMode[0]  = cudaAddressModeBorder;
+    td.addressMode[1]  = cudaAddressModeBorder;
+    td.addressMode[2]  = cudaAddressModeBorder;
+    td.filterMode      = cudaFilterModeLinear;
+    td.readMode        = cudaReadModeElementType;
+    td.normalizedCoords = 0;
+
+    cudaTextureObject_t tex;
+    cudaCreateTextureObject(&tex, &rd, &td, nullptr);
+    return tex;
+}
+
+/* forward_project_rotmat_kernel
+ * Grid: (⌈N_det/16⌉, ⌈Ny/16⌉, n_angles)   Block: (16, 16, 1)
+ * Each thread owns one (detector-u, detector-v, angle) output sample.
+ * Rotation matrix M (row-major, 9 floats per projection):
+ *   detector-u = M[0]*x + M[1]*y + M[2]*z
+ *   detector-v = M[3]*x + M[4]*y + M[5]*z
+ * Ray tracing (R^T applied to ray direction):
+ *   x(s) = u*M[0] + v*M[3] + s*M[6]
+ *   y(s) = u*M[1] + v*M[4] + s*M[7]
+ *   z(s) = u*M[2] + v*M[5] + s*M[8]
+ * tex3D axis mapping: tex3D(tex, ix, iz, iy) → vol[iy][iz][ix]
+ */
+__global__ static void forward_project_rotmat_kernel(
+    cudaTextureObject_t  vol_tex,
+    float *__restrict__  sinogram,         /* [n_angles, Ny, N_det] */
+    const float *__restrict__ matrices,    /* [n_angles * 9] row-major */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    float half_det, float half_x, float half_z, float half_y,
+    int ray_len
+) {
+    int iu = blockIdx.x * blockDim.x + threadIdx.x;  /* detector u */
+    int iv = blockIdx.y * blockDim.y + threadIdx.y;  /* detector v = Y-slice */
+    int ia = blockIdx.z;
+
+    if (iu >= N_det || iv >= Ny) return;
+
+    const float *M = matrices + ia * 9;
+    float u = iu - half_det;
+    float v = iv - half_y;
+
+    /* precompute origin of ray at s=0 and step increments */
+    float ox = u * M[0] + v * M[3];
+    float oy = u * M[1] + v * M[4];
+    float oz = u * M[2] + v * M[5];
+    float dx = M[6], dy = M[7], dz = M[8];  /* ray direction */
+
+    float sum = 0.0f;
+    for (int step = -ray_len; step <= ray_len; step++) {
+        float s  = (float)step;
+        float tx = ox + s * dx + half_x + 0.5f;
+        float tz = oz + s * dz + half_z + 0.5f;
+        float ty = oy + s * dy + half_y + 0.5f;
+        /* tex3D: (x→width=Nx, z→height=Nz, y→depth=Ny) */
+        sum += tex3D<float>(vol_tex, tx, tz, ty);
+    }
+    sinogram[((size_t)ia * Ny + iv) * N_det + iu] = sum;
+}
+
+void forward_project_rotmat_cuda(
+    const float *d_volume,
+    float       *d_sinogram,
+    const float *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+    int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
+
+    cudaArray_t vol_array;
+    cudaTextureObject_t vol_tex = make_vol_texture_3d(d_volume, Ny, Nz, Nx, vol_array);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((N_det + 15) / 16,
+              (Ny    + 15) / 16,
+              n_angles);
+
+    forward_project_rotmat_kernel<<<grid, block>>>(
+        vol_tex, d_sinogram, d_matrices,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, half_y, ray_len
+    );
+
+    cudaDestroyTextureObject(vol_tex);
+    cudaFreeArray(vol_array);
+}
+
+/* back_project_rotmat_kernel
+ * Grid: (⌈Nx/8⌉, ⌈Nz/8⌉, ⌈Ny/4⌉)   Block: (8, 8, 4)
+ * Each thread owns one (ix, iz, iy) voxel and loops over all angles.
+ * Rotation matrices loaded into shared memory (9 * n_angles floats).
+ * Sinogram sampled with tex2DLayered (n_angles layers of [Ny, N_det]).
+ */
+__global__ static void back_project_rotmat_kernel(
+    cudaTextureObject_t  sino_tex,        /* n_angles layers of [Ny, N_det] */
+    float *__restrict__  volume,          /* [Ny, Nz, Nx] */
+    const float *__restrict__ matrices,   /* [n_angles * 9] row-major */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    float half_det, float half_x, float half_z, float half_y
+) {
+    extern __shared__ float sh_mats[];   /* 9 * n_angles floats */
+
+    int tid       = threadIdx.x + threadIdx.y * blockDim.x
+                  + threadIdx.z * blockDim.x * blockDim.y;
+    int block_sz  = blockDim.x * blockDim.y * blockDim.z;
+    for (int k = tid; k < n_angles * 9; k += block_sz)
+        sh_mats[k] = matrices[k];
+    __syncthreads();
+
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iz = blockIdx.y * blockDim.y + threadIdx.y;
+    int iy = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (ix >= Nx || iz >= Nz || iy >= Ny) return;
+
+    float x = ix - half_x;
+    float y = iy - half_y;
+    float z = iz - half_z;
+    float val = 0.0f;
+
+    for (int ia = 0; ia < n_angles; ia++) {
+        const float *M = sh_mats + ia * 9;
+        /* u = R[0,:] · (x,y,z)   v = R[1,:] · (x,y,z) */
+        float u_det = M[0]*x + M[1]*y + M[2]*z;
+        float v_det = M[3]*x + M[4]*y + M[5]*z;
+        /* tex2DLayered: x→N_det, y→Ny, layer→ia */
+        val += tex2DLayered<float>(sino_tex,
+                                   u_det + half_det + 0.5f,
+                                   v_det + half_y   + 0.5f,
+                                   ia);
+    }
+
+    volume[((size_t)iy * Nz + iz) * Nx + ix] = val;
+}
+
+void back_project_rotmat_cuda(
+    const float *d_sinogram,
+    float       *d_volume,
+    const float *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+
+    cudaArray_t sino_array;
+    cudaTextureObject_t sino_tex =
+        make_sino_texture(d_sinogram, n_angles, Ny, N_det, sino_array);
+
+    dim3 block(8, 8, 4);
+    dim3 grid((Nx + 7) / 8,
+              (Nz + 7) / 8,
+              (Ny + 3) / 4);
+    size_t smem = 9 * (size_t)n_angles * sizeof(float);
+
+    back_project_rotmat_kernel<<<grid, block, smem>>>(
+        sino_tex, d_volume, d_matrices,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, half_y
+    );
+
+    cudaDestroyTextureObject(sino_tex);
+    cudaFreeArray(sino_array);
+}
+
+/* ── GENFIRE 2D Fourier gridding ─────────────────────────────────────────── */
+
+__global__ static void genfire_gridding_2d_kernel(
+    const float *fk_real, const float *fk_imag,
+    const float *cos_a,   const float *sin_a,
+    float *grid_real, float *grid_imag, float *weight_grid,
+    int bigN, int Ny, int n_angles, float cutoff_dist
+) {
+    int ixi = blockIdx.x * blockDim.x + threadIdx.x;
+    int ia  = (int)blockIdx.y;
+    int iy  = (int)blockIdx.z;
+
+    if (ixi >= bigN || ia >= n_angles || iy >= Ny) return;
+
+    int   half = bigN / 2;
+    float xi   = (float)(ixi - half);
+    float kx   = xi * cos_a[ia];
+    float kz   = xi * sin_a[ia];
+    int   ikx  = __float2int_rn(kx);
+    int   ikz  = __float2int_rn(kz);
+    float dx   = kx - (float)ikx;
+    float dz   = kz - (float)ikz;
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (dist > cutoff_dist) return;
+
+    int gx = ikx + half;
+    int gz = ikz + half;
+    if (gx < 0 || gx >= bigN || gz < 0 || gz >= bigN) return;
+
+    float  w       = 1.0f / (dist + 1e-5f);
+    size_t fk_idx  = ((size_t)ia * Ny + iy) * bigN + (size_t)ixi;
+    size_t out_idx = (size_t)iy * bigN * bigN + (size_t)gz * bigN + (size_t)gx;
+
+    atomicAdd(&grid_real[out_idx],    w * fk_real[fk_idx]);
+    atomicAdd(&grid_imag[out_idx],    w * fk_imag[fk_idx]);
+    atomicAdd(&weight_grid[out_idx],  w);
+}
+
+void genfire_gridding_2d_cuda(
+    const float *fk_real, const float *fk_imag,
+    const float *cos_a,   const float *sin_a,
+    float *grid_real, float *grid_imag, float *weight_grid,
+    int bigN, int Ny, int n_angles, float cutoff_dist
+) {
+    dim3 block(128, 1, 1);
+    dim3 grid((bigN + 127) / 128, (unsigned)n_angles, (unsigned)Ny);
+    genfire_gridding_2d_kernel<<<grid, block>>>(
+        fk_real, fk_imag, cos_a, sin_a,
+        grid_real, grid_imag, weight_grid,
+        bigN, Ny, n_angles, cutoff_dist
+    );
+    cudaDeviceSynchronize();
+}
