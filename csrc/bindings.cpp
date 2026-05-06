@@ -20,7 +20,9 @@ static void check_f32(const f32arr &a, const char *name) {
         throw std::invalid_argument(std::string(name) + " must have at least 1 dim");
 }
 
-/* precompute cos/sin from a 1-D angles array (radians) */
+/* precompute cos/sin from a 1-D angles array (radians) — used by CPU path
+ * only. CUDA path takes cos/sin device pointers computed by the Python
+ * wrapper, so the precompute can stay on the GPU. */
 static void compute_trig(const f32arr &angles,
                           std::vector<float> &cos_a,
                           std::vector<float> &sin_a) {
@@ -133,6 +135,100 @@ static f32arr py_grad_angle_cpu(
     return grad_angles;
 }
 
+static f32arr py_forward_project_3d_cpu(
+    const f32arr &volume,    /* [Ny, Nz, Nx] */
+    const f32arr &matrices,  /* [n_angles, 9] or [n_angles*9] row-major */
+    int N_det                /* detector width; -1 → use Nx */
+) {
+    check_f32(volume, "volume");
+    check_f32(matrices, "matrices");
+    if (volume.ndim() != 3)
+        throw std::invalid_argument("volume must be 3-D [Ny, Nz, Nx]");
+    if ((int)matrices.size() % 9 != 0)
+        throw std::invalid_argument("matrices size must be multiple of 9");
+
+    int Ny       = (int)volume.shape(0);
+    int Nz       = (int)volume.shape(1);
+    int Nx       = (int)volume.shape(2);
+    int n_angles = (int)matrices.size() / 9;
+    if (N_det < 0) N_det = Nx;
+
+    auto sinogram = py::array_t<float>({n_angles, Ny, N_det});
+    auto out_buf  = sinogram.request();
+
+    forward_project_3d_cpu(
+        static_cast<const float *>(volume.request().ptr),
+        static_cast<float *>(out_buf.ptr),
+        static_cast<const float *>(matrices.request().ptr),
+        Ny, Nz, Nx, n_angles, N_det
+    );
+    return sinogram;
+}
+
+static f32arr py_back_project_3d_cpu(
+    const f32arr &sinogram,  /* [n_angles, Ny, N_det] */
+    const f32arr &matrices,  /* [n_angles, 9] or [n_angles*9] */
+    int Nz                   /* reconstruction depth; -1 → use N_det */
+) {
+    check_f32(sinogram, "sinogram");
+    check_f32(matrices, "matrices");
+    if (sinogram.ndim() != 3)
+        throw std::invalid_argument("sinogram must be 3-D [n_angles, Ny, N_det]");
+
+    int n_angles = (int)sinogram.shape(0);
+    int Ny       = (int)sinogram.shape(1);
+    int N_det    = (int)sinogram.shape(2);
+    int Nx       = N_det;
+    if (Nz < 0) Nz = N_det;
+    if ((int)matrices.size() != n_angles * 9)
+        throw std::invalid_argument("matrices size must equal n_angles * 9");
+
+    auto volume  = py::array_t<float>({Ny, Nz, Nx});
+    auto out_buf = volume.request();
+
+    back_project_3d_cpu(
+        static_cast<const float *>(sinogram.request().ptr),
+        static_cast<float *>(out_buf.ptr),
+        static_cast<const float *>(matrices.request().ptr),
+        Ny, Nz, Nx, n_angles, N_det
+    );
+    return volume;
+}
+
+static f32arr py_grad_rotmat_cpu(
+    const f32arr &volume,    /* [Ny, Nz, Nx] */
+    const f32arr &grad_sino, /* [n_angles, Ny, N_det] */
+    const f32arr &matrices   /* [n_angles, 9] or [n_angles*9] */
+) {
+    check_f32(volume, "volume");
+    check_f32(grad_sino, "grad_sino");
+    check_f32(matrices, "matrices");
+    if (volume.ndim() != 3)
+        throw std::invalid_argument("volume must be 3-D [Ny, Nz, Nx]");
+    if (grad_sino.ndim() != 3)
+        throw std::invalid_argument("grad_sino must be 3-D [n_angles, Ny, N_det]");
+
+    int Ny       = (int)volume.shape(0);
+    int Nz       = (int)volume.shape(1);
+    int Nx       = (int)volume.shape(2);
+    int n_angles = (int)grad_sino.shape(0);
+    int N_det    = (int)grad_sino.shape(2);
+    if ((int)matrices.size() != n_angles * 9)
+        throw std::invalid_argument("matrices size must equal n_angles * 9");
+
+    auto grad_mats = py::array_t<float>({n_angles, 9});
+    auto out_buf   = grad_mats.request();
+
+    grad_rotmat_cpu(
+        static_cast<const float *>(volume.request().ptr),
+        static_cast<const float *>(grad_sino.request().ptr),
+        static_cast<const float *>(matrices.request().ptr),
+        static_cast<float *>(out_buf.ptr),
+        Ny, Nz, Nx, n_angles, N_det
+    );
+    return grad_mats;
+}
+
 static py::tuple py_genfire_gridding_2d_cpu(
     const f32arr &fk_real,  /* [n_angles, Ny, bigN] */
     const f32arr &fk_imag,
@@ -174,107 +270,113 @@ static py::tuple py_genfire_gridding_2d_cpu(
 
 #ifdef FASTTOMO_CUDA
 
-/* Helper: allocate device memory, copy from host, return device pointer. */
-static float *to_device(const float *host, size_t n) {
-    float *dev;
-    cudaMalloc(&dev, n * sizeof(float));
-    cudaMemcpy(dev, host, n * sizeof(float), cudaMemcpyHostToDevice);
-    return dev;
+/* Cast a Python int (caller passes torch.cuda.current_stream().cuda_stream)
+ * to cudaStream_t. 0 means the legacy default stream. */
+static inline cudaStream_t to_stream(long stream_ptr) {
+    return reinterpret_cast<cudaStream_t>(stream_ptr);
 }
 
 static void py_forward_project_cuda(
-    long   volume_ptr,    /* d_volume  data_ptr() — device float* as Python int */
-    long   sinogram_ptr,  /* d_sinogram data_ptr() */
-    const f32arr &angles, /* [n_angles] radians — host array */
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    long volume_ptr, long sinogram_ptr,
+    long cos_ptr, long sin_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
-    std::vector<float> cos_a, sin_a;
-    compute_trig(angles, cos_a, sin_a);
-
-    float *d_cos = to_device(cos_a.data(), n_angles);
-    float *d_sin = to_device(sin_a.data(), n_angles);
-
     forward_project_cuda(
         reinterpret_cast<const float *>(volume_ptr),
         reinterpret_cast<float *>(sinogram_ptr),
-        d_cos, d_sin,
-        Ny, Nz, Nx, n_angles, N_det
+        reinterpret_cast<const float *>(cos_ptr),
+        reinterpret_cast<const float *>(sin_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
-
-    cudaFree(d_cos);
-    cudaFree(d_sin);
 }
 
 static void py_back_project_cuda(
-    long   sinogram_ptr,
-    long   volume_ptr,
-    const f32arr &angles,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    long sinogram_ptr, long volume_ptr,
+    long cos_ptr, long sin_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
-    std::vector<float> cos_a, sin_a;
-    compute_trig(angles, cos_a, sin_a);
-
-    float *d_cos = to_device(cos_a.data(), n_angles);
-    float *d_sin = to_device(sin_a.data(), n_angles);
-
     back_project_cuda(
         reinterpret_cast<const float *>(sinogram_ptr),
         reinterpret_cast<float *>(volume_ptr),
-        d_cos, d_sin,
-        Ny, Nz, Nx, n_angles, N_det
+        reinterpret_cast<const float *>(cos_ptr),
+        reinterpret_cast<const float *>(sin_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
-
-    cudaFree(d_cos);
-    cudaFree(d_sin);
 }
 
 static void py_forward_project_rotmat_cuda(
     long vol_ptr, long sino_ptr, long matrices_ptr,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
     forward_project_rotmat_cuda(
         reinterpret_cast<const float *>(vol_ptr),
         reinterpret_cast<float *>(sino_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
 }
 
 static void py_back_project_rotmat_cuda(
     long sino_ptr, long vol_ptr, long matrices_ptr,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
     back_project_rotmat_cuda(
         reinterpret_cast<const float *>(sino_ptr),
         reinterpret_cast<float *>(vol_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
 }
 
 static void py_forward_project_resire_cuda(
     long vol_ptr, long sino_ptr, long matrices_ptr,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
     forward_project_resire_cuda(
         reinterpret_cast<const float *>(vol_ptr),
         reinterpret_cast<float *>(sino_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
 }
 
 static void py_back_project_resire_cuda(
     long sino_ptr, long vol_ptr, long matrices_ptr,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
     back_project_resire_cuda(
         reinterpret_cast<const float *>(sino_ptr),
         reinterpret_cast<float *>(vol_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_grad_rotmat_cuda(
+    long vol_ptr, long grad_sino_ptr,
+    long matrices_ptr, long grad_matrices_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    grad_rotmat_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<const float *>(grad_sino_ptr),
+        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<float *>(grad_matrices_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
 }
 
@@ -282,7 +384,8 @@ static void py_grad_angle_cuda(
     long vol_ptr, long grad_sino_ptr,
     long cos_ptr, long sin_ptr,
     long grad_angles_ptr,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
 ) {
     grad_angle_cuda(
         reinterpret_cast<const float *>(vol_ptr),
@@ -290,21 +393,8 @@ static void py_grad_angle_cuda(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         reinterpret_cast<float *>(grad_angles_ptr),
-        Ny, Nz, Nx, n_angles, N_det
-    );
-}
-
-static void py_grad_rotmat_resire_cuda(
-    long vol_ptr, long grad_sino_ptr,
-    long matrices_ptr, long grad_matrices_ptr,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
-) {
-    grad_rotmat_resire_cuda(
-        reinterpret_cast<const float *>(vol_ptr),
-        reinterpret_cast<const float *>(grad_sino_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
-        reinterpret_cast<float *>(grad_matrices_ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
     );
 }
 
@@ -312,7 +402,8 @@ static void py_genfire_gridding_2d_cuda(
     long fk_real_ptr, long fk_imag_ptr,
     long cos_ptr,     long sin_ptr,
     long grid_real_ptr, long grid_imag_ptr, long weight_ptr,
-    int bigN, int Ny, int n_angles, float cutoff_dist
+    int bigN, int Ny, int n_angles, float cutoff_dist,
+    long stream_ptr
 ) {
     genfire_gridding_2d_cuda(
         reinterpret_cast<const float *>(fk_real_ptr),
@@ -322,7 +413,8 @@ static void py_genfire_gridding_2d_cuda(
         reinterpret_cast<float *>(grid_real_ptr),
         reinterpret_cast<float *>(grid_imag_ptr),
         reinterpret_cast<float *>(weight_ptr),
-        bigN, Ny, n_angles, cutoff_dist
+        bigN, Ny, n_angles, cutoff_dist,
+        to_stream(stream_ptr)
     );
 }
 
@@ -362,30 +454,37 @@ PYBIND11_MODULE(_core, m) {
 
 #ifdef FASTTOMO_CUDA
     m.def("forward_project_cuda", &py_forward_project_cuda,
-          "Forward projection (CUDA). Accepts device data_ptr() ints.",
-          py::arg("volume_ptr"), py::arg("sinogram_ptr"), py::arg("angles"),
+          "Forward projection (CUDA). All ptr args are device data_ptr() ints. "
+          "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream).",
+          py::arg("volume_ptr"), py::arg("sinogram_ptr"),
+          py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("back_project_cuda", &py_back_project_cuda,
-          "Back-projection (CUDA). Accepts device data_ptr() ints.",
-          py::arg("sinogram_ptr"), py::arg("volume_ptr"), py::arg("angles"),
+          "Back-projection (CUDA). All ptr args are device data_ptr() ints.",
+          py::arg("sinogram_ptr"), py::arg("volume_ptr"),
+          py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda", &py_forward_project_rotmat_cuda,
           "3D rotation-matrix forward projection (CUDA). "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
           py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("back_project_rotmat_cuda", &py_back_project_rotmat_cuda,
           "3D rotation-matrix back-projection (CUDA). "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_resire_cuda", &py_forward_project_resire_cuda,
           "RESIRE voxel-driven forward projection (CUDA). "
@@ -393,7 +492,8 @@ PYBIND11_MODULE(_core, m) {
           "sino_ptr must point to a zeroed buffer.",
           py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("back_project_resire_cuda", &py_back_project_resire_cuda,
           "RESIRE voxel-driven back-projection (CUDA). "
@@ -401,7 +501,18 @@ PYBIND11_MODULE(_core, m) {
           "vol_ptr must point to a zeroed buffer.",
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("grad_rotmat_cuda", &py_grad_rotmat_cuda,
+          "Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CUDA). "
+          "All ptr args are device data_ptr() ints. "
+          "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
+          py::arg("vol_ptr"), py::arg("grad_sino_ptr"),
+          py::arg("matrices_ptr"), py::arg("grad_matrices_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("grad_angle_cuda", &py_grad_angle_cuda,
           "Gradient of forward projection w.r.t. tilt angles (CUDA). "
@@ -411,16 +522,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("grad_angles_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
-
-    m.def("grad_rotmat_resire_cuda", &py_grad_rotmat_resire_cuda,
-          "Gradient of RESIRE forward projection w.r.t. rotation matrices (CUDA). "
-          "All pointer args are device data_ptr() ints. "
-          "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
-          py::arg("vol_ptr"), py::arg("grad_sino_ptr"),
-          py::arg("matrices_ptr"), py::arg("grad_matrices_ptr"),
-          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("n_angles"), py::arg("N_det"));
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("genfire_gridding_2d_cuda", &py_genfire_gridding_2d_cuda,
           "GENFIRE Fourier gridding (CUDA). All args are device data_ptr() ints "
@@ -429,7 +532,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("cos_ptr"),     py::arg("sin_ptr"),
           py::arg("grid_real_ptr"), py::arg("grid_imag_ptr"), py::arg("weight_ptr"),
           py::arg("bigN"), py::arg("Ny"), py::arg("n_angles"),
-          py::arg("cutoff_dist") = 0.5f);
+          py::arg("cutoff_dist") = 0.5f,
+          py::arg("stream_ptr") = 0L);
 
     m.attr("cuda_available") = true;
 #else

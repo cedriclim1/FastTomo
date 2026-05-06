@@ -1,6 +1,33 @@
 #include "ops.h"
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdexcept>
+#include <string>
+
+/* ── error handling ───────────────────────────────────────────────────────
+ * CUDA_CHECK propagates cudaError_t failures as std::runtime_error so the
+ * pybind11 layer can surface them as Python RuntimeError. CUDA_CHECK_KERNEL
+ * is called immediately after a <<< >>> launch to catch launch-time errors
+ * (invalid configuration, too much shared memory, etc.) without paying for
+ * a host-device sync. Stream-ordered errors (out-of-bounds writes etc.) are
+ * surfaced later when PyTorch syncs on tensor read.
+ */
+#define CUDA_CHECK(call) do {                                                \
+    cudaError_t _err = (call);                                                \
+    if (_err != cudaSuccess) {                                                \
+        throw std::runtime_error(std::string("CUDA error at " __FILE__ ":")   \
+            + std::to_string(__LINE__) + ": " + cudaGetErrorString(_err));    \
+    }                                                                          \
+} while (0)
+
+#define CUDA_CHECK_KERNEL() do {                                              \
+    cudaError_t _err = cudaPeekAtLastError();                                 \
+    if (_err != cudaSuccess) {                                                \
+        throw std::runtime_error(std::string("CUDA kernel launch error at "   \
+            __FILE__ ":") + std::to_string(__LINE__) + ": "                   \
+            + cudaGetErrorString(_err));                                       \
+    }                                                                          \
+} while (0)
 
 /* ── helpers ──────────────────────────────────────────────────────────────
  * make_vol_texture:  wrap a device [Ny, Nz, Nx] float buffer in a layered
@@ -14,12 +41,12 @@
  */
 static cudaTextureObject_t make_vol_texture(
     const float *d_vol, int Ny, int Nz, int Nx,
-    cudaArray_t &out_array
+    cudaArray_t &out_array, cudaStream_t stream
 ) {
     cudaChannelFormatDesc fmt = cudaCreateChannelDesc<float>();
     /* Ny layers, each Nx wide × Nz tall */
-    cudaMalloc3DArray(&out_array, &fmt,
-                      make_cudaExtent(Nx, Nz, Ny), cudaArrayLayered);
+    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+                                 make_cudaExtent(Nx, Nz, Ny), cudaArrayLayered));
 
     cudaMemcpy3DParms cp = {};
     cp.srcPtr   = make_cudaPitchedPtr((void *)d_vol,
@@ -27,7 +54,7 @@ static cudaTextureObject_t make_vol_texture(
     cp.dstArray = out_array;
     cp.extent   = make_cudaExtent(Nx, Nz, Ny);
     cp.kind     = cudaMemcpyDeviceToDevice;
-    cudaMemcpy3D(&cp);
+    CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -41,18 +68,18 @@ static cudaTextureObject_t make_vol_texture(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    cudaCreateTextureObject(&tex, &rd, &td, nullptr);
+    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
 static cudaTextureObject_t make_sino_texture(
     const float *d_sino, int n_angles, int Ny, int N_det,
-    cudaArray_t &out_array
+    cudaArray_t &out_array, cudaStream_t stream
 ) {
     cudaChannelFormatDesc fmt = cudaCreateChannelDesc<float>();
     /* n_angles layers, each N_det wide × Ny tall */
-    cudaMalloc3DArray(&out_array, &fmt,
-                      make_cudaExtent(N_det, Ny, n_angles), cudaArrayLayered);
+    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+                                 make_cudaExtent(N_det, Ny, n_angles), cudaArrayLayered));
 
     cudaMemcpy3DParms cp = {};
     cp.srcPtr   = make_cudaPitchedPtr((void *)d_sino,
@@ -60,7 +87,7 @@ static cudaTextureObject_t make_sino_texture(
     cp.dstArray = out_array;
     cp.extent   = make_cudaExtent(N_det, Ny, n_angles);
     cp.kind     = cudaMemcpyDeviceToDevice;
-    cudaMemcpy3D(&cp);
+    CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -74,8 +101,21 @@ static cudaTextureObject_t make_sino_texture(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    cudaCreateTextureObject(&tex, &rd, &td, nullptr);
+    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
+}
+
+/* If smem exceeds the default 48 KB cap, opt the kernel into the extended
+ * dynamic shared memory pool. Capped at 96 KB which is safe on every arch
+ * we target (Volta+: 96, Ampere/Ada: 100/164, Hopper: 228, Blackwell: 228).
+ */
+static void enable_extended_smem_if_needed(const void *kernel, size_t smem) {
+    if (smem > 48 * 1024) {
+        size_t cap = 96 * 1024;
+        size_t want = smem < cap ? smem : cap;
+        CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)want));
+    }
 }
 
 /* ── forward projection ───────────────────────────────────────────────────
@@ -121,7 +161,8 @@ void forward_project_cuda(
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -129,21 +170,24 @@ void forward_project_cuda(
     int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx * Nx + Nz * Nz))) + 1;
 
     cudaArray_t vol_array;
-    cudaTextureObject_t vol_tex = make_vol_texture(d_volume, Ny, Nz, Nx, vol_array);
+    cudaTextureObject_t vol_tex = make_vol_texture(d_volume, Ny, Nz, Nx, vol_array, stream);
 
     dim3 block(16, 16, 1);
     dim3 grid((N_det    + 15) / 16,
               (n_angles + 15) / 16,
               Ny);
 
-    forward_project_kernel<<<grid, block>>>(
+    forward_project_kernel<<<grid, block, 0, stream>>>(
         vol_tex, d_sinogram, d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det,
         half_det, half_x, half_z, ray_len
     );
+    CUDA_CHECK_KERNEL();
 
-    cudaDestroyTextureObject(vol_tex);
-    cudaFreeArray(vol_array);
+    /* Texture object and array are stream-ordered with the launch above:
+     * destroying them schedules the release after the kernel completes. */
+    CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
+    CUDA_CHECK(cudaFreeArray(vol_array));
 }
 
 /* ── back-projection ──────────────────────────────────────────────────────
@@ -201,7 +245,8 @@ void back_project_cuda(
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -209,20 +254,23 @@ void back_project_cuda(
 
     cudaArray_t sino_array;
     cudaTextureObject_t sino_tex =
-        make_sino_texture(d_sinogram, n_angles, Ny, N_det, sino_array);
+        make_sino_texture(d_sinogram, n_angles, Ny, N_det, sino_array, stream);
 
     dim3 block(16, 16, 1);
     dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
     size_t smem = 2 * (size_t)n_angles * sizeof(float);
 
-    back_project_kernel<<<grid, block, smem>>>(
+    enable_extended_smem_if_needed((const void *)back_project_kernel, smem);
+
+    back_project_kernel<<<grid, block, smem, stream>>>(
         sino_tex, d_volume, d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det,
         half_det, half_x, half_z
     );
+    CUDA_CHECK_KERNEL();
 
-    cudaDestroyTextureObject(sino_tex);
-    cudaFreeArray(sino_array);
+    CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
+    CUDA_CHECK(cudaFreeArray(sino_array));
 }
 
 /* ── 3D rotation-matrix forward projection ───────────────────────────────
@@ -232,12 +280,12 @@ void back_project_cuda(
  */
 static cudaTextureObject_t make_vol_texture_3d(
     const float *d_vol, int Ny, int Nz, int Nx,
-    cudaArray_t &out_array
+    cudaArray_t &out_array, cudaStream_t stream
 ) {
     cudaChannelFormatDesc fmt = cudaCreateChannelDesc<float>();
     /* extent: (width=Nx, height=Nz, depth=Ny) — matches C-order [Ny][Nz][Nx] */
-    cudaMalloc3DArray(&out_array, &fmt,
-                      make_cudaExtent(Nx, Nz, Ny), 0 /* no cudaArrayLayered */);
+    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+                                 make_cudaExtent(Nx, Nz, Ny), 0 /* no cudaArrayLayered */));
 
     cudaMemcpy3DParms cp = {};
     cp.srcPtr   = make_cudaPitchedPtr((void *)d_vol,
@@ -245,7 +293,7 @@ static cudaTextureObject_t make_vol_texture_3d(
     cp.dstArray = out_array;
     cp.extent   = make_cudaExtent(Nx, Nz, Ny);
     cp.kind     = cudaMemcpyDeviceToDevice;
-    cudaMemcpy3D(&cp);
+    CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -260,7 +308,7 @@ static cudaTextureObject_t make_vol_texture_3d(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    cudaCreateTextureObject(&tex, &rd, &td, nullptr);
+    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
@@ -318,7 +366,8 @@ void forward_project_rotmat_cuda(
     float       *d_sinogram,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -327,21 +376,165 @@ void forward_project_rotmat_cuda(
     int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
 
     cudaArray_t vol_array;
-    cudaTextureObject_t vol_tex = make_vol_texture_3d(d_volume, Ny, Nz, Nx, vol_array);
+    cudaTextureObject_t vol_tex = make_vol_texture_3d(d_volume, Ny, Nz, Nx, vol_array, stream);
 
     dim3 block(16, 16, 1);
     dim3 grid((N_det + 15) / 16,
               (Ny    + 15) / 16,
               n_angles);
 
-    forward_project_rotmat_kernel<<<grid, block>>>(
+    forward_project_rotmat_kernel<<<grid, block, 0, stream>>>(
         vol_tex, d_sinogram, d_matrices,
         Ny, Nz, Nx, n_angles, N_det,
         half_det, half_x, half_z, half_y, ray_len
     );
+    CUDA_CHECK_KERNEL();
 
-    cudaDestroyTextureObject(vol_tex);
-    cudaFreeArray(vol_array);
+    CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
+    CUDA_CHECK(cudaFreeArray(vol_array));
+}
+
+/* ── gradient of 3D rotmat forward projection w.r.t. rotation matrix ─────
+ * Grid:  (⌈N_det/16⌉, ⌈Ny/16⌉, n_angles)   Block: (16, 16, 1)
+ * Same detector-driven layout as forward_project_rotmat_kernel, with one
+ * block per angle's matrix entries reduced via shared memory.
+ *
+ * Forward sample at ray step s, detector cell (iu, iv):
+ *   u = iu - half_det,  v = iv - half_y,  s = step
+ *   tx = u*M[0] + v*M[3] + s*M[6] + half_x
+ *   ty = u*M[1] + v*M[4] + s*M[7] + half_y
+ *   tz = u*M[2] + v*M[5] + s*M[8] + half_z
+ *   sino += vol(tx, ty, tz)   (trilinear)
+ *
+ * ∂tx/∂M[{0,3,6}] = {u, v, s}, ∂ty/∂M[{1,4,7}] = {u, v, s},
+ * ∂tz/∂M[{2,5,8}] = {u, v, s}. Spatial derivatives ∂vol/∂{x,y,z}
+ * computed analytically from trilinear interpolation weights.
+ */
+__global__ static void grad_rotmat_kernel(
+    const float *__restrict__ volume,        /* [Ny, Nz, Nx] */
+    const float *__restrict__ grad_sino,     /* [n_angles, Ny, N_det] */
+    const float *__restrict__ matrices,      /* [n_angles*9] row-major */
+    float       *__restrict__ grad_matrices, /* [n_angles*9] (zeroed by caller) */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    float half_det, float half_x, float half_y, float half_z,
+    int ray_len
+) {
+    int iu = blockIdx.x * blockDim.x + threadIdx.x;
+    int iv = blockIdx.y * blockDim.y + threadIdx.y;
+    int ia = blockIdx.z;
+
+    int tid       = threadIdx.y * blockDim.x + threadIdx.x;
+    int nthreads  = blockDim.x * blockDim.y;          /* 256 */
+
+    float gM[9] = {0,0,0,0,0,0,0,0,0};
+
+    if (iu < N_det && iv < Ny) {
+        const float *M = matrices + (size_t)ia * 9;
+        float u = (float)iu - half_det;
+        float v = (float)iv - half_y;
+        float ox = u * M[0] + v * M[3];
+        float oy = u * M[1] + v * M[4];
+        float oz = u * M[2] + v * M[5];
+        float dxs = M[6], dys = M[7], dzs = M[8];
+
+        float gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
+
+        if (gs != 0.0f) {
+            for (int step = -ray_len; step <= ray_len; step++) {
+                float s  = (float)step;
+                float fx = ox + s * dxs + half_x;
+                float fy = oy + s * dys + half_y;
+                float fz = oz + s * dzs + half_z;
+
+                if (fx < 0.0f || fx >= (float)(Nx - 1) ||
+                    fy < 0.0f || fy >= (float)(Ny - 1) ||
+                    fz < 0.0f || fz >= (float)(Nz - 1))
+                    continue;
+
+                int ix0 = (int)fx, iy0 = (int)fy, iz0 = (int)fz;
+                int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
+                float wx = fx - (float)ix0;
+                float wy = fy - (float)iy0;
+                float wz = fz - (float)iz0;
+                float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
+
+                /* volume[iy][iz][ix] linearised */
+                size_t row_y0 = (size_t)iy0 * Nz;
+                size_t row_y1 = (size_t)iy1 * Nz;
+                float v000 = volume[(row_y0 + iz0) * Nx + ix0];
+                float v001 = volume[(row_y0 + iz0) * Nx + ix1];
+                float v010 = volume[(row_y0 + iz1) * Nx + ix0];
+                float v011 = volume[(row_y0 + iz1) * Nx + ix1];
+                float v100 = volume[(row_y1 + iz0) * Nx + ix0];
+                float v101 = volume[(row_y1 + iz0) * Nx + ix1];
+                float v110 = volume[(row_y1 + iz1) * Nx + ix0];
+                float v111 = volume[(row_y1 + iz1) * Nx + ix1];
+
+                /* analytic derivatives of trilinear interpolation */
+                float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
+                          + uy * wz * (v011 - v010) + wy * wz * (v111 - v110);
+                float dfy = ux * uz * (v100 - v000) + wx * uz * (v101 - v001)
+                          + ux * wz * (v110 - v010) + wx * wz * (v111 - v011);
+                float dfz = ux * uy * (v010 - v000) + wx * uy * (v011 - v001)
+                          + ux * wy * (v110 - v100) + wx * wy * (v111 - v101);
+
+                float gdfx = gs * dfx, gdfy = gs * dfy, gdfz = gs * dfz;
+                gM[0] += gdfx * u;  gM[1] += gdfy * u;  gM[2] += gdfz * u;
+                gM[3] += gdfx * v;  gM[4] += gdfy * v;  gM[5] += gdfz * v;
+                gM[6] += gdfx * s;  gM[7] += gdfy * s;  gM[8] += gdfz * s;
+            }
+        }
+    }
+
+    /* Block-level reduction. smem layout: [9 * nthreads] flat. */
+    extern __shared__ float smem[];
+    #pragma unroll
+    for (int k = 0; k < 9; k++) smem[k * nthreads + tid] = gM[k];
+    __syncthreads();
+
+    for (int stride = nthreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            #pragma unroll
+            for (int k = 0; k < 9; k++)
+                smem[k * nthreads + tid] += smem[k * nthreads + tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid < 9)
+        atomicAdd(&grad_matrices[(size_t)ia * 9 + tid], smem[tid * nthreads]);
+}
+
+void grad_rotmat_cuda(
+    const float *d_volume,
+    const float *d_grad_sino,
+    const float *d_matrices,
+    float       *d_grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
+
+    dim3 block(16, 16, 1);
+    dim3 grid((N_det + 15) / 16,
+              (Ny    + 15) / 16,
+              n_angles);
+    size_t smem = 9 * (size_t)(block.x * block.y) * sizeof(float);
+
+    enable_extended_smem_if_needed((const void *)grad_rotmat_kernel, smem);
+
+    grad_rotmat_kernel<<<grid, block, smem, stream>>>(
+        d_volume, d_grad_sino, d_matrices, d_grad_matrices,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_y, half_z, ray_len
+    );
+    CUDA_CHECK_KERNEL();
 }
 
 /* back_project_rotmat_kernel
@@ -398,7 +591,8 @@ void back_project_rotmat_cuda(
     float       *d_volume,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -407,7 +601,7 @@ void back_project_rotmat_cuda(
 
     cudaArray_t sino_array;
     cudaTextureObject_t sino_tex =
-        make_sino_texture(d_sinogram, n_angles, Ny, N_det, sino_array);
+        make_sino_texture(d_sinogram, n_angles, Ny, N_det, sino_array, stream);
 
     dim3 block(8, 8, 4);
     dim3 grid((Nx + 7) / 8,
@@ -415,33 +609,32 @@ void back_project_rotmat_cuda(
               (Ny + 3) / 4);
     size_t smem = 9 * (size_t)n_angles * sizeof(float);
 
-    back_project_rotmat_kernel<<<grid, block, smem>>>(
+    enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel, smem);
+
+    back_project_rotmat_kernel<<<grid, block, smem, stream>>>(
         sino_tex, d_volume, d_matrices,
         Ny, Nz, Nx, n_angles, N_det,
         half_det, half_x, half_z, half_y
     );
+    CUDA_CHECK_KERNEL();
 
-    cudaDestroyTextureObject(sino_tex);
-    cudaFreeArray(sino_array);
+    CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
+    CUDA_CHECK(cudaFreeArray(sino_array));
 }
 
 /* ── RESIRE voxel-driven projectors ──────────────────────────────────────────
  * forward_project_resire_kernel  — voxel-driven scatter with 4-point
- *   supersampling; uses atomicAdd to the sinogram slice for this projection.
+ *   supersampling; atomicAdd to the sinogram slice for this projection.
  * back_project_resire_kernel     — voxel-driven gather with 4-point
- *   supersampling; accumulates into volume (no atomics needed since each
- *   voxel is owned by exactly one thread and kernel launches are serialised).
+ *   supersampling; accumulates into volume. No atomic: each voxel is owned
+ *   by exactly one thread per launch, and per-projection launches on the
+ *   same stream are serialised so the read-modify-write is safe across
+ *   projections.
  *
- * Both kernels operate on ONE projection at a time (called in a host loop).
- * Grid: (⌈Nx/16⌉, ⌈Nz/16⌉, Ny)   Block: (16, 16, 1)
- *
+ * Each launch processes ONE projection. The host loops over n_angles.
  * Supersampling: 4 sub-voxel offsets (±0.25, ±0.25) in volume XZ space are
  * rotated to detector coordinates via rows 0–1 of the projection matrix M.
  * The host divides the output by 4 to normalise to the single-sample scale.
- *
- * Matrix convention (row-major, same as rotmat kernels):
- *   detector-u = M[0]*x + M[1]*y + M[2]*z
- *   detector-v = M[3]*x + M[4]*y + M[5]*z
  */
 
 __global__ static void forward_project_resire_kernel(
@@ -466,25 +659,21 @@ __global__ static void forward_project_resire_kernel(
     float y = iy - half_y;
     float z = iz - half_z;
 
-    /* Base projected pixel coordinates */
     float u0 = sh_M[0]*x + sh_M[1]*y + sh_M[2]*z + half_det;
     float v0 = sh_M[3]*x + sh_M[4]*y + sh_M[5]*z + half_y;
 
     const float data_val = volume[((size_t)iy * Nz + iz) * Nx + ix];
 
-    /* 4 sub-pixel offsets in volume XZ space */
     const float sdx[4] = { 0.25f,  0.25f, -0.25f, -0.25f };
     const float sdz[4] = { 0.25f, -0.25f,  0.25f, -0.25f };
 
     for (int s = 0; s < 4; s++) {
-        /* Rotate the XZ shift to detector space (rows 0 and 1 of M, Y=0) */
         float u_s = u0 + sh_M[0]*sdx[s] + sh_M[2]*sdz[s];
         float v_s = v0 + sh_M[3]*sdx[s] + sh_M[5]*sdz[s];
 
         int u1 = (int)floorf(u_s);  int u2 = u1 + 1;
         int v1 = (int)floorf(v_s);  int v2 = v1 + 1;
 
-        /* Skip if stencil centre is entirely off-detector */
         if ((u1 < 0 && u2 < 0) || (u1 >= N_det && u2 >= N_det)) continue;
         if ((v1 < 0 && v2 < 0) || (v1 >= Ny   && v2 >= Ny  )) continue;
 
@@ -537,10 +726,8 @@ __global__ static void back_project_resire_kernel(
         float u_s = u0 + sh_M[0]*sdx[s] + sh_M[2]*sdz[s];
         float v_s = v0 + sh_M[3]*sdx[s] + sh_M[5]*sdz[s];
 
-        /* Skip if projected position is entirely outside the sinogram */
         if (u_s < -0.5f || u_s > N_det - 0.5f || v_s < -0.5f || v_s > Ny - 0.5f) continue;
 
-        /* Clamp stencil to valid grid — handles Ny=1 and boundary voxels */
         int u1 = max(0, (int)floorf(u_s));  int u2 = min(N_det - 1, u1 + 1);
         int v1 = max(0, (int)floorf(v_s));  int v2 = min(Ny   - 1, v1 + 1);
 
@@ -561,7 +748,8 @@ void forward_project_resire_cuda(
     float       *d_sinogram,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -572,7 +760,7 @@ void forward_project_resire_cuda(
     dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
 
     for (int ia = 0; ia < n_angles; ia++) {
-        forward_project_resire_kernel<<<grid, block>>>(
+        forward_project_resire_kernel<<<grid, block, 0, stream>>>(
             d_volume,
             d_sinogram + (size_t)ia * Ny * N_det,
             d_matrices + ia * 9,
@@ -580,7 +768,7 @@ void forward_project_resire_cuda(
             half_x, half_y, half_z, half_det
         );
     }
-    cudaDeviceSynchronize();
+    CUDA_CHECK_KERNEL();
 }
 
 void back_project_resire_cuda(
@@ -588,7 +776,8 @@ void back_project_resire_cuda(
     float       *d_volume,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -599,7 +788,7 @@ void back_project_resire_cuda(
     dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
 
     for (int ia = 0; ia < n_angles; ia++) {
-        back_project_resire_kernel<<<grid, block>>>(
+        back_project_resire_kernel<<<grid, block, 0, stream>>>(
             d_sinogram + (size_t)ia * Ny * N_det,
             d_volume,
             d_matrices + ia * 9,
@@ -607,7 +796,7 @@ void back_project_resire_cuda(
             half_x, half_y, half_z, half_det
         );
     }
-    cudaDeviceSynchronize();
+    CUDA_CHECK_KERNEL();
 }
 
 /* ── GENFIRE 2D Fourier gridding ─────────────────────────────────────────── */
@@ -652,26 +841,28 @@ void genfire_gridding_2d_cuda(
     const float *fk_real, const float *fk_imag,
     const float *cos_a,   const float *sin_a,
     float *grid_real, float *grid_imag, float *weight_grid,
-    int bigN, int Ny, int n_angles, float cutoff_dist
+    int bigN, int Ny, int n_angles, float cutoff_dist,
+    cudaStream_t stream
 ) {
     dim3 block(128, 1, 1);
     dim3 grid((bigN + 127) / 128, (unsigned)n_angles, (unsigned)Ny);
-    genfire_gridding_2d_kernel<<<grid, block>>>(
+    genfire_gridding_2d_kernel<<<grid, block, 0, stream>>>(
         fk_real, fk_imag, cos_a, sin_a,
         grid_real, grid_imag, weight_grid,
         bigN, Ny, n_angles, cutoff_dist
     );
-    cudaDeviceSynchronize();
+    CUDA_CHECK_KERNEL();
 }
 
 /* ── gradient of forward projection w.r.t. tilt angles ───────────────────
  * Grid:  (ceil(N_det/16), ceil(n_angles/16), Ny)   Block: (16, 16, 1)
  * Same detector-driven layout as forward_project_kernel.
- * Each thread (id, ia, iy) walks the ray and accumulates:
- *   local_g += gs * (dvol_dx * (-z) + dvol_dz * x)
- * where dvol_dx/dvol_dz are bilinear finite-differences of the volume.
- * In-block reduction over threadIdx.x collapses (detector) dimension;
- * then one atomicAdd per block row writes to grad_angles[ia].
+ *
+ * Reduction strategy: each (ia, ty) row of 16 threads sits inside a single
+ * warp (block is 16×16 = 256 threads = 8 warps; for ty even, those 16
+ * threads occupy lanes 0..15; for ty odd, lanes 16..31). A half-warp
+ * butterfly via __shfl_xor_sync collapses the 16 detector cells, after
+ * which threadIdx.x==0 issues one atomicAdd per row.
  */
 __global__ static void grad_angle_kernel(
     const float *__restrict__ volume,     /* [Ny, Nz, Nx] */
@@ -683,8 +874,6 @@ __global__ static void grad_angle_kernel(
     int n_angles, int N_det,
     float half_det, float half_x, float half_z, int ray_len
 ) {
-    __shared__ float sh[16 * 16];
-
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int ia = blockIdx.y * blockDim.y + threadIdx.y;
     int iy = (int)blockIdx.z;
@@ -727,18 +916,18 @@ __global__ static void grad_angle_kernel(
         }
     }
 
-    sh[threadIdx.y * 16 + threadIdx.x] = local_g;
-    __syncthreads();
-
-    /* Reduce over threadIdx.x (all detector cells sharing the same ia). */
-    for (int stride = 8; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            sh[threadIdx.y * 16 + threadIdx.x] += sh[threadIdx.y * 16 + threadIdx.x + stride];
-        __syncthreads();
-    }
+    /* Half-warp shuffle reduction over threadIdx.x (16 lanes share each ia row).
+     * Lanes for ty even occupy 0..15 within their warp; for ty odd, 16..31.
+     * The xor butterfly with offsets ≤ 8 stays within the half-warp, so a
+     * full-warp mask gives the correct partial sum on every lane. */
+    unsigned mask = 0xFFFFFFFFu;
+    local_g += __shfl_xor_sync(mask, local_g, 8);
+    local_g += __shfl_xor_sync(mask, local_g, 4);
+    local_g += __shfl_xor_sync(mask, local_g, 2);
+    local_g += __shfl_xor_sync(mask, local_g, 1);
 
     if (threadIdx.x == 0 && ia < n_angles)
-        atomicAdd(&grad_angles[ia], sh[threadIdx.y * 16]);
+        atomicAdd(&grad_angles[ia], local_g);
 }
 
 void grad_angle_cuda(
@@ -748,7 +937,8 @@ void grad_angle_cuda(
     const float *d_sin_a,
     float       *d_grad_angles,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -760,125 +950,11 @@ void grad_angle_cuda(
               (n_angles + 15) / 16,
               Ny);
 
-    grad_angle_kernel<<<grid, block>>>(
+    grad_angle_kernel<<<grid, block, 0, stream>>>(
         d_volume, d_grad_sino, d_cos_a, d_sin_a, d_grad_angles,
         Ny, Nz, Nx, n_angles, N_det,
         half_det, half_x, half_z, ray_len
     );
-    cudaDeviceSynchronize();
+    CUDA_CHECK_KERNEL();
 }
 
-/* ── gradient of RESIRE forward projection w.r.t. rotation matrices ──────
- * Grid:  (ceil(Nx/16), ceil(Nz/16), Ny)   Block: (16, 16, 1)
- * Per voxel: 4 supersamples with same boundary logic as the forward kernel.
- * Block reduction via __shared__ float s_gM[6]; per-block atomicAdd to global.
- */
-__global__ static void grad_rotmat_resire_kernel(
-    const float *__restrict__ volume,     /* [Ny, Nz, Nx] */
-    const float *__restrict__ grad_sino,  /* [Ny, N_det] — one angle slice */
-    const float *__restrict__ M,          /* [9] rotation matrix */
-    float       *__restrict__ grad_M,     /* [9] output — must be zeroed */
-    int Ny, int Nz, int Nx, int N_det,
-    float half_x, float half_y, float half_z, float half_det
-) {
-    __shared__ float sh_M[9];
-    __shared__ float s_gM[6];
-
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    if (tid < 9)  sh_M[tid] = M[tid];
-    if (tid < 6)  s_gM[tid] = 0.0f;
-    __syncthreads();
-
-    int ix = blockIdx.x * blockDim.x + threadIdx.x;
-    int iz = blockIdx.y * blockDim.y + threadIdx.y;
-    int iy = (int)blockIdx.z;
-
-    float local_gM[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-
-    if (ix < Nx && iz < Nz) {
-        float x = ix - half_x;
-        float y = iy - half_y;
-        float z = iz - half_z;
-
-        float u0 = sh_M[0]*x + sh_M[1]*y + sh_M[2]*z + half_det;
-        float v0 = sh_M[3]*x + sh_M[4]*y + sh_M[5]*z + half_y;
-
-        const float data_val = volume[((size_t)iy * Nz + iz) * Nx + ix];
-
-        const float sdx[4] = { 0.25f,  0.25f, -0.25f, -0.25f };
-        const float sdz[4] = { 0.25f, -0.25f,  0.25f, -0.25f };
-
-        for (int s = 0; s < 4; s++) {
-            float cx = x + sdx[s];
-            float cz = z + sdz[s];
-            float u_s = u0 + sh_M[0]*sdx[s] + sh_M[2]*sdz[s];
-            float v_s = v0 + sh_M[3]*sdx[s] + sh_M[5]*sdz[s];
-
-            int u1 = (int)floorf(u_s);  int u2 = u1 + 1;
-            int v1 = (int)floorf(v_s);  int v2 = v1 + 1;
-
-            /* Mirror FP kernel: skip if stencil entirely off-detector */
-            if ((u1 < 0 && u2 < 0) || (u1 >= N_det && u2 >= N_det)) continue;
-            if ((v1 < 0 && v2 < 0) || (v1 >= Ny   && v2 >= Ny  )) continue;
-
-            float wu2 = u_s - u1,  wu1 = 1.0f - wu2;
-            float wv2 = v_s - v1,  wv1 = 1.0f - wv2;
-
-            bool u1ok = (u1 >= 0 && u1 < N_det);
-            bool u2ok = (u2 >= 0 && u2 < N_det);
-            bool v1ok = (v1 >= 0 && v1 < Ny);
-            bool v2ok = (v2 >= 0 && v2 < Ny);
-
-            float dL_du = 0.0f, dL_dv = 0.0f;
-            if (u1ok && v1ok) { float gs = grad_sino[(size_t)v1*N_det+u1]; dL_du -= wv1*gs; dL_dv -= wu1*gs; }
-            if (u2ok && v1ok) { float gs = grad_sino[(size_t)v1*N_det+u2]; dL_du += wv1*gs; dL_dv -= wu2*gs; }
-            if (u1ok && v2ok) { float gs = grad_sino[(size_t)v2*N_det+u1]; dL_du -= wv2*gs; dL_dv += wu1*gs; }
-            if (u2ok && v2ok) { float gs = grad_sino[(size_t)v2*N_det+u2]; dL_du += wv2*gs; dL_dv += wu2*gs; }
-            dL_du *= data_val;
-            dL_dv *= data_val;
-
-            local_gM[0] += dL_du * cx;
-            local_gM[1] += dL_du * y;
-            local_gM[2] += dL_du * cz;
-            local_gM[3] += dL_dv * cx;
-            local_gM[4] += dL_dv * y;
-            local_gM[5] += dL_dv * cz;
-        }
-    }
-
-    for (int k = 0; k < 6; k++)
-        atomicAdd(&s_gM[k], local_gM[k]);
-    __syncthreads();
-
-    if (tid < 6)
-        atomicAdd(&grad_M[tid], s_gM[tid]);
-}
-
-void grad_rotmat_resire_cuda(
-    const float *d_volume,
-    const float *d_grad_sinogram,
-    const float *d_matrices,
-    float       *d_grad_matrices,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det
-) {
-    float half_det = (N_det - 1) * 0.5f;
-    float half_x   = (Nx   - 1) * 0.5f;
-    float half_z   = (Nz   - 1) * 0.5f;
-    float half_y   = (Ny   - 1) * 0.5f;
-
-    dim3 block(16, 16, 1);
-    dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
-
-    for (int ia = 0; ia < n_angles; ia++) {
-        grad_rotmat_resire_kernel<<<grid, block>>>(
-            d_volume,
-            d_grad_sinogram + (size_t)ia * Ny * N_det,
-            d_matrices + ia * 9,
-            d_grad_matrices + ia * 9,
-            Ny, Nz, Nx, N_det,
-            half_x, half_y, half_z, half_det
-        );
-    }
-    cudaDeviceSynchronize();
-}

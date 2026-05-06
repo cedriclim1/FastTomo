@@ -81,6 +81,47 @@ void grad_angle_cpu(
     int n_angles, int N_det
 );
 
+/*
+ * 3D rotation-matrix forward / back projection (CPU).
+ *
+ * Mirrors the CUDA texture-based projector pair (forward_project_rotmat_cuda
+ * / back_project_rotmat_cuda). Detector-driven trilinear FP, voxel-driven
+ * gather BP. matrices: [n_angles*9] row-major; M[ia*9 + row*3 + col].
+ *
+ * Slower than the CUDA path by O(10×) — useful for testing on hosts without
+ * a GPU and as a reference for the autograd backward.
+ */
+void forward_project_3d_cpu(
+    const float *volume,
+    float       *sinogram,
+    const float *matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
+void back_project_3d_cpu(
+    const float *sinogram,
+    float       *volume,
+    const float *matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
+/*
+ * Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries
+ * (CPU). grad_matrices: [n_angles*9] zeroed by this function before
+ * accumulating. Used by _FP3D's autograd backward on CPU; PyTorch chains
+ * the result through _euler_zyz_to_rotmat to yield ∂L/∂euler.
+ */
+void grad_rotmat_cpu(
+    const float *volume,
+    const float *grad_sino,
+    const float *matrices,
+    float       *grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
 void genfire_gridding_2d_cpu(
     const float *fk_real,
     const float *fk_imag,

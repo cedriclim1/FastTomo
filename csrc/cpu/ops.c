@@ -172,6 +172,226 @@ void grad_angle_cpu(
     }
 }
 
+/* ── 3D rotation-matrix forward projection (CPU) ───────────────────────────
+ * Detector-driven; trilinear interpolation in 3D; one ray per (ia, iv, iu).
+ * Mirrors forward_project_rotmat_cuda but with explicit interpolation.
+ *
+ * matrices: [n_angles*9] row-major. M = matrices + ia*9.
+ *   detector-u = M[0]*x + M[1]*y + M[2]*z   (R[0,:] · world)
+ *   detector-v = M[3]*x + M[4]*y + M[5]*z   (R[1,:] · world)
+ *   ray dir   = (M[6], M[7], M[8])          (R[2,:])
+ * Ray parameterisation (R^T applied to (u, v, s)):
+ *   x(s) = u*M[0] + v*M[3] + s*M[6]
+ *   y(s) = u*M[1] + v*M[4] + s*M[7]
+ *   z(s) = u*M[2] + v*M[5] + s*M[8]
+ * Rays may cross all three faces, so ray length covers the full 3D diagonal.
+ */
+void forward_project_3d_cpu(
+    const float *volume,     /* [Ny, Nz, Nx] */
+    float       *sinogram,   /* [n_angles, Ny, N_det] */
+    const float *matrices,   /* [n_angles*9] row-major */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int ray_len = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
+
+    for (int ia = 0; ia < n_angles; ia++) {
+        const float *M = matrices + (size_t)ia * 9;
+        float dxs = M[6], dys = M[7], dzs = M[8];
+
+        for (int iv = 0; iv < Ny; iv++) {
+            float v = iv - half_y;
+
+            for (int iu = 0; iu < N_det; iu++) {
+                float u  = iu - half_det;
+                float ox = u * M[0] + v * M[3];
+                float oy = u * M[1] + v * M[4];
+                float oz = u * M[2] + v * M[5];
+
+                float sum = 0.0f;
+                for (int step = -ray_len; step <= ray_len; step++) {
+                    float s  = (float)step;
+                    float fx = ox + s * dxs + half_x;
+                    float fy = oy + s * dys + half_y;
+                    float fz = oz + s * dzs + half_z;
+
+                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
+                        fy < 0.0f || fy >= (float)(Ny - 1) ||
+                        fz < 0.0f || fz >= (float)(Nz - 1))
+                        continue;
+
+                    int ix0 = (int)fx, iy0 = (int)fy, iz0 = (int)fz;
+                    int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
+                    float wx = fx - ix0, wy = fy - iy0, wz = fz - iz0;
+                    float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
+
+                    size_t r0 = (size_t)iy0 * Nz, r1 = (size_t)iy1 * Nz;
+                    float v000 = volume[(r0 + iz0) * Nx + ix0];
+                    float v001 = volume[(r0 + iz0) * Nx + ix1];
+                    float v010 = volume[(r0 + iz1) * Nx + ix0];
+                    float v011 = volume[(r0 + iz1) * Nx + ix1];
+                    float v100 = volume[(r1 + iz0) * Nx + ix0];
+                    float v101 = volume[(r1 + iz0) * Nx + ix1];
+                    float v110 = volume[(r1 + iz1) * Nx + ix0];
+                    float v111 = volume[(r1 + iz1) * Nx + ix1];
+
+                    sum += uy * uz * (ux * v000 + wx * v001)
+                         + uy * wz * (ux * v010 + wx * v011)
+                         + wy * uz * (ux * v100 + wx * v101)
+                         + wy * wz * (ux * v110 + wx * v111);
+                }
+
+                sinogram[((size_t)ia * Ny + iv) * N_det + iu] = sum;
+            }
+        }
+    }
+}
+
+/* ── 3D rotation-matrix back-projection (CPU) ──────────────────────────────
+ * Voxel-driven gather (mirrors back_project_rotmat_cuda); each voxel reads
+ * the bilinearly-interpolated sinogram value at its rotated detector position
+ * and accumulates over angles. Approximate adjoint of forward_project_3d_cpu
+ * — see CLAUDE.md note that CPU/CUDA BP outputs are not expected to match
+ * numerically.
+ */
+void back_project_3d_cpu(
+    const float *sinogram,   /* [n_angles, Ny, N_det] */
+    float       *volume,     /* [Ny, Nz, Nx] */
+    const float *matrices,   /* [n_angles*9] row-major */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+
+    memset(volume, 0, (size_t)Ny * Nz * Nx * sizeof(float));
+
+    for (int iy = 0; iy < Ny; iy++) {
+        float y = iy - half_y;
+        for (int iz = 0; iz < Nz; iz++) {
+            float z = iz - half_z;
+            for (int ix = 0; ix < Nx; ix++) {
+                float x = ix - half_x;
+                float val = 0.0f;
+
+                for (int ia = 0; ia < n_angles; ia++) {
+                    const float *M = matrices + (size_t)ia * 9;
+                    float u_det = M[0]*x + M[1]*y + M[2]*z + half_det;
+                    float v_det = M[3]*x + M[4]*y + M[5]*z + half_y;
+
+                    if (u_det < 0.0f || u_det >= (float)(N_det - 1) ||
+                        v_det < 0.0f || v_det >= (float)(Ny    - 1))
+                        continue;
+
+                    int iu0 = (int)u_det, iv0 = (int)v_det;
+                    int iu1 = iu0 + 1,    iv1 = iv0 + 1;
+                    float wu = u_det - iu0, wv = v_det - iv0;
+
+                    const float *layer = sinogram + (size_t)ia * Ny * N_det;
+                    val += (1.0f - wv) * (1.0f - wu) * layer[(size_t)iv0 * N_det + iu0]
+                         + (1.0f - wv) *          wu  * layer[(size_t)iv0 * N_det + iu1]
+                         +          wv  * (1.0f - wu) * layer[(size_t)iv1 * N_det + iu0]
+                         +          wv  *          wu  * layer[(size_t)iv1 * N_det + iu1];
+                }
+
+                volume[((size_t)iy * Nz + iz) * Nx + ix] = val;
+            }
+        }
+    }
+    (void)half_z;  /* unused — declared for parity with CUDA path */
+}
+
+/* ── gradient of 3D rotmat FP w.r.t. rotation matrix (CPU) ─────────────────
+ * Mirrors grad_rotmat_cuda exactly. Detector-driven loop accumulates per-ray
+ * partials of all 9 matrix entries, no reduction needed (pure serial).
+ *
+ * Per ray step (s = step):
+ *   ∂tx/∂M[{0,3,6}] = (u, v, s)
+ *   ∂ty/∂M[{1,4,7}] = (u, v, s)
+ *   ∂tz/∂M[{2,5,8}] = (u, v, s)
+ * with spatial derivatives ∂vol/∂{x,y,z} from analytic trilinear weights.
+ */
+void grad_rotmat_cpu(
+    const float *volume,         /* [Ny, Nz, Nx] */
+    const float *grad_sino,      /* [n_angles, Ny, N_det] */
+    const float *matrices,       /* [n_angles*9] */
+    float       *grad_matrices,  /* [n_angles*9] zeroed by this fn */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int ray_len = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
+
+    for (int k = 0; k < n_angles * 9; k++) grad_matrices[k] = 0.0f;
+
+    for (int ia = 0; ia < n_angles; ia++) {
+        const float *M = matrices + (size_t)ia * 9;
+        float *gM = grad_matrices + (size_t)ia * 9;
+        float dxs = M[6], dys = M[7], dzs = M[8];
+
+        for (int iv = 0; iv < Ny; iv++) {
+            float v = iv - half_y;
+            for (int iu = 0; iu < N_det; iu++) {
+                float gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
+                if (gs == 0.0f) continue;
+
+                float u  = iu - half_det;
+                float ox = u * M[0] + v * M[3];
+                float oy = u * M[1] + v * M[4];
+                float oz = u * M[2] + v * M[5];
+
+                for (int step = -ray_len; step <= ray_len; step++) {
+                    float s  = (float)step;
+                    float fx = ox + s * dxs + half_x;
+                    float fy = oy + s * dys + half_y;
+                    float fz = oz + s * dzs + half_z;
+
+                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
+                        fy < 0.0f || fy >= (float)(Ny - 1) ||
+                        fz < 0.0f || fz >= (float)(Nz - 1))
+                        continue;
+
+                    int ix0 = (int)fx, iy0 = (int)fy, iz0 = (int)fz;
+                    int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
+                    float wx = fx - ix0, wy = fy - iy0, wz = fz - iz0;
+                    float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
+
+                    size_t r0 = (size_t)iy0 * Nz, r1 = (size_t)iy1 * Nz;
+                    float v000 = volume[(r0 + iz0) * Nx + ix0];
+                    float v001 = volume[(r0 + iz0) * Nx + ix1];
+                    float v010 = volume[(r0 + iz1) * Nx + ix0];
+                    float v011 = volume[(r0 + iz1) * Nx + ix1];
+                    float v100 = volume[(r1 + iz0) * Nx + ix0];
+                    float v101 = volume[(r1 + iz0) * Nx + ix1];
+                    float v110 = volume[(r1 + iz1) * Nx + ix0];
+                    float v111 = volume[(r1 + iz1) * Nx + ix1];
+
+                    float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
+                              + uy * wz * (v011 - v010) + wy * wz * (v111 - v110);
+                    float dfy = ux * uz * (v100 - v000) + wx * uz * (v101 - v001)
+                              + ux * wz * (v110 - v010) + wx * wz * (v111 - v011);
+                    float dfz = ux * uy * (v010 - v000) + wx * uy * (v011 - v001)
+                              + ux * wy * (v110 - v100) + wx * wy * (v111 - v101);
+
+                    float gdfx = gs * dfx, gdfy = gs * dfy, gdfz = gs * dfz;
+                    gM[0] += gdfx * u;  gM[1] += gdfy * u;  gM[2] += gdfz * u;
+                    gM[3] += gdfx * v;  gM[4] += gdfy * v;  gM[5] += gdfz * v;
+                    gM[6] += gdfx * s;  gM[7] += gdfy * s;  gM[8] += gdfz * s;
+                }
+            }
+        }
+    }
+}
+
 void genfire_gridding_2d_cpu(
     const float *fk_real, const float *fk_imag,
     const float *cos_a,   const float *sin_a,

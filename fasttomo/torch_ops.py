@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire, _FPResireMat,
+    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
     _euler_zyz_to_rotmat,
 )
 
@@ -97,11 +97,15 @@ def forward_project_3d(
     Returns sinogram [n_angles, Ny, N_det] on CUDA — same shape convention
     as forward_project so algorithms can swap projectors transparently.
 
-    Differentiable w.r.t. ``volume``: backward calls back_project_3d.
+    Differentiable w.r.t. ``volume`` and ``euler_zyz_deg``: backward calls
+    back_project_3d for the volume gradient and a dedicated grad_rotmat
+    kernel for the rotation-matrix gradient. The euler→rotmat conversion
+    lives in pure PyTorch so autograd chains ∂L/∂M into ∂L/∂euler.
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    return _FP3D.apply(volume, euler_zyz_deg, N_det)
+    mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
+    return _FP3D.apply(volume, mats, N_det)
 
 
 def back_project_3d(
@@ -142,15 +146,15 @@ def forward_project_resire(
 
     Returns sinogram [n_angles, Ny, N_det].
 
-    Differentiable w.r.t. ``volume`` and ``euler_zyz_deg``: backward calls
-    back_project_resire for the volume gradient and a dedicated kernel for
-    the rotation-matrix gradient (chained through _euler_zyz_to_rotmat to
-    yield ∂L/∂euler_zyz_deg automatically via PyTorch autograd).
+    Differentiable w.r.t. ``volume``: backward calls back_project_resire.
+    Not differentiable w.r.t. ``euler_zyz_deg`` — use ``refine_angles`` for
+    angular refinement (brute-force grid search) outside the reconstruction
+    loop. For autograd-driven angle optimisation, prefer the texture-based
+    ``forward_project_3d`` (or the single-axis ``forward_project``).
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through here
-    return _FPResireMat.apply(volume, mats, N_det)
+    return _FPResire.apply(volume, euler_zyz_deg, N_det)
 
 
 def back_project_resire(
@@ -625,6 +629,7 @@ def run_genfire(
             cos_t.data_ptr(), sin_t.data_ptr(),
             grid_r.data_ptr(), grid_i.data_ptr(), grid_w.data_ptr(),
             bigN, Ny, n_angles, cutoff_dist,
+            torch.cuda.current_stream(device).cuda_stream,
         )
     else:
         gr_np, gi_np, gw_np = _core.genfire_gridding_2d_cpu(

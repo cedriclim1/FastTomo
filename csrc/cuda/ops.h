@@ -1,125 +1,107 @@
 #ifndef FASTTOMO_CUDA_OPS_H
 #define FASTTOMO_CUDA_OPS_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <cuda_runtime.h>
 
 /*
- * Parallel-beam forward projection (CUDA).
+ * All CUDA entry points run on a caller-supplied stream so the kernels
+ * compose cleanly with PyTorch's stream model. None of them call
+ * cudaDeviceSynchronize — the caller (PyTorch) syncs implicitly when the
+ * output tensor is read.
  *
- * All pointers are device pointers (cudaMalloc'd).
- * Shapes and geometry conventions mirror the CPU version:
- *   volume   : [Ny, Nz, Nx]
- *   sinogram : [n_angles, Ny, N_det]  — written (not accumulated)
- *   cos_a / sin_a : [n_angles]
+ * Every host-callable function may throw std::runtime_error on a CUDA error.
  *
- * Kernel strategy: detector-driven, no atomics.
- * Each thread owns one (ia, iy, id) output sample and marches
- * along the ray accumulating bilinearly-interpolated volume samples.
+ * Cos/sin tables (single-axis kernels) are passed as device pointers so the
+ * trig precompute can stay on the GPU.
  */
+
 void forward_project_cuda(
     const float *d_volume,
     float       *d_sinogram,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
-/*
- * Parallel-beam back-projection (CUDA).
- *
- * Voxel-driven: each thread owns one (iy, iz, ix) voxel and
- * loops over all angles reading linearly-interpolated sinogram values.
- * The volume is overwritten (not accumulated from a previous value).
- */
 void back_project_cuda(
     const float *d_sinogram,
     float       *d_volume,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
 /*
- * 3D rotation-matrix forward projection (CUDA).
- *
- * d_matrices: device pointer to [n_angles * 9] row-major rotation matrices.
- *   M[i*9 + row*3 + col] = R_i[row][col]
- *   detector-u = R[0,:] · (x,y,z),  detector-v = R[1,:] · (x,y,z)
- *
- * Volume wrapped in tex3D (trilinear + border); rays may cross Y boundaries.
- * Thread layout: (⌈N_det/16⌉, ⌈Ny/16⌉, n_angles) × (16,16,1).
+ * 3D rotation-matrix projection: matrices are device-side
+ * [n_angles * 9] row-major; M[ia*9 + row*3 + col] = R_ia[row][col].
  */
 void forward_project_rotmat_cuda(
     const float *d_volume,
     float       *d_sinogram,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
-/*
- * 3D rotation-matrix back-projection (CUDA).
- *
- * Voxel-driven gather: each thread reads sinogram via tex2DLayered at the
- * rotated detector position for each angle. Rotation matrices loaded into
- * shared memory (9 * n_angles floats ≤ 48 KB for n_angles ≤ ~1300).
- * Thread layout: (⌈Nx/8⌉, ⌈Nz/8⌉, ⌈Ny/4⌉) × (8,8,4).
- */
 void back_project_rotmat_cuda(
     const float *d_sinogram,
     float       *d_volume,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
 /*
- * RESIRE voxel-driven forward projection (CUDA).
- *
- * Voxel-driven scatter with 4-point supersampling (±0.25 px in volume XZ
- * space, pre-rotated to detector coordinates via the projection matrix).
- * Uses atomicAdd; d_sinogram must be zeroed by the caller.
- *
- * d_matrices: [n_angles * 9] row-major rotation matrices — same convention
- *   as forward_project_rotmat_cuda.
+ * RESIRE voxel-driven scatter/gather with 4-point supersampling. Output
+ * normalisation (÷4) is applied by the Python caller. d_sinogram (FP) and
+ * d_volume (BP) must be zeroed before the call. The host loops over
+ * n_angles internally, launching one kernel per projection on the supplied
+ * stream — BP relies on the same-stream serialisation to accumulate without
+ * atomics.
  */
 void forward_project_resire_cuda(
     const float *d_volume,
     float       *d_sinogram,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
-/*
- * RESIRE voxel-driven back-projection (CUDA).
- *
- * Voxel-driven gather with 4-point supersampling. No atomics: each voxel is
- * owned by exactly one thread; accumulation across projections is safe
- * because kernel launches on the same stream are serialised.
- * d_volume must be zeroed by the caller.
- */
 void back_project_resire_cuda(
     const float *d_sinogram,
     float       *d_volume,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
 /*
- * Gradient of forward projection w.r.t. tilt angles (CUDA).
- *
- * Computes ∂L/∂θ_ia for each angle given the upstream gradient
- * d_grad_sino [n_angles, Ny, N_det] and the forward-pass volume.
- * Uses ∂x/∂θ = −z, ∂z/∂θ = x at each ray step with bilinear finite
- * differences for ∂vol/∂x and ∂vol/∂z.
- *
- * d_grad_angles : [n_angles] — zeroed by caller; returned in radians
+ * Gradient of 3D rotation-matrix forward projection w.r.t. the rotation
+ * matrix entries. d_grad_matrices is [n_angles*9] row-major, must be zeroed
+ * by the caller. Used by _FP3D's autograd backward; the host chains the
+ * result through _euler_zyz_to_rotmat (pure-PyTorch) to yield ∂L/∂euler.
+ */
+void grad_rotmat_cuda(
+    const float *d_volume,
+    const float *d_grad_sino,
+    const float *d_matrices,
+    float       *d_grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+/*
+ * Gradient of forward projection w.r.t. tilt angles.
+ * d_grad_angles must be zeroed by the caller; result is in radians.
  */
 void grad_angle_cuda(
     const float *d_volume,
@@ -128,32 +110,10 @@ void grad_angle_cuda(
     const float *d_sin_a,
     float       *d_grad_angles,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    cudaStream_t stream
 );
 
-/*
- * Gradient of RESIRE forward projection w.r.t. rotation matrices (CUDA).
- *
- * Accumulates ∂L/∂M[0..5] per angle into d_grad_matrices [n_angles * 9].
- * Elements [6..8] remain zero (row 2 of M is not used by RESIRE).
- * d_grad_matrices must be zeroed by the caller.
- */
-void grad_rotmat_resire_cuda(
-    const float *d_volume,
-    const float *d_grad_sinogram,
-    const float *d_matrices,
-    float       *d_grad_matrices,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det
-);
-
-/*
- * GENFIRE Fourier gridding (CUDA).
- *
- * All pointers are device pointers.
- * Parallelises over (iy, ia, ixi); uses atomicAdd for scatter.
- * grid_real / grid_imag / weight_grid must be zeroed before the call.
- */
 void genfire_gridding_2d_cuda(
     const float *fk_real,
     const float *fk_imag,
@@ -163,11 +123,8 @@ void genfire_gridding_2d_cuda(
     float       *grid_imag,
     float       *weight_grid,
     int bigN, int Ny, int n_angles,
-    float cutoff_dist
+    float cutoff_dist,
+    cudaStream_t stream
 );
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* FASTTOMO_CUDA_OPS_H */
