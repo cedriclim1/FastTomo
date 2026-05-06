@@ -112,6 +112,42 @@ void back_project_resire_cuda(
 );
 
 /*
+ * Gradient of forward projection w.r.t. tilt angles (CUDA).
+ *
+ * Computes ∂L/∂θ_ia for each angle given the upstream gradient
+ * d_grad_sino [n_angles, Ny, N_det] and the forward-pass volume.
+ * Uses ∂x/∂θ = −z, ∂z/∂θ = x at each ray step with bilinear finite
+ * differences for ∂vol/∂x and ∂vol/∂z.
+ *
+ * d_grad_angles : [n_angles] — zeroed by caller; returned in radians
+ */
+void grad_angle_cuda(
+    const float *d_volume,
+    const float *d_grad_sino,
+    const float *d_cos_a,
+    const float *d_sin_a,
+    float       *d_grad_angles,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
+/*
+ * Gradient of RESIRE forward projection w.r.t. rotation matrices (CUDA).
+ *
+ * Accumulates ∂L/∂M[0..5] per angle into d_grad_matrices [n_angles * 9].
+ * Elements [6..8] remain zero (row 2 of M is not used by RESIRE).
+ * d_grad_matrices must be zeroed by the caller.
+ */
+void grad_rotmat_resire_cuda(
+    const float *d_volume,
+    const float *d_grad_sinogram,
+    const float *d_matrices,
+    float       *d_grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
+/*
  * GENFIRE Fourier gridding (CUDA).
  *
  * All pointers are device pointers.

@@ -10,9 +10,11 @@ Caveats:
 - The CUDA texture-based BPs are only approximate adjoints (~15-65 % relative
   error in the inner-product test). Sufficient as descent directions (SIRT and
   RESIRE rely on this), but `torch.autograd.gradcheck` will fail by design.
-- Gradients are NOT propagated through angle inputs (`angles_deg` /
-  `euler_zyz_deg`). Adding angle differentiability would require new
-  C/CUDA Jacobian kernels; out of scope here.
+- Angle gradients (`angles_deg` / `euler_zyz_deg`) ARE now supported:
+  `_FP2D` computes ∂L/∂θ via `_grad_angle_raw` (CPU + CUDA);
+  `_FPResireMat` computes ∂L/∂M via `_grad_rotmat_resire_raw` (CUDA only),
+  then PyTorch chains through `_euler_zyz_to_rotmat` to yield ∂L/∂euler.
+  Finite-diff relative error is typically < 15 %.
 
 See: fasttomo-wiki/wiki/concepts/autograd-projectors.md
 """
@@ -245,18 +247,58 @@ def _back_project_resire_raw(
 # for the angles tensor — angle differentiability is deferred (would need
 # Jacobian kernels w.r.t. rotation parameters).
 
+def _grad_angle_raw(
+    volume: torch.Tensor,
+    grad_sino: torch.Tensor,
+    angles_deg: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Returns [n_angles] gradient of the loss w.r.t. tilt angles in degrees.
+
+    Computed analytically: at each ray step, ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x,
+    where the spatial derivatives use bilinear finite differences of the volume.
+    """
+    n_angles, Ny, N_det = grad_sino.shape
+    _, Nz, Nx = volume.shape
+    angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
+    cos_a = np.cos(angles_np).astype(np.float32)
+    sin_a = np.sin(angles_np).astype(np.float32)
+
+    if volume.is_cuda:
+        if not _core.cuda_available:
+            raise RuntimeError("fasttomo was compiled without CUDA support")
+        cos_t = torch.from_numpy(cos_a).to(device=volume.device)
+        sin_t = torch.from_numpy(sin_a).to(device=volume.device)
+        grad_a = torch.zeros(n_angles, dtype=torch.float32, device=volume.device)
+        _core.grad_angle_cuda(
+            volume.data_ptr(), grad_sino.data_ptr(),
+            cos_t.data_ptr(), sin_t.data_ptr(), grad_a.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+        )
+        return grad_a * (math.pi / 180.0)
+
+    vol_np = volume.detach().float().numpy()
+    gs_np  = grad_sino.detach().float().numpy()
+    grad_np = _core.grad_angle_cpu(vol_np, gs_np, angles_np.astype(np.float32), N_det)
+    return torch.from_numpy(grad_np) * (math.pi / 180.0)
+
+
 class _FP2D(torch.autograd.Function):
     @staticmethod
     def forward(ctx, volume, angles_deg, N_det):
-        ctx.save_for_backward(angles_deg)
+        ctx.save_for_backward(volume.detach(), angles_deg)
         ctx.Nz = volume.shape[-2]
         return _forward_project_raw(volume, angles_deg, N_det)
 
     @staticmethod
     def backward(ctx, grad_sino):
-        (angles_deg,) = ctx.saved_tensors
-        grad_vol = _back_project_raw(grad_sino.contiguous(), angles_deg, Nz=ctx.Nz)
-        return grad_vol, None, None
+        volume, angles_deg = ctx.saved_tensors
+        grad_sino = grad_sino.contiguous()
+        grad_vol = _back_project_raw(grad_sino, angles_deg, Nz=ctx.Nz)
+        grad_angles = None
+        if ctx.needs_input_grad[1]:
+            grad_angles = _grad_angle_raw(volume, grad_sino, angles_deg)
+        return grad_vol, grad_angles, None
 
 
 class _BP2D(torch.autograd.Function):
@@ -327,3 +369,100 @@ class _BPResire(torch.autograd.Function):
         (euler_zyz_deg,) = ctx.saved_tensors
         grad_sino = _forward_project_resire_raw(grad_vol.contiguous(), euler_zyz_deg, N_det=ctx.N_det)
         return grad_sino, None, None
+
+
+# ── RESIRE helpers that accept pre-computed mats_flat instead of Euler angles ─
+#
+# These avoid the euler→rotmat conversion inside the autograd Function, so that
+# _euler_zyz_to_rotmat (pure PyTorch) can live outside the Function boundary
+# and be traced by autograd — enabling gradient flow to euler_zyz_deg.
+
+def _forward_project_resire_mats_raw(
+    volume: torch.Tensor,
+    mats_flat: torch.Tensor,   # [n_angles, 9], detached, on same device
+    N_det: int = -1,
+) -> torch.Tensor:
+    if not _core.cuda_available:
+        raise RuntimeError("fasttomo was compiled without CUDA support")
+    n_angles = mats_flat.shape[0]
+    Ny, Nz, Nx = volume.shape
+    if N_det < 0:
+        N_det = Nx
+    vol  = volume.contiguous().float()
+    sino = torch.zeros(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
+    _core.forward_project_resire_cuda(
+        vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
+        Ny, Nz, Nx, n_angles, N_det,
+    )
+    return sino * 0.25
+
+
+def _back_project_resire_mats_raw(
+    sinogram: torch.Tensor,
+    mats_flat: torch.Tensor,   # [n_angles, 9], detached, on same device
+    Nz: int = -1,
+) -> torch.Tensor:
+    if not _core.cuda_available:
+        raise RuntimeError("fasttomo was compiled without CUDA support")
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+    sino = sinogram.contiguous().float()
+    vol  = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
+    _core.back_project_resire_cuda(
+        sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
+        Ny, Nz, Nx, n_angles, N_det,
+    )
+    return vol * 0.25
+
+
+def _grad_rotmat_resire_raw(
+    volume: torch.Tensor,
+    grad_sino: torch.Tensor,
+    mats_flat: torch.Tensor,   # [n_angles, 9], detached
+) -> torch.Tensor:
+    """
+    Returns [n_angles, 9] gradient of the loss w.r.t. the rotation matrix
+    elements (rows 0 and 1 only; row 2 is zero).  Scaled by 0.25 to chain
+    through the Python normalisation factor applied in the forward pass.
+    """
+    if not _core.cuda_available:
+        raise RuntimeError("fasttomo was compiled without CUDA support")
+    n_angles = mats_flat.shape[0]
+    Ny, Nz, Nx = volume.shape
+    n_angles_sino, Ny_sino, N_det = grad_sino.shape
+    vol  = volume.contiguous().float()
+    gs   = grad_sino.contiguous().float()
+    grad_mats = torch.zeros(n_angles, 9, dtype=torch.float32, device=vol.device)
+    _core.grad_rotmat_resire_cuda(
+        vol.data_ptr(), gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+        Ny, Nz, Nx, n_angles, N_det,
+    )
+    return grad_mats * 0.25
+
+
+class _FPResireMat(torch.autograd.Function):
+    """
+    RESIRE forward projection differentiable w.r.t. both volume and rotation
+    matrices.  Takes mats [n_angles, 3, 3] instead of Euler angles so that
+    _euler_zyz_to_rotmat (pure PyTorch) lives outside the Function boundary
+    and autograd automatically chains grad_mats → grad_euler.
+    """
+
+    @staticmethod
+    def forward(ctx, volume, mats, N_det):
+        mats_flat = mats.detach().reshape(-1, 9).contiguous()
+        ctx.save_for_backward(volume.detach(), mats_flat)
+        ctx.Nz = volume.shape[-2]
+        return _forward_project_resire_mats_raw(volume.detach(), mats_flat, N_det)
+
+    @staticmethod
+    def backward(ctx, grad_sino):
+        volume, mats_flat = ctx.saved_tensors
+        grad_sino = grad_sino.contiguous()
+        grad_vol = _back_project_resire_mats_raw(grad_sino, mats_flat, ctx.Nz)
+        grad_mats = None
+        if ctx.needs_input_grad[1]:
+            grad_mats = _grad_rotmat_resire_raw(volume, grad_sino, mats_flat).reshape(-1, 3, 3)
+        return grad_vol, grad_mats, None

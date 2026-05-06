@@ -663,3 +663,222 @@ void genfire_gridding_2d_cuda(
     );
     cudaDeviceSynchronize();
 }
+
+/* ── gradient of forward projection w.r.t. tilt angles ───────────────────
+ * Grid:  (ceil(N_det/16), ceil(n_angles/16), Ny)   Block: (16, 16, 1)
+ * Same detector-driven layout as forward_project_kernel.
+ * Each thread (id, ia, iy) walks the ray and accumulates:
+ *   local_g += gs * (dvol_dx * (-z) + dvol_dz * x)
+ * where dvol_dx/dvol_dz are bilinear finite-differences of the volume.
+ * In-block reduction over threadIdx.x collapses (detector) dimension;
+ * then one atomicAdd per block row writes to grad_angles[ia].
+ */
+__global__ static void grad_angle_kernel(
+    const float *__restrict__ volume,     /* [Ny, Nz, Nx] */
+    const float *__restrict__ grad_sino,  /* [n_angles, Ny, N_det] */
+    const float *__restrict__ cos_a,
+    const float *__restrict__ sin_a,
+    float       *__restrict__ grad_angles,/* [n_angles] */
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    float half_det, float half_x, float half_z, int ray_len
+) {
+    __shared__ float sh[16 * 16];
+
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int ia = blockIdx.y * blockDim.y + threadIdx.y;
+    int iy = (int)blockIdx.z;
+
+    float local_g = 0.0f;
+
+    if (id < N_det && ia < n_angles) {
+        float ca = cos_a[ia], sa = sin_a[ia];
+        float t   = id - half_det;
+        float gs  = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
+
+        if (gs != 0.0f) {
+            const float *slice = volume + (size_t)iy * Nz * Nx;
+
+            for (int step = -ray_len; step <= ray_len; step++) {
+                float s  = (float)step;
+                float x  = t * ca - s * sa;
+                float z  = t * sa + s * ca;
+                float fx = x + half_x;
+                float fz = z + half_z;
+
+                if (fx < 0.0f || fx >= (float)(Nx - 1) ||
+                    fz < 0.0f || fz >= (float)(Nz - 1))
+                    continue;
+
+                int ix0 = (int)fx, iz0 = (int)fz;
+                int ix1 = ix0 + 1, iz1 = iz0 + 1;
+                float wx = fx - ix0, wz = fz - iz0;
+
+                float v00 = slice[(size_t)iz0 * Nx + ix0];
+                float v01 = slice[(size_t)iz0 * Nx + ix1];
+                float v10 = slice[(size_t)iz1 * Nx + ix0];
+                float v11 = slice[(size_t)iz1 * Nx + ix1];
+
+                float dvol_dx = (1.0f - wz) * (v01 - v00) + wz * (v11 - v10);
+                float dvol_dz = (1.0f - wx) * (v10 - v00) + wx * (v11 - v01);
+
+                local_g += gs * (dvol_dx * (-z) + dvol_dz * x);
+            }
+        }
+    }
+
+    sh[threadIdx.y * 16 + threadIdx.x] = local_g;
+    __syncthreads();
+
+    /* Reduce over threadIdx.x (all detector cells sharing the same ia). */
+    for (int stride = 8; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            sh[threadIdx.y * 16 + threadIdx.x] += sh[threadIdx.y * 16 + threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0 && ia < n_angles)
+        atomicAdd(&grad_angles[ia], sh[threadIdx.y * 16]);
+}
+
+void grad_angle_cuda(
+    const float *d_volume,
+    const float *d_grad_sino,
+    const float *d_cos_a,
+    const float *d_sin_a,
+    float       *d_grad_angles,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx * Nx + Nz * Nz))) + 1;
+
+    dim3 block(16, 16, 1);
+    dim3 grid((N_det    + 15) / 16,
+              (n_angles + 15) / 16,
+              Ny);
+
+    grad_angle_kernel<<<grid, block>>>(
+        d_volume, d_grad_sino, d_cos_a, d_sin_a, d_grad_angles,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, ray_len
+    );
+    cudaDeviceSynchronize();
+}
+
+/* ── gradient of RESIRE forward projection w.r.t. rotation matrices ──────
+ * Grid:  (ceil(Nx/16), ceil(Nz/16), Ny)   Block: (16, 16, 1)
+ * Per voxel: 4 supersamples with same boundary logic as the forward kernel.
+ * Block reduction via __shared__ float s_gM[6]; per-block atomicAdd to global.
+ */
+__global__ static void grad_rotmat_resire_kernel(
+    const float *__restrict__ volume,     /* [Ny, Nz, Nx] */
+    const float *__restrict__ grad_sino,  /* [Ny, N_det] — one angle slice */
+    const float *__restrict__ M,          /* [9] rotation matrix */
+    float       *__restrict__ grad_M,     /* [9] output — must be zeroed */
+    int Ny, int Nz, int Nx, int N_det,
+    float half_x, float half_y, float half_z, float half_det
+) {
+    __shared__ float sh_M[9];
+    __shared__ float s_gM[6];
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if (tid < 9)  sh_M[tid] = M[tid];
+    if (tid < 6)  s_gM[tid] = 0.0f;
+    __syncthreads();
+
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iz = blockIdx.y * blockDim.y + threadIdx.y;
+    int iy = (int)blockIdx.z;
+
+    float local_gM[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (ix < Nx && iz < Nz) {
+        float x = ix - half_x;
+        float y = iy - half_y;
+        float z = iz - half_z;
+
+        float u0 = sh_M[0]*x + sh_M[1]*y + sh_M[2]*z + half_det;
+        float v0 = sh_M[3]*x + sh_M[4]*y + sh_M[5]*z + half_y;
+
+        const float data_val = volume[((size_t)iy * Nz + iz) * Nx + ix];
+
+        const float sdx[4] = { 0.25f,  0.25f, -0.25f, -0.25f };
+        const float sdz[4] = { 0.25f, -0.25f,  0.25f, -0.25f };
+
+        for (int s = 0; s < 4; s++) {
+            float cx = x + sdx[s];
+            float cz = z + sdz[s];
+            float u_s = u0 + sh_M[0]*sdx[s] + sh_M[2]*sdz[s];
+            float v_s = v0 + sh_M[3]*sdx[s] + sh_M[5]*sdz[s];
+
+            int u1 = (int)floorf(u_s);  int u2 = u1 + 1;
+            int v1 = (int)floorf(v_s);  int v2 = v1 + 1;
+
+            /* Mirror FP kernel: skip if stencil entirely off-detector */
+            if ((u1 < 0 && u2 < 0) || (u1 >= N_det && u2 >= N_det)) continue;
+            if ((v1 < 0 && v2 < 0) || (v1 >= Ny   && v2 >= Ny  )) continue;
+
+            float wu2 = u_s - u1,  wu1 = 1.0f - wu2;
+            float wv2 = v_s - v1,  wv1 = 1.0f - wv2;
+
+            bool u1ok = (u1 >= 0 && u1 < N_det);
+            bool u2ok = (u2 >= 0 && u2 < N_det);
+            bool v1ok = (v1 >= 0 && v1 < Ny);
+            bool v2ok = (v2 >= 0 && v2 < Ny);
+
+            float dL_du = 0.0f, dL_dv = 0.0f;
+            if (u1ok && v1ok) { float gs = grad_sino[(size_t)v1*N_det+u1]; dL_du -= wv1*gs; dL_dv -= wu1*gs; }
+            if (u2ok && v1ok) { float gs = grad_sino[(size_t)v1*N_det+u2]; dL_du += wv1*gs; dL_dv -= wu2*gs; }
+            if (u1ok && v2ok) { float gs = grad_sino[(size_t)v2*N_det+u1]; dL_du -= wv2*gs; dL_dv += wu1*gs; }
+            if (u2ok && v2ok) { float gs = grad_sino[(size_t)v2*N_det+u2]; dL_du += wv2*gs; dL_dv += wu2*gs; }
+            dL_du *= data_val;
+            dL_dv *= data_val;
+
+            local_gM[0] += dL_du * cx;
+            local_gM[1] += dL_du * y;
+            local_gM[2] += dL_du * cz;
+            local_gM[3] += dL_dv * cx;
+            local_gM[4] += dL_dv * y;
+            local_gM[5] += dL_dv * cz;
+        }
+    }
+
+    for (int k = 0; k < 6; k++)
+        atomicAdd(&s_gM[k], local_gM[k]);
+    __syncthreads();
+
+    if (tid < 6)
+        atomicAdd(&grad_M[tid], s_gM[tid]);
+}
+
+void grad_rotmat_resire_cuda(
+    const float *d_volume,
+    const float *d_grad_sinogram,
+    const float *d_matrices,
+    float       *d_grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+
+    dim3 block(16, 16, 1);
+    dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
+
+    for (int ia = 0; ia < n_angles; ia++) {
+        grad_rotmat_resire_kernel<<<grid, block>>>(
+            d_volume,
+            d_grad_sinogram + (size_t)ia * Ny * N_det,
+            d_matrices + ia * 9,
+            d_grad_matrices + ia * 9,
+            Ny, Nz, Nx, N_det,
+            half_x, half_y, half_z, half_det
+        );
+    }
+    cudaDeviceSynchronize();
+}

@@ -26,7 +26,7 @@ from tqdm.auto import tqdm
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
+    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire, _FPResireMat,
     _euler_zyz_to_rotmat,
 )
 
@@ -51,8 +51,9 @@ def forward_project(
     Returns [n_angles, Ny, N_det] float32 on the same device as volume.
     N_det defaults to Nx.
 
-    Differentiable w.r.t. ``volume``: backward calls back_project (the
-    discrete adjoint).
+    Differentiable w.r.t. ``volume`` and ``angles_deg``.  Volume gradient
+    calls back_project (the discrete adjoint). Angle gradient uses
+    ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x at each ray step (CPU + CUDA).
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
@@ -141,11 +142,15 @@ def forward_project_resire(
 
     Returns sinogram [n_angles, Ny, N_det].
 
-    Differentiable w.r.t. ``volume``: backward calls back_project_resire.
+    Differentiable w.r.t. ``volume`` and ``euler_zyz_deg``: backward calls
+    back_project_resire for the volume gradient and a dedicated kernel for
+    the rotation-matrix gradient (chained through _euler_zyz_to_rotmat to
+    yield ∂L/∂euler_zyz_deg automatically via PyTorch autograd).
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    return _FPResire.apply(volume, euler_zyz_deg, N_det)
+    mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through here
+    return _FPResireMat.apply(volume, mats, N_det)
 
 
 def back_project_resire(

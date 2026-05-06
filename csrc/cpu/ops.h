@@ -62,6 +62,25 @@ void back_project_cpu(
  * Each point within cutoff_dist of a grid cell contributes value/distance.
  * Normalization by accumulated weights is left to the caller.
  */
+/*
+ * Gradient of forward projection w.r.t. tilt angles (CPU).
+ *
+ * Computes ∂L/∂θ_ia for each angle, given the upstream gradient on the
+ * sinogram.  Uses the identity ∂x/∂θ = −z, ∂z/∂θ = x at each ray step,
+ * combined with bilinear-weighted finite differences for ∂vol/∂x and ∂vol/∂z.
+ *
+ * grad_angles : [n_angles] — zeroed by caller; returned in radians
+ */
+void grad_angle_cpu(
+    const float *volume,
+    const float *grad_sino,
+    float       *grad_angles,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
 void genfire_gridding_2d_cpu(
     const float *fk_real,
     const float *fk_imag,

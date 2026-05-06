@@ -110,6 +110,68 @@ void back_project_cpu(
     }
 }
 
+void grad_angle_cpu(
+    const float *volume,
+    const float *grad_sino,
+    float       *grad_angles,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+) {
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int ray_len = (int)ceilf(0.5f * sqrtf((float)(Nx * Nx + Nz * Nz))) + 1;
+
+    for (int ia = 0; ia < n_angles; ia++)
+        grad_angles[ia] = 0.0f;
+
+    for (int ia = 0; ia < n_angles; ia++) {
+        float ca = cos_a[ia], sa = sin_a[ia];
+        float g_theta = 0.0f;
+
+        for (int iy = 0; iy < Ny; iy++) {
+            const float *slice = volume + (size_t)iy * Nz * Nx;
+
+            for (int id = 0; id < N_det; id++) {
+                float t  = id - half_det;
+                float gs = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
+                if (gs == 0.0f) continue;
+
+                for (int step = -ray_len; step <= ray_len; step++) {
+                    float s  = (float)step;
+                    float x  = t * ca - s * sa;
+                    float z  = t * sa + s * ca;
+                    float fx = x + half_x;
+                    float fz = z + half_z;
+
+                    /* bounds check mirrors forward_project_cpu exactly */
+                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
+                        fz < 0.0f || fz >= (float)(Nz - 1))
+                        continue;
+
+                    int ix0 = (int)fx, iz0 = (int)fz;
+                    int ix1 = ix0 + 1, iz1 = iz0 + 1;
+                    float wx = fx - ix0, wz = fz - iz0;
+
+                    float v00 = slice[(size_t)iz0 * Nx + ix0];
+                    float v01 = slice[(size_t)iz0 * Nx + ix1];
+                    float v10 = slice[(size_t)iz1 * Nx + ix0];
+                    float v11 = slice[(size_t)iz1 * Nx + ix1];
+
+                    float dvol_dx = (1.0f - wz) * (v01 - v00) + wz * (v11 - v10);
+                    float dvol_dz = (1.0f - wx) * (v10 - v00) + wx * (v11 - v01);
+
+                    g_theta += gs * (dvol_dx * (-z) + dvol_dz * x);
+                }
+            }
+        }
+
+        grad_angles[ia] = g_theta;
+    }
+}
+
 void genfire_gridding_2d_cpu(
     const float *fk_real, const float *fk_imag,
     const float *cos_a,   const float *sin_a,
