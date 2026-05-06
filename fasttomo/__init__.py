@@ -3,6 +3,10 @@ from fasttomo.torch_ops import (
     back_project,
     forward_project_3d,
     back_project_3d,
+    forward_project_resire,
+    back_project_resire,
+    apply_shifts,
+    estimate_shifts_xcorr,
     ramp_filter,
     cylindrical_mask,
     run_fbp,
@@ -11,6 +15,7 @@ from fasttomo.torch_ops import (
     run_wsirt,
     run_genfire,
     run_resire,
+    run_grad_descent,
     refine_angles,
 )
 
@@ -19,6 +24,10 @@ __all__ = [
     "back_project",
     "forward_project_3d",
     "back_project_3d",
+    "forward_project_resire",
+    "back_project_resire",
+    "apply_shifts",
+    "estimate_shifts_xcorr",
     "ramp_filter",
     "cylindrical_mask",
     "run_fbp",
@@ -27,5 +36,6 @@ __all__ = [
     "run_wsirt",
     "run_genfire",
     "run_resire",
+    "run_grad_descent",
     "refine_angles",
 ]

@@ -25,9 +25,20 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 import fasttomo._core as _core
+from fasttomo.autograd import (
+    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
+    _euler_zyz_to_rotmat,
+)
 
 
 # ── primitive projection ops ───────────────────────────────────────────────
+#
+# These are thin shims around torch.autograd.Function subclasses defined in
+# fasttomo/autograd.py. When inputs do not require grad, Function.apply
+# short-circuits and behaves identically to a direct kernel call. When a
+# volume (or sinogram) has requires_grad=True, loss.backward() flows the
+# adjoint partner kernel back into .grad. See fasttomo/autograd.py and
+# fasttomo-wiki/wiki/concepts/autograd-projectors.md.
 
 def forward_project(
     volume: torch.Tensor,          # [Ny, Nz, Nx]
@@ -39,31 +50,13 @@ def forward_project(
 
     Returns [n_angles, Ny, N_det] float32 on the same device as volume.
     N_det defaults to Nx.
+
+    Differentiable w.r.t. ``volume``: backward calls back_project (the
+    discrete adjoint).
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-
-    angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
-
-    if volume.is_cuda:
-        if not _core.cuda_available:
-            raise RuntimeError("fasttomo was compiled without CUDA support")
-        Ny, Nz, Nx = volume.shape
-        n_angles    = len(angles_np)
-        if N_det < 0:
-            N_det = Nx
-        vol = volume.contiguous().float()
-        sino = torch.empty(n_angles, Ny, N_det,
-                           dtype=torch.float32, device=volume.device)
-        _core.forward_project_cuda(
-            vol.data_ptr(), sino.data_ptr(),
-            angles_np, Ny, Nz, Nx, n_angles, N_det,
-        )
-        return sino
-    else:
-        vol_np = volume.detach().float().numpy()
-        sino_np = _core.forward_project_cpu(vol_np, angles_np, N_det)
-        return torch.from_numpy(sino_np)
+    return _FP2D.apply(volume, angles_deg, N_det)
 
 
 def back_project(
@@ -75,31 +68,12 @@ def back_project(
     Back-project sinogram → volume [Ny, Nz, Nx].
 
     Nz defaults to N_det (square reconstruction).
+
+    Differentiable w.r.t. ``sinogram``: backward calls forward_project.
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-
-    angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
-
-    if sinogram.is_cuda:
-        if not _core.cuda_available:
-            raise RuntimeError("fasttomo was compiled without CUDA support")
-        n_angles, Ny, N_det = sinogram.shape
-        Nx = N_det
-        if Nz < 0:
-            Nz = N_det
-        sino = sinogram.contiguous().float()
-        vol = torch.empty(Ny, Nz, Nx,
-                          dtype=torch.float32, device=sinogram.device)
-        _core.back_project_cuda(
-            sino.data_ptr(), vol.data_ptr(),
-            angles_np, Ny, Nz, Nx, n_angles, N_det,
-        )
-        return vol
-    else:
-        sino_np = sinogram.detach().float().numpy()
-        vol_np  = _core.back_project_cpu(sino_np, angles_np, Nz)
-        return torch.from_numpy(vol_np)
+    return _BP2D.apply(sinogram, angles_deg, Nz)
 
 
 # ── 3D rotation-matrix projection (CUDA only) ────────────────────────────
@@ -121,33 +95,12 @@ def forward_project_3d(
 
     Returns sinogram [n_angles, Ny, N_det] on CUDA — same shape convention
     as forward_project so algorithms can swap projectors transparently.
-    """
-    if not volume.is_cuda:
-        raise RuntimeError(
-            "forward_project_3d requires CUDA — move volume to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
 
+    Differentiable w.r.t. ``volume``: backward calls back_project_3d.
+    """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-
-    Ny, Nz, Nx = volume.shape
-    n_angles = euler_zyz_deg.shape[0]
-    if N_det < 0:
-        N_det = Nx
-
-    vol  = volume.contiguous().float()
-    sino = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
-
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=vol.device)  # [n_angles, 3, 3]
-    mats_flat = mats.reshape(n_angles, 9).contiguous()                 # [n_angles, 9]
-
-    _core.forward_project_rotmat_cuda(
-        vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-    )
-    return sino
+    return _FP3D.apply(volume, euler_zyz_deg, N_det)
 
 
 def back_project_3d(
@@ -162,68 +115,58 @@ def back_project_3d(
     the sinogram at its rotated detector position for every projection.
 
     Returns volume [Ny, Nz, Nx].
-    """
-    if not sinogram.is_cuda:
-        raise RuntimeError(
-            "back_project_3d requires CUDA — move sinogram to GPU first"
-        )
-    if not _core.cuda_available:
-        raise RuntimeError("fasttomo was compiled without CUDA support")
 
+    Differentiable w.r.t. ``sinogram``: backward calls forward_project_3d.
+    """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-
-    n_angles, Ny, N_det = sinogram.shape
-    Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    sino = sinogram.contiguous().float()
-    vol  = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
-
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=sino.device)
-    mats_flat = mats.reshape(n_angles, 9).contiguous()
-
-    _core.back_project_rotmat_cuda(
-        sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-    )
-    return vol
+    return _BP3D.apply(sinogram, euler_zyz_deg, Nz)
 
 
-# ── ZYZ Euler angles → rotation matrix ───────────────────────────────────
-
-def _euler_zyz_to_rotmat(euler_zyz_deg: torch.Tensor) -> torch.Tensor:
+def forward_project_resire(
+    volume: torch.Tensor,           # [Ny, Nz, Nx]
+    euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
+    N_det: int = -1,
+) -> torch.Tensor:
     """
-    Convert ZYZ Euler angles to 3×3 rotation matrices (row-major).
+    RESIRE voxel-driven forward projection (CUDA only).
 
-    euler_zyz_deg: [n_angles, 3]  — columns are (φ, θ, ψ) in degrees.
-    Convention: R = R_Z(ψ) · R_Y(θ) · R_Z(φ)  (same as RESIRE reference).
+    Implements the Miao group scatter kernel: each voxel is projected to
+    the detector using a full 3×3 rotation matrix with 4-point supersampling
+    (±0.25 px in volume XZ space). Uses atomicAdd; output is normalised by
+    the supersampling factor (÷4) so it is on the same scale as
+    forward_project_3d.
 
-    Returns [n_angles, 3, 3] float32 on the same device as input.
+    euler_zyz_deg: [n_angles, 3] — (φ, θ, ψ) ZYZ Euler angles in degrees.
 
-    Consistency: _euler_zyz_to_rotmat([[0, θ, 0]]) equals the standard
-    Y-rotation matrix [[cosθ, 0, sinθ], [0,1,0], [−sinθ, 0, cosθ]], which
-    is the rotation used by FastTomo's scalar-angle projection kernels.
+    Returns sinogram [n_angles, Ny, N_det].
+
+    Differentiable w.r.t. ``volume``: backward calls back_project_resire.
     """
-    r   = math.pi / 180.0
-    phi   = euler_zyz_deg[:, 0].float() * r
-    theta = euler_zyz_deg[:, 1].float() * r
-    psi   = euler_zyz_deg[:, 2].float() * r
+    if volume.ndim == 2:
+        volume = volume.unsqueeze(0)
+    return _FPResire.apply(volume, euler_zyz_deg, N_det)
 
-    cp, sp = torch.cos(phi),   torch.sin(phi)
-    ct, st = torch.cos(theta), torch.sin(theta)
-    cu, su = torch.cos(psi),   torch.sin(psi)
 
-    # R_ZYZ rows (each [n_angles]):
-    r00 =  cu*ct*cp - su*sp;  r01 = -cu*ct*sp - su*cp;  r02 = cu*st
-    r10 =  su*ct*cp + cu*sp;  r11 = -su*ct*sp + cu*cp;  r12 = su*st
-    r20 = -st*cp;             r21 =  st*sp;              r22 = ct
+def back_project_resire(
+    sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
+    euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
+    Nz: int = -1,
+) -> torch.Tensor:
+    """
+    RESIRE voxel-driven back-projection (CUDA only).
 
-    row0 = torch.stack([r00, r01, r02], dim=1)   # [n_angles, 3]
-    row1 = torch.stack([r10, r11, r12], dim=1)
-    row2 = torch.stack([r20, r21, r22], dim=1)
-    return torch.stack([row0, row1, row2], dim=1)  # [n_angles, 3, 3]
+    Adjoint of forward_project_resire. Each voxel gathers from the sinogram
+    at its rotated detector position with 4-point supersampling. Output is
+    normalised by the supersampling factor (÷4).
+
+    Returns volume [Ny, Nz, Nx].
+
+    Differentiable w.r.t. ``sinogram``: backward calls forward_project_resire.
+    """
+    if sinogram.ndim == 2:
+        sinogram = sinogram.unsqueeze(1)
+    return _BPResire.apply(sinogram, euler_zyz_deg, Nz)
 
 
 # ── cylindrical support mask ──────────────────────────────────────────────
@@ -266,6 +209,106 @@ def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
     freqs  = torch.fft.rfftfreq(N_det, device=sinogram.device, dtype=torch.float32)
     f      = f * freqs.abs()
     return torch.fft.irfft(f, n=N_det, dim=-1)
+
+
+def apply_shifts(
+    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
+    shifts: torch.Tensor,     # [n_angles] detector-axis shifts in pixels
+) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
+    """
+    Sub-pixel shift each projection row along the detector axis via Fourier
+    phase multiplication.  Positive shift moves the signal to the right.
+
+    shifts may be on CPU even when sinogram is on CUDA.
+    """
+    N_det = sinogram.shape[-1]
+    s = shifts.to(device=sinogram.device, dtype=torch.float32)
+    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device)          # [N_freq]
+    phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s.view(-1, 1, 1)
+    phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
+    F = torch.fft.rfft(sinogram.float(), n=N_det, dim=-1)
+    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
+
+
+def estimate_shifts_xcorr(
+    volume: torch.Tensor,                       # [Ny, Nz, Nx]
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    *,
+    upsample_factor: int = 10,                  # reserved; parabolic fit used today
+    max_shift: float | None = None,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — CUDA only
+) -> torch.Tensor:                              # [n_angles] float32, CPU
+    """
+    Estimate the translational shift of each projection (along the detector
+    axis) by 1-D phase cross-correlation between the forward projection of
+    *volume* and the corresponding row of *sinogram*.
+
+    Returns the correction shift to apply so that::
+
+        aligned_sino = ft.apply_shifts(sinogram, shifts)
+
+    brings sinogram into alignment with the volume (no negation needed at the
+    call site).
+
+    Sub-pixel precision is achieved via 3-point parabolic interpolation around
+    the cross-correlation peak.  upsample_factor is accepted for API
+    compatibility but currently unused.
+
+    Typical outer-loop usage::
+
+        for _ in range(n_outer):
+            vol    = ft.run_resire(aligned_sino, angles, n_iter=100)
+            shifts = ft.estimate_shifts_xcorr(vol, aligned_sino, angles)
+            aligned_sino = ft.apply_shifts(aligned_sino, shifts)
+    """
+    N_det = sinogram.shape[-1]
+
+    if euler_zyz_deg is not None:
+        pred = forward_project_3d(volume, euler_zyz_deg)
+    else:
+        pred = forward_project(volume, angles_deg)
+
+    F_pred = torch.fft.rfft(pred.float(),      n=N_det, dim=-1)  # [n_a, Ny, N_freq]
+    F_meas = torch.fft.rfft(sinogram.float(),  n=N_det, dim=-1)
+
+    # Phase cross-power spectrum: peaks at +s when sinogram is shifted +s vs pred
+    cross   = F_pred * F_meas.conj()
+    cross_n = cross / cross.abs().clamp(min=1e-12)
+
+    # Coherent sum over Ny before IRFFT (SNR ∝ sqrt(Ny))
+    cross_sum = cross_n.sum(dim=1)                                  # [n_a, N_freq]
+    ccf       = torch.fft.irfft(cross_sum, n=N_det, dim=-1)        # [n_a, N_det]
+
+    # Integer peak → signed shift
+    peak_idx  = ccf.argmax(dim=-1)                                  # [n_a]
+    shifts_int = torch.where(
+        peak_idx <= N_det // 2,
+        peak_idx.float(),
+        peak_idx.float() - N_det,
+    )
+
+    # Parabolic sub-pixel refinement with circular neighbour wrap
+    idx_m = (peak_idx - 1) % N_det
+    idx_p = (peak_idx + 1) % N_det
+    y_m   = ccf.gather(1, idx_m.unsqueeze(1)).squeeze(1)
+    y_0   = ccf.gather(1, peak_idx.unsqueeze(1)).squeeze(1)
+    y_p   = ccf.gather(1, idx_p.unsqueeze(1)).squeeze(1)
+    denom = y_m - 2.0 * y_0 + y_p
+    delta = torch.where(
+        denom.abs() > 1e-9,
+        0.5 * (y_m - y_p) / denom,
+        torch.zeros_like(denom),
+    )
+
+    # Negate: F_pred * conj(F_meas) peaks at +s when sino is +s vs pred;
+    # returning -s so that apply_shifts(sino, shifts) corrects the alignment.
+    shifts_out = -(shifts_int + delta)
+
+    if max_shift is not None:
+        shifts_out = shifts_out.clamp(-max_shift, max_shift)
+
+    return shifts_out.cpu()
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -399,7 +442,9 @@ def run_sirt(
     positivity: bool = False,
     mask: bool = False,
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
-) -> torch.Tensor:
+    return_loss: bool = False,
+    sparsity: float = 0.0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
 
@@ -411,6 +456,13 @@ def run_sirt(
     euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
     (forward_project_3d / back_project_3d) instead of the scalar-angle
     single-axis projector. CUDA only when set.
+
+    return_loss: if True, returns (volume, loss_history) where loss_history
+    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
+    ||b - A·x^k||² / numel at each iteration.
+
+    sparsity: L1 soft-threshold applied after each update (proximal operator
+    of sparsity·‖x‖₁). 0.0 disables it.
 
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
@@ -440,16 +492,24 @@ def run_sirt(
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
     _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0) if mask else None
+    losses: list[float] = []
 
     # --- iteration loop ---
     for _ in range(n_iter):
-        residual = (sinogram - _fp(volume)) * R_sino
+        raw_res  = sinogram - _fp(volume)
+        if return_loss:
+            losses.append(raw_res.pow(2).mean().item())
+        residual = raw_res * R_sino
         volume   = volume + omega * C_vol * _bp(residual)
+        if sparsity > 0.0:
+            volume = volume.sign() * (volume.abs() - sparsity).clamp_(min=0.0)
         if positivity:
             volume.clamp_(min=0.0)
         if _mask is not None:
             volume = volume * _mask
 
+    if return_loss:
+        return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
 
 
@@ -494,7 +554,9 @@ def run_genfire(
     positivity: bool = True,
     mask: bool = True,
     resolution_extension: bool = True,
-) -> torch.Tensor:
+    return_loss: bool = False,
+    sparsity: float = 0.0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     GENFIRE reconstruction (Pryor et al. 2017).
 
@@ -504,6 +566,13 @@ def run_genfire(
     positivity).  Optional resolution extension/suppression schedule
     gradually widens then narrows the enforced frequency band to improve
     convergence under limited tilt range.
+
+    return_loss: if True, returns (volume, loss_history) where loss_history
+    is a float32 CPU tensor of shape [n_iter] containing the mean L1 Fourier
+    error on known grid points at each iteration.
+
+    sparsity: L1 soft-threshold applied in real space after each IFFT step
+    (proximal operator of sparsity·‖x‖₁). 0.0 disables it.
 
     Returns volume [Ny, Nz, Nx].
     mask=True inscribes a cylindrical support in the reconstruction plane.
@@ -610,6 +679,7 @@ def run_genfire(
     current_F = measured_K.clone()
     best_F = current_F
     best_err = float("inf")
+    losses: list[float] = []
 
     for i_iter in range(n_iter):
         # build enforce mask for this iteration
@@ -623,6 +693,8 @@ def run_genfire(
         vol = torch.fft.ifftn(current_F, dim=(-2, -1)).real    # [Ny, bigN, bigN]
 
         # real-space constraints
+        if sparsity > 0.0:
+            vol = vol.sign() * (vol.abs() - sparsity).clamp_(min=0.0)
         if positivity:
             vol.clamp_(min=0.0)
         vol = vol * support.unsqueeze(0)
@@ -632,6 +704,7 @@ def run_genfire(
 
         # track best-error iterate (L1 on all known voxels, not just enforce_us)
         err = (F_cur[:, known_us] - measured_K[:, known_us]).abs().mean().item()
+        losses.append(err)
         if err < best_err:
             best_err = err
             best_F = F_cur.clone()
@@ -646,7 +719,10 @@ def run_genfire(
         vol.clamp_(min=0.0)
 
     # crop to [Ny, Nz, Nx]
-    return vol[:, z0:z1, x0:x1]
+    vol = vol[:, z0:z1, x0:x1]
+    if return_loss:
+        return vol, torch.tensor(losses, dtype=torch.float32)
+    return vol
 
 
 def run_wsirt(
@@ -658,7 +734,9 @@ def run_wsirt(
     positivity: bool = False,
     threshold_scale: float = 1.0,
     mask: bool = False,
-) -> torch.Tensor:
+    return_loss: bool = False,
+    sparsity: float = 0.0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Weighted SIRT (Wolf et al. 2014).
 
@@ -667,6 +745,14 @@ def run_wsirt(
     SIRT, especially under limited tilt range.
 
     f^k = f^{k-1} + ω · W-BP(b - A·f^{k-1})
+
+    return_loss: if True, returns (volume, loss_history) where loss_history
+    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
+    ||b - A·f^k||² / numel at each iteration.
+
+    sparsity: L1 soft-threshold applied after each update (proximal operator
+    of sparsity·‖x‖₁). 0.0 disables it.
+
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
     n_angles, Ny, N_det = sinogram.shape
@@ -693,16 +779,23 @@ def run_wsirt(
         return out
 
     _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0) if mask else None
+    losses: list[float] = []
 
     for _ in range(n_iter):
         proj     = forward_project(volume, angles_deg, N_det=N_det)
         residual = sinogram - proj
+        if return_loss:
+            losses.append(residual.pow(2).mean().item())
         volume   = volume + omega * _wbp(residual)
+        if sparsity > 0.0:
+            volume = volume.sign() * (volume.abs() - sparsity).clamp_(min=0.0)
         if positivity:
             volume.clamp_(min=0.0)
         if _mask is not None:
             volume = volume * _mask
 
+    if return_loss:
+        return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
 
 
@@ -809,27 +902,41 @@ def run_resire(
     positivity: bool = True,
     mask: bool = False,
     support: torch.Tensor | None = None,        # [Ny, Nz, Nx] or [1, Nz, Nx] float mask
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
-) -> torch.Tensor:
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — overrides angles_deg
+    return_loss: bool = False,
+    sparsity: float = 0.0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
-    REal Space Iterative REconstruction (RESIRE, Miao group).
+    REal Space Iterative REconstruction (RESIRE, Miao group).  CUDA only.
 
     Projected gradient descent on ||Ax - b||²:
 
         x^{k+1} = P_C(x^k + α · A^T(b − A·x^k))
 
-    where α = step_size / (n_angles · Nz).  Unlike SIRT there are no
-    per-voxel / per-ray normalisation matrices; the step size plays that
-    role.  Convergence is controlled by step_size (default 1.0 is safe for
-    most geometries).
+    where α = step_size / (n_angles · Nz).
 
-    euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
-    instead of the scalar-angle single-axis projector. CUDA only when set.
+    Uses the Miao group voxel-driven scatter/gather kernels with 4-point
+    supersampling (forward_project_resire / back_project_resire).  For a
+    single-axis tilt series, angles_deg is wrapped as ZYZ triples (φ=0,
+    θ=angle, ψ=0) internally.  Pass euler_zyz_deg directly for dual-axis
+    tilt or general orientations.
 
     support: explicit float mask [Ny, Nz, Nx] or [1, Nz, Nx] applied each
     iteration.  If None and mask=True, uses the inscribed cylindrical mask.
+
+    return_loss: if True, returns (volume, loss_history) where loss_history
+    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
+    ||b - A·x^k||² / numel at each iteration.
+
+    sparsity: L1 soft-threshold applied after each gradient step (proximal
+    operator of sparsity·‖x‖₁, as noted in Algorithm 1 of the RESIRE paper).
+    0.0 disables it.
+
     Returns volume [Ny, Nz, Nx].
     """
+    if not sinogram.is_cuda:
+        raise RuntimeError("run_resire requires CUDA — move sinogram to GPU first")
+
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
@@ -841,12 +948,13 @@ def run_resire(
     # step size: matches RESIRE's dt = step_size / Num_pjs / dimz
     alpha = step_size / (n_angles * Nz)
 
-    if euler_zyz_deg is not None:
-        _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det)
-        _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz)
-    else:
-        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
-        _bp = lambda s: back_project(s, angles_deg, Nz=Nz)
+    if euler_zyz_deg is None:
+        # Wrap scalar tilt angles as ZYZ triples (φ=0, θ=angle, ψ=0)
+        euler_zyz_deg = torch.zeros(n_angles, 3, dtype=torch.float32)
+        euler_zyz_deg[:, 1] = angles_deg.cpu().float()
+
+    _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
+    _bp = lambda s: back_project_resire(s, euler_zyz_deg, Nz=Nz)
 
     if support is not None:
         _mask = support.to(device=device, dtype=torch.float32)
@@ -855,12 +963,145 @@ def run_resire(
     else:
         _mask = None
 
+    losses: list[float] = []
+
     for _ in range(n_iter):
         residual = sinogram - _fp(volume)
+        if return_loss:
+            losses.append(residual.pow(2).mean().item())
         volume   = volume + alpha * _bp(residual)
+        if sparsity > 0.0:
+            volume = volume.sign() * (volume.abs() - sparsity).clamp_(min=0.0)
         if positivity:
             volume.clamp_(min=0.0)
         if _mask is not None:
             volume = volume * _mask
 
+    if return_loss:
+        return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+# ── autograd-based reference reconstruction ──────────────────────────────
+
+def run_grad_descent(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor | None = None,     # [n_angles] — single-axis
+    n_iter: int = 200,
+    lr: float = 1e-2,
+    Nz: int = -1,
+    optimizer_cls=torch.optim.Adam,
+    positivity: bool = False,
+    mask: bool = False,
+    tv_weight: float = 0.0,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — 3D mode (CUDA)
+    use_resire_projector: bool = False,
+    return_loss: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Reference autograd-based reconstruction.
+
+    Demonstrates the canonical pattern using FastTomo's differentiable
+    projectors: a torch.optim optimizer drives ``volume.requires_grad_(True)``
+    by calling ``loss.backward()`` each iteration. Equivalent to Landweber
+    iteration when ``optimizer_cls=torch.optim.SGD``; with ``Adam`` (default)
+    the adaptive step size loosely substitutes for SIRT's diagonal
+    preconditioners.
+
+    This is *not* a SIRT/RESIRE replacement — those remain the
+    production-fast iterative entry points. Use this when you need a custom
+    differentiable loss, learnable prior, or any reconstruction that benefits
+    from being part of a larger autograd graph.
+
+    Args:
+        sinogram:       [n_angles, Ny, N_det] — measured tilt series
+        angles_deg:     [n_angles] — single-axis tilt angles, mutually
+                        exclusive with ``euler_zyz_deg``
+        n_iter:         number of optimizer steps
+        lr:             optimizer learning rate
+        Nz:             reconstruction depth; defaults to N_det
+        optimizer_cls:  any torch.optim class (Adam, SGD, LBFGS, …)
+        positivity:     project volume onto [0, ∞) after each step
+        mask:           apply inscribed-cylinder mask after each step
+        tv_weight:      3-D anisotropic TV regularisation weight; the
+                        penalty is mean(|∂y f|) + mean(|∂z f|) + mean(|∂x f|)
+                        across the full [Ny, Nz, Nx] volume (0.0 disables)
+        euler_zyz_deg:  [n_angles, 3] — switches to the 3D rotmat projector
+                        (CUDA only). Mutually exclusive with ``angles_deg``.
+        use_resire_projector: with ``euler_zyz_deg``, use the RESIRE 4-pt
+                        scatter projector instead of the rotmat tex3D one.
+        return_loss:    if True, also return the per-iteration loss history.
+
+    Constraints (positivity, mask) are applied **inside torch.no_grad()** on
+    the leaf tensor — the autograd-correct way to project. Users hand-rolling
+    similar loops should mimic this; in-place ops on a graph-tracked tensor
+    raise "leaf Variable that requires grad ... in-place operation".
+
+    Memory note: peak ~7 N³ vs SIRT's ~5 N³ because the BP backward must
+    materialise both the sinogram (forward output) and the volume gradient.
+
+    LBFGS is supported — it calls the closure multiple times per ``step()``
+    and rebuilds the graph each call.
+    """
+    if (angles_deg is None) == (euler_zyz_deg is None):
+        raise ValueError(
+            "Provide exactly one of angles_deg (single-axis) or "
+            "euler_zyz_deg (3D ZYZ), not both or neither."
+        )
+
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+    device = sinogram.device
+
+    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
+                         requires_grad=True)
+    opt = optimizer_cls([volume], lr=lr)
+
+    if euler_zyz_deg is not None:
+        if use_resire_projector:
+            _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
+        else:
+            _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det)
+    else:
+        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
+
+    _mask = (
+        cylindrical_mask(Nz, Nx, device=device).unsqueeze(0) if mask else None
+    )
+    losses: list[float] = []
+
+    is_lbfgs = isinstance(opt, torch.optim.LBFGS)
+
+    def closure():
+        opt.zero_grad()
+        sino_pred = _fp(volume)
+        loss = ((sino_pred - sinogram) ** 2).mean()
+        if tv_weight > 0.0:
+            dy = volume[1:, :, :] - volume[:-1, :, :]
+            dz = volume[:, 1:, :] - volume[:, :-1, :]
+            dx = volume[:, :, 1:] - volume[:, :, :-1]
+            loss = loss + tv_weight * (
+                dy.abs().mean() + dz.abs().mean() + dx.abs().mean()
+            )
+        loss.backward()
+        return loss
+
+    for _ in range(n_iter):
+        if is_lbfgs:
+            loss_val = opt.step(closure)
+        else:
+            loss_val = closure()
+            opt.step()
+        losses.append(float(loss_val.detach()))
+        with torch.no_grad():
+            if positivity:
+                volume.clamp_(min=0.0)
+            if _mask is not None:
+                volume.mul_(_mask)
+
+    out = volume.detach()
+    if return_loss:
+        return out, torch.tensor(losses, dtype=torch.float32)
+    return out

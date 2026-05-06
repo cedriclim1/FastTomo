@@ -78,6 +78,40 @@ void back_project_rotmat_cuda(
 );
 
 /*
+ * RESIRE voxel-driven forward projection (CUDA).
+ *
+ * Voxel-driven scatter with 4-point supersampling (±0.25 px in volume XZ
+ * space, pre-rotated to detector coordinates via the projection matrix).
+ * Uses atomicAdd; d_sinogram must be zeroed by the caller.
+ *
+ * d_matrices: [n_angles * 9] row-major rotation matrices — same convention
+ *   as forward_project_rotmat_cuda.
+ */
+void forward_project_resire_cuda(
+    const float *d_volume,
+    float       *d_sinogram,
+    const float *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
+/*
+ * RESIRE voxel-driven back-projection (CUDA).
+ *
+ * Voxel-driven gather with 4-point supersampling. No atomics: each voxel is
+ * owned by exactly one thread; accumulation across projections is safe
+ * because kernel launches on the same stream are serialised.
+ * d_volume must be zeroed by the caller.
+ */
+void back_project_resire_cuda(
+    const float *d_sinogram,
+    float       *d_volume,
+    const float *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det
+);
+
+/*
  * GENFIRE Fourier gridding (CUDA).
  *
  * All pointers are device pointers.

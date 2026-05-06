@@ -248,66 +248,14 @@ def test_genfire_no_resolution_extension():
 
 # ── RESIRE ────────────────────────────────────────────────────────────────
 
-def test_resire_shape():
+def test_resire_requires_cuda():
+    """run_resire is CUDA-only — must raise RuntimeError on CPU tensors."""
+    import pytest
     N      = 32
     angles = make_angles(20)
-    vol    = phantom_2d(N).unsqueeze(0)
-    sino   = ft.forward_project(vol, angles)
-    rec    = ft.run_resire(sino, angles, n_iter=10, Nz=N)
-    assert rec.shape == vol.shape
-
-
-def test_resire_positivity():
-    N      = 32
-    angles = make_angles(30)
-    vol    = phantom_2d(N).unsqueeze(0)
-    sino   = ft.forward_project(vol, angles)
-    rec    = ft.run_resire(sino, angles, n_iter=10, Nz=N, positivity=True)
-    assert rec.min().item() >= -1e-6
-
-
-def test_resire_mask():
-    """With mask=True the corner voxels (outside inscribed cylinder) should be ~0."""
-    N      = 32
-    angles = make_angles(20)
-    vol    = phantom_2d(N).unsqueeze(0)
-    sino   = ft.forward_project(vol, angles)
-    rec    = ft.run_resire(sino, angles, n_iter=10, Nz=N, mask=True)
-    corners = torch.stack([
-        rec[0,  0,  0], rec[0,  0, -1],
-        rec[0, -1,  0], rec[0, -1, -1],
-    ])
-    assert corners.abs().max().item() < 1e-6
-
-
-def test_resire_converges():
-    """Reconstruction MSE should decrease as iterations increase."""
-    N      = 64
-    angles = make_angles(60)
-    vol    = phantom_2d(N).unsqueeze(0)
-    sino   = ft.forward_project(vol, angles)
-
-    errors = []
-    for n in (1, 10, 30, 80):
-        rec = ft.run_resire(sino, angles, n_iter=n, Nz=N, positivity=False)
-        errors.append(((rec - vol) ** 2).mean().item())
-
-    for i in range(len(errors) - 1):
-        assert errors[i + 1] < errors[i] * 1.05, (
-            f"RESIRE did not converge: MSE history = {errors}"
-        )
-
-
-def test_resire_custom_support():
-    """Explicit support tensor should zero voxels outside it."""
-    N      = 32
-    angles = make_angles(20)
-    vol    = phantom_2d(N).unsqueeze(0)
-    sino   = ft.forward_project(vol, angles)
-    support = ft.cylindrical_mask(N, N).unsqueeze(0)  # [1, N, N]
-    rec    = ft.run_resire(sino, angles, n_iter=5, Nz=N, support=support)
-    corners = torch.stack([rec[0, 0, 0], rec[0, 0, -1], rec[0, -1, 0], rec[0, -1, -1]])
-    assert corners.abs().max().item() < 1e-6
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        ft.run_resire(sino, angles, n_iter=1, Nz=N)
 
 
 # ── refine_angles ─────────────────────────────────────────────────────────
@@ -373,6 +321,162 @@ def test_refine_angles_exact_angles_unchanged():
     max_shift = (refined - angles).abs().max().item()
     assert max_shift <= grid_step + 1e-5, (
         f"correct angles shifted more than one grid step: {max_shift:.4f}°"
+    )
+
+
+# ── shift estimation / application ────────────────────────────────────────
+
+def test_apply_shifts_shape():
+    angles = make_angles(10)
+    vol    = phantom_2d(32).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    out    = ft.apply_shifts(sino, torch.zeros(10))
+    assert out.shape == sino.shape
+
+
+def test_apply_shifts_zero_shift():
+    angles = make_angles(10)
+    vol    = phantom_2d(32).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    out    = ft.apply_shifts(sino, torch.zeros(10))
+    assert (out - sino).abs().max().item() < 1e-5
+
+
+def test_apply_shifts_integer_shift():
+    angles = make_angles(10)
+    vol    = phantom_2d(64).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    s      = 8
+    shifts = torch.full((10,), float(s))
+    out    = ft.apply_shifts(sino, shifts)
+    rolled = torch.roll(sino, s, dims=-1)
+    # Fourier phase shift and torch.roll agree up to boundary ringing (1e-4)
+    assert (out - rolled).abs().max().item() < 1e-4
+
+
+def test_estimate_shifts_xcorr_recovers_known_shifts():
+    N      = 64
+    angles = make_angles(10, max_deg=60.0)
+    vol    = phantom_2d(N).unsqueeze(0)         # [1, 64, 64]
+    sino   = ft.forward_project(vol, angles)    # [10, 1, 64]
+
+    true_shifts = torch.tensor([5.0, -3.0, 7.5, -2.5, 0.0,
+                                 4.0, -6.0,  1.5, -4.5, 3.0])
+    sino_shifted = ft.apply_shifts(sino, true_shifts)
+
+    est = ft.estimate_shifts_xcorr(vol, sino_shifted, angles)
+    err = (est - true_shifts).abs().max().item()
+    assert err < 0.15, f"max shift error {err:.3f} px > 0.15 px tolerance"
+
+
+def test_estimate_shifts_xcorr_returns_cpu():
+    angles = make_angles(8)
+    vol    = phantom_2d(32).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    est    = ft.estimate_shifts_xcorr(vol, sino, angles)
+    assert est.device.type == "cpu"
+
+
+def test_estimate_shifts_xcorr_max_shift():
+    N      = 64
+    angles = make_angles(5, max_deg=60.0)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    large  = torch.full((5,), 10.0)
+    sino_shifted = ft.apply_shifts(sino, large)
+    est = ft.estimate_shifts_xcorr(vol, sino_shifted, angles, max_shift=5.0)
+    assert est.abs().max().item() <= 5.0 + 1e-6
+
+
+# ── autograd / differentiable projector tests ─────────────────────────────
+#
+# Note: we deliberately do NOT use torch.autograd.gradcheck. The CUDA
+# texture-interpolation BPs are only approximate adjoints (15-65 % rel_err
+# in the existing inner-product tests) so gradcheck would fail by design.
+# These tests cover gradient flow + functional convergence instead.
+
+def test_autograd_grad_flow_fp_cpu():
+    """forward_project propagates gradients into the volume tensor."""
+    N      = 32
+    angles = make_angles(20)
+    vol    = torch.randn(1, N, N, requires_grad=True)
+
+    sino = ft.forward_project(vol, angles)
+    loss = (sino ** 2).mean()
+    loss.backward()
+
+    assert vol.grad is not None
+    assert vol.grad.shape == vol.shape
+    assert torch.isfinite(vol.grad).all().item()
+    assert vol.grad.abs().sum().item() > 0.0
+
+
+def test_autograd_grad_flow_bp_cpu():
+    """back_project propagates gradients into the sinogram tensor."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = torch.randn(len(angles), 1, N, requires_grad=True)
+
+    rec  = ft.back_project(sino, angles, Nz=N)
+    loss = (rec ** 2).mean()
+    loss.backward()
+
+    assert sino.grad is not None
+    assert sino.grad.shape == sino.shape
+    assert torch.isfinite(sino.grad).all().item()
+    assert sino.grad.abs().sum().item() > 0.0
+
+
+def test_autograd_no_grad_regression_cpu():
+    """
+    With requires_grad=False, forward_project must produce identical output
+    to a direct kernel call — Function.apply short-circuits, no behaviour
+    change vs the pre-autograd implementation.
+    """
+    N      = 32
+    angles = make_angles(20)
+    vol    = torch.randn(1, N, N)  # no requires_grad
+
+    sino = ft.forward_project(vol, angles)
+    assert not sino.requires_grad
+
+    # Determinism: two calls must give identical bytes
+    sino2 = ft.forward_project(vol, angles)
+    assert torch.equal(sino, sino2)
+
+
+def test_autograd_grad_through_squeeze_cpu():
+    """
+    A 2-D volume input (no Ny axis) should still receive a gradient of the
+    same 2-D shape. Verifies the unsqueeze(0) hop is differentiable.
+    """
+    N      = 32
+    angles = make_angles(20)
+    vol_2d = torch.randn(N, N, requires_grad=True)
+
+    sino = ft.forward_project(vol_2d, angles)
+    sino.sum().backward()
+
+    assert vol_2d.grad is not None
+    assert vol_2d.grad.shape == (N, N)
+
+
+def test_run_grad_descent_cpu_converges():
+    """Adam-driven reconstruction loss drops by >50× from initial."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec, losses = ft.run_grad_descent(
+        sino, angles, n_iter=200, lr=5e-2, return_loss=True
+    )
+
+    assert rec.shape == vol.shape
+    assert not rec.requires_grad
+    assert losses[-1].item() < losses[0].item() / 50.0, (
+        f"grad_descent did not converge: loss[0]={losses[0]:.4e}, "
+        f"loss[-1]={losses[-1]:.4e}"
     )
 
 

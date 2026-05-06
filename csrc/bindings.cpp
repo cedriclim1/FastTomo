@@ -218,6 +218,30 @@ static void py_back_project_rotmat_cuda(
     );
 }
 
+static void py_forward_project_resire_cuda(
+    long vol_ptr, long sino_ptr, long matrices_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det
+) {
+    forward_project_resire_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(sino_ptr),
+        reinterpret_cast<const float *>(matrices_ptr),
+        Ny, Nz, Nx, n_angles, N_det
+    );
+}
+
+static void py_back_project_resire_cuda(
+    long sino_ptr, long vol_ptr, long matrices_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det
+) {
+    back_project_resire_cuda(
+        reinterpret_cast<const float *>(sino_ptr),
+        reinterpret_cast<float *>(vol_ptr),
+        reinterpret_cast<const float *>(matrices_ptr),
+        Ny, Nz, Nx, n_angles, N_det
+    );
+}
+
 static void py_genfire_gridding_2d_cuda(
     long fk_real_ptr, long fk_imag_ptr,
     long cos_ptr,     long sin_ptr,
@@ -287,6 +311,22 @@ PYBIND11_MODULE(_core, m) {
     m.def("back_project_rotmat_cuda", &py_back_project_rotmat_cuda,
           "3D rotation-matrix back-projection (CUDA). "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
+          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"));
+
+    m.def("forward_project_resire_cuda", &py_forward_project_resire_cuda,
+          "RESIRE voxel-driven forward projection (CUDA). "
+          "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
+          "sino_ptr must point to a zeroed buffer.",
+          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"));
+
+    m.def("back_project_resire_cuda", &py_back_project_resire_cuda,
+          "RESIRE voxel-driven back-projection (CUDA). "
+          "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
+          "vol_ptr must point to a zeroed buffer.",
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"));
