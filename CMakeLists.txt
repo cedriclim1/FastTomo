@@ -1,5 +1,47 @@
 cmake_minimum_required(VERSION 3.18)
 
+# Pip-installed CUDA 13 toolkit detection.
+# `nvidia-cuda-nvcc` (and friends) install at
+# <env>/lib/pythonX.Y/site-packages/nvidia/cu13/{bin,include,lib,nvvm};
+# CMake's find_package(CUDAToolkit) does not search site-packages, so seed
+# CUDAToolkit_ROOT / CMAKE_CUDA_COMPILER before language detection runs.
+if(NOT DEFINED CUDAToolkit_ROOT AND NOT DEFINED CMAKE_CUDA_COMPILER)
+    if(NOT DEFINED Python_EXECUTABLE)
+        find_program(Python_EXECUTABLE NAMES python3 python)
+    endif()
+    if(Python_EXECUTABLE)
+        execute_process(
+            COMMAND ${Python_EXECUTABLE} -c [==[
+import os, sys
+try:
+    import nvidia
+except ImportError:
+    sys.exit(0)
+for base in nvidia.__path__:
+    cu13 = os.path.join(base, 'cu13')
+    if os.path.isfile(os.path.join(cu13, 'bin', 'nvcc')):
+        print(cu13)
+        break
+]==]
+            OUTPUT_VARIABLE _PIP_CUDA_ROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_PIP_CUDA_ROOT)
+            message(STATUS "Detected pip-installed CUDA toolkit at ${_PIP_CUDA_ROOT}")
+            set(CUDAToolkit_ROOT "${_PIP_CUDA_ROOT}" CACHE PATH "")
+            set(CMAKE_CUDA_COMPILER "${_PIP_CUDA_ROOT}/bin/nvcc" CACHE FILEPATH "")
+            # cu13 wheels ship versioned libs only (libcudart.so.13); seed the
+            # unversioned symlink that CMake's find_library expects.
+            file(GLOB _cudart_versioned "${_PIP_CUDA_ROOT}/lib/libcudart.so.*")
+            if(_cudart_versioned AND NOT EXISTS "${_PIP_CUDA_ROOT}/lib/libcudart.so")
+                list(GET _cudart_versioned 0 _cudart_first)
+                file(CREATE_LINK "${_cudart_first}" "${_PIP_CUDA_ROOT}/lib/libcudart.so" SYMBOLIC)
+            endif()
+        endif()
+    endif()
+endif()
+
 # Tri-state CUDA selection: AUTO (detect), ON (require), OFF (CPU-only).
 # Override at configure time via -DFASTTOMO_USE_CUDA=ON|OFF|AUTO
 # or, with pip/uv: --config-settings=cmake.define.FASTTOMO_USE_CUDA=OFF
