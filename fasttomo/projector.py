@@ -80,7 +80,64 @@ def _dtype_to_tc_code(dtype: torch.dtype) -> int:
     )
 
 
-class ParallelProjector:
+class _ProjectorBase:
+    """Private base class holding state and logic shared by ParallelProjector
+    and RotmatProjector.
+
+    Subclasses must call ``super().__init__(...)`` with the shared fields
+    listed below and then initialise their own projector-specific state.
+    """
+
+    def __init__(
+        self,
+        Ny: int,
+        Nz: int,
+        Nx: int,
+        N_det: int,
+        n_angles: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        self.Ny       = Ny
+        self.Nz       = Nz
+        self.Nx       = Nx
+        self.N_det    = N_det
+        self.n_angles = n_angles
+        self.device   = device
+        self.dtype: torch.dtype | None = dtype
+        self._vol_handle:  int | None = None
+        self._sino_handle: int | None = None
+
+    def _lock_dtype(self, t: torch.Tensor) -> int:
+        """Return the io_dtype int. Locks self.dtype on first call; raises
+        on mismatch afterwards.  The error message uses ``type(self).__name__``
+        so subclass-specific names appear in the message."""
+        code = _io_dtype_code(t)
+        if self.dtype is None:
+            self.dtype = t.dtype
+        elif t.dtype != self.dtype:
+            raise TypeError(
+                f"{type(self).__name__} dtype lock-in mismatch: cache was "
+                f"allocated for {self.dtype}, got {t.dtype}. Construct a "
+                f"new projector for a different dtype."
+            )
+        return code
+
+    def __del__(self) -> None:
+        # Tear down explicitly.  tc_destroy is safe-on-null and frees both the
+        # cudaArray and the textureObject.
+        try:
+            if getattr(self, "_vol_handle", None) is not None:
+                _core.tc_destroy(self._vol_handle)
+                self._vol_handle = None
+            if getattr(self, "_sino_handle", None) is not None:
+                _core.tc_destroy(self._sino_handle)
+                self._sino_handle = None
+        except Exception:
+            pass
+
+
+class ParallelProjector(_ProjectorBase):
     """Cached parallel-beam projector for fixed-angle tight loops.
 
     The angle tensor is stored at construction; cos/sin are precomputed once
@@ -113,34 +170,19 @@ class ParallelProjector:
         )
         self._cos = a_rad.cos().contiguous()
         self._sin = a_rad.sin().contiguous()
-        self.n_angles = int(a_rad.numel())
-
-        self.Ny    = Ny
-        self.Nz    = Nz
-        self.Nx    = Nx
-        self.N_det = int(N_det) if N_det is not None else Nx
-        self.device = device
+        n_angles = int(a_rad.numel())
 
         # I/O dtype is locked on the first FP/BP call. Subsequent calls with
         # a mismatched dtype raise — matches the existing shape-mismatch
         # contract in the *_cuda_cached entry points.
-        self.dtype: torch.dtype | None = None
-        self._vol_handle:  int | None = None
-        self._sino_handle: int | None = None
-
-    def _lock_dtype(self, t: torch.Tensor) -> int:
-        """Return the io_dtype int. Locks self.dtype on first call; raises
-        on mismatch afterwards."""
-        code = _io_dtype_code(t)
-        if self.dtype is None:
-            self.dtype = t.dtype
-        elif t.dtype != self.dtype:
-            raise TypeError(
-                f"ParallelProjector dtype lock-in mismatch: cache was "
-                f"allocated for {self.dtype}, got {t.dtype}. Construct a "
-                f"new projector for a different dtype."
-            )
-        return code
+        super().__init__(
+            Ny=Ny,
+            Nz=Nz,
+            Nx=Nx,
+            N_det=int(N_det) if N_det is not None else Nx,
+            n_angles=n_angles,
+            device=device,
+        )
 
     def _channels(self) -> int:
         """4-channel packed-Y mode is auto-enabled for fp16 caches when
@@ -210,21 +252,8 @@ class ParallelProjector:
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
         return _BP2DCached.apply(sinogram, self)
 
-    def __del__(self) -> None:
-        # Tear down explicitly. tc_destroy is safe-on-null and frees both the
-        # cudaArray and the textureObject.
-        try:
-            if getattr(self, "_vol_handle", None) is not None:
-                _core.tc_destroy(self._vol_handle)
-                self._vol_handle = None
-            if getattr(self, "_sino_handle", None) is not None:
-                _core.tc_destroy(self._sino_handle)
-                self._sino_handle = None
-        except Exception:
-            pass
 
-
-class RotmatProjector:
+class RotmatProjector(_ProjectorBase):
     """Cached 3D rotation-matrix projector for tight loops.
 
     Unlike ``ParallelProjector`` the rotation matrices are passed at every
@@ -245,29 +274,16 @@ class RotmatProjector:
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("RotmatProjector requires a CUDA device")
-        self.Ny       = Ny
-        self.Nz       = Nz
-        self.Nx       = Nx
-        self.N_det    = int(N_det) if N_det is not None else Nx
-        self.n_angles = int(n_angles)
-        self.device   = device
 
         # Locked on first FP/BP call (see ParallelProjector for the rationale).
-        self.dtype: torch.dtype | None = None
-        self._vol_handle:  int | None = None
-        self._sino_handle: int | None = None
-
-    def _lock_dtype(self, t: torch.Tensor) -> int:
-        code = _io_dtype_code(t)
-        if self.dtype is None:
-            self.dtype = t.dtype
-        elif t.dtype != self.dtype:
-            raise TypeError(
-                f"RotmatProjector dtype lock-in mismatch: cache was "
-                f"allocated for {self.dtype}, got {t.dtype}. Construct a "
-                f"new projector for a different dtype."
-            )
-        return code
+        super().__init__(
+            Ny=Ny,
+            Nz=Nz,
+            Nx=Nx,
+            N_det=int(N_det) if N_det is not None else Nx,
+            n_angles=int(n_angles),
+            device=device,
+        )
 
     def _ensure_vol_cache(self) -> None:
         # Rotmat kernels need continuous Y interpolation (tex3D), so they
@@ -331,14 +347,3 @@ class RotmatProjector:
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
         mats_flat = mats.reshape(self.n_angles, 9) if mats.ndim == 3 else mats
         return _BP3DCached.apply(sinogram, mats_flat, self)
-
-    def __del__(self) -> None:
-        try:
-            if getattr(self, "_vol_handle", None) is not None:
-                _core.tc_destroy(self._vol_handle)
-                self._vol_handle = None
-            if getattr(self, "_sino_handle", None) is not None:
-                _core.tc_destroy(self._sino_handle)
-                self._sino_handle = None
-        except Exception:
-            pass

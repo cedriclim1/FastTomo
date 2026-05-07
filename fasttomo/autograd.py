@@ -34,6 +34,18 @@ import torch
 import fasttomo._core as _core
 
 
+# ── private guards ───────────────────────────────────────────────────────────
+
+def _assert_cuda(t, name="op"):
+    if not t.is_cuda:
+        raise RuntimeError(f"{name} requires a CUDA tensor; got {t.device}")
+
+def _ensure_fp32(t, op_name):
+    if t.dtype != torch.float32:
+        raise TypeError(f"{op_name} is fp32-only (got {t.dtype}). "
+                        "Cast your tensor to float32 first.")
+
+
 # ── thread-count resolution ──────────────────────────────────────────────────
 #
 # Resolution order for the CPU 3D rotmat kernels:
@@ -348,18 +360,10 @@ def _forward_project_resire_raw(
     euler_zyz_deg: torch.Tensor,
     N_det: int = -1,
 ) -> torch.Tensor:
-    if not volume.is_cuda:
-        raise RuntimeError(
-            "forward_project_resire requires CUDA — move volume to GPU first"
-        )
+    _assert_cuda(volume, "forward_project_resire")
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
-    if volume.dtype != torch.float32:
-        raise TypeError(
-            f"forward_project_resire is fp32-only (got {volume.dtype}). The "
-            f"RESIRE voxel-scatter projector with atomicAdd is intentionally "
-            f"out of scope for the fp16 path."
-        )
+    _ensure_fp32(volume, "forward_project_resire")
 
     Ny, Nz, Nx = volume.shape
     n_angles = euler_zyz_deg.shape[0]
@@ -385,18 +389,10 @@ def _back_project_resire_raw(
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
 ) -> torch.Tensor:
-    if not sinogram.is_cuda:
-        raise RuntimeError(
-            "back_project_resire requires CUDA — move sinogram to GPU first"
-        )
+    _assert_cuda(sinogram, "back_project_resire")
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
-    if sinogram.dtype != torch.float32:
-        raise TypeError(
-            f"back_project_resire is fp32-only (got {sinogram.dtype}). The "
-            f"RESIRE voxel-scatter projector with atomicAdd is intentionally "
-            f"out of scope for the fp16 path."
-        )
+    _ensure_fp32(sinogram, "back_project_resire")
 
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det

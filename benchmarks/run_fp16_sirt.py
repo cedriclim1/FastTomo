@@ -58,7 +58,7 @@ def sirt_run(
 
     _mask = None
     if mask:
-        _mask = ft.torch_ops.cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
+        _mask = ft.cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
 
     losses: list[float] = []
     torch.cuda.reset_peak_memory_stats(device)

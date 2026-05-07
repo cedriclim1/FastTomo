@@ -34,21 +34,14 @@ __host__ static cudaChannelFormatDesc make_channel_desc_half4() {
 }
 
 /* ── error handling ───────────────────────────────────────────────────────
- * CUDA_CHECK propagates cudaError_t failures as std::runtime_error so the
- * pybind11 layer can surface them as Python RuntimeError. CUDA_CHECK_KERNEL
- * is called immediately after a <<< >>> launch to catch launch-time errors
- * (invalid configuration, too much shared memory, etc.) without paying for
- * a host-device sync. Stream-ordered errors (out-of-bounds writes etc.) are
- * surfaced later when PyTorch syncs on tensor read.
+ * FASTTOMO_CUDA_CHECK (defined in texture_cache.h) propagates cudaError_t
+ * failures as std::runtime_error so the pybind11 layer can surface them as
+ * Python RuntimeError. CUDA_CHECK_KERNEL is called immediately after a
+ * <<< >>> launch to catch launch-time errors (invalid configuration, too
+ * much shared memory, etc.) without paying for a host-device sync.
+ * Stream-ordered errors (out-of-bounds writes etc.) are surfaced later when
+ * PyTorch syncs on tensor read.
  */
-#define CUDA_CHECK(call) do {                                                \
-    cudaError_t _err = (call);                                                \
-    if (_err != cudaSuccess) {                                                \
-        throw std::runtime_error(std::string("CUDA error at " __FILE__ ":")   \
-            + std::to_string(__LINE__) + ": " + cudaGetErrorString(_err));    \
-    }                                                                          \
-} while (0)
-
 #define CUDA_CHECK_KERNEL() do {                                              \
     cudaError_t _err = cudaPeekAtLastError();                                 \
     if (_err != cudaSuccess) {                                                \
@@ -75,7 +68,7 @@ static cudaTextureObject_t make_vol_texture(
 ) {
     cudaChannelFormatDesc fmt = make_channel_desc<T>();
     /* Ny layers, each Nx wide × Nz tall */
-    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+    FASTTOMO_CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
                                  make_cudaExtent(Nx, Nz, Ny), cudaArrayLayered));
 
     cudaMemcpy3DParms cp = {};
@@ -84,7 +77,7 @@ static cudaTextureObject_t make_vol_texture(
     cp.dstArray = out_array;
     cp.extent   = make_cudaExtent(Nx, Nz, Ny);
     cp.kind     = cudaMemcpyDeviceToDevice;
-    CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
+    FASTTOMO_CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -98,7 +91,7 @@ static cudaTextureObject_t make_vol_texture(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
+    FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
@@ -109,7 +102,7 @@ static cudaTextureObject_t make_sino_texture(
 ) {
     cudaChannelFormatDesc fmt = make_channel_desc<T>();
     /* n_angles layers, each N_det wide × Ny tall */
-    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+    FASTTOMO_CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
                                  make_cudaExtent(N_det, Ny, n_angles), cudaArrayLayered));
 
     cudaMemcpy3DParms cp = {};
@@ -118,7 +111,7 @@ static cudaTextureObject_t make_sino_texture(
     cp.dstArray = out_array;
     cp.extent   = make_cudaExtent(N_det, Ny, n_angles);
     cp.kind     = cudaMemcpyDeviceToDevice;
-    CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
+    FASTTOMO_CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -132,7 +125,7 @@ static cudaTextureObject_t make_sino_texture(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
+    FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
@@ -195,7 +188,7 @@ static cudaTextureObject_t make_vol_texture_packed_half(
     cudaArray_t &out_array, cudaSurfaceObject_t &out_surf, cudaStream_t stream
 ) {
     cudaChannelFormatDesc fmt = make_channel_desc_half4();
-    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+    FASTTOMO_CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
                                  make_cudaExtent(Nx, Nz, Ny / 4),
                                  cudaArrayLayered | cudaArraySurfaceLoadStore));
 
@@ -203,7 +196,7 @@ static cudaTextureObject_t make_vol_texture_packed_half(
     rd.resType         = cudaResourceTypeArray;
     rd.res.array.array = out_array;
 
-    CUDA_CHECK(cudaCreateSurfaceObject(&out_surf, &rd));
+    FASTTOMO_CUDA_CHECK(cudaCreateSurfaceObject(&out_surf, &rd));
 
     dim3 block(16, 16, 1);
     dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny / 4);
@@ -218,7 +211,7 @@ static cudaTextureObject_t make_vol_texture_packed_half(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
+    FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
@@ -227,7 +220,7 @@ static cudaTextureObject_t make_sino_texture_packed_half(
     cudaArray_t &out_array, cudaSurfaceObject_t &out_surf, cudaStream_t stream
 ) {
     cudaChannelFormatDesc fmt = make_channel_desc_half4();
-    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+    FASTTOMO_CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
                                  make_cudaExtent(N_det, Ny / 4, n_angles),
                                  cudaArrayLayered | cudaArraySurfaceLoadStore));
 
@@ -235,7 +228,7 @@ static cudaTextureObject_t make_sino_texture_packed_half(
     rd.resType         = cudaResourceTypeArray;
     rd.res.array.array = out_array;
 
-    CUDA_CHECK(cudaCreateSurfaceObject(&out_surf, &rd));
+    FASTTOMO_CUDA_CHECK(cudaCreateSurfaceObject(&out_surf, &rd));
 
     dim3 block(16, 16, 1);
     dim3 grid((N_det + 15) / 16, ((Ny / 4) + 15) / 16, n_angles);
@@ -250,7 +243,7 @@ static cudaTextureObject_t make_sino_texture_packed_half(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
+    FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
@@ -262,7 +255,7 @@ static void enable_extended_smem_if_needed(const void *kernel, size_t smem) {
     if (smem > 48 * 1024) {
         size_t cap = 96 * 1024;
         size_t want = smem < cap ? smem : cap;
-        CUDA_CHECK(cudaFuncSetAttribute(
+        FASTTOMO_CUDA_CHECK(cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)want));
     }
 }
@@ -461,8 +454,8 @@ static void forward_project_cuda_impl(
 
     /* Texture object and array are stream-ordered with the launch above:
      * destroying them schedules the release after the kernel completes. */
-    CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
-    CUDA_CHECK(cudaFreeArray(vol_array));
+    FASTTOMO_CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
+    FASTTOMO_CUDA_CHECK(cudaFreeArray(vol_array));
 }
 
 /* fp16 + Ny%4==0: packed-Y (4-channel) path. Allocates a one-shot 4-channel
@@ -496,9 +489,9 @@ static void forward_project_cuda_impl_packed_h4(
         half_det, half_x, half_z, ray_len);
     CUDA_CHECK_KERNEL();
 
-    CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
-    CUDA_CHECK(cudaDestroySurfaceObject(vol_surf));
-    CUDA_CHECK(cudaFreeArray(vol_array));
+    FASTTOMO_CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
+    FASTTOMO_CUDA_CHECK(cudaDestroySurfaceObject(vol_surf));
+    FASTTOMO_CUDA_CHECK(cudaFreeArray(vol_array));
 }
 
 void forward_project_cuda(
@@ -703,8 +696,8 @@ static void back_project_cuda_impl(
     );
     CUDA_CHECK_KERNEL();
 
-    CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
-    CUDA_CHECK(cudaFreeArray(sino_array));
+    FASTTOMO_CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
+    FASTTOMO_CUDA_CHECK(cudaFreeArray(sino_array));
 }
 
 static void back_project_cuda_impl_packed_h4(
@@ -735,9 +728,9 @@ static void back_project_cuda_impl_packed_h4(
         half_det, half_x, half_z);
     CUDA_CHECK_KERNEL();
 
-    CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
-    CUDA_CHECK(cudaDestroySurfaceObject(sino_surf));
-    CUDA_CHECK(cudaFreeArray(sino_array));
+    FASTTOMO_CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
+    FASTTOMO_CUDA_CHECK(cudaDestroySurfaceObject(sino_surf));
+    FASTTOMO_CUDA_CHECK(cudaFreeArray(sino_array));
 }
 
 void back_project_cuda(
@@ -869,7 +862,7 @@ static cudaTextureObject_t make_vol_texture_3d(
 ) {
     cudaChannelFormatDesc fmt = make_channel_desc<T>();
     /* extent: (width=Nx, height=Nz, depth=Ny) — matches C-order [Ny][Nz][Nx] */
-    CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
+    FASTTOMO_CUDA_CHECK(cudaMalloc3DArray(&out_array, &fmt,
                                  make_cudaExtent(Nx, Nz, Ny), 0 /* no cudaArrayLayered */));
 
     cudaMemcpy3DParms cp = {};
@@ -878,7 +871,7 @@ static cudaTextureObject_t make_vol_texture_3d(
     cp.dstArray = out_array;
     cp.extent   = make_cudaExtent(Nx, Nz, Ny);
     cp.kind     = cudaMemcpyDeviceToDevice;
-    CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
+    FASTTOMO_CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -893,7 +886,7 @@ static cudaTextureObject_t make_vol_texture_3d(
     td.normalizedCoords = 0;
 
     cudaTextureObject_t tex;
-    CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
+    FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     return tex;
 }
 
@@ -978,8 +971,8 @@ static void forward_project_rotmat_cuda_impl(
     );
     CUDA_CHECK_KERNEL();
 
-    CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
-    CUDA_CHECK(cudaFreeArray(vol_array));
+    FASTTOMO_CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
+    FASTTOMO_CUDA_CHECK(cudaFreeArray(vol_array));
 }
 
 void forward_project_rotmat_cuda(
@@ -1290,8 +1283,8 @@ static void back_project_rotmat_cuda_impl(
     );
     CUDA_CHECK_KERNEL();
 
-    CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
-    CUDA_CHECK(cudaFreeArray(sino_array));
+    FASTTOMO_CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
+    FASTTOMO_CUDA_CHECK(cudaFreeArray(sino_array));
 }
 
 void back_project_rotmat_cuda(

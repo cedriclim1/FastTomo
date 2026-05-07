@@ -1,19 +1,11 @@
 """
-PyTorch-level wrappers around FastTomo's C/CUDA projection kernels.
+Reconstruction algorithms for FastTomo.
 
 All public functions accept and return torch.Tensor (float32).
 
 Volume convention:  [Ny, Nz, Nx]
-  Ny  — tilt axis (independent slices)
-  Nz  — depth (beam direction at θ=0)
-  Nx  — lateral (detector direction)
-
 Sinogram convention: [n_angles, Ny, N_det]
-
 Angles: 1-D tensor, degrees.
-
-For a 2-D single-slice problem wrap your [Nz, Nx] volume as [1, Nz, Nx]
-and squeeze the result.
 """
 
 from __future__ import annotations
@@ -22,404 +14,47 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that import from here
 
 import fasttomo._core as _core
-from fasttomo.autograd import (
-    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
-    _euler_zyz_to_rotmat, _resolve_num_threads,
+from fasttomo.autograd import _euler_zyz_to_rotmat
+from fasttomo.projection import (
+    forward_project,
+    back_project,
+    forward_project_3d,
+    back_project_3d,
+    forward_project_resire,
+    back_project_resire,
 )
+from fasttomo.utilities import cylindrical_mask, ramp_filter
 from fasttomo.projector import ParallelProjector, RotmatProjector
 
 
-# ── primitive projection ops ───────────────────────────────────────────────
-#
-# These are thin shims around torch.autograd.Function subclasses defined in
-# fasttomo/autograd.py. When inputs do not require grad, Function.apply
-# short-circuits and behaves identically to a direct kernel call. When a
-# volume (or sinogram) has requires_grad=True, loss.backward() flows the
-# adjoint partner kernel back into .grad. See fasttomo/autograd.py and
-# fasttomo-wiki/wiki/concepts/autograd-projectors.md.
+# ── module-level constants ─────────────────────────────────────────────────
 
-def forward_project(
-    volume: torch.Tensor,          # [Ny, Nz, Nx]
-    angles_deg: torch.Tensor,      # [n_angles] degrees
-    N_det: int = -1,
-) -> torch.Tensor:
-    """
-    Forward-project volume → sinogram.
-
-    Returns [n_angles, Ny, N_det] float32 on the same device as volume.
-    N_det defaults to Nx.
-
-    Differentiable w.r.t. ``volume`` and ``angles_deg``.  Volume gradient
-    calls back_project (the discrete adjoint). Angle gradient uses
-    ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x at each ray step (CPU + CUDA).
-    """
-    if volume.ndim == 2:
-        volume = volume.unsqueeze(0)
-    return _FP2D.apply(volume, angles_deg, N_det)
+# GENFIRE resolution extension/suppression schedule control points.
+# np.interp maps iteration progress [0,1] through these pivots to produce
+# the per-iteration Fourier cutoff fraction.
+_GENFIRE_RES_EXTENSION_PIVOTS = (0.0, 0.5, 0.95, 0.5, 0.0)
 
 
-def back_project(
-    sinogram: torch.Tensor,        # [n_angles, Ny, N_det]
-    angles_deg: torch.Tensor,      # [n_angles] degrees
-    Nz: int = -1,
-) -> torch.Tensor:
-    """
-    Back-project sinogram → volume [Ny, Nz, Nx].
+# ── private helpers shared across algorithms ───────────────────────────────
 
-    Nz defaults to N_det (square reconstruction).
-
-    Differentiable w.r.t. ``sinogram``: backward calls forward_project.
-    """
-    if sinogram.ndim == 2:
-        sinogram = sinogram.unsqueeze(1)
-    return _BP2D.apply(sinogram, angles_deg, Nz)
+def _apply_sparsity(vol: torch.Tensor, weight: float) -> torch.Tensor:
+    """L1 soft-threshold (proximal operator of weight·‖·‖₁)."""
+    return vol.sign() * (vol.abs() - weight).clamp_(min=0.0)
 
 
-# ── 3D rotation-matrix projection (CPU + CUDA) ───────────────────────────
-
-def forward_project_3d(
-    volume: torch.Tensor,                       # [Ny, Nz, Nx]
-    euler_zyz_deg: torch.Tensor,                # [n_angles, 3] — (φ, θ, ψ) degrees
-    N_det: int = -1,
-    shifts: torch.Tensor | None = None,         # [n_angles, 2] — optional per-tilt detector-plane shifts (px)
-    num_threads: int | None = None,             # CPU only; resolution: kwarg → OMP_NUM_THREADS → 1
-) -> torch.Tensor:
-    """
-    3D rotation-matrix forward projection (CPU + CUDA).
-
-    Each projection uses a full 3×3 ZYZ rotation matrix, so rays can cross
-    Y-slice boundaries. This is required for general orientations (dual-axis,
-    in-plane rotation, azimuthal misalignment).
-
-    euler_zyz_deg columns: (φ, θ, ψ) — ZYZ Euler angles in degrees.
-    For a pure single-axis tilt series: φ=0, ψ=0, θ=tilt_angle.
-
-    If ``shifts`` is provided, a per-tilt sub-pixel translation is applied to
-    the predicted sinogram via :func:`apply_shifts_2d` (bilinear). This makes
-    the operator a full pose model — rotation + detector-plane translation —
-    so a learnable ``[n_angles, 2]`` shifts tensor can be optimized jointly
-    with ``volume`` and ``euler_zyz_deg`` under autograd.
-
-    Returns sinogram [n_angles, Ny, N_det] on the same device as ``volume``.
-    Same shape convention as forward_project so algorithms can swap projectors
-    transparently. The CPU path uses explicit trilinear interpolation; pass
-    ``num_threads=N`` to opt into OpenMP parallelism. Default behavior is
-    serial (single-threaded) so reconstructions don't silently grab cores.
-
-    ``num_threads`` resolution: explicit kwarg → ``OMP_NUM_THREADS`` env →
-    fall back to 1. The CUDA path ignores ``num_threads`` (the kernel
-    manages its own grid).
-
-    Differentiable w.r.t. ``volume``, ``euler_zyz_deg``, and ``shifts`` on
-    both devices: backward calls back_project_3d for the volume gradient and
-    a dedicated grad_rotmat kernel for the rotation-matrix gradient. The
-    euler→rotmat conversion lives in pure PyTorch so autograd chains ∂L/∂M
-    into ∂L/∂euler; ``grid_sample`` handles ∂L/∂shifts.
-    """
-    if volume.ndim == 2:
-        volume = volume.unsqueeze(0)
-    nt = _resolve_num_threads(num_threads)
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    sino = _FP3D.apply(volume, mats, N_det, nt)
-    if shifts is not None:
-        sino = apply_shifts_2d(sino, shifts)
-    return sino
-
-
-def back_project_3d(
-    sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
-    euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
-    Nz: int = -1,
-    num_threads: int | None = None,
-) -> torch.Tensor:
-    """
-    3D rotation-matrix back-projection (CPU + CUDA).
-
-    Adjoint of forward_project_3d. Voxel-driven gather: each voxel samples
-    the sinogram at its rotated detector position for every projection.
-
-    Returns volume [Ny, Nz, Nx] on the same device as ``sinogram``.
-    Pass ``num_threads=N`` to opt into OpenMP parallelism on the CPU path
-    (default 1 — serial). Resolution order: kwarg → OMP_NUM_THREADS → 1.
-
-    Differentiable w.r.t. ``sinogram``: backward calls forward_project_3d.
-    """
-    if sinogram.ndim == 2:
-        sinogram = sinogram.unsqueeze(1)
-    nt = _resolve_num_threads(num_threads)
-    return _BP3D.apply(sinogram, euler_zyz_deg, Nz, nt)
-
-
-def forward_project_resire(
-    volume: torch.Tensor,           # [Ny, Nz, Nx]
-    euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
-    N_det: int = -1,
-) -> torch.Tensor:
-    """
-    RESIRE voxel-driven forward projection (CUDA only).
-
-    Implements the Miao group scatter kernel: each voxel is projected to
-    the detector using a full 3×3 rotation matrix with 4-point supersampling
-    (±0.25 px in volume XZ space). Uses atomicAdd; output is normalised by
-    the supersampling factor (÷4) so it is on the same scale as
-    forward_project_3d.
-
-    euler_zyz_deg: [n_angles, 3] — (φ, θ, ψ) ZYZ Euler angles in degrees.
-
-    Returns sinogram [n_angles, Ny, N_det].
-
-    Differentiable w.r.t. ``volume``: backward calls back_project_resire.
-    Not differentiable w.r.t. ``euler_zyz_deg`` — use ``refine_angles`` for
-    angular refinement (brute-force grid search) outside the reconstruction
-    loop. For autograd-driven angle optimisation, prefer the texture-based
-    ``forward_project_3d`` (or the single-axis ``forward_project``).
-    """
-    if volume.ndim == 2:
-        volume = volume.unsqueeze(0)
-    return _FPResire.apply(volume, euler_zyz_deg, N_det)
-
-
-def back_project_resire(
-    sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
-    euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
-    Nz: int = -1,
-) -> torch.Tensor:
-    """
-    RESIRE voxel-driven back-projection (CUDA only).
-
-    Adjoint of forward_project_resire. Each voxel gathers from the sinogram
-    at its rotated detector position with 4-point supersampling. Output is
-    normalised by the supersampling factor (÷4).
-
-    Returns volume [Ny, Nz, Nx].
-
-    Differentiable w.r.t. ``sinogram``: backward calls forward_project_resire.
-    """
-    if sinogram.ndim == 2:
-        sinogram = sinogram.unsqueeze(1)
-    return _BPResire.apply(sinogram, euler_zyz_deg, Nz)
-
-
-# ── cylindrical support mask ──────────────────────────────────────────────
-
-def cylindrical_mask(
+def _maybe_cylindrical_mask(
     Nz: int,
     Nx: int,
-    radius: float | None = None,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """
-    Inscribed-cylinder support mask for the XZ reconstruction plane.
-
-    Returns [Nz, Nx] float32 tensor — 1.0 inside the cylinder, 0.0 outside.
-    Multiply a volume [Ny, Nz, Nx] by ``mask.unsqueeze(0)`` to apply.
-
-    Default radius = min(Nz, Nx) / 2, which inscribes the cylinder in the
-    smaller dimension.  Uses the same centering as the projection kernels:
-    pixel index ``i`` maps to coordinate ``i - (N-1)/2``.
-    """
-    r = float(min(Nz, Nx)) / 2.0 if radius is None else radius
-    iz = np.linspace(-(Nz - 1) / 2.0, (Nz - 1) / 2.0, Nz, dtype=np.float32)
-    ix = np.linspace(-(Nx - 1) / 2.0, (Nx - 1) / 2.0, Nx, dtype=np.float32)
-    mask_np = (iz[:, None] ** 2 + ix[None, :] ** 2 <= r ** 2).astype(np.float32)
-    mask = torch.Tensor(mask_np)  # CPU float32; torch.Tensor is a class, not a factory
-    return mask.to(device) if device is not None else mask
-
-
-# ── ramp filter (PyTorch, runs on same device as input) ───────────────────
-
-# Ramp-filter |ξ| is shape-only; cache per (N_det, device, dtype) so tight
-# loops (FBP per slice, SIRT-style residual filtering) avoid the rfftfreq +
-# abs allocation each call.
-_RAMP_FILTER_CACHE: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
-
-
-def _ramp_filter_coeffs(N_det: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (int(N_det), device, dtype)
-    coeffs = _RAMP_FILTER_CACHE.get(key)
-    if coeffs is None:
-        coeffs = torch.fft.rfftfreq(N_det, device=device, dtype=dtype).abs().contiguous()
-        _RAMP_FILTER_CACHE[key] = coeffs
-    return coeffs
-
-
-def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
-    """
-    Apply ramp filter |ξ| to each detector row of sinogram.
-
-    sinogram: [n_angles, Ny, N_det]
-    Returns same shape, same device, same dtype. fp32 / fp16 supported; bf16
-    raises.
-
-    Implementation note on fp16: cuFFT only supports power-of-two signal
-    lengths in half precision. Rather than restrict the user to power-of-two
-    detectors, we always run the FFT in fp32 and cast the result back to the
-    input dtype. Mirrors TorchRadon's `padded_sinogram.float() ... .to(dtype)`
-    pattern — minor cost on the FFT itself, no cost on the BP that dominates.
-    """
-    if sinogram.dtype == torch.bfloat16:
-        raise TypeError(
-            "ramp_filter does not support torch.bfloat16; cast to "
-            "torch.float16 or torch.float32 first."
-        )
-    N_det = sinogram.shape[-1]
-    sino_f = sinogram.float() if sinogram.dtype != torch.float32 else sinogram
-    f      = torch.fft.rfft(sino_f, n=N_det, dim=-1)
-    f      = f * _ramp_filter_coeffs(N_det, sino_f.device, torch.float32)
-    out    = torch.fft.irfft(f, n=N_det, dim=-1)
-    return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
-
-
-def apply_shifts(
-    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
-    shifts: torch.Tensor,     # [n_angles] detector-axis shifts in pixels
-) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
-    """
-    Sub-pixel shift each projection row along the detector axis via Fourier
-    phase multiplication.  Positive shift moves the signal to the right.
-
-    shifts may be on CPU even when sinogram is on CUDA.
-    """
-    N_det = sinogram.shape[-1]
-    s = shifts.to(device=sinogram.device, dtype=torch.float32)
-    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device)          # [N_freq]
-    phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s.view(-1, 1, 1)
-    phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
-    F = torch.fft.rfft(sinogram.float(), n=N_det, dim=-1)
-    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
-
-
-def apply_shifts_2d(
-    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
-    shifts: torch.Tensor,     # [n_angles, 2] — (det-axis, tilt-axis) pixel shifts
-) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
-    """
-    Per-tilt sub-pixel translation of the sinogram in the detector plane via
-    bilinear ``grid_sample``.  Differentiable w.r.t. both ``sinogram`` and
-    ``shifts`` — autograd flows through ``grid_sample`` natively.
-
-    ``shifts[:, 0]`` shifts along the detector axis (last dim, ``N_det``);
-    ``shifts[:, 1]`` shifts along the tilt axis (``Ny``).  Sign convention
-    matches ``apply_shifts``: positive shift moves the signal toward larger
-    indices (right / down).
-
-    Intended for joint optimization with the volume and pose: drop in after
-    ``forward_project_3d`` (or pass ``shifts=`` to it directly) so per-tilt
-    translational alignment becomes a learnable parameter.
-    """
-    if shifts.ndim != 2 or shifts.shape[-1] != 2:
-        raise ValueError(f"shifts must have shape [n_angles, 2], got {tuple(shifts.shape)}")
-    n_a, Ny, Nd = sinogram.shape
-    if shifts.shape[0] != n_a:
-        raise ValueError(
-            f"shifts has {shifts.shape[0]} entries but sinogram has {n_a} angles"
-        )
-
-    s = shifts.to(device=sinogram.device, dtype=torch.float32)
-
-    ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=torch.float32)
-    xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=torch.float32)
-    gy, gx = torch.meshgrid(ys, xs, indexing="ij")                  # [Ny, Nd]
-    base = torch.stack((gx, gy), dim=-1)                            # [Ny, Nd, 2]
-    base = base.unsqueeze(0).expand(n_a, -1, -1, -1)                # [n_a, Ny, Nd, 2]
-
-    # Sample from (x - sx, y - sy) so positive shift moves the signal +x / +y.
-    # Normalized coords with align_corners=True: 1 pixel = 2/(N-1).
-    norm_x = 2.0 / max(Nd - 1, 1)
-    norm_y = 2.0 / max(Ny - 1, 1)
-    off = torch.stack((s[:, 0] * norm_x, s[:, 1] * norm_y), dim=-1) # [n_a, 2]
-    grid = base - off.view(n_a, 1, 1, 2)                            # [n_a, Ny, Nd, 2]
-
-    inp = sinogram.unsqueeze(1).float()                             # [n_a, 1, Ny, Nd]
-    out = torch.nn.functional.grid_sample(
-        inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-    )
-    return out.squeeze(1)
-
-
-def estimate_shifts_xcorr(
-    volume: torch.Tensor,                       # [Ny, Nz, Nx]
-    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
-    angles_deg: torch.Tensor,                   # [n_angles] degrees
-    *,
-    upsample_factor: int = 10,                  # reserved; parabolic fit used today
-    max_shift: float | None = None,
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — CUDA only
-    num_threads: int | None = None,             # CPU 3D path only
-) -> torch.Tensor:                              # [n_angles] float32, CPU
-    """
-    Estimate the translational shift of each projection (along the detector
-    axis) by 1-D phase cross-correlation between the forward projection of
-    *volume* and the corresponding row of *sinogram*.
-
-    Returns the correction shift to apply so that::
-
-        aligned_sino = ft.apply_shifts(sinogram, shifts)
-
-    brings sinogram into alignment with the volume (no negation needed at the
-    call site).
-
-    Sub-pixel precision is achieved via 3-point parabolic interpolation around
-    the cross-correlation peak.  upsample_factor is accepted for API
-    compatibility but currently unused.
-
-    Typical outer-loop usage::
-
-        for _ in range(n_outer):
-            vol    = ft.run_resire(aligned_sino, angles, n_iter=100)
-            shifts = ft.estimate_shifts_xcorr(vol, aligned_sino, angles)
-            aligned_sino = ft.apply_shifts(aligned_sino, shifts)
-    """
-    N_det = sinogram.shape[-1]
-
-    if euler_zyz_deg is not None:
-        pred = forward_project_3d(volume, euler_zyz_deg, num_threads=num_threads)
-    else:
-        pred = forward_project(volume, angles_deg)
-
-    F_pred = torch.fft.rfft(pred.float(),      n=N_det, dim=-1)  # [n_a, Ny, N_freq]
-    F_meas = torch.fft.rfft(sinogram.float(),  n=N_det, dim=-1)
-
-    # Phase cross-power spectrum: peaks at +s when sinogram is shifted +s vs pred
-    cross   = F_pred * F_meas.conj()
-    cross_n = cross / cross.abs().clamp(min=1e-12)
-
-    # Coherent sum over Ny before IRFFT (SNR ∝ sqrt(Ny))
-    cross_sum = cross_n.sum(dim=1)                                  # [n_a, N_freq]
-    ccf       = torch.fft.irfft(cross_sum, n=N_det, dim=-1)        # [n_a, N_det]
-
-    # Integer peak → signed shift
-    peak_idx  = ccf.argmax(dim=-1)                                  # [n_a]
-    shifts_int = torch.where(
-        peak_idx <= N_det // 2,
-        peak_idx.float(),
-        peak_idx.float() - N_det,
-    )
-
-    # Parabolic sub-pixel refinement with circular neighbour wrap
-    idx_m = (peak_idx - 1) % N_det
-    idx_p = (peak_idx + 1) % N_det
-    y_m   = ccf.gather(1, idx_m.unsqueeze(1)).squeeze(1)
-    y_0   = ccf.gather(1, peak_idx.unsqueeze(1)).squeeze(1)
-    y_p   = ccf.gather(1, idx_p.unsqueeze(1)).squeeze(1)
-    denom = y_m - 2.0 * y_0 + y_p
-    delta = torch.where(
-        denom.abs() > 1e-9,
-        0.5 * (y_m - y_p) / denom,
-        torch.zeros_like(denom),
-    )
-
-    # Negate: F_pred * conj(F_meas) peaks at +s when sino is +s vs pred;
-    # returning -s so that apply_shifts(sino, shifts) corrects the alignment.
-    shifts_out = -(shifts_int + delta)
-
-    if max_shift is not None:
-        shifts_out = shifts_out.clamp(-max_shift, max_shift)
-
-    return shifts_out.cpu()
+    device: torch.device,
+    apply: bool,
+) -> torch.Tensor | None:
+    """Return a [1, Nz, Nx] cylindrical mask if apply=True, else None."""
+    if not apply:
+        return None
+    return cylindrical_mask(Nz, Nx, device=device).unsqueeze(0)
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -438,9 +73,8 @@ def _compute_exact_wf(
     (i.e., the sinogram of a unit point at the volume centre).
     WF = |g| / |TF|  (thresholded).
 
-    Returns real 2D filter [Nz, Nx] in Fourier space ready to multiply
-    against rfft2 of a volume slice.  Actually returns the spatial-domain
-    WF [Nz, Nx] so it can be applied via fft2 multiplication.
+    Returns real 2D filter [Nz, Nx//2+1] Fourier amplitudes ready to
+    multiply against rfft2 of a volume slice.
     """
     # sinogram of a unit point at the origin: each row has a 1 at t=0
     n_angles = len(angles_deg)
@@ -463,7 +97,7 @@ def _compute_exact_wf(
     # WF = 1 / TF  (thresholded)
     WF_amp = torch.where(TF_amp > thresh, 1.0 / TF_amp, torch.zeros_like(TF_amp))
 
-    # return as real-valued spatial filter (apply via fft2 multiply)
+    # return as real-valued Fourier amplitudes (apply via rfft2 multiply)
     return WF_amp  # [Nz, Nx//2+1] complex magnitudes
 
 
@@ -669,7 +303,7 @@ def run_sirt(
     R_sino    = _fp(ones_vol)
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
-    _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0) if mask else None
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     losses: list[float] = []
 
     # --- iteration loop ---
@@ -680,7 +314,7 @@ def run_sirt(
         residual = raw_res * R_sino
         volume   = volume + omega * C_vol * _bp(residual)
         if sparsity > 0.0:
-            volume = volume.sign() * (volume.abs() - sparsity).clamp_(min=0.0)
+            volume = _apply_sparsity(volume, sparsity)
         if positivity:
             volume.clamp_(min=0.0)
         if _mask is not None:
@@ -842,7 +476,7 @@ def run_genfire(
     cutoffs: np.ndarray = np.zeros(n_iter, dtype=np.float32)
     res_ind_us: torch.Tensor = sinogram.new_zeros(bigN, bigN)
     if resolution_extension:
-        delay_pts = np.array([0.0, 0.5, 0.95, 0.5, 0.0], dtype=np.float32)
+        delay_pts = np.array(_GENFIRE_RES_EXTENSION_PIVOTS, dtype=np.float32)
         cutoffs = np.interp(
             np.linspace(0.0, 1.0, n_iter),
             np.linspace(0.0, 1.0, len(delay_pts)),
@@ -879,7 +513,7 @@ def run_genfire(
 
         # real-space constraints
         if sparsity > 0.0:
-            vol = vol.sign() * (vol.abs() - sparsity).clamp_(min=0.0)
+            vol = _apply_sparsity(vol, sparsity)
         if positivity:
             vol.clamp_(min=0.0)
         vol = vol * support.unsqueeze(0)
@@ -967,7 +601,7 @@ def run_wsirt(
             out[iy] = torch.fft.irfft2(ph * (F.abs() * WF_amp), s=(Nz, Nx))
         return out
 
-    _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0) if mask else None
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -977,7 +611,7 @@ def run_wsirt(
             losses.append(residual.pow(2).mean().item())
         volume   = volume + omega * _wbp(residual)
         if sparsity > 0.0:
-            volume = volume.sign() * (volume.abs() - sparsity).clamp_(min=0.0)
+            volume = _apply_sparsity(volume, sparsity)
         if positivity:
             volume.clamp_(min=0.0)
         if _mask is not None:
@@ -1162,7 +796,7 @@ def run_resire(
             losses.append(residual.pow(2).mean().item())
         volume   = volume + alpha * _bp(residual)
         if sparsity > 0.0:
-            volume = volume.sign() * (volume.abs() - sparsity).clamp_(min=0.0)
+            volume = _apply_sparsity(volume, sparsity)
         if positivity:
             volume.clamp_(min=0.0)
         if _mask is not None:
@@ -1259,9 +893,7 @@ def run_grad_descent(
     else:
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
 
-    _mask = (
-        cylindrical_mask(Nz, Nx, device=device).unsqueeze(0) if mask else None
-    )
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     losses: list[float] = []
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
