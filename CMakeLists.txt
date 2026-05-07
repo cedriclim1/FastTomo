@@ -15,7 +15,7 @@ endif()
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
-find_package(OpenMP REQUIRED)
+find_package(OpenMP)
 
 set(CORE_SOURCES
     csrc/bindings.cpp
@@ -28,7 +28,12 @@ endif()
 
 pybind11_add_module(_core ${CORE_SOURCES})
 target_include_directories(_core PRIVATE csrc)
-target_link_libraries(_core PRIVATE OpenMP::OpenMP_C)
+if(OpenMP_C_FOUND)
+    target_link_libraries(_core PRIVATE OpenMP::OpenMP_C)
+    message(STATUS "OpenMP found: building CPU kernels with OpenMP")
+else()
+    message(STATUS "OpenMP not found: building CPU kernels in serial mode")
+endif()
 
 if(FASTTOMO_CUDA)
     find_package(CUDAToolkit REQUIRED)
