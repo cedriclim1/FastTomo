@@ -82,6 +82,29 @@ cmake --build build --parallel
 cp build/_core*.so fasttomo/
 ```
 
+## Releasing (maintainer notes)
+
+Wheels are built by `.github/workflows/wheels.yml`:
+
+- **CPU manylinux wheels** for cp39–cp313 × x86_64
+- **CUDA wheel** for cp39–cp313, with `libcudart` excluded from the wheel via `auditwheel --exclude` and resolved at import time against the `libcudart` that PyTorch loads into the process. One CUDA wheel works across PyTorch's CUDA versions (the TorchRadon pattern).
+- **Sdist** for source-builds when no wheel matches.
+
+### One-time setup
+
+1. **PyPI Trusted Publishing** — on PyPI, go to your project's Settings → Publishing, add a publisher: GitHub repo `cedriclim1/FastTomo`, workflow `wheels.yml`, environment `pypi`. Repeat on TestPyPI with environment `testpypi`.
+2. **GitHub environments** — in repo Settings → Environments, create `pypi` and `testpypi` (no secrets needed; OIDC handles auth).
+
+### Cutting a release
+
+```bash
+# Bump version in pyproject.toml, commit, then tag:
+git tag v0.1.0
+git push --tags
+```
+
+The tag push triggers the full matrix and publishes to PyPI. To dry-run against TestPyPI: use the workflow_dispatch UI on GitHub Actions and pick `publish_to = testpypi`.
+
 ## License
 
 GPLv3 — all derivative works must remain open source.

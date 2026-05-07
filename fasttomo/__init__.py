@@ -1,3 +1,9 @@
+# Import torch first so its bundled libcudart is loaded into the process before
+# fasttomo._core is imported. The CUDA wheel is intentionally built without
+# bundling libcudart so the symbol resolves to whatever PyTorch already loaded
+# — this is what lets one wheel work across PyTorch's CUDA versions.
+import torch  # noqa: F401
+
 from fasttomo.torch_ops import (
     forward_project,
     back_project,

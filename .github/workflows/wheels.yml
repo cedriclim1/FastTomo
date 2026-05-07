@@ -1,0 +1,162 @@
+name: Build wheels
+
+# Two jobs:
+#   build_cpu  — manylinux_2_28 CPU wheels for cp39..cp313
+#   build_cuda — single-CUDA-toolkit wheels per Python ABI; libcudart is
+#                excluded from the wheel via auditwheel and resolved at import
+#                time against the libcudart that PyTorch loaded into the
+#                process (see fasttomo/__init__.py).
+#
+# Triggers: tag push (v*), manual dispatch. Not on every PR — too slow.
+# Publishing: enable the publish_pypi job once you've configured PyPI Trusted
+# Publishing for this repo (see README "Releasing" section).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_to:
+        description: "Where to publish (none/testpypi/pypi)"
+        required: true
+        default: "none"
+        type: choice
+        options: [none, testpypi, pypi]
+
+permissions:
+  contents: read
+
+jobs:
+  build_cpu:
+    name: CPU wheel ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [cp39, cp310, cp311, cp312, cp313]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
+          CIBW_SKIP: "*-musllinux*"
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_LINUX: FASTTOMO_USE_CUDA=OFF
+          CIBW_CONFIG_SETTINGS: cmake.define.FASTTOMO_USE_CUDA=OFF
+          # Test the built wheel against PyTorch's CPU-only PyPI build.
+          CIBW_TEST_REQUIRES: pytest
+          CIBW_BEFORE_TEST_LINUX: pip install torch --index-url https://download.pytorch.org/whl/cpu
+          CIBW_TEST_COMMAND: pytest {project}/tests/test_wheel_smoke.py -v
+          CIBW_TEST_ENVIRONMENT: FASTTOMO_EXPECT_CUDA=0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cpu-${{ matrix.python }}
+          path: ./wheelhouse/*.whl
+
+  build_cuda:
+    name: CUDA wheel ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [cp39, cp310, cp311, cp312, cp313]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
+          CIBW_SKIP: "*-musllinux*"
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+
+          # Install CUDA toolkit (nvcc + cudart-dev only) inside the manylinux
+          # container before any builds. We use 12.4 — pick any 12.x; the wheel
+          # is cross-CUDA-version-compatible because we exclude libcudart from
+          # the wheel and resolve it from PyTorch at runtime.
+          CIBW_BEFORE_ALL_LINUX: |
+            dnf -y install dnf-plugins-core
+            dnf config-manager --add-repo \
+              https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+            dnf -y install cuda-nvcc-12-4 cuda-cudart-devel-12-4
+
+          CIBW_ENVIRONMENT_LINUX: >
+            FASTTOMO_USE_CUDA=ON
+            PATH=/usr/local/cuda-12.4/bin:$PATH
+            CUDACXX=/usr/local/cuda-12.4/bin/nvcc
+
+          CIBW_CONFIG_SETTINGS: >
+            cmake.define.FASTTOMO_USE_CUDA=ON
+            cmake.define.CMAKE_CUDA_ARCHITECTURES=70;75;80;86;89;90
+
+          # The whole point: do NOT bundle libcudart into the wheel. At runtime
+          # it resolves to the libcudart that PyTorch loaded into the process.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair -w {dest_dir} {wheel}
+            --exclude libcudart.so.12
+            --exclude libcudart.so.11.0
+            --exclude libcudart.so
+
+          # Test in a clean env that has only torch+cu124 (no system CUDA).
+          # Runners have no GPU, so smoke test falls back to CPU path; what
+          # we're verifying is that the .so loads (i.e. cudart symbols
+          # resolve via PyTorch's bundled libcudart).
+          CIBW_TEST_REQUIRES: pytest
+          CIBW_BEFORE_TEST_LINUX: pip install torch --index-url https://download.pytorch.org/whl/cu124
+          CIBW_TEST_COMMAND: pytest {project}/tests/test_wheel_smoke.py -v
+          CIBW_TEST_ENVIRONMENT: FASTTOMO_EXPECT_CUDA=1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cuda-${{ matrix.python }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./dist/*.tar.gz
+
+  publish_pypi:
+    name: Publish to ${{ inputs.publish_to || 'pypi' }}
+    needs: [build_cpu, build_cuda, build_sdist]
+    runs-on: ubuntu-latest
+    # Only publish on tag push, or manual dispatch with publish_to != none.
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_to != 'none')
+    environment:
+      name: ${{ inputs.publish_to == 'testpypi' && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write  # required for OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: inputs.publish_to == 'testpypi'
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: github.event_name == 'push' || inputs.publish_to == 'pypi'
+        with:
+          packages-dir: dist/
