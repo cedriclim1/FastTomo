@@ -23,6 +23,7 @@ jobs:
         uses: pypa/cibuildwheel@v2.22.0
         env:
           CIBW_ENVIRONMENT: CMAKE_ARGS='-DCMAKE_CUDA_COMPILER=CMAKE_CUDA_COMPILER-NOTFOUND'
+          CIBW_ARCHS_WINDOWS: AMD64
           CIBW_TEST_COMMAND: python -c "import torch, fasttomo as ft; vol=torch.zeros(1,16,16); ang=torch.linspace(-60,60,12); sino=ft.forward_project(vol, ang); assert sino.shape == (12, 1, 16)"
 
       - name: Upload wheel artifacts
