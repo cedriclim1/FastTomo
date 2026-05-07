@@ -722,5 +722,104 @@ def test_run_grad_descent_3d_cuda_converges():
     assert losses[-1].item() < losses[0].item() / 20.0
 
 
+# ── FP16 path ─────────────────────────────────────────────────────────────
+#
+# fp16 input → fp16 output, kernel accumulates in fp32 internally. Texture
+# hardware bilinear filtering on 16-bit half texels has reduced fractional
+# precision; we accept ~1% relative agreement against fp32 (matches the
+# CPU-vs-CUDA fp32 floor, mirrors TorchRadon's tolerance).
+
+def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    diff = (actual.float() - expected.float()).abs().max().item()
+    scale = expected.abs().max().item() + 1e-12
+    return diff / scale
+
+
+def test_forward_project_fp16_matches_fp32():
+    """fp16 forward projection must match fp32 to within 1% relative."""
+    N      = 64
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino_fp32 = ft.forward_project(vol, angles)
+    sino_fp16 = ft.forward_project(vol.half(), angles)
+    assert sino_fp16.dtype == torch.float16
+    assert _rel_err(sino_fp16, sino_fp32) < 1e-2
+
+
+def test_back_project_fp16_matches_fp32():
+    """fp16 back-projection must match fp32 to within 1% relative."""
+    N      = 64
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec_fp32 = ft.back_project(sino, angles, Nz=N)
+    rec_fp16 = ft.back_project(sino.half(), angles, Nz=N)
+    assert rec_fp16.dtype == torch.float16
+    assert _rel_err(rec_fp16, rec_fp32) < 1e-2
+
+
+def test_fp3d_fp16_matches_fp32():
+    N      = 32
+    angles = make_angles(20)
+    euler  = make_euler_pure_y(angles).to(DEVICE)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino_fp32 = ft.forward_project_3d(vol, euler)
+    sino_fp16 = ft.forward_project_3d(vol.half(), euler)
+    assert sino_fp16.dtype == torch.float16
+    assert _rel_err(sino_fp16, sino_fp32) < 1e-2
+
+
+def test_bp3d_fp16_matches_fp32():
+    N      = 32
+    angles = make_angles(20)
+    euler  = make_euler_pure_y(angles).to(DEVICE)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project_3d(vol, euler)
+    rec_fp32 = ft.back_project_3d(sino, euler, Nz=N)
+    rec_fp16 = ft.back_project_3d(sino.half(), euler, Nz=N)
+    assert rec_fp16.dtype == torch.float16
+    assert _rel_err(rec_fp16, rec_fp32) < 1e-2
+
+
+def test_run_fbp_fp16_matches_fp32():
+    """fp16 run_fbp recon should match fp32 to within ~1% relative on
+    a structured phantom (FFT in fp16 is accepted, see run_fbp docstring)."""
+    N      = 64
+    angles = make_angles(60)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec_fp32 = ft.run_fbp(sino, angles, Nz=N, mask=True)
+    rec_fp16 = ft.run_fbp(sino.half(), angles, Nz=N, mask=True)
+    assert rec_fp16.dtype == torch.float16
+    # Looser tolerance because fp16 FFT compounds the precision loss.
+    assert _rel_err(rec_fp16, rec_fp32) < 5e-2
+
+
+def test_bf16_raises_on_forward_project():
+    N      = 16
+    angles = make_angles(5)
+    vol    = phantom_2d(N).unsqueeze(0).bfloat16()
+    with pytest.raises(TypeError, match="bfloat16"):
+        ft.forward_project(vol, angles)
+
+
+def test_bf16_raises_on_back_project():
+    N      = 16
+    angles = make_angles(5)
+    sino   = torch.zeros(angles.numel(), 1, N, device=DEVICE, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="bfloat16"):
+        ft.back_project(sino, angles, Nz=N)
+
+
+def test_resire_rejects_fp16():
+    """RESIRE projector ops are fp32-only (out of scope for fp16 path)."""
+    N      = 16
+    angles = make_angles(5)
+    euler  = make_euler_pure_y(angles).to(DEVICE)
+    vol    = phantom_2d(N).unsqueeze(0).half()
+    with pytest.raises(TypeError, match="fp32-only"):
+        ft.forward_project_resire(vol, euler)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

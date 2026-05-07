@@ -21,9 +21,16 @@
  * allocation. Used by ParallelProjector / RotmatProjector for tight loops.
  */
 
+/* The 4 in-scope projection ops + their cached variants accept a runtime
+ * `io_dtype` integer (0 = fp32, 1 = fp16) and use void* for I/O tensors.
+ * The dispatcher reinterprets the pointers based on io_dtype and calls a
+ * templated impl. cos/sin tables and rotation matrices stay fp32 in all
+ * paths. Out-of-scope ops below (RESIRE, grad_*) keep their fp32-only
+ * signatures. */
 void forward_project_cuda(
-    const float *d_volume,
-    float       *d_sinogram,
+    int io_dtype,
+    const void  *d_volume,
+    void        *d_sinogram,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx,
@@ -32,8 +39,9 @@ void forward_project_cuda(
 );
 
 void back_project_cuda(
-    const float *d_sinogram,
-    float       *d_volume,
+    int io_dtype,
+    const void  *d_sinogram,
+    void        *d_volume,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx,
@@ -46,8 +54,9 @@ void back_project_cuda(
  * [n_angles * 9] row-major; M[ia*9 + row*3 + col] = R_ia[row][col].
  */
 void forward_project_rotmat_cuda(
-    const float *d_volume,
-    float       *d_sinogram,
+    int io_dtype,
+    const void  *d_volume,
+    void        *d_sinogram,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
@@ -55,8 +64,9 @@ void forward_project_rotmat_cuda(
 );
 
 void back_project_rotmat_cuda(
-    const float *d_sinogram,
-    float       *d_volume,
+    int io_dtype,
+    const void  *d_sinogram,
+    void        *d_volume,
     const float *d_matrices,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
@@ -64,14 +74,16 @@ void back_project_rotmat_cuda(
 );
 
 /* ── cached variants ──────────────────────────────────────────────────────
- * `vol_cache` / `sino_cache` must already be sized to the input. Each call
- * uploads the caller's data into the cache's cudaArray, then launches the
- * kernel. Output buffer is written through a regular device pointer.
+ * `vol_cache` / `sino_cache` must already be sized to the input AND match
+ * the io_dtype. Each call uploads the caller's data into the cache's
+ * cudaArray, then launches the kernel. Output buffer is written through a
+ * regular device pointer.
  */
 void forward_project_cuda_cached(
+    int io_dtype,
     TextureCache *vol_cache,
-    const float  *d_volume,
-    float        *d_sinogram,
+    const void   *d_volume,
+    void         *d_sinogram,
     const float  *d_cos_a,
     const float  *d_sin_a,
     int Ny, int Nz, int Nx,
@@ -80,9 +92,10 @@ void forward_project_cuda_cached(
 );
 
 void back_project_cuda_cached(
+    int io_dtype,
     TextureCache *sino_cache,
-    const float  *d_sinogram,
-    float        *d_volume,
+    const void   *d_sinogram,
+    void         *d_volume,
     const float  *d_cos_a,
     const float  *d_sin_a,
     int Ny, int Nz, int Nx,
@@ -91,9 +104,10 @@ void back_project_cuda_cached(
 );
 
 void forward_project_rotmat_cuda_cached(
+    int io_dtype,
     TextureCache *vol_cache,
-    const float  *d_volume,
-    float        *d_sinogram,
+    const void   *d_volume,
+    void         *d_sinogram,
     const float  *d_matrices,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
@@ -101,9 +115,10 @@ void forward_project_rotmat_cuda_cached(
 );
 
 void back_project_rotmat_cuda_cached(
+    int io_dtype,
     TextureCache *sino_cache,
-    const float  *d_sinogram,
-    float        *d_volume,
+    const void   *d_sinogram,
+    void         *d_volume,
     const float  *d_matrices,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,

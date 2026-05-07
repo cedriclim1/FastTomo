@@ -251,13 +251,26 @@ def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
     Apply ramp filter |ξ| to each detector row of sinogram.
 
     sinogram: [n_angles, Ny, N_det]
-    Returns same shape, same device.
+    Returns same shape, same device, same dtype. fp32 / fp16 supported; bf16
+    raises.
+
+    Implementation note on fp16: cuFFT only supports power-of-two signal
+    lengths in half precision. Rather than restrict the user to power-of-two
+    detectors, we always run the FFT in fp32 and cast the result back to the
+    input dtype. Mirrors TorchRadon's `padded_sinogram.float() ... .to(dtype)`
+    pattern — minor cost on the FFT itself, no cost on the BP that dominates.
     """
-    N_det  = sinogram.shape[-1]
-    sino_f = sinogram.float()
+    if sinogram.dtype == torch.bfloat16:
+        raise TypeError(
+            "ramp_filter does not support torch.bfloat16; cast to "
+            "torch.float16 or torch.float32 first."
+        )
+    N_det = sinogram.shape[-1]
+    sino_f = sinogram.float() if sinogram.dtype != torch.float32 else sinogram
     f      = torch.fft.rfft(sino_f, n=N_det, dim=-1)
     f      = f * _ramp_filter_coeffs(N_det, sino_f.device, torch.float32)
-    return torch.fft.irfft(f, n=N_det, dim=-1)
+    out    = torch.fft.irfft(f, n=N_det, dim=-1)
+    return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
 
 
 def apply_shifts(
@@ -479,6 +492,13 @@ def run_fbp(
     replaces the ``angles_deg`` argument for BP. Numerics are bit-identical
     to the functional path. On CPU the functional ``back_project`` is used
     regardless (cached projectors are CUDA-only).
+
+    Input dtype is preserved end-to-end (fp32 / fp16). The ramp filter
+    internally runs in fp32 (cuFFT requires power-of-two N_det for fp16 —
+    we sidestep that by upcasting around the FFT only) and the BP runs in
+    the input dtype. fp16 FBP gets the BP speedup; quality is comparable
+    to fp32 on visualization-grade reconstructions but visibly noisier
+    on edges — use fp32 for quantitative work. bf16 raises.
     """
     filtered = ramp_filter(sinogram)
     if projector is not None:
@@ -498,7 +518,8 @@ def run_fbp(
     if positivity:
         volume.clamp_(min=0.0)
     if mask:
-        _mask = cylindrical_mask(volume.shape[1], volume.shape[2], device=volume.device)
+        _mask = cylindrical_mask(volume.shape[1], volume.shape[2],
+                                 device=volume.device).to(volume.dtype)
         volume = volume * _mask.unsqueeze(0)
     return volume
 

@@ -287,14 +287,16 @@ static inline cudaStream_t to_stream(long stream_ptr) {
 }
 
 static void py_forward_project_cuda(
+    int io_dtype,
     long volume_ptr, long sinogram_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     forward_project_cuda(
-        reinterpret_cast<const float *>(volume_ptr),
-        reinterpret_cast<float *>(sinogram_ptr),
+        io_dtype,
+        reinterpret_cast<const void *>(volume_ptr),
+        reinterpret_cast<void *>(sinogram_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -303,14 +305,16 @@ static void py_forward_project_cuda(
 }
 
 static void py_back_project_cuda(
+    int io_dtype,
     long sinogram_ptr, long volume_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     back_project_cuda(
-        reinterpret_cast<const float *>(sinogram_ptr),
-        reinterpret_cast<float *>(volume_ptr),
+        io_dtype,
+        reinterpret_cast<const void *>(sinogram_ptr),
+        reinterpret_cast<void *>(volume_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -319,13 +323,15 @@ static void py_back_project_cuda(
 }
 
 static void py_forward_project_rotmat_cuda(
+    int io_dtype,
     long vol_ptr, long sino_ptr, long matrices_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     forward_project_rotmat_cuda(
-        reinterpret_cast<const float *>(vol_ptr),
-        reinterpret_cast<float *>(sino_ptr),
+        io_dtype,
+        reinterpret_cast<const void *>(vol_ptr),
+        reinterpret_cast<void *>(sino_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
@@ -333,13 +339,15 @@ static void py_forward_project_rotmat_cuda(
 }
 
 static void py_back_project_rotmat_cuda(
+    int io_dtype,
     long sino_ptr, long vol_ptr, long matrices_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     back_project_rotmat_cuda(
-        reinterpret_cast<const float *>(sino_ptr),
-        reinterpret_cast<float *>(vol_ptr),
+        io_dtype,
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<void *>(vol_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
@@ -410,10 +418,19 @@ static void py_grad_angle_cuda(
 
 /* ── texture cache (opaque pointer exposed as Python int) ──────────────── */
 
-static long py_tc_create(int kind, int dim_a, int dim_b, int dim_c) {
+static long py_tc_create(int kind, int dtype, int channels,
+                         int dim_a, int dim_b, int dim_c) {
     if (kind < 0 || kind > 2)
         throw std::invalid_argument("tc_create: kind must be 0..2");
-    TextureCache *tc = tc_create(static_cast<tc_kind_t>(kind), dim_a, dim_b, dim_c);
+    if (dtype < 0 || dtype > 1)
+        throw std::invalid_argument("tc_create: dtype must be 0 (fp32) or 1 (fp16)");
+    if (channels != 1 && channels != 4)
+        throw std::invalid_argument("tc_create: channels must be 1 or 4");
+    TextureCache *tc = tc_create(
+        static_cast<tc_kind_t>(kind),
+        static_cast<tc_dtype_t>(dtype),
+        channels,
+        dim_a, dim_b, dim_c);
     return reinterpret_cast<long>(tc);
 }
 
@@ -424,6 +441,7 @@ static void py_tc_destroy(long handle) {
 /* ── cached FP/BP entry points ─────────────────────────────────────────── */
 
 static void py_forward_project_cuda_cached(
+    int io_dtype,
     long cache_ptr,
     long volume_ptr, long sinogram_ptr,
     long cos_ptr, long sin_ptr,
@@ -431,9 +449,10 @@ static void py_forward_project_cuda_cached(
     long stream_ptr
 ) {
     forward_project_cuda_cached(
+        io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
-        reinterpret_cast<const float *>(volume_ptr),
-        reinterpret_cast<float *>(sinogram_ptr),
+        reinterpret_cast<const void *>(volume_ptr),
+        reinterpret_cast<void *>(sinogram_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -442,6 +461,7 @@ static void py_forward_project_cuda_cached(
 }
 
 static void py_back_project_cuda_cached(
+    int io_dtype,
     long cache_ptr,
     long sinogram_ptr, long volume_ptr,
     long cos_ptr, long sin_ptr,
@@ -449,9 +469,10 @@ static void py_back_project_cuda_cached(
     long stream_ptr
 ) {
     back_project_cuda_cached(
+        io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
-        reinterpret_cast<const float *>(sinogram_ptr),
-        reinterpret_cast<float *>(volume_ptr),
+        reinterpret_cast<const void *>(sinogram_ptr),
+        reinterpret_cast<void *>(volume_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -460,15 +481,17 @@ static void py_back_project_cuda_cached(
 }
 
 static void py_forward_project_rotmat_cuda_cached(
+    int io_dtype,
     long cache_ptr,
     long vol_ptr, long sino_ptr, long matrices_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     forward_project_rotmat_cuda_cached(
+        io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
-        reinterpret_cast<const float *>(vol_ptr),
-        reinterpret_cast<float *>(sino_ptr),
+        reinterpret_cast<const void *>(vol_ptr),
+        reinterpret_cast<void *>(sino_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
@@ -476,15 +499,17 @@ static void py_forward_project_rotmat_cuda_cached(
 }
 
 static void py_back_project_rotmat_cuda_cached(
+    int io_dtype,
     long cache_ptr,
     long sino_ptr, long vol_ptr, long matrices_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     back_project_rotmat_cuda_cached(
+        io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
-        reinterpret_cast<const float *>(sino_ptr),
-        reinterpret_cast<float *>(vol_ptr),
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<void *>(vol_ptr),
         reinterpret_cast<const float *>(matrices_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
@@ -570,8 +595,10 @@ PYBIND11_MODULE(_core, m) {
 
 #ifdef FASTTOMO_CUDA
     m.def("forward_project_cuda", &py_forward_project_cuda,
-          "Forward projection (CUDA). All ptr args are device data_ptr() ints. "
+          "Forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
+          "All ptr args are device data_ptr() ints. "
           "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream).",
+          py::arg("io_dtype"),
           py::arg("volume_ptr"), py::arg("sinogram_ptr"),
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
@@ -579,7 +606,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_cuda", &py_back_project_cuda,
-          "Back-projection (CUDA). All ptr args are device data_ptr() ints.",
+          "Back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
+          "All ptr args are device data_ptr() ints.",
+          py::arg("io_dtype"),
           py::arg("sinogram_ptr"), py::arg("volume_ptr"),
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
@@ -587,16 +616,18 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda", &py_forward_project_rotmat_cuda,
-          "3D rotation-matrix forward projection (CUDA). "
+          "3D rotation-matrix forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
+          py::arg("io_dtype"),
           py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_rotmat_cuda", &py_back_project_rotmat_cuda,
-          "3D rotation-matrix back-projection (CUDA). "
+          "3D rotation-matrix back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
+          py::arg("io_dtype"),
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
@@ -644,19 +675,25 @@ PYBIND11_MODULE(_core, m) {
     m.def("tc_create", &py_tc_create,
           "Allocate a persistent cudaArray + cudaTextureObject. "
           "kind: 0=TC_VOL_LAYERED (FP scalar), 1=TC_SINO_LAYERED (BP scalar/rotmat), "
-          "2=TC_VOL_3D (FP rotmat). dim_a/b/c match the source-tensor dims in C order: "
-          "vol is (Ny,Nz,Nx); sino is (n_angles,Ny,N_det). "
+          "2=TC_VOL_3D (FP rotmat). dtype: 0=fp32, 1=fp16. "
+          "channels: 1 (default) or 4. channels=4 enables TorchRadon-style "
+          "Y-axis packing (4 Y-slices per texel) — fp16 only, packing-axis "
+          "must be divisible by 4. dim_a/b/c match the source-tensor dims "
+          "in C order: vol is (Ny,Nz,Nx); sino is (n_angles,Ny,N_det). "
           "Returns an opaque integer handle — pass to tc_destroy when done.",
-          py::arg("kind"), py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"));
+          py::arg("kind"), py::arg("dtype"), py::arg("channels"),
+          py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"));
 
     m.def("tc_destroy", &py_tc_destroy,
           "Release a TextureCache handle returned by tc_create.",
           py::arg("handle"));
 
     m.def("forward_project_cuda_cached", &py_forward_project_cuda_cached,
-          "Forward projection (CUDA, cached). cache_ptr: TC_VOL_LAYERED handle "
-          "sized to (Ny, Nz, Nx). Uploads volume into the cache's cudaArray and "
-          "launches the kernel — no per-call cudaMalloc3DArray.",
+          "Forward projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
+          "cache_ptr: TC_VOL_LAYERED handle sized to (Ny, Nz, Nx) with matching dtype. "
+          "Uploads volume into the cache's cudaArray and launches the kernel — "
+          "no per-call cudaMalloc3DArray.",
+          py::arg("io_dtype"),
           py::arg("cache_ptr"),
           py::arg("volume_ptr"), py::arg("sinogram_ptr"),
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
@@ -665,8 +702,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_cuda_cached", &py_back_project_cuda_cached,
-          "Back-projection (CUDA, cached). cache_ptr: TC_SINO_LAYERED handle "
-          "sized to (n_angles, Ny, N_det).",
+          "Back-projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
+          "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
+          py::arg("io_dtype"),
           py::arg("cache_ptr"),
           py::arg("sinogram_ptr"), py::arg("volume_ptr"),
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
@@ -675,8 +713,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda_cached", &py_forward_project_rotmat_cuda_cached,
-          "3D rotmat forward projection (CUDA, cached). cache_ptr: TC_VOL_3D handle "
-          "sized to (Ny, Nz, Nx).",
+          "3D rotmat forward projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
+          "cache_ptr: TC_VOL_3D handle sized to (Ny, Nz, Nx) with matching dtype.",
+          py::arg("io_dtype"),
           py::arg("cache_ptr"),
           py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
@@ -684,8 +723,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_rotmat_cuda_cached", &py_back_project_rotmat_cuda_cached,
-          "3D rotmat back-projection (CUDA, cached). cache_ptr: TC_SINO_LAYERED handle "
-          "sized to (n_angles, Ny, N_det).",
+          "3D rotmat back-projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
+          "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
+          py::arg("io_dtype"),
           py::arg("cache_ptr"),
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),

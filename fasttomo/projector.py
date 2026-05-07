@@ -50,13 +50,34 @@ import math
 import torch
 
 import fasttomo._core as _core
-from fasttomo.autograd import _FP2DCached, _BP2DCached, _FP3DCached, _BP3DCached
+from fasttomo.autograd import _FP2DCached, _BP2DCached, _FP3DCached, _BP3DCached, _io_dtype_code
 
 
 # Texture-cache kind enum mirrors texture_cache.h:
 _TC_VOL_LAYERED  = 0
 _TC_SINO_LAYERED = 1
 _TC_VOL_3D       = 2
+
+# Texture-cache dtype enum mirrors texture_cache.h tc_dtype_t:
+_TC_DTYPE_FP32 = 0
+_TC_DTYPE_FP16 = 1
+
+
+def _dtype_to_tc_code(dtype: torch.dtype) -> int:
+    """Translate a torch dtype to the tc_dtype_t int used by tc_create."""
+    if dtype == torch.float32:
+        return _TC_DTYPE_FP32
+    if dtype == torch.float16:
+        return _TC_DTYPE_FP16
+    if dtype == torch.bfloat16:
+        raise TypeError(
+            "Projector textures do not support torch.bfloat16: CUDA "
+            "textures have no BF16 channel descriptor. Cast to "
+            "torch.float16 or torch.float32."
+        )
+    raise TypeError(
+        f"Projector textures only support float32 and float16 (got {dtype})."
+    )
 
 
 class ParallelProjector:
@@ -100,28 +121,62 @@ class ParallelProjector:
         self.N_det = int(N_det) if N_det is not None else Nx
         self.device = device
 
+        # I/O dtype is locked on the first FP/BP call. Subsequent calls with
+        # a mismatched dtype raise — matches the existing shape-mismatch
+        # contract in the *_cuda_cached entry points.
+        self.dtype: torch.dtype | None = None
         self._vol_handle:  int | None = None
         self._sino_handle: int | None = None
 
+    def _lock_dtype(self, t: torch.Tensor) -> int:
+        """Return the io_dtype int. Locks self.dtype on first call; raises
+        on mismatch afterwards."""
+        code = _io_dtype_code(t)
+        if self.dtype is None:
+            self.dtype = t.dtype
+        elif t.dtype != self.dtype:
+            raise TypeError(
+                f"ParallelProjector dtype lock-in mismatch: cache was "
+                f"allocated for {self.dtype}, got {t.dtype}. Construct a "
+                f"new projector for a different dtype."
+            )
+        return code
+
+    def _channels(self) -> int:
+        """4-channel packed-Y mode is auto-enabled for fp16 caches when
+        Ny % 4 == 0 (TorchRadon's batch-channel-packing trick). Otherwise
+        falls back to single-channel. fp32 caches stay 1-channel."""
+        if self.dtype == torch.float16 and self.Ny % 4 == 0:
+            return 4
+        return 1
+
     def _ensure_vol_cache(self) -> None:
         if self._vol_handle is None:
-            self._vol_handle = int(_core.tc_create(_TC_VOL_LAYERED, self.Ny, self.Nz, self.Nx))
+            assert self.dtype is not None, "_lock_dtype must be called first"
+            self._vol_handle = int(_core.tc_create(
+                _TC_VOL_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
+                self.Ny, self.Nz, self.Nx,
+            ))
 
     def _ensure_sino_cache(self) -> None:
         if self._sino_handle is None:
-            self._sino_handle = int(
-                _core.tc_create(_TC_SINO_LAYERED, self.n_angles, self.Ny, self.N_det)
-            )
+            assert self.dtype is not None, "_lock_dtype must be called first"
+            self._sino_handle = int(_core.tc_create(
+                _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
+                self.n_angles, self.Ny, self.N_det,
+            ))
 
     # ── raw (non-autograd) entry points used by the autograd Function ──
     def _fp_raw(self, volume: torch.Tensor) -> torch.Tensor:
+        io_dtype = self._lock_dtype(volume)
         self._ensure_vol_cache()
         vol = volume.contiguous()
         sino = torch.empty(
             self.n_angles, self.Ny, self.N_det,
-            dtype=torch.float32, device=self.device,
+            dtype=self.dtype, device=self.device,
         )
         _core.forward_project_cuda_cached(
+            io_dtype,
             self._vol_handle,
             vol.data_ptr(), sino.data_ptr(),
             self._cos.data_ptr(), self._sin.data_ptr(),
@@ -131,13 +186,15 @@ class ParallelProjector:
         return sino
 
     def _bp_raw(self, sinogram: torch.Tensor) -> torch.Tensor:
+        io_dtype = self._lock_dtype(sinogram)
         self._ensure_sino_cache()
         sino = sinogram.contiguous()
         vol = torch.empty(
             self.Ny, self.Nz, self.Nx,
-            dtype=torch.float32, device=self.device,
+            dtype=self.dtype, device=self.device,
         )
         _core.back_project_cuda_cached(
+            io_dtype,
             self._sino_handle,
             sino.data_ptr(), vol.data_ptr(),
             self._cos.data_ptr(), self._sin.data_ptr(),
@@ -195,28 +252,52 @@ class RotmatProjector:
         self.n_angles = int(n_angles)
         self.device   = device
 
+        # Locked on first FP/BP call (see ParallelProjector for the rationale).
+        self.dtype: torch.dtype | None = None
         self._vol_handle:  int | None = None
         self._sino_handle: int | None = None
 
+    def _lock_dtype(self, t: torch.Tensor) -> int:
+        code = _io_dtype_code(t)
+        if self.dtype is None:
+            self.dtype = t.dtype
+        elif t.dtype != self.dtype:
+            raise TypeError(
+                f"RotmatProjector dtype lock-in mismatch: cache was "
+                f"allocated for {self.dtype}, got {t.dtype}. Construct a "
+                f"new projector for a different dtype."
+            )
+        return code
+
     def _ensure_vol_cache(self) -> None:
+        # Rotmat kernels need continuous Y interpolation (tex3D), so they
+        # can't pack 4 Y-slices into channels — channels stays 1.
         if self._vol_handle is None:
-            self._vol_handle = int(_core.tc_create(_TC_VOL_3D, self.Ny, self.Nz, self.Nx))
+            assert self.dtype is not None, "_lock_dtype must be called first"
+            self._vol_handle = int(_core.tc_create(
+                _TC_VOL_3D, _dtype_to_tc_code(self.dtype), 1,
+                self.Ny, self.Nz, self.Nx,
+            ))
 
     def _ensure_sino_cache(self) -> None:
         if self._sino_handle is None:
-            self._sino_handle = int(
-                _core.tc_create(_TC_SINO_LAYERED, self.n_angles, self.Ny, self.N_det)
-            )
+            assert self.dtype is not None, "_lock_dtype must be called first"
+            self._sino_handle = int(_core.tc_create(
+                _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), 1,
+                self.n_angles, self.Ny, self.N_det,
+            ))
 
     def _fp_raw(self, volume: torch.Tensor, mats_flat: torch.Tensor) -> torch.Tensor:
+        io_dtype = self._lock_dtype(volume)
         self._ensure_vol_cache()
         vol = volume.contiguous()
         mats = mats_flat.detach().contiguous()
         sino = torch.empty(
             self.n_angles, self.Ny, self.N_det,
-            dtype=torch.float32, device=self.device,
+            dtype=self.dtype, device=self.device,
         )
         _core.forward_project_rotmat_cuda_cached(
+            io_dtype,
             self._vol_handle,
             vol.data_ptr(), sino.data_ptr(), mats.data_ptr(),
             self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
@@ -225,14 +306,16 @@ class RotmatProjector:
         return sino
 
     def _bp_raw(self, sinogram: torch.Tensor, mats_flat: torch.Tensor) -> torch.Tensor:
+        io_dtype = self._lock_dtype(sinogram)
         self._ensure_sino_cache()
         sino = sinogram.contiguous()
         mats = mats_flat.detach().contiguous()
         vol = torch.empty(
             self.Ny, self.Nz, self.Nx,
-            dtype=torch.float32, device=self.device,
+            dtype=self.dtype, device=self.device,
         )
         _core.back_project_rotmat_cuda_cached(
+            io_dtype,
             self._sino_handle,
             sino.data_ptr(), vol.data_ptr(), mats.data_ptr(),
             self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,

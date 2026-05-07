@@ -104,3 +104,76 @@ def test_rotmat_projector_back_matches_functional(workload):
     for _ in range(5):
         vol_cached = proj.back(sino, mats)
         torch.testing.assert_close(vol_cached, vol_func, rtol=0, atol=1e-5)
+
+
+# ── FP16 path ────────────────────────────────────────────────────────────
+#
+# fp16 textures are 16-bit half-precision; hardware bilinear filtering
+# operates on the half values directly, accumulators stay fp32. We expect
+# ~1% relative agreement with fp32 — the same precision floor as the
+# CPU-vs-CUDA fp32 test, just bumped slightly because both axes lose
+# fractional bits.
+
+_FP16_REL = 1e-2  # 1% relative tolerance (TorchRadon precedent)
+
+
+def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    diff = (actual.float() - expected.float()).abs().max().item()
+    scale = expected.abs().max().item() + 1e-12
+    return diff / scale
+
+
+def test_parallel_projector_forward_fp16_matches_fp32(workload):
+    vol, _, ang = workload
+    sino_fp32 = ft.forward_project(vol, ang)
+    proj = ft.ParallelProjector(vol.shape, ang, device=vol.device)
+    sino_fp16 = proj.forward(vol.half())
+    assert sino_fp16.dtype == torch.float16
+    assert proj.dtype == torch.float16
+    assert _rel_err(sino_fp16, sino_fp32) < _FP16_REL
+
+
+def test_parallel_projector_back_fp16_matches_fp32(workload):
+    _, sino, ang = workload
+    Ny, N_det = sino.shape[1], sino.shape[2]
+    vol_fp32 = ft.back_project(sino, ang)
+    proj = ft.ParallelProjector((Ny, N_det, N_det), ang, device=sino.device)
+    vol_fp16 = proj.back(sino.half())
+    assert vol_fp16.dtype == torch.float16
+    assert _rel_err(vol_fp16, vol_fp32) < _FP16_REL
+
+
+def test_rotmat_projector_forward_fp16_matches_fp32(workload):
+    vol, _, ang = workload
+    n_angles = ang.numel()
+    euler = torch.zeros(n_angles, 3, device=vol.device, dtype=torch.float32)
+    euler[:, 1] = ang
+    mats = _euler_zyz_to_rotmat(euler)
+    sino_fp32 = ft.forward_project_3d(vol, euler, N_det=vol.shape[-1])
+    proj = ft.RotmatProjector(vol.shape, n_angles, device=vol.device)
+    sino_fp16 = proj.forward(vol.half(), mats)
+    assert sino_fp16.dtype == torch.float16
+    assert _rel_err(sino_fp16, sino_fp32) < _FP16_REL
+
+
+def test_rotmat_projector_back_fp16_matches_fp32(workload):
+    _, sino, ang = workload
+    n_angles, Ny, N_det = sino.shape
+    euler = torch.zeros(n_angles, 3, device=sino.device, dtype=torch.float32)
+    euler[:, 1] = ang
+    mats = _euler_zyz_to_rotmat(euler)
+    vol_fp32 = ft.back_project_3d(sino, euler)
+    proj = ft.RotmatProjector((Ny, N_det, N_det), n_angles, device=sino.device)
+    vol_fp16 = proj.back(sino.half(), mats)
+    assert vol_fp16.dtype == torch.float16
+    assert _rel_err(vol_fp16, vol_fp32) < _FP16_REL
+
+
+def test_projector_dtype_lock_in_raises(workload):
+    """A projector locks its dtype on first FP/BP call. Calling with a
+    mismatched dtype afterwards raises a clear TypeError."""
+    vol, _, ang = workload
+    proj = ft.ParallelProjector(vol.shape, ang, device=vol.device)
+    _ = proj.forward(vol)              # locks fp32
+    with pytest.raises(TypeError, match="dtype lock-in"):
+        proj.forward(vol.half())

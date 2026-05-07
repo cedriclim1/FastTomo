@@ -57,6 +57,35 @@ def _resolve_num_threads(num_threads: int | None) -> int:
     return 1
 
 
+# ── dtype dispatch ─────────────────────────────────────────────────────────
+#
+# The 4 in-scope projection ops (FP/BP scalar + FP/BP rotmat) preserve the
+# I/O dtype of the input tensor. On CUDA the kernels are templated on
+# float32 / __half (single-channel fp16 textures, fp32 accumulators). On CPU
+# kernels stay fp32 only — fp16 inputs are upcast on entry and the output is
+# downcast back to the user's dtype. BF16 raises (no native CUDA texture
+# support; see fasttomo-wiki/wiki/concepts/half-precision-projection.md).
+
+def _io_dtype_code(t: torch.Tensor) -> int:
+    """Map a tensor dtype to the io_dtype int the bindings expect.
+    Returns 0 for float32, 1 for float16. Raises on bfloat16 (no native
+    CUDA texture support) and other unsupported dtypes."""
+    if t.dtype == torch.float32:
+        return 0
+    if t.dtype == torch.float16:
+        return 1
+    if t.dtype == torch.bfloat16:
+        raise TypeError(
+            "FastTomo projection ops do not support torch.bfloat16: CUDA "
+            "textures have no BF16 channel descriptor. Cast to torch.float16 "
+            "(half precision, mirrors TorchRadon) or torch.float32."
+        )
+    raise TypeError(
+        f"FastTomo projection ops only support float32 and float16 "
+        f"(got {t.dtype}). BF16 is intentionally not supported."
+    )
+
+
 # ── ZYZ Euler → rotation matrix ──────────────────────────────────────────────
 
 def _euler_zyz_to_rotmat(euler_zyz_deg: torch.Tensor) -> torch.Tensor:
@@ -108,6 +137,7 @@ def _forward_project_raw(
     angles_deg: torch.Tensor,
     N_det: int = -1,
 ) -> torch.Tensor:
+    io_dtype = _io_dtype_code(volume)
     if volume.is_cuda:
         if not _core.cuda_available:
             raise RuntimeError("fasttomo was compiled without CUDA support")
@@ -115,11 +145,12 @@ def _forward_project_raw(
         n_angles   = angles_deg.numel()
         if N_det < 0:
             N_det = Nx
-        vol  = volume.contiguous().float()
+        vol  = volume.contiguous()
         sino = torch.empty(n_angles, Ny, N_det,
-                           dtype=torch.float32, device=volume.device)
+                           dtype=volume.dtype, device=volume.device)
         cos_t, sin_t = _trig_on_device(angles_deg, volume.device)
         _core.forward_project_cuda(
+            io_dtype,
             vol.data_ptr(), sino.data_ptr(),
             cos_t.data_ptr(), sin_t.data_ptr(),
             Ny, Nz, Nx, n_angles, N_det,
@@ -127,10 +158,12 @@ def _forward_project_raw(
         )
         return sino
 
+    # CPU: kernel is fp32-only; upcast on entry, downcast on exit.
     angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
     vol_np  = volume.detach().float().numpy()
     sino_np = _core.forward_project_cpu(vol_np, angles_np, N_det)
-    return torch.from_numpy(sino_np)
+    out = torch.from_numpy(sino_np)
+    return out.to(volume.dtype) if volume.dtype != torch.float32 else out
 
 
 def _back_project_raw(
@@ -138,6 +171,7 @@ def _back_project_raw(
     angles_deg: torch.Tensor,
     Nz: int = -1,
 ) -> torch.Tensor:
+    io_dtype = _io_dtype_code(sinogram)
     if sinogram.is_cuda:
         if not _core.cuda_available:
             raise RuntimeError("fasttomo was compiled without CUDA support")
@@ -145,11 +179,12 @@ def _back_project_raw(
         Nx = N_det
         if Nz < 0:
             Nz = N_det
-        sino = sinogram.contiguous().float()
+        sino = sinogram.contiguous()
         vol  = torch.empty(Ny, Nz, Nx,
-                           dtype=torch.float32, device=sinogram.device)
+                           dtype=sinogram.dtype, device=sinogram.device)
         cos_t, sin_t = _trig_on_device(angles_deg, sinogram.device)
         _core.back_project_cuda(
+            io_dtype,
             sino.data_ptr(), vol.data_ptr(),
             cos_t.data_ptr(), sin_t.data_ptr(),
             Ny, Nz, Nx, n_angles, N_det,
@@ -157,10 +192,12 @@ def _back_project_raw(
         )
         return vol
 
+    # CPU: fp32-only; upcast on entry, downcast on exit.
     angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
     sino_np = sinogram.detach().float().numpy()
     vol_np  = _core.back_project_cpu(sino_np, angles_np, Nz)
-    return torch.from_numpy(vol_np)
+    out = torch.from_numpy(vol_np)
+    return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
 
 
 def _forward_project_3d_raw(
@@ -196,7 +233,11 @@ def _forward_project_3d_mats_raw(
     """3D rotmat FP that bypasses the euler→rotmat step (mats already given).
     Used by _FP3D's autograd Function so the conversion lives in PyTorch.
     Dispatches to CPU or CUDA based on `volume.device`. ``num_threads`` only
-    applies to the CPU path (the CUDA kernel manages its own grid)."""
+    applies to the CPU path (the CUDA kernel manages its own grid).
+
+    Preserves the volume's dtype on the output sinogram. Matrices stay
+    float32. CPU path upcasts fp16 inputs to fp32 internally."""
+    io_dtype = _io_dtype_code(volume)
     Ny, Nz, Nx = volume.shape
     n_angles = mats_flat.shape[0]
     if N_det < 0:
@@ -205,9 +246,10 @@ def _forward_project_3d_mats_raw(
     if volume.is_cuda:
         if not _core.cuda_available:
             raise RuntimeError("fasttomo was compiled without CUDA support")
-        vol  = volume.contiguous().float()
-        sino = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
+        vol  = volume.contiguous()
+        sino = torch.empty(n_angles, Ny, N_det, dtype=volume.dtype, device=vol.device)
         _core.forward_project_rotmat_cuda(
+            io_dtype,
             vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
             Ny, Nz, Nx, n_angles, N_det,
             _stream_ptr(vol.device),
@@ -218,7 +260,8 @@ def _forward_project_3d_mats_raw(
     vol_np  = volume.detach().contiguous().float().numpy()
     mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
     sino_np = _core.forward_project_3d_cpu(vol_np, mats_np, N_det, nt)
-    return torch.from_numpy(sino_np)
+    out = torch.from_numpy(sino_np)
+    return out.to(volume.dtype) if volume.dtype != torch.float32 else out
 
 
 def _back_project_3d_mats_raw(
@@ -229,7 +272,9 @@ def _back_project_3d_mats_raw(
 ) -> torch.Tensor:
     """Adjoint of _forward_project_3d_mats_raw — used inside _FP3D.backward.
     Dispatches to CPU or CUDA based on `sinogram.device`. ``num_threads`` only
-    applies to the CPU path."""
+    applies to the CPU path. Preserves the sinogram's dtype on the output
+    volume."""
+    io_dtype = _io_dtype_code(sinogram)
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
@@ -238,9 +283,10 @@ def _back_project_3d_mats_raw(
     if sinogram.is_cuda:
         if not _core.cuda_available:
             raise RuntimeError("fasttomo was compiled without CUDA support")
-        sino = sinogram.contiguous().float()
-        vol  = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
+        sino = sinogram.contiguous()
+        vol  = torch.empty(Ny, Nz, Nx, dtype=sinogram.dtype, device=sino.device)
         _core.back_project_rotmat_cuda(
+            io_dtype,
             sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
             Ny, Nz, Nx, n_angles, N_det,
             _stream_ptr(sino.device),
@@ -251,7 +297,8 @@ def _back_project_3d_mats_raw(
     sino_np = sinogram.detach().contiguous().float().numpy()
     mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
     vol_np  = _core.back_project_3d_cpu(sino_np, mats_np, Nz, nt)
-    return torch.from_numpy(vol_np)
+    out = torch.from_numpy(vol_np)
+    return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
 
 
 def _grad_rotmat_raw(
@@ -266,6 +313,10 @@ def _grad_rotmat_raw(
     through `_euler_zyz_to_rotmat` to give ∂L/∂euler_zyz_deg. Dispatches to
     CPU or CUDA based on `volume.device`. ``num_threads`` only applies to
     the CPU path.
+
+    Always runs in fp32 (gradient kernels stay at full precision); fp16
+    inputs are upcast on entry. Output grad is fp32 — autograd's chain rule
+    will downcast as needed.
     """
     n_angles = mats_flat.shape[0]
     Ny, Nz, Nx = volume.shape
@@ -303,6 +354,12 @@ def _forward_project_resire_raw(
         )
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
+    if volume.dtype != torch.float32:
+        raise TypeError(
+            f"forward_project_resire is fp32-only (got {volume.dtype}). The "
+            f"RESIRE voxel-scatter projector with atomicAdd is intentionally "
+            f"out of scope for the fp16 path."
+        )
 
     Ny, Nz, Nx = volume.shape
     n_angles = euler_zyz_deg.shape[0]
@@ -334,6 +391,12 @@ def _back_project_resire_raw(
         )
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
+    if sinogram.dtype != torch.float32:
+        raise TypeError(
+            f"back_project_resire is fp32-only (got {sinogram.dtype}). The "
+            f"RESIRE voxel-scatter projector with atomicAdd is intentionally "
+            f"out of scope for the fp16 path."
+        )
 
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
