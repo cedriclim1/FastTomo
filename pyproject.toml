@@ -16,7 +16,7 @@ cmake.build-type = "Release"
 wheel.packages = ["fasttomo"]
 
 [tool.cibuildwheel]
-build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+build = "cp312-* cp313-*"
 skip = "pp* *-musllinux* *-win32"
 archs = ["auto64"]
 test-command = "python -c 'import torch, fasttomo as ft; vol=torch.zeros(1,16,16); ang=torch.linspace(-60,60,12); sino=ft.forward_project(vol, ang); assert sino.shape == (12, 1, 16)'"
