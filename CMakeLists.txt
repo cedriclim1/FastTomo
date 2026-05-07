@@ -28,20 +28,41 @@ for base in nvidia.__path__:
             ERROR_QUIET
         )
         if(_PIP_CUDA_ROOT)
-            message(STATUS "Detected pip-installed CUDA toolkit at ${_PIP_CUDA_ROOT}")
-            set(CUDAToolkit_ROOT "${_PIP_CUDA_ROOT}" CACHE PATH "")
-            set(CMAKE_CUDA_COMPILER "${_PIP_CUDA_ROOT}/bin/nvcc" CACHE FILEPATH "")
+            set(_PIP_CUDA_ROOT_USABLE TRUE)
             # cu13 wheels ship versioned libs only (libcudart.so.13); seed the
             # unversioned symlink that CMake's find_library expects.
             file(GLOB _cudart_versioned "${_PIP_CUDA_ROOT}/lib/libcudart.so.*")
             if(_cudart_versioned AND NOT EXISTS "${_PIP_CUDA_ROOT}/lib/libcudart.so")
                 list(GET _cudart_versioned 0 _cudart_first)
-                file(CREATE_LINK "${_cudart_first}" "${_PIP_CUDA_ROOT}/lib/libcudart.so" SYMBOLIC)
+                file(
+                    CREATE_LINK "${_cudart_first}" "${_PIP_CUDA_ROOT}/lib/libcudart.so"
+                    SYMBOLIC
+                    RESULT _cudart_link_result
+                )
+                if(NOT _cudart_link_result STREQUAL "0")
+                    set(_PIP_CUDA_ROOT_USABLE FALSE)
+                    message(WARNING "Unable to create libcudart.so link in ${_PIP_CUDA_ROOT}/lib: ${_cudart_link_result}")
+                endif()
             endif()
             # nvcc's device link step searches `<root>/lib64/`; the wheel uses
             # `lib/`. Add a sibling symlink so -lcudadevrt etc. resolve.
-            if(NOT EXISTS "${_PIP_CUDA_ROOT}/lib64")
-                file(CREATE_LINK "lib" "${_PIP_CUDA_ROOT}/lib64" SYMBOLIC)
+            if(_PIP_CUDA_ROOT_USABLE AND NOT EXISTS "${_PIP_CUDA_ROOT}/lib64")
+                file(
+                    CREATE_LINK "lib" "${_PIP_CUDA_ROOT}/lib64"
+                    SYMBOLIC
+                    RESULT _lib64_link_result
+                )
+                if(NOT _lib64_link_result STREQUAL "0")
+                    set(_PIP_CUDA_ROOT_USABLE FALSE)
+                    message(WARNING "Unable to create lib64 link in ${_PIP_CUDA_ROOT}: ${_lib64_link_result}")
+                endif()
+            endif()
+            if(_PIP_CUDA_ROOT_USABLE)
+                message(STATUS "Detected pip-installed CUDA toolkit at ${_PIP_CUDA_ROOT}")
+                set(CUDAToolkit_ROOT "${_PIP_CUDA_ROOT}" CACHE PATH "")
+                set(CMAKE_CUDA_COMPILER "${_PIP_CUDA_ROOT}/bin/nvcc" CACHE FILEPATH "")
+            else()
+                message(STATUS "Skipping pip CUDA auto-detect because toolkit links could not be prepared")
             endif()
         endif()
     endif()
