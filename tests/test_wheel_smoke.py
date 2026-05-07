@@ -12,6 +12,7 @@ cudart linkage actually works at runtime.
 """
 
 import os
+import importlib
 
 import pytest
 import torch
@@ -22,6 +23,10 @@ import fasttomo._core as _core
 
 def test_package_imports():
     assert hasattr(_core, "cuda_available")
+
+def test_legacy_torch_ops_submodule_import():
+    mod = importlib.import_module("fasttomo.torch_ops")
+    assert hasattr(mod, "run_sirt")
 
 
 def test_cuda_available_matches_env():
