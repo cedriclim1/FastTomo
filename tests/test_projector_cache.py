@@ -80,6 +80,17 @@ def test_rotmat_projector_forward_matches_functional(workload):
         torch.testing.assert_close(sino_cached, sino_func, rtol=0, atol=1e-5)
 
 
+def test_run_fbp_projector_matches_functional(workload):
+    _, sino, ang = workload
+    n_angles, Ny, N_det = sino.shape
+    proj = ft.ParallelProjector((Ny, N_det, N_det), ang, device=sino.device)
+
+    rec_func = ft.run_fbp(sino, ang, positivity=True, mask=True)
+    for _ in range(5):
+        rec_cached = ft.run_fbp(sino, ang, positivity=True, mask=True, projector=proj)
+        torch.testing.assert_close(rec_cached, rec_func, rtol=0, atol=1e-5)
+
+
 def test_rotmat_projector_back_matches_functional(workload):
     _, sino, ang = workload
     n_angles, Ny, N_det = sino.shape

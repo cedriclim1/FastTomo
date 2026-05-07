@@ -461,6 +461,7 @@ def run_fbp(
     Nz: int = -1,
     positivity: bool = False,
     mask: bool = False,
+    projector: object | None = None,
 ) -> torch.Tensor:
     """
     Filtered Back-Projection.
@@ -468,9 +469,20 @@ def run_fbp(
     Applies ramp filter to each sinogram row then back-projects.
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
+
+    projector: pass a :class:`ParallelProjector` to reuse a persistent
+    cudaArray + texture handle for the back-projection. The ramp filter
+    coefficients are already cached per (N_det, device, dtype) in
+    ``_RAMP_FILTER_CACHE``, so handing in a projector closes the remaining
+    per-call BP texture-init cost. Numerics are bit-identical to the
+    functional path. Geometry must match: the projector's ``angles_deg``
+    replaces the ``angles_deg`` argument for BP.
     """
     filtered = ramp_filter(sinogram)
-    volume   = back_project(filtered, angles_deg, Nz=Nz)
+    if projector is not None:
+        volume = projector.back(filtered)
+    else:
+        volume = back_project(filtered, angles_deg, Nz=Nz)
     # angular sampling normalisation: π / n_angles
     volume   = volume * (math.pi / len(angles_deg))
     if positivity:
