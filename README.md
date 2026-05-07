@@ -10,7 +10,7 @@ All public functions accept and return `torch.Tensor` (float32). Forward and bac
 - A C/C++ compiler with OpenMP (Linux: gcc; macOS: `brew install libomp`)
 - CMake ≥ 3.18
 - PyTorch (`pip install torch`)
-- **For the CUDA backend only:** `nvcc` on `PATH` and matching CUDA runtime headers. The simplest way is conda: `conda install -c nvidia cuda-nvcc cuda-cudart-dev`.
+- **For the CUDA backend only:** `nvcc` on `PATH` and matching CUDA runtime headers. The simplest way is conda: `conda install -c nvidia cuda-nvcc cuda-cudart-dev`. Both CUDA 12.x and 13.x toolkits are supported for source builds; the released wheels are built with CUDA 13.0.
 
 The build auto-detects CUDA: if `nvcc` is found it builds the CUDA backend, otherwise it falls back to a CPU-only build silently.
 
