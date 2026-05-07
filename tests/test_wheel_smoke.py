@@ -27,10 +27,12 @@ def test_split_modules_import():
     import fasttomo.projection as projection
     import fasttomo.utilities as utilities
     import fasttomo.algorithms as algorithms
+    import fasttomo.torch_ops as torch_ops
 
     assert hasattr(projection, "forward_project")
     assert hasattr(utilities, "ramp_filter")
     assert hasattr(algorithms, "run_sirt")
+    assert hasattr(torch_ops, "run_sirt")
 
 
 def test_cuda_available_matches_env():
