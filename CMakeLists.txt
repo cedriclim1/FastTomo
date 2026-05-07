@@ -15,6 +15,7 @@ endif()
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
+find_package(OpenMP REQUIRED)
 
 set(CORE_SOURCES
     csrc/bindings.cpp
@@ -27,6 +28,7 @@ endif()
 
 pybind11_add_module(_core ${CORE_SOURCES})
 target_include_directories(_core PRIVATE csrc)
+target_link_libraries(_core PRIVATE OpenMP::OpenMP_C)
 
 if(FASTTOMO_CUDA)
     find_package(CUDAToolkit REQUIRED)

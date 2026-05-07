@@ -27,7 +27,7 @@ from tqdm.auto import tqdm
 import fasttomo._core as _core
 from fasttomo.autograd import (
     _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
-    _euler_zyz_to_rotmat,
+    _euler_zyz_to_rotmat, _resolve_num_threads,
 )
 
 
@@ -84,6 +84,7 @@ def forward_project_3d(
     euler_zyz_deg: torch.Tensor,                # [n_angles, 3] — (φ, θ, ψ) degrees
     N_det: int = -1,
     shifts: torch.Tensor | None = None,         # [n_angles, 2] — optional per-tilt detector-plane shifts (px)
+    num_threads: int | None = None,             # CPU only; resolution: kwarg → OMP_NUM_THREADS → 1
 ) -> torch.Tensor:
     """
     3D rotation-matrix forward projection (CPU + CUDA).
@@ -103,9 +104,13 @@ def forward_project_3d(
 
     Returns sinogram [n_angles, Ny, N_det] on the same device as ``volume``.
     Same shape convention as forward_project so algorithms can swap projectors
-    transparently. The CPU path uses explicit trilinear interpolation and is
-    O(10×) slower than the CUDA texture path — useful for testing on hosts
-    without a GPU.
+    transparently. The CPU path uses explicit trilinear interpolation; pass
+    ``num_threads=N`` to opt into OpenMP parallelism. Default behavior is
+    serial (single-threaded) so reconstructions don't silently grab cores.
+
+    ``num_threads`` resolution: explicit kwarg → ``OMP_NUM_THREADS`` env →
+    fall back to 1. The CUDA path ignores ``num_threads`` (the kernel
+    manages its own grid).
 
     Differentiable w.r.t. ``volume``, ``euler_zyz_deg``, and ``shifts`` on
     both devices: backward calls back_project_3d for the volume gradient and
@@ -115,8 +120,9 @@ def forward_project_3d(
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
+    nt = _resolve_num_threads(num_threads)
     mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    sino = _FP3D.apply(volume, mats, N_det)
+    sino = _FP3D.apply(volume, mats, N_det, nt)
     if shifts is not None:
         sino = apply_shifts_2d(sino, shifts)
     return sino
@@ -126,6 +132,7 @@ def back_project_3d(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
     Nz: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     3D rotation-matrix back-projection (CPU + CUDA).
@@ -134,12 +141,15 @@ def back_project_3d(
     the sinogram at its rotated detector position for every projection.
 
     Returns volume [Ny, Nz, Nx] on the same device as ``sinogram``.
+    Pass ``num_threads=N`` to opt into OpenMP parallelism on the CPU path
+    (default 1 — serial). Resolution order: kwarg → OMP_NUM_THREADS → 1.
 
     Differentiable w.r.t. ``sinogram``: backward calls forward_project_3d.
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    return _BP3D.apply(sinogram, euler_zyz_deg, Nz)
+    nt = _resolve_num_threads(num_threads)
+    return _BP3D.apply(sinogram, euler_zyz_deg, Nz, nt)
 
 
 def forward_project_resire(
@@ -309,6 +319,7 @@ def estimate_shifts_xcorr(
     upsample_factor: int = 10,                  # reserved; parabolic fit used today
     max_shift: float | None = None,
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — CUDA only
+    num_threads: int | None = None,             # CPU 3D path only
 ) -> torch.Tensor:                              # [n_angles] float32, CPU
     """
     Estimate the translational shift of each projection (along the detector
@@ -336,7 +347,7 @@ def estimate_shifts_xcorr(
     N_det = sinogram.shape[-1]
 
     if euler_zyz_deg is not None:
-        pred = forward_project_3d(volume, euler_zyz_deg)
+        pred = forward_project_3d(volume, euler_zyz_deg, num_threads=num_threads)
     else:
         pred = forward_project(volume, angles_deg)
 
@@ -515,6 +526,7 @@ def run_sirt(
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
     return_loss: bool = False,
     sparsity: float = 0.0,
+    num_threads: int | None = None,             # CPU 3D path only
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
@@ -526,7 +538,8 @@ def run_sirt(
 
     euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
     (forward_project_3d / back_project_3d) instead of the scalar-angle
-    single-axis projector. CUDA only when set.
+    single-axis projector. ``num_threads`` is forwarded to the CPU 3D
+    kernels (kwarg → OMP_NUM_THREADS → 1).
 
     return_loss: if True, returns (volume, loss_history) where loss_history
     is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
@@ -547,8 +560,8 @@ def run_sirt(
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
     if euler_zyz_deg is not None:
-        _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det)
-        _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz)
+        _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
+        _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
     else:
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
         _bp = lambda s: back_project(s, angles_deg, Nz=Nz)
@@ -878,6 +891,7 @@ def refine_angles(
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — ZYZ mode (CUDA)
     search_range_deg: float = 3.0,
     n_steps: int = 31,
+    num_threads: int | None = None,             # CPU 3D path only
 ) -> torch.Tensor:
     """
     RESIRE angular refinement — brute-force grid search per projection.
@@ -951,7 +965,8 @@ def refine_angles(
 
                 # forward project at all n_steps orientations → [n_steps, Ny, N_det]
                 projs = forward_project_3d(
-                    volume, euler_batch.to(sinogram.device), N_det=N_det
+                    volume, euler_batch.to(sinogram.device), N_det=N_det,
+                    num_threads=num_threads,
                 )
                 residuals = (projs - measured_j.unsqueeze(0)).abs().sum(dim=(-2, -1))
                 refined[j, axis] = candidates[residuals.div(normalizer).argmin()]
@@ -1069,6 +1084,7 @@ def run_grad_descent(
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — 3D mode (CUDA)
     use_resire_projector: bool = False,
     return_loss: bool = False,
+    num_threads: int | None = None,             # CPU 3D path only
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Reference autograd-based reconstruction.
@@ -1135,7 +1151,7 @@ def run_grad_descent(
         if use_resire_projector:
             _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
         else:
-            _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det)
+            _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
     else:
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
 

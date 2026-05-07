@@ -26,11 +26,35 @@ See: fasttomo-wiki/wiki/concepts/autograd-projectors.md
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import torch
 
 import fasttomo._core as _core
+
+
+# ── thread-count resolution ──────────────────────────────────────────────────
+#
+# Resolution order for the CPU 3D rotmat kernels:
+#   1. Explicit num_threads kwarg on the Python call
+#   2. OMP_NUM_THREADS environment variable
+#   3. 1 (serial)
+#
+# Step 3 is deliberate — OpenMP's stock default of `omp_get_max_threads()`
+# (≈ all cores) would silently parallelize when the user didn't ask. The
+# library defaults to predictable serial execution; the caller opts in.
+
+def _resolve_num_threads(num_threads: int | None) -> int:
+    if num_threads is not None:
+        return max(1, int(num_threads))
+    env = os.environ.get("OMP_NUM_THREADS")
+    if env is not None and env.strip():
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    return 1
 
 
 # ── ZYZ Euler → rotation matrix ──────────────────────────────────────────────
@@ -143,32 +167,36 @@ def _forward_project_3d_raw(
     volume: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
     N_det: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=volume.device)
     n_angles  = euler_zyz_deg.shape[0]
     mats_flat = mats.reshape(n_angles, 9).contiguous()
-    return _forward_project_3d_mats_raw(volume, mats_flat, N_det)
+    return _forward_project_3d_mats_raw(volume, mats_flat, N_det, num_threads)
 
 
 def _back_project_3d_raw(
     sinogram: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=sinogram.device)
     n_angles  = euler_zyz_deg.shape[0]
     mats_flat = mats.reshape(n_angles, 9).contiguous()
-    return _back_project_3d_mats_raw(sinogram, mats_flat, Nz)
+    return _back_project_3d_mats_raw(sinogram, mats_flat, Nz, num_threads)
 
 
 def _forward_project_3d_mats_raw(
     volume: torch.Tensor,
     mats_flat: torch.Tensor,   # [n_angles, 9] float32, on volume.device
     N_det: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """3D rotmat FP that bypasses the euler→rotmat step (mats already given).
     Used by _FP3D's autograd Function so the conversion lives in PyTorch.
-    Dispatches to CPU or CUDA based on `volume.device`."""
+    Dispatches to CPU or CUDA based on `volume.device`. ``num_threads`` only
+    applies to the CPU path (the CUDA kernel manages its own grid)."""
     Ny, Nz, Nx = volume.shape
     n_angles = mats_flat.shape[0]
     if N_det < 0:
@@ -186,9 +214,10 @@ def _forward_project_3d_mats_raw(
         )
         return sino
 
+    nt = _resolve_num_threads(num_threads)
     vol_np  = volume.detach().contiguous().float().numpy()
     mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
-    sino_np = _core.forward_project_3d_cpu(vol_np, mats_np, N_det)
+    sino_np = _core.forward_project_3d_cpu(vol_np, mats_np, N_det, nt)
     return torch.from_numpy(sino_np)
 
 
@@ -196,9 +225,11 @@ def _back_project_3d_mats_raw(
     sinogram: torch.Tensor,
     mats_flat: torch.Tensor,   # [n_angles, 9] float32, on sinogram.device
     Nz: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """Adjoint of _forward_project_3d_mats_raw — used inside _FP3D.backward.
-    Dispatches to CPU or CUDA based on `sinogram.device`."""
+    Dispatches to CPU or CUDA based on `sinogram.device`. ``num_threads`` only
+    applies to the CPU path."""
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
@@ -216,9 +247,10 @@ def _back_project_3d_mats_raw(
         )
         return vol
 
+    nt = _resolve_num_threads(num_threads)
     sino_np = sinogram.detach().contiguous().float().numpy()
     mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
-    vol_np  = _core.back_project_3d_cpu(sino_np, mats_np, Nz)
+    vol_np  = _core.back_project_3d_cpu(sino_np, mats_np, Nz, nt)
     return torch.from_numpy(vol_np)
 
 
@@ -226,12 +258,14 @@ def _grad_rotmat_raw(
     volume: torch.Tensor,
     grad_sino: torch.Tensor,
     mats_flat: torch.Tensor,   # [n_angles, 9] float32, on volume.device
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Returns [n_angles, 9] gradient of the loss w.r.t. the rotation-matrix
     entries used by forward_project_3d. PyTorch autograd then chains this
     through `_euler_zyz_to_rotmat` to give ∂L/∂euler_zyz_deg. Dispatches to
-    CPU or CUDA based on `volume.device`.
+    CPU or CUDA based on `volume.device`. ``num_threads`` only applies to
+    the CPU path.
     """
     n_angles = mats_flat.shape[0]
     Ny, Nz, Nx = volume.shape
@@ -250,10 +284,11 @@ def _grad_rotmat_raw(
         )
         return grad_mats
 
+    nt = _resolve_num_threads(num_threads)
     vol_np  = volume.detach().contiguous().float().numpy()
     gs_np   = grad_sino.detach().contiguous().float().numpy()
     mats_np = mats_flat.detach().contiguous().float().cpu().numpy()
-    grad_np = _core.grad_rotmat_cpu(vol_np, gs_np, mats_np)
+    grad_np = _core.grad_rotmat_cpu(vol_np, gs_np, mats_np, nt)
     return torch.from_numpy(grad_np)
 
 
@@ -399,16 +434,23 @@ class _FP3D(torch.autograd.Function):
     `volume` and the rotation matrix `mats` ([n_angles, 3, 3]). The Euler →
     rotmat conversion lives in pure PyTorch (`_euler_zyz_to_rotmat`) outside
     this Function, so autograd chains ∂L/∂M into ∂L/∂euler_zyz_deg.
+
+    ``num_threads`` is the resolved CPU OpenMP thread count; CUDA path ignores
+    it. It is stashed on ctx so the backward (BP + grad_rotmat) uses the same
+    parallelism the forward did.
     """
 
     @staticmethod
-    def forward(ctx, volume, mats, N_det):
+    def forward(ctx, volume, mats, N_det, num_threads):
         mats_flat = mats.detach().reshape(-1, 9).contiguous().to(
             device=volume.device, dtype=torch.float32
         )
         ctx.save_for_backward(volume.detach(), mats_flat)
         ctx.Nz = volume.shape[-2]
-        return _forward_project_3d_mats_raw(volume.detach(), mats_flat, N_det)
+        ctx.num_threads = num_threads
+        return _forward_project_3d_mats_raw(
+            volume.detach(), mats_flat, N_det, num_threads
+        )
 
     @staticmethod
     def backward(ctx, grad_sino):
@@ -416,25 +458,33 @@ class _FP3D(torch.autograd.Function):
         grad_sino = grad_sino.contiguous()
         grad_vol = None
         if ctx.needs_input_grad[0]:
-            grad_vol = _back_project_3d_mats_raw(grad_sino, mats_flat, Nz=ctx.Nz)
+            grad_vol = _back_project_3d_mats_raw(
+                grad_sino, mats_flat, Nz=ctx.Nz, num_threads=ctx.num_threads
+            )
         grad_mats = None
         if ctx.needs_input_grad[1]:
-            grad_mats = _grad_rotmat_raw(volume, grad_sino, mats_flat).reshape(-1, 3, 3)
-        return grad_vol, grad_mats, None
+            grad_mats = _grad_rotmat_raw(
+                volume, grad_sino, mats_flat, num_threads=ctx.num_threads
+            ).reshape(-1, 3, 3)
+        return grad_vol, grad_mats, None, None
 
 
 class _BP3D(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sinogram, euler_zyz_deg, Nz):
+    def forward(ctx, sinogram, euler_zyz_deg, Nz, num_threads):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.N_det = sinogram.shape[-1]
-        return _back_project_3d_raw(sinogram, euler_zyz_deg, Nz)
+        ctx.num_threads = num_threads
+        return _back_project_3d_raw(sinogram, euler_zyz_deg, Nz, num_threads)
 
     @staticmethod
     def backward(ctx, grad_vol):
         (euler_zyz_deg,) = ctx.saved_tensors
-        grad_sino = _forward_project_3d_raw(grad_vol.contiguous(), euler_zyz_deg, N_det=ctx.N_det)
-        return grad_sino, None, None
+        grad_sino = _forward_project_3d_raw(
+            grad_vol.contiguous(), euler_zyz_deg,
+            N_det=ctx.N_det, num_threads=ctx.num_threads,
+        )
+        return grad_sino, None, None, None
 
 
 class _FPResire(torch.autograd.Function):

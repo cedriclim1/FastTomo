@@ -96,7 +96,8 @@ void forward_project_3d_cpu(
     float       *sinogram,
     const float *matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 );
 
 void back_project_3d_cpu(
@@ -104,7 +105,8 @@ void back_project_3d_cpu(
     float       *volume,
     const float *matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 );
 
 /*
@@ -119,7 +121,8 @@ void grad_rotmat_cpu(
     const float *matrices,
     float       *grad_matrices,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 );
 
 void genfire_gridding_2d_cpu(

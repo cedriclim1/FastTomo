@@ -2,6 +2,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <omp.h>
 
 void forward_project_cpu(
     const float *volume,
@@ -202,7 +203,8 @@ void forward_project_3d_cpu(
     float       *sinogram,   /* [n_angles, Ny, N_det] */
     const float *matrices,   /* [n_angles*9] row-major */
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -210,14 +212,13 @@ void forward_project_3d_cpu(
     float half_z   = (Nz   - 1) * 0.5f;
     int ray_len = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
 
+    #pragma omp parallel for collapse(3) schedule(static) num_threads(num_threads)
     for (int ia = 0; ia < n_angles; ia++) {
-        const float *M = matrices + (size_t)ia * 9;
-        float dxs = M[6], dys = M[7], dzs = M[8];
-
         for (int iv = 0; iv < Ny; iv++) {
-            float v = iv - half_y;
-
             for (int iu = 0; iu < N_det; iu++) {
+                const float *M = matrices + (size_t)ia * 9;
+                float dxs = M[6], dys = M[7], dzs = M[8];
+                float v  = iv - half_y;
                 float u  = iu - half_det;
                 float ox = u * M[0] + v * M[3];
                 float oy = u * M[1] + v * M[4];
@@ -280,7 +281,8 @@ void back_project_3d_cpu(
     float       *volume,     /* [Ny, Nz, Nx] */
     const float *matrices,   /* [n_angles*9] row-major */
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -289,11 +291,12 @@ void back_project_3d_cpu(
 
     memset(volume, 0, (size_t)Ny * Nz * Nx * sizeof(float));
 
+    #pragma omp parallel for collapse(3) schedule(static) num_threads(num_threads)
     for (int iy = 0; iy < Ny; iy++) {
-        float y = iy - half_y;
         for (int iz = 0; iz < Nz; iz++) {
-            float z = iz - half_z;
             for (int ix = 0; ix < Nx; ix++) {
+                float y = iy - half_y;
+                float z = iz - half_z;
                 float x = ix - half_x;
                 float val = 0.0f;
 
@@ -345,7 +348,8 @@ void grad_rotmat_cpu(
     const float *matrices,       /* [n_angles*9] */
     float       *grad_matrices,  /* [n_angles*9] zeroed by this fn */
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 ) {
     float half_det = (N_det - 1) * 0.5f;
     float half_x   = (Nx   - 1) * 0.5f;
@@ -355,6 +359,7 @@ void grad_rotmat_cpu(
 
     for (int k = 0; k < n_angles * 9; k++) grad_matrices[k] = 0.0f;
 
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int ia = 0; ia < n_angles; ia++) {
         const float *M = matrices + (size_t)ia * 9;
         float *gM = grad_matrices + (size_t)ia * 9;

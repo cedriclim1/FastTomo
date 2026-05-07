@@ -480,5 +480,94 @@ def test_run_grad_descent_cpu_converges():
     )
 
 
+# ── 3D rotation-matrix CPU tests ──────────────────────────────────────────
+#
+# The 3D rotmat projector now has CPU OpenMP parallelism. These tests cover
+# (a) numerical equivalence with the scalar-axis projector when φ=ψ=0,
+# (b) approximate adjoint, (c) thread-count invariance of FP output.
+
+def test_fp3d_matches_scalar_fp_cpu():
+    """With φ=ψ=0, forward_project_3d must match the scalar-axis FP.
+
+    Mirrors test_cuda.py::test_fp3d_matches_scalar_fp — same phantom, same
+    absolute tolerance (1e-2). The small residual comes from the 3D
+    diagonal ray-length being slightly longer than the 2D one, so the very
+    last ray step can fall just past the volume face.
+    """
+    N      = 64
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+
+    sino_2d = ft.forward_project(vol, angles)
+
+    euler = torch.zeros(len(angles), 3, dtype=torch.float32)
+    euler[:, 1] = angles
+    sino_3d = ft.forward_project_3d(vol, euler, num_threads=4)
+
+    diff = (sino_2d - sino_3d).abs()
+    assert diff.max().item() < 1e-2, (
+        f"3D FP (pure-Y) disagrees with scalar FP: max_diff={diff.max():.2e}"
+    )
+
+
+def test_fp3d_adjoint_cpu():
+    """<Ax, y> ≈ <x, Aᵀ y> for the CPU 3D pair (approximate adjoint).
+
+    Mirrors test_cuda.py::test_fp3d_bp3d_adjoint — random inputs with pure-Y
+    Euler angles. CPU BP is approximate per CLAUDE.md (~CUDA-comparable).
+    """
+    N      = 32
+    angles = make_angles(20)
+    euler  = torch.zeros(len(angles), 3, dtype=torch.float32)
+    euler[:, 1] = angles
+
+    torch.manual_seed(0)
+    x = torch.randn(1, N, N)
+    y = torch.randn(len(angles), 1, N)
+
+    Ax  = ft.forward_project_3d(x, euler, num_threads=4)
+    ATy = ft.back_project_3d(y, euler, Nz=N, num_threads=4)
+
+    lhs = (Ax * y).sum().item()
+    rhs = (x * ATy).sum().item()
+    rel_err = abs(lhs - rhs) / (abs(lhs) + 1e-12)
+    assert rel_err < 0.75, (
+        f"3D adjoint test failed: <Ax,y>={lhs:.4f} <x,Aᵀy>={rhs:.4f} "
+        f"rel_err={rel_err:.2e}"
+    )
+
+
+def test_fp3d_threading_consistency_cpu():
+    """FP output must be byte-identical across thread counts (no atomics)."""
+    N      = 24
+    Ny     = 3
+    torch.manual_seed(0)
+    angles = make_angles(20, max_deg=60.0)
+    euler  = torch.zeros(len(angles), 3, dtype=torch.float32)
+    euler[:, 1] = angles
+    vol    = torch.randn(Ny, N, N)
+
+    sino_serial = ft.forward_project_3d(vol, euler, num_threads=1)
+    sino_par    = ft.forward_project_3d(vol, euler, num_threads=8)
+
+    assert torch.equal(sino_serial, sino_par), (
+        "FP3D output differs between num_threads=1 and num_threads=8 — "
+        f"max-diff={(sino_serial - sino_par).abs().max().item():.3e}"
+    )
+
+
+def test_fp3d_default_is_serial(monkeypatch):
+    """With no num_threads kwarg and no OMP_NUM_THREADS, kernel runs serial.
+
+    We can't observe thread count directly from Python, but we can verify
+    the resolution helper: it must return 1 in this configuration."""
+    from fasttomo.autograd import _resolve_num_threads
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    assert _resolve_num_threads(None) == 1
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    assert _resolve_num_threads(None) == 8
+    assert _resolve_num_threads(2) == 2   # explicit kwarg wins over env
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

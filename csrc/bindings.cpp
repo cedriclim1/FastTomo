@@ -138,7 +138,8 @@ static f32arr py_grad_angle_cpu(
 static f32arr py_forward_project_3d_cpu(
     const f32arr &volume,    /* [Ny, Nz, Nx] */
     const f32arr &matrices,  /* [n_angles, 9] or [n_angles*9] row-major */
-    int N_det                /* detector width; -1 → use Nx */
+    int N_det,               /* detector width; -1 → use Nx */
+    int num_threads          /* threads for the OpenMP-parallel inner loops */
 ) {
     check_f32(volume, "volume");
     check_f32(matrices, "matrices");
@@ -152,6 +153,7 @@ static f32arr py_forward_project_3d_cpu(
     int Nx       = (int)volume.shape(2);
     int n_angles = (int)matrices.size() / 9;
     if (N_det < 0) N_det = Nx;
+    if (num_threads < 1) num_threads = 1;
 
     auto sinogram = py::array_t<float>({n_angles, Ny, N_det});
     auto out_buf  = sinogram.request();
@@ -160,7 +162,8 @@ static f32arr py_forward_project_3d_cpu(
         static_cast<const float *>(volume.request().ptr),
         static_cast<float *>(out_buf.ptr),
         static_cast<const float *>(matrices.request().ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
     );
     return sinogram;
 }
@@ -168,7 +171,8 @@ static f32arr py_forward_project_3d_cpu(
 static f32arr py_back_project_3d_cpu(
     const f32arr &sinogram,  /* [n_angles, Ny, N_det] */
     const f32arr &matrices,  /* [n_angles, 9] or [n_angles*9] */
-    int Nz                   /* reconstruction depth; -1 → use N_det */
+    int Nz,                  /* reconstruction depth; -1 → use N_det */
+    int num_threads
 ) {
     check_f32(sinogram, "sinogram");
     check_f32(matrices, "matrices");
@@ -180,6 +184,7 @@ static f32arr py_back_project_3d_cpu(
     int N_det    = (int)sinogram.shape(2);
     int Nx       = N_det;
     if (Nz < 0) Nz = N_det;
+    if (num_threads < 1) num_threads = 1;
     if ((int)matrices.size() != n_angles * 9)
         throw std::invalid_argument("matrices size must equal n_angles * 9");
 
@@ -190,7 +195,8 @@ static f32arr py_back_project_3d_cpu(
         static_cast<const float *>(sinogram.request().ptr),
         static_cast<float *>(out_buf.ptr),
         static_cast<const float *>(matrices.request().ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
     );
     return volume;
 }
@@ -198,7 +204,8 @@ static f32arr py_back_project_3d_cpu(
 static f32arr py_grad_rotmat_cpu(
     const f32arr &volume,    /* [Ny, Nz, Nx] */
     const f32arr &grad_sino, /* [n_angles, Ny, N_det] */
-    const f32arr &matrices   /* [n_angles, 9] or [n_angles*9] */
+    const f32arr &matrices,  /* [n_angles, 9] or [n_angles*9] */
+    int num_threads
 ) {
     check_f32(volume, "volume");
     check_f32(grad_sino, "grad_sino");
@@ -213,6 +220,7 @@ static f32arr py_grad_rotmat_cpu(
     int Nx       = (int)volume.shape(2);
     int n_angles = (int)grad_sino.shape(0);
     int N_det    = (int)grad_sino.shape(2);
+    if (num_threads < 1) num_threads = 1;
     if ((int)matrices.size() != n_angles * 9)
         throw std::invalid_argument("matrices size must equal n_angles * 9");
 
@@ -224,7 +232,8 @@ static f32arr py_grad_rotmat_cpu(
         static_cast<const float *>(grad_sino.request().ptr),
         static_cast<const float *>(matrices.request().ptr),
         static_cast<float *>(out_buf.ptr),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
     );
     return grad_mats;
 }
@@ -446,19 +455,25 @@ PYBIND11_MODULE(_core, m) {
     m.def("forward_project_3d_cpu", &py_forward_project_3d_cpu,
           "3D rotation-matrix forward projection (CPU). "
           "volume: [Ny,Nz,Nx]. matrices: [n_angles,9] or [n_angles*9] row-major rotation matrices. "
+          "num_threads: OpenMP thread count for the inner loops (default 1 — serial). "
           "Returns sinogram [n_angles, Ny, N_det].",
-          py::arg("volume"), py::arg("matrices"), py::arg("N_det") = -1);
+          py::arg("volume"), py::arg("matrices"), py::arg("N_det") = -1,
+          py::arg("num_threads") = 1);
 
     m.def("back_project_3d_cpu", &py_back_project_3d_cpu,
           "3D rotation-matrix back-projection (CPU). "
           "sinogram: [n_angles,Ny,N_det]. matrices: [n_angles,9] row-major. "
+          "num_threads: OpenMP thread count (default 1 — serial). "
           "Returns volume [Ny, Nz, Nx].",
-          py::arg("sinogram"), py::arg("matrices"), py::arg("Nz") = -1);
+          py::arg("sinogram"), py::arg("matrices"), py::arg("Nz") = -1,
+          py::arg("num_threads") = 1);
 
     m.def("grad_rotmat_cpu", &py_grad_rotmat_cpu,
           "Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CPU). "
+          "num_threads: OpenMP thread count (default 1 — serial). "
           "Returns [n_angles, 9] gradient.",
-          py::arg("volume"), py::arg("grad_sino"), py::arg("matrices"));
+          py::arg("volume"), py::arg("grad_sino"), py::arg("matrices"),
+          py::arg("num_threads") = 1);
 
     m.def("genfire_gridding_2d_cpu", &py_genfire_gridding_2d_cpu,
           "GENFIRE Fourier gridding (CPU). "
