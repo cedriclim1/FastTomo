@@ -10,13 +10,20 @@ Two flavours:
   ZYZ Euler triple and 2D detector shifts as learnable parameters, each with
   its own Adam optimiser and cosine schedule. Uses ``forward_project_3d``.
 
-Both apply MSE data fidelity, anisotropic Charbonnier-style TV regularisation,
+Both apply MSE data fidelity, isotropic Charbonnier-style TV regularisation,
 and a positivity projection after each step. Defaults match the notebook.
+
+Each function accepts an optional ``tv_fn`` callable so callers can swap
+between the inline pure-PyTorch expression (``_tv_charbonnier``, default for
+historical comparability) and the fused CUDA kernel (``ft.tv_loss_3d``). This
+is what ``benchmarks/run_tv_loss_iterative.py`` uses to measure the end-to-end
+speedup of the fused TV reduction on full reconstruction loops.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -25,8 +32,11 @@ import fasttomo as ft
 from fasttomo.autograd import _euler_zyz_to_rotmat
 
 
+TVFn = Callable[[torch.Tensor], torch.Tensor]
+
+
 def _tv_charbonnier(vol: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Anisotropic Charbonnier TV from opt_test.ipynb."""
+    """Isotropic Charbonnier TV from opt_test.ipynb (pure-PyTorch reference)."""
     dy = vol[1:, :, :] - vol[:-1, :, :]
     dz = vol[:, 1:, :] - vol[:, :-1, :]
     dx = vol[:, :, 1:] - vol[:, :, :-1]
@@ -36,6 +46,11 @@ def _tv_charbonnier(vol: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         + dz[:-1, :, :-1] ** 2
         + eps
     ).sqrt().mean()
+
+
+def _tv_fused(vol: torch.Tensor) -> torch.Tensor:
+    """Fused CUDA isotropic Charbonnier TV via ``ft.tv_loss_3d``."""
+    return ft.tv_loss_3d(vol, eps=1e-8)
 
 
 @dataclass
@@ -54,6 +69,7 @@ def ad_reconstruct(
     n_iter: int = 1000,
     lr: float = 0.05,
     tv_weight: float = 1.0,
+    tv_fn: TVFn = _tv_charbonnier,
 ) -> ADResult:
     """Volume-only AD reconstruction with the static ``forward_project``.
 
@@ -75,7 +91,7 @@ def ad_reconstruct(
     for _ in range(n_iter):
         opt.zero_grad()
         pred = ft.forward_project(vol, angles_deg, N_det=N_det)
-        loss = F.mse_loss(pred, sinogram) + tv_weight * _tv_charbonnier(vol)
+        loss = F.mse_loss(pred, sinogram) + tv_weight * tv_fn(vol)
         losses.append(float(loss.item()))
         loss.backward()
         opt.step()
@@ -96,6 +112,7 @@ def ad_reconstruct_with_pose(
     lr_ang: float = 1.0,
     lr_shf: float = 0.1,
     tv_weight: float = 1.0,
+    tv_fn: TVFn = _tv_charbonnier,
 ) -> ADResult:
     """AD reconstruction that jointly optimises volume, ZYZ Euler triple, and
     per-projection 2D shifts. Uses ``forward_project_3d``.
@@ -130,7 +147,7 @@ def ad_reconstruct_with_pose(
         opt_ang.zero_grad()
         opt_shf.zero_grad()
         pred = ft.forward_project_3d(vol, euler, N_det=N_det, shifts=shifts)
-        loss = F.mse_loss(pred, sinogram) + tv_weight * _tv_charbonnier(vol)
+        loss = F.mse_loss(pred, sinogram) + tv_weight * tv_fn(vol)
         losses.append(float(loss.item()))
         loss.backward()
         opt_vol.step()
@@ -158,6 +175,7 @@ def ad_reconstruct_cached(
     n_iter: int = 1000,
     lr: float = 0.05,
     tv_weight: float = 1.0,
+    tv_fn: TVFn = _tv_charbonnier,
 ) -> ADResult:
     """Same as :func:`ad_reconstruct` but routes FP/BP through ``ParallelProjector``.
 
@@ -182,7 +200,7 @@ def ad_reconstruct_cached(
     for _ in range(n_iter):
         opt.zero_grad()
         pred = proj.forward(vol)
-        loss = F.mse_loss(pred, sinogram) + tv_weight * _tv_charbonnier(vol)
+        loss = F.mse_loss(pred, sinogram) + tv_weight * tv_fn(vol)
         losses.append(float(loss.item()))
         loss.backward()
         opt.step()
@@ -203,6 +221,7 @@ def ad_reconstruct_with_pose_cached(
     lr_ang: float = 1.0,
     lr_shf: float = 0.1,
     tv_weight: float = 1.0,
+    tv_fn: TVFn = _tv_charbonnier,
 ) -> ADResult:
     """Same as :func:`ad_reconstruct_with_pose` but routes FP through
     ``RotmatProjector``. Euler→rotmat conversion stays in pure PyTorch so
@@ -239,7 +258,7 @@ def ad_reconstruct_with_pose_cached(
         mats = _euler_zyz_to_rotmat(euler)                 # [n_angles, 3, 3]
         pred = proj.forward(vol, mats)                     # [n_angles, Ny, N_det]
         pred = ft.apply_shifts_2d(pred, shifts)
-        loss = F.mse_loss(pred, sinogram) + tv_weight * _tv_charbonnier(vol)
+        loss = F.mse_loss(pred, sinogram) + tv_weight * tv_fn(vol)
         losses.append(float(loss.item()))
         loss.backward()
         opt_vol.step()
