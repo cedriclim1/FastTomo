@@ -38,11 +38,11 @@ def gaussian_filter_2d_batched(vol: torch.Tensor, kernel_1d: torch.Tensor) -> to
     but batch the B axis through the channel dim of ``conv2d`` to avoid the Python
     loop while preserving identical numerics.
     """
-    B = vol.shape[0]
     pad = kernel_1d.numel() // 2
     img = vol.unsqueeze(1)  # [B, 1, H, W]
-    w_v = kernel_1d.view(1, 1, -1, 1)
-    w_h = kernel_1d.view(1, 1, 1, -1)
+    k = kernel_1d.to(dtype=vol.dtype)
+    w_v = k.view(1, 1, -1, 1)
+    w_h = k.view(1, 1, 1, -1)
     img = F.conv2d(img, weight=w_v, padding=(pad, 0))
     img = F.conv2d(img, weight=w_h, padding=(0, pad))
     return img.squeeze(1)
@@ -103,7 +103,7 @@ class TorchRadonParallelBeam:
         recon = torch.zeros(Ny, N_det, N_det, device=sinogram.device, dtype=sinogram.dtype)
         scale = math.pi / n_angles
         kernel_1d = (
-            gaussian_kernel_1d(smoothing_sigma).to(sinogram.device)
+            gaussian_kernel_1d(smoothing_sigma).to(device=sinogram.device, dtype=torch.float32)
             if smoothing_sigma is not None
             else None
         )

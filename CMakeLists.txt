@@ -50,6 +50,7 @@ if(FASTTOMO_CUDA)
         csrc/cuda/projection_resire.cu
         csrc/cuda/genfire.cu
         csrc/cuda/grad_angle.cu
+        csrc/cuda/tv_loss.cu
         csrc/cuda/texture_cache.cu
     )
 endif()

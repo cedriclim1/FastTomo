@@ -182,6 +182,32 @@ void grad_angle_cuda(
     cudaStream_t stream
 );
 
+/*
+ * Fused 3-D isotropic Total-Variation loss.
+ *   loss = mean( sqrt( dy² + dz² + dx² + eps ) )
+ * over the (Ny-1)·(Nz-1)·(Nx-1) inner-corner grid. d_acc must be zeroed
+ * by the caller; the kernel atomicAdds Σ s into it. The 1/N normalization
+ * is applied by the Python caller. Backward expects `d_g_scaled[0]` to
+ * already contain `grad_out · 1/N` (single-element device buffer).
+ * d_grad_vol must be zeroed by the caller (kernel writes once per voxel).
+ */
+void tv_loss_iso_3d_cuda(
+    const float *d_vol,
+    float       *d_acc,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+);
+
+void tv_loss_iso_3d_grad_cuda(
+    const float *d_vol,
+    const float *d_g_scaled,
+    float       *d_grad_vol,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+);
+
 void genfire_gridding_2d_cuda(
     const float *fk_real,
     const float *fk_imag,

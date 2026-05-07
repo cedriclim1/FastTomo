@@ -821,5 +821,85 @@ def test_resire_rejects_fp16():
         ft.forward_project_resire(vol, euler)
 
 
+# ── 3-D isotropic TV loss ──────────────────────────────────────────────────
+
+def _tv_reference(vol: torch.Tensor, eps: float) -> torch.Tensor:
+    dy = vol[1:, :, :] - vol[:-1, :, :]
+    dz = vol[:, 1:, :] - vol[:, :-1, :]
+    dx = vol[:, :, 1:] - vol[:, :, :-1]
+    return (dx[:-1, :-1, :] ** 2 + dy[:, :-1, :-1] ** 2
+            + dz[:-1, :, :-1] ** 2 + eps).sqrt().mean()
+
+
+def test_tv_loss_iso_3d_forward_matches_pytorch():
+    """Fused CUDA TV loss matches the pure-PyTorch reference within fp32."""
+    torch.manual_seed(0)
+    vol = torch.randn(16, 24, 20, device=DEVICE) * 5.0
+    eps = 1e-8
+
+    loss_cuda = ft.tv_loss_3d(vol, eps=eps)
+    loss_ref  = _tv_reference(vol, eps)
+
+    rel = (loss_cuda - loss_ref).abs() / loss_ref.abs().clamp_min(1e-12)
+    assert rel.item() < 1e-5, (loss_cuda.item(), loss_ref.item())
+
+
+def test_tv_loss_iso_3d_backward_matches_pytorch():
+    """Fused TV backward matches PyTorch autograd on the closed-form expression."""
+    torch.manual_seed(1)
+    vol_a = torch.randn(12, 14, 10, device=DEVICE, requires_grad=True)
+    vol_b = vol_a.detach().clone().requires_grad_(True)
+    eps = 1e-7  # avoid eps-domination so the gradient signal is meaningful
+
+    loss_a = ft.tv_loss_3d(vol_a, eps=eps)
+    loss_a.backward()
+
+    loss_b = _tv_reference(vol_b, eps)
+    loss_b.backward()
+
+    assert vol_a.grad is not None and vol_b.grad is not None
+    diff  = (vol_a.grad - vol_b.grad).abs().max()
+    scale = vol_b.grad.abs().max().clamp_min(1e-12)
+    assert (diff / scale).item() < 1e-4, (diff.item(), scale.item())
+
+
+def test_tv_loss_iso_3d_chained_backward_matches_pytorch():
+    """Chained loss (data + λ·TV) should yield matching gradients."""
+    torch.manual_seed(2)
+    vol_a = torch.randn(10, 12, 14, device=DEVICE, requires_grad=True)
+    vol_b = vol_a.detach().clone().requires_grad_(True)
+    target = torch.randn(10, 12, 14, device=DEVICE)
+    lam = 0.37
+
+    loss_a = ((vol_a - target) ** 2).mean() + lam * ft.tv_loss_3d(vol_a, eps=1e-7)
+    loss_a.backward()
+    loss_b = ((vol_b - target) ** 2).mean() + lam * _tv_reference(vol_b, 1e-7)
+    loss_b.backward()
+
+    diff  = (vol_a.grad - vol_b.grad).abs().max()
+    scale = vol_b.grad.abs().max().clamp_min(1e-12)
+    assert (diff / scale).item() < 1e-4
+
+
+def test_tv_loss_iso_3d_scalar_shape_and_device():
+    vol = torch.randn(8, 8, 8, device=DEVICE)
+    loss = ft.tv_loss_3d(vol)
+    assert loss.shape == torch.Size([])
+    assert loss.device.type == "cuda"
+    assert loss.dtype == torch.float32
+
+
+def test_tv_loss_iso_3d_rejects_fp16():
+    vol = torch.randn(8, 8, 8, device=DEVICE, dtype=torch.float16)
+    with pytest.raises(TypeError, match="fp32"):
+        ft.tv_loss_3d(vol)
+
+
+def test_tv_loss_iso_3d_rejects_wrong_ndim():
+    vol = torch.randn(8, 8, device=DEVICE)
+    with pytest.raises(ValueError, match="3-D"):
+        ft.tv_loss_3d(vol)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

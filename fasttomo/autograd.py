@@ -560,6 +560,66 @@ class _FPResire(torch.autograd.Function):
         return grad_vol, None, None
 
 
+# ── 3-D isotropic TV loss (fused CUDA kernel) ──────────────────────────────
+
+def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
+    _assert_cuda(volume, "tv_loss_3d")
+    _ensure_fp32(volume, "tv_loss_3d")
+    if volume.ndim != 3:
+        raise ValueError(f"tv_loss_3d expects a 3-D [Ny, Nz, Nx] tensor, "
+                         f"got shape {tuple(volume.shape)}")
+    vol = volume.contiguous()
+    Ny, Nz, Nx = vol.shape
+    acc = torch.zeros(1, dtype=torch.float32, device=vol.device)
+    stream = torch.cuda.current_stream(vol.device).cuda_stream
+    _core.tv_loss_iso_3d_cuda(
+        vol.data_ptr(), acc.data_ptr(),
+        Ny, Nz, Nx, float(eps), stream,
+    )
+    N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))
+    return acc.squeeze(0) / float(N)
+
+
+def _tv_loss_iso_3d_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
+                             eps: float) -> torch.Tensor:
+    vol = volume.contiguous()
+    Ny, Nz, Nx = vol.shape
+    N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))
+    g_scaled = (grad_out.detach().to(dtype=torch.float32, device=vol.device)
+                .reshape(1).contiguous() / float(N))
+    grad_vol = torch.zeros_like(vol)
+    stream = torch.cuda.current_stream(vol.device).cuda_stream
+    _core.tv_loss_iso_3d_grad_cuda(
+        vol.data_ptr(), g_scaled.data_ptr(), grad_vol.data_ptr(),
+        Ny, Nz, Nx, float(eps), stream,
+    )
+    return grad_vol
+
+
+class _TVLossIso3D(torch.autograd.Function):
+    """Fused isotropic 3-D TV loss with analytic gradient.
+
+    Forward returns a scalar tensor (shape ``[]``); backward populates the
+    gradient w.r.t. ``volume`` via a single voxel-driven kernel. Unlike the
+    projection ops, this Function's adjoint is exact (it implements the
+    closed-form gradient of a smooth scalar function), so ``gradcheck``
+    would pass — we still verify against the pure-PyTorch reference instead
+    of relying on it, matching the rest of the test suite.
+    """
+
+    @staticmethod
+    def forward(ctx, volume, eps):
+        ctx.save_for_backward(volume)
+        ctx.eps = float(eps)
+        return _tv_loss_iso_3d_raw(volume, eps)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (volume,) = ctx.saved_tensors
+        grad_vol = _tv_loss_iso_3d_grad_raw(volume, grad_out, ctx.eps)
+        return grad_vol, None
+
+
 # ── cached autograd Functions ───────────────────────────────────────────────
 #
 # Used by ParallelProjector / RotmatProjector. Each Function takes a projector

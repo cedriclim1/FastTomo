@@ -26,7 +26,7 @@ from fasttomo.projection import (
     forward_project_resire,
     back_project_resire,
 )
-from fasttomo.utilities import cylindrical_mask, ramp_filter
+from fasttomo.utilities import cylindrical_mask, ramp_filter, tv_loss_3d
 from fasttomo.projector import ParallelProjector, RotmatProjector
 
 
@@ -819,6 +819,7 @@ def run_grad_descent(
     positivity: bool = False,
     mask: bool = False,
     tv_weight: float = 0.0,
+    tv_eps: float = 1e-8,
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — 3D mode (CUDA)
     use_resire_projector: bool = False,
     return_loss: bool = False,
@@ -849,9 +850,14 @@ def run_grad_descent(
         optimizer_cls:  any torch.optim class (Adam, SGD, LBFGS, …)
         positivity:     project volume onto [0, ∞) after each step
         mask:           apply inscribed-cylinder mask after each step
-        tv_weight:      3-D anisotropic TV regularisation weight; the
-                        penalty is mean(|∂y f|) + mean(|∂z f|) + mean(|∂x f|)
-                        across the full [Ny, Nz, Nx] volume (0.0 disables)
+        tv_weight:      3-D isotropic TV regularisation weight; the
+                        penalty is ``mean(sqrt(∂y² + ∂z² + ∂x² + tv_eps))``
+                        across the inner-corner grid of the volume.
+                        Dispatches to a fused CUDA kernel via
+                        ``fasttomo.tv_loss_3d`` (CPU falls back to pure
+                        PyTorch). 0.0 disables the regularizer.
+        tv_eps:         smoothing constant inside the TV sqrt (default
+                        1e-8); only used when ``tv_weight > 0``.
         euler_zyz_deg:  [n_angles, 3] — switches to the 3D rotmat projector
                         (CUDA only). Mutually exclusive with ``angles_deg``.
         use_resire_projector: with ``euler_zyz_deg``, use the RESIRE 4-pt
@@ -903,12 +909,7 @@ def run_grad_descent(
         sino_pred = _fp(volume)
         loss = ((sino_pred - sinogram) ** 2).mean()
         if tv_weight > 0.0:
-            dy = volume[1:, :, :] - volume[:-1, :, :]
-            dz = volume[:, 1:, :] - volume[:, :-1, :]
-            dx = volume[:, :, 1:] - volume[:, :, :-1]
-            loss = loss + tv_weight * (
-                dy.abs().mean() + dz.abs().mean() + dx.abs().mean()
-            )
+            loss = loss + tv_weight * tv_loss_3d(volume, eps=tv_eps)
         loss.backward()
         return loss
 

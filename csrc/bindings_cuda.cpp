@@ -269,6 +269,35 @@ static void py_back_project_rotmat_cuda_cached(
     );
 }
 
+static void py_tv_loss_iso_3d_cuda(
+    long vol_ptr, long acc_ptr,
+    int Ny, int Nz, int Nx,
+    float eps,
+    long stream_ptr
+) {
+    tv_loss_iso_3d_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(acc_ptr),
+        Ny, Nz, Nx, eps,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_tv_loss_iso_3d_grad_cuda(
+    long vol_ptr, long g_scaled_ptr, long grad_vol_ptr,
+    int Ny, int Nz, int Nx,
+    float eps,
+    long stream_ptr
+) {
+    tv_loss_iso_3d_grad_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<const float *>(g_scaled_ptr),
+        reinterpret_cast<float *>(grad_vol_ptr),
+        Ny, Nz, Nx, eps,
+        to_stream(stream_ptr)
+    );
+}
+
 static void py_genfire_gridding_2d_cuda(
     long fk_real_ptr, long fk_imag_ptr,
     long cos_ptr,     long sin_ptr,
@@ -426,6 +455,24 @@ void register_cuda(py::module_ &m) {
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("tv_loss_iso_3d_cuda", &py_tv_loss_iso_3d_cuda,
+          "Fused 3-D isotropic TV loss (CUDA). Forward: atomicAdd Σ s into "
+          "acc_ptr (single-element fp32 buffer, must be zeroed). Caller "
+          "post-divides by N=(Ny-1)(Nz-1)(Nx-1) to obtain mean(s).",
+          py::arg("vol_ptr"), py::arg("acc_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("eps"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("tv_loss_iso_3d_grad_cuda", &py_tv_loss_iso_3d_grad_cuda,
+          "Backward of tv_loss_iso_3d. g_scaled_ptr: single-element fp32 "
+          "buffer holding grad_out · 1/N. grad_vol_ptr: [Ny, Nz, Nx] fp32 "
+          "output (must be zeroed; kernel writes once per voxel).",
+          py::arg("vol_ptr"), py::arg("g_scaled_ptr"), py::arg("grad_vol_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("eps"),
           py::arg("stream_ptr") = 0L);
 
     m.def("genfire_gridding_2d_cuda", &py_genfire_gridding_2d_cuda,

@@ -74,38 +74,43 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
 
           # Install CUDA toolkit (nvcc + cudart-dev only) inside the manylinux
-          # container before any builds. We use 12.4 — pick any 12.x; the wheel
-          # is cross-CUDA-version-compatible because we exclude libcudart from
-          # the wheel and resolve it from PyTorch at runtime.
+          # container before any builds. We use 13.0 to match the dev env. The
+          # build-time toolkit choice does NOT restrict which torch+cuXX users
+          # can install the wheel against — the wheel is cross-CUDA-version-
+          # compatible because we exclude libcudart and resolve it from PyTorch
+          # at runtime. The toolkit version only affects the minimum NVIDIA
+          # driver and the targeted CUDA architectures (Volta sm_70 dropped in
+          # CUDA 13).
           CIBW_BEFORE_ALL_LINUX: |
             dnf -y install dnf-plugins-core
             dnf config-manager --add-repo \
               https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-            dnf -y install cuda-nvcc-12-4 cuda-cudart-devel-12-4
+            dnf -y install cuda-nvcc-13-0 cuda-cudart-devel-13-0
 
           CIBW_ENVIRONMENT_LINUX: >
             FASTTOMO_USE_CUDA=ON
-            PATH=/usr/local/cuda-12.4/bin:$PATH
-            CUDACXX=/usr/local/cuda-12.4/bin/nvcc
+            PATH=/usr/local/cuda-13.0/bin:$PATH
+            CUDACXX=/usr/local/cuda-13.0/bin/nvcc
 
           CIBW_CONFIG_SETTINGS: >
             cmake.define.FASTTOMO_USE_CUDA=ON
-            cmake.define.CMAKE_CUDA_ARCHITECTURES=70;75;80;86;89;90
+            cmake.define.CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90
 
           # The whole point: do NOT bundle libcudart into the wheel. At runtime
           # it resolves to the libcudart that PyTorch loaded into the process.
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             auditwheel repair -w {dest_dir} {wheel}
+            --exclude libcudart.so.13
             --exclude libcudart.so.12
             --exclude libcudart.so.11.0
             --exclude libcudart.so
 
-          # Test in a clean env that has only torch+cu124 (no system CUDA).
+          # Test in a clean env that has only torch+cu130 (no system CUDA).
           # Runners have no GPU, so smoke test falls back to CPU path; what
           # we're verifying is that the .so loads (i.e. cudart symbols
           # resolve via PyTorch's bundled libcudart).
           CIBW_TEST_REQUIRES: pytest
-          CIBW_BEFORE_TEST_LINUX: pip install torch --index-url https://download.pytorch.org/whl/cu124
+          CIBW_BEFORE_TEST_LINUX: pip install torch --index-url https://download.pytorch.org/whl/cu130
           CIBW_TEST_COMMAND: pytest {project}/tests/test_wheel_smoke.py -v
           CIBW_TEST_ENVIRONMENT: FASTTOMO_EXPECT_CUDA=1
 
