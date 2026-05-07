@@ -147,9 +147,16 @@ __global__ static void forward_project_kernel(
         float s  = (float)step;
         float fx = (t * ca - s * sa) + half_x;
         float fz = (t * sa + s * ca) + half_z;
+        /* Match forward_project_cpu's tight bilinear-stencil bounds: only
+         * sample when both pixel neighbours along each axis are inside the
+         * volume (fx in [0, Nx-1), fz in [0, Nz-1)). Border-mode tex2DLayered
+         * would otherwise contribute a half-texel slab at each edge that the
+         * CPU kernel skips. */
+        if (fx < 0.0f || fx >= (float)(Nx - 1) ||
+            fz < 0.0f || fz >= (float)(Nz - 1))
+            continue;
         /* tex2DLayered: x→Nx axis, y→Nz axis, layer→iy.
-         * +0.5 maps integer pixel index to texel centre.
-         * Border addressing returns 0 outside the volume automatically. */
+         * +0.5 maps integer pixel index to texel centre. */
         sum += tex2DLayered<float>(vol_tex, fx + 0.5f, fz + 0.5f, iy);
     }
 

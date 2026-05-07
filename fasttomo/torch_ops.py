@@ -29,6 +29,7 @@ from fasttomo.autograd import (
     _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
     _euler_zyz_to_rotmat, _resolve_num_threads,
 )
+from fasttomo.projector import ParallelProjector, RotmatProjector
 
 
 # ── primitive projection ops ───────────────────────────────────────────────
@@ -470,17 +471,26 @@ def run_fbp(
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
 
-    projector: pass a :class:`ParallelProjector` to reuse a persistent
-    cudaArray + texture handle for the back-projection. The ramp filter
-    coefficients are already cached per (N_det, device, dtype) in
-    ``_RAMP_FILTER_CACHE``, so handing in a projector closes the remaining
-    per-call BP texture-init cost. Numerics are bit-identical to the
-    functional path. Geometry must match: the projector's ``angles_deg``
-    replaces the ``angles_deg`` argument for BP.
+    On CUDA a :class:`ParallelProjector` is built internally if ``projector``
+    is None — the BP runs through a persistent cudaArray + texture handle that
+    is torn down when the function returns. Pass an explicit projector to
+    amortize the texture-cache allocation across many calls (e.g. a
+    tilt-series sweep). Geometry must match: the projector's ``angles_deg``
+    replaces the ``angles_deg`` argument for BP. Numerics are bit-identical
+    to the functional path. On CPU the functional ``back_project`` is used
+    regardless (cached projectors are CUDA-only).
     """
     filtered = ramp_filter(sinogram)
     if projector is not None:
         volume = projector.back(filtered)
+    elif sinogram.is_cuda:
+        n_angles, Ny, N_det = sinogram.shape
+        Nz_resolved = N_det if Nz < 0 else Nz
+        _proj = ParallelProjector(
+            (Ny, Nz_resolved, N_det), angles_deg,
+            device=sinogram.device, N_det=N_det,
+        )
+        volume = _proj.back(filtered)
     else:
         volume = back_project(filtered, angles_deg, Nz=Nz)
     # angular sampling normalisation: π / n_angles
@@ -569,11 +579,14 @@ def run_sirt(
     single-axis projector. ``num_threads`` is forwarded to the CPU 3D
     kernels (kwarg → OMP_NUM_THREADS → 1).
 
-    projector: pass a :class:`ParallelProjector` (or :class:`RotmatProjector`
-    when using ``euler_zyz_deg``) to reuse a persistent cudaArray + texture
-    handle across all FP/BP calls. Same numerics, ~1.5–1.9× faster on the
-    inner loop. Must be sized to the volume / sinogram shape; angles passed
-    via the projector replace ``angles_deg`` / ``euler_zyz_deg`` for FP/BP.
+    projector: on CUDA a cached projector is always used — built internally
+    if not supplied. Pass an explicit :class:`ParallelProjector` (or
+    :class:`RotmatProjector` when using ``euler_zyz_deg``) to reuse a
+    persistent cudaArray + texture handle across multiple ``run_sirt`` calls;
+    otherwise the internal projector is torn down on return. Must be sized
+    to the volume / sinogram shape; angles passed via the projector replace
+    ``angles_deg`` / ``euler_zyz_deg`` for FP/BP. CPU SIRT uses the
+    functional API (cached projectors are CUDA-only).
 
     return_loss: if True, returns (volume, loss_history) where loss_history
     is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
@@ -593,16 +606,32 @@ def run_sirt(
     device = sinogram.device
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
+    # Build closures _fp / _bp. On CUDA we always go through a cached projector
+    # (built locally if the caller didn't pass one); on CPU we use the
+    # functional API. Numerics match across both paths.
+    _internal_proj = None  # held to keep texture caches alive across iterations
     if projector is not None:
         if euler_zyz_deg is not None:
-            # RotmatProjector path: matrices are fixed for SIRT, baked into a closure
-            from fasttomo.autograd import _euler_zyz_to_rotmat
             mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
             _fp = lambda v: projector.forward(v, mats)
             _bp = lambda s: projector.back(s, mats)
         else:
             _fp = lambda v: projector.forward(v)
             _bp = lambda s: projector.back(s)
+    elif sinogram.is_cuda:
+        if euler_zyz_deg is not None:
+            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+            _internal_proj = RotmatProjector(
+                (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
+            )
+            _fp = lambda v: _internal_proj.forward(v, mats)
+            _bp = lambda s: _internal_proj.back(s, mats)
+        else:
+            _internal_proj = ParallelProjector(
+                (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
+            )
+            _fp = lambda v: _internal_proj.forward(v)
+            _bp = lambda s: _internal_proj.back(s)
     elif euler_zyz_deg is not None:
         _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
         _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
