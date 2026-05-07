@@ -480,6 +480,33 @@ def test_run_grad_descent_cpu_converges():
     )
 
 
+def test_run_grad_descent_positional_kwargs_backward_compat_cpu():
+    """Legacy positional optional args should still map correctly."""
+    N      = 24
+    angles = make_angles(12)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec, losses = ft.run_grad_descent(
+        sino,                       # sinogram
+        angles,                     # angles_deg
+        5,                          # n_iter
+        5e-2,                       # lr
+        -1,                         # Nz
+        torch.optim.Adam,           # optimizer_cls
+        False,                      # positivity
+        False,                      # mask
+        0.0,                        # tv_weight
+        None,                       # euler_zyz_deg
+        False,                      # use_resire_projector
+        True,                       # return_loss
+    )
+
+    assert rec.shape == vol.shape
+    assert losses.shape == torch.Size([5])
+    assert torch.isfinite(losses).all().item()
+
+
 # ── 3D rotation-matrix CPU tests ──────────────────────────────────────────
 #
 # The 3D rotmat projector now has CPU OpenMP parallelism. These tests cover
