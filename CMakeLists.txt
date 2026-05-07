@@ -38,6 +38,11 @@ for base in nvidia.__path__:
                 list(GET _cudart_versioned 0 _cudart_first)
                 file(CREATE_LINK "${_cudart_first}" "${_PIP_CUDA_ROOT}/lib/libcudart.so" SYMBOLIC)
             endif()
+            # nvcc's device link step searches `<root>/lib64/`; the wheel uses
+            # `lib/`. Add a sibling symlink so -lcudadevrt etc. resolve.
+            if(NOT EXISTS "${_PIP_CUDA_ROOT}/lib64")
+                file(CREATE_LINK "lib" "${_PIP_CUDA_ROOT}/lib64" SYMBOLIC)
+            endif()
         endif()
     endif()
 endif()
