@@ -11,6 +11,7 @@ torch installed (no CUDA toolkit) — it's the assertion that the Torch-bundled-
 cudart linkage actually works at runtime.
 """
 
+import importlib
 import os
 import pytest
 import torch
@@ -31,6 +32,11 @@ def test_split_modules_import():
     assert hasattr(projection, "forward_project")
     assert hasattr(utilities, "ramp_filter")
     assert hasattr(algorithms, "run_sirt")
+
+
+def test_legacy_torch_ops_submodule_import():
+    mod = importlib.import_module("fasttomo.torch_ops")
+    assert hasattr(mod, "run_sirt")
 
 
 def test_cuda_available_matches_env():
