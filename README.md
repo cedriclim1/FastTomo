@@ -87,7 +87,7 @@ cp build/_core*.so fasttomo/
 Wheels are built by `.github/workflows/wheels.yml`:
 
 - **CPU manylinux wheels** for cp39–cp313 × x86_64
-- **CUDA wheel** for cp39–cp313, with `libcudart` excluded from the wheel via `auditwheel --exclude` and resolved at import time against the `libcudart` that PyTorch loads into the process. One CUDA wheel works across PyTorch's CUDA versions (the TorchRadon pattern).
+- **CUDA wheel** for cp39–cp313, with `libcudart` excluded from the wheel via `auditwheel --exclude` and resolved at import time against the `libcudart` that PyTorch loads into the process. One CUDA wheel works across PyTorch's CUDA versions (the TorchRadon pattern). Built with the **CUDA 13.0 toolkit** (`nvcc 13.0`, `cudart 13.0`); the CI test step verifies the wheel under `torch+cu130`. Because `libcudart` is excluded, the same wheel works for users on `torch+cu12x` as well as `torch+cu13x` — the toolkit choice only affects the minimum NVIDIA driver and the targeted CUDA architectures. Volta (`sm_70` / V100) is **not** in the wheel since CUDA 13 dropped Volta; V100 users should build from source with a CUDA 12.x toolkit.
 - **Sdist** for source-builds when no wheel matches.
 
 ### One-time setup

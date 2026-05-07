@@ -18,6 +18,7 @@ from fasttomo.utilities import (
     estimate_shifts_xcorr,
     ramp_filter,
     cylindrical_mask,
+    tv_loss_3d,
 )
 from fasttomo.algorithms import (
     run_fbp,
@@ -43,6 +44,7 @@ __all__ = [
     "estimate_shifts_xcorr",
     "ramp_filter",
     "cylindrical_mask",
+    "tv_loss_3d",
     "run_fbp",
     "run_weighted_backprojection",
     "run_sirt",
