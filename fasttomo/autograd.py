@@ -501,6 +501,80 @@ class _FPResire(torch.autograd.Function):
         return grad_vol, None, None
 
 
+# ── cached autograd Functions ───────────────────────────────────────────────
+#
+# Used by ParallelProjector / RotmatProjector. Each Function takes a projector
+# instance via ctx (non-tensor, non-grad) and routes through projector._fp_raw
+# / ._bp_raw, which call the *_cuda_cached entry points and reuse the
+# projector's persistent TextureCache. The angle-gradient path is intentionally
+# absent on the parallel cached pair (use the functional API for that); the
+# rotmat cached pair forwards mats grad through the existing grad_rotmat
+# kernel (no texture, so caching gives nothing there).
+
+
+class _FP2DCached(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, volume, projector):
+        ctx.projector = projector
+        return projector._fp_raw(volume)
+
+    @staticmethod
+    def backward(ctx, grad_sino):
+        grad_vol = ctx.projector._bp_raw(grad_sino.contiguous())
+        return grad_vol, None
+
+
+class _BP2DCached(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, sinogram, projector):
+        ctx.projector = projector
+        return projector._bp_raw(sinogram)
+
+    @staticmethod
+    def backward(ctx, grad_vol):
+        grad_sino = ctx.projector._fp_raw(grad_vol.contiguous())
+        return grad_sino, None
+
+
+class _FP3DCached(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, volume, mats_flat, projector):
+        ctx.projector = projector
+        ctx.save_for_backward(volume.detach(), mats_flat.detach())
+        return projector._fp_raw(volume, mats_flat)
+
+    @staticmethod
+    def backward(ctx, grad_sino):
+        volume, mats_flat = ctx.saved_tensors
+        proj = ctx.projector
+        grad_sino = grad_sino.contiguous()
+        grad_vol = None
+        if ctx.needs_input_grad[0]:
+            grad_vol = proj._bp_raw(grad_sino, mats_flat)
+        grad_mats = None
+        if ctx.needs_input_grad[1]:
+            grad_mats = _grad_rotmat_raw(volume, grad_sino, mats_flat)
+        return grad_vol, grad_mats, None
+
+
+class _BP3DCached(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, sinogram, mats_flat, projector):
+        ctx.projector = projector
+        ctx.save_for_backward(mats_flat.detach())
+        return projector._bp_raw(sinogram, mats_flat)
+
+    @staticmethod
+    def backward(ctx, grad_vol):
+        (mats_flat,) = ctx.saved_tensors
+        proj = ctx.projector
+        grad_sino = proj._fp_raw(grad_vol.contiguous(), mats_flat)
+        # grad w.r.t. mats: needs the volume that produced grad_vol — adjoint
+        # path doesn't have it, so we return None. Pose optimisation should
+        # use forward (FP) as the differentiable handle on mats, not back.
+        return grad_sino, None, None
+
+
 class _BPResire(torch.autograd.Function):
     @staticmethod
     def forward(ctx, sinogram, euler_zyz_deg, Nz):

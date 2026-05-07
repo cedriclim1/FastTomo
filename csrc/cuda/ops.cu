@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "texture_cache.h"
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdexcept>
@@ -190,6 +191,41 @@ void forward_project_cuda(
     CUDA_CHECK(cudaFreeArray(vol_array));
 }
 
+void forward_project_cuda_cached(
+    TextureCache *vol_cache,
+    const float  *d_volume,
+    float        *d_sinogram,
+    const float  *d_cos_a,
+    const float  *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+) {
+    if (!vol_cache) throw std::runtime_error("forward_project_cuda_cached: null cache");
+    if (vol_cache->kind  != TC_VOL_LAYERED ||
+        vol_cache->dim_a != Ny || vol_cache->dim_b != Nz || vol_cache->dim_c != Nx)
+        throw std::runtime_error("forward_project_cuda_cached: cache shape mismatch");
+
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx * Nx + Nz * Nz))) + 1;
+
+    tc_upload(vol_cache, d_volume, stream);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((N_det    + 15) / 16,
+              (n_angles + 15) / 16,
+              Ny);
+
+    forward_project_kernel<<<grid, block, 0, stream>>>(
+        vol_cache->tex, d_sinogram, d_cos_a, d_sin_a,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, ray_len
+    );
+    CUDA_CHECK_KERNEL();
+}
+
 /* ── back-projection ──────────────────────────────────────────────────────
  * Grid:  (ceil(Nx/16), ceil(Nz/16), Ny)   Block: (16, 16, 1)
  * Each thread owns one (ix, iz) voxel in one Y-slice and loops over angles.
@@ -271,6 +307,41 @@ void back_project_cuda(
 
     CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
     CUDA_CHECK(cudaFreeArray(sino_array));
+}
+
+void back_project_cuda_cached(
+    TextureCache *sino_cache,
+    const float  *d_sinogram,
+    float        *d_volume,
+    const float  *d_cos_a,
+    const float  *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+) {
+    if (!sino_cache) throw std::runtime_error("back_project_cuda_cached: null cache");
+    if (sino_cache->kind  != TC_SINO_LAYERED ||
+        sino_cache->dim_a != n_angles || sino_cache->dim_b != Ny || sino_cache->dim_c != N_det)
+        throw std::runtime_error("back_project_cuda_cached: cache shape mismatch");
+
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+
+    tc_upload(sino_cache, d_sinogram, stream);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
+    size_t smem = 2 * (size_t)n_angles * sizeof(float);
+
+    enable_extended_smem_if_needed((const void *)back_project_kernel, smem);
+
+    back_project_kernel<<<grid, block, smem, stream>>>(
+        sino_cache->tex, d_volume, d_cos_a, d_sin_a,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z
+    );
+    CUDA_CHECK_KERNEL();
 }
 
 /* ── 3D rotation-matrix forward projection ───────────────────────────────
@@ -392,6 +463,41 @@ void forward_project_rotmat_cuda(
 
     CUDA_CHECK(cudaDestroyTextureObject(vol_tex));
     CUDA_CHECK(cudaFreeArray(vol_array));
+}
+
+void forward_project_rotmat_cuda_cached(
+    TextureCache *vol_cache,
+    const float  *d_volume,
+    float        *d_sinogram,
+    const float  *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+) {
+    if (!vol_cache) throw std::runtime_error("forward_project_rotmat_cuda_cached: null cache");
+    if (vol_cache->kind  != TC_VOL_3D ||
+        vol_cache->dim_a != Ny || vol_cache->dim_b != Nz || vol_cache->dim_c != Nx)
+        throw std::runtime_error("forward_project_rotmat_cuda_cached: cache shape mismatch");
+
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+    int   ray_len  = (int)ceilf(0.5f * sqrtf((float)(Nx*Nx + Ny*Ny + Nz*Nz))) + 1;
+
+    tc_upload(vol_cache, d_volume, stream);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((N_det + 15) / 16,
+              (Ny    + 15) / 16,
+              n_angles);
+
+    forward_project_rotmat_kernel<<<grid, block, 0, stream>>>(
+        vol_cache->tex, d_sinogram, d_matrices,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, half_y, ray_len
+    );
+    CUDA_CHECK_KERNEL();
 }
 
 /* ── gradient of 3D rotmat forward projection w.r.t. rotation matrix ─────
@@ -620,6 +726,43 @@ void back_project_rotmat_cuda(
 
     CUDA_CHECK(cudaDestroyTextureObject(sino_tex));
     CUDA_CHECK(cudaFreeArray(sino_array));
+}
+
+void back_project_rotmat_cuda_cached(
+    TextureCache *sino_cache,
+    const float  *d_sinogram,
+    float        *d_volume,
+    const float  *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+) {
+    if (!sino_cache) throw std::runtime_error("back_project_rotmat_cuda_cached: null cache");
+    if (sino_cache->kind  != TC_SINO_LAYERED ||
+        sino_cache->dim_a != n_angles || sino_cache->dim_b != Ny || sino_cache->dim_c != N_det)
+        throw std::runtime_error("back_project_rotmat_cuda_cached: cache shape mismatch");
+
+    float half_det = (N_det - 1) * 0.5f;
+    float half_x   = (Nx   - 1) * 0.5f;
+    float half_z   = (Nz   - 1) * 0.5f;
+    float half_y   = (Ny   - 1) * 0.5f;
+
+    tc_upload(sino_cache, d_sinogram, stream);
+
+    dim3 block(8, 8, 4);
+    dim3 grid((Nx + 7) / 8,
+              (Nz + 7) / 8,
+              (Ny + 3) / 4);
+    size_t smem = 9 * (size_t)n_angles * sizeof(float);
+
+    enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel, smem);
+
+    back_project_rotmat_kernel<<<grid, block, smem, stream>>>(
+        sino_cache->tex, d_volume, d_matrices,
+        Ny, Nz, Nx, n_angles, N_det,
+        half_det, half_x, half_z, half_y
+    );
+    CUDA_CHECK_KERNEL();
 }
 
 /* ── RESIRE voxel-driven projectors ──────────────────────────────────────────

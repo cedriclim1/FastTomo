@@ -17,9 +17,35 @@ import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch_radon import Radon
 
 from fasttomo import ramp_filter
+
+
+def gaussian_kernel_1d(sigma: float, num_sigmas: float = 3.0) -> torch.Tensor:
+    """Normalised 1D Gaussian, ported from sirt_recon_ex.py."""
+    radius = int(math.ceil(num_sigmas * sigma))
+    support = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    kernel = torch.distributions.Normal(loc=0.0, scale=float(sigma)).log_prob(support).exp_()
+    return kernel.mul_(1.0 / kernel.sum())
+
+
+def gaussian_filter_2d_batched(vol: torch.Tensor, kernel_1d: torch.Tensor) -> torch.Tensor:
+    """Separable 2D Gaussian over the last two dims of a [B, H, W] tensor.
+
+    The original example loops ``conv2d`` per slice; we keep the kernel separable
+    but batch the B axis through the channel dim of ``conv2d`` to avoid the Python
+    loop while preserving identical numerics.
+    """
+    B = vol.shape[0]
+    pad = kernel_1d.numel() // 2
+    img = vol.unsqueeze(1)  # [B, 1, H, W]
+    w_v = kernel_1d.view(1, 1, -1, 1)
+    w_h = kernel_1d.view(1, 1, 1, -1)
+    img = F.conv2d(img, weight=w_v, padding=(pad, 0))
+    img = F.conv2d(img, weight=w_h, padding=(0, pad))
+    return img.squeeze(1)
 
 
 class TorchRadonParallelBeam:
@@ -45,33 +71,49 @@ class TorchRadonParallelBeam:
         self,
         sinogram: torch.Tensor,
         num_iter: int = 100,
-        step_size: float = 0.15,
+        step_size: float | None = None,
         positivity: bool = True,
+        smoothing_sigma: float | None = 1.0,
     ) -> torch.Tensor:
         """Iterative-FBP-with-positivity, ported from sirt_recon_ex.py.
 
         Each iteration: filter the projection residual (with FastTomo's ramp
         filter), back-project, accumulate scaled by ``step_size``. ``positivity``
-        clamps after every outer iteration. All smoothing is removed.
+        clamps after every outer iteration.
 
-        ``step_size`` is reduced to 0.15 (the original example used 0.95 with
-        Gaussian smoothing as a stabiliser; without smoothing, 0.95 diverges
-        on limited-angle sinograms where the per-iter FBP-of-residual amplifies
-        missing-wedge artefacts).
+        ``smoothing_sigma`` enables the Gaussian regulariser from the original
+        example (separable conv2d after every inner update). It stabilises the
+        per-iter FBP-of-residual against missing-wedge amplification. The
+        original ``sirt_recon_ex.py`` paired ``sigma=1.0`` with ``step=0.95``,
+        but that combination only converges for the handful of iterations
+        used in the example — by ~iter 160 on limited-angle data it diverges
+        to NaN even with smoothing. We default to ``sigma=1.0`` with
+        ``step=0.5`` instead, which is stable past 1000 iterations on the
+        29-angle phantom. Pass ``smoothing_sigma=None`` for the
+        unregularised variant (then defaults to ``step_size=0.15``).
 
         sinogram: [n_angles, Ny, N_det] CUDA → recon [Ny, Nz=N_det, Nx=N_det] CUDA.
         Slices are batched over Y rather than looped (the original code's per-slice
         loop is a Python-overhead artifact, not algorithmic).
         """
         n_angles, Ny, N_det = sinogram.shape
+        if step_size is None:
+            step_size = 0.5 if smoothing_sigma is not None else 0.15
         sino_b = sinogram.permute(1, 0, 2).contiguous()        # [Ny, n_angles, N_det]
         recon = torch.zeros(Ny, N_det, N_det, device=sinogram.device, dtype=sinogram.dtype)
         scale = math.pi / n_angles
+        kernel_1d = (
+            gaussian_kernel_1d(smoothing_sigma).to(sinogram.device)
+            if smoothing_sigma is not None
+            else None
+        )
         for _ in range(num_iter):
             pred = self.radon.forward(recon)                   # [Ny, n_angles, N_det]
             diff = sino_b - pred
             update = self.radon.backprojection(ramp_filter(diff)) * scale
             recon += step_size * update
+            if kernel_1d is not None:
+                recon = gaussian_filter_2d_batched(recon, kernel_1d)
             if positivity:
                 recon.clamp_(min=0.0)
         return recon

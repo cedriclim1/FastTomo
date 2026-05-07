@@ -19,6 +19,7 @@ from fasttomo.torch_ops import (
     run_grad_descent,
     refine_angles,
 )
+from fasttomo.projector import ParallelProjector, RotmatProjector
 
 __all__ = [
     "forward_project",
@@ -40,4 +41,6 @@ __all__ = [
     "run_resire",
     "run_grad_descent",
     "refine_angles",
+    "ParallelProjector",
+    "RotmatProjector",
 ]

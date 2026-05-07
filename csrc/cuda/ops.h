@@ -2,6 +2,7 @@
 #define FASTTOMO_CUDA_OPS_H
 
 #include <cuda_runtime.h>
+#include "texture_cache.h"
 
 /*
  * All CUDA entry points run on a caller-supplied stream so the kernels
@@ -13,6 +14,11 @@
  *
  * Cos/sin tables (single-axis kernels) are passed as device pointers so the
  * trig precompute can stay on the GPU.
+ *
+ * The *_cached variants take a pre-allocated TextureCache* (sized to match
+ * the input shape). They cudaMemcpy3DAsync the caller's data into the
+ * cache's existing cudaArray and launch the kernel — no per-call cudaArray
+ * allocation. Used by ParallelProjector / RotmatProjector for tight loops.
  */
 
 void forward_project_cuda(
@@ -52,6 +58,53 @@ void back_project_rotmat_cuda(
     const float *d_sinogram,
     float       *d_volume,
     const float *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+/* ── cached variants ──────────────────────────────────────────────────────
+ * `vol_cache` / `sino_cache` must already be sized to the input. Each call
+ * uploads the caller's data into the cache's cudaArray, then launches the
+ * kernel. Output buffer is written through a regular device pointer.
+ */
+void forward_project_cuda_cached(
+    TextureCache *vol_cache,
+    const float  *d_volume,
+    float        *d_sinogram,
+    const float  *d_cos_a,
+    const float  *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+void back_project_cuda_cached(
+    TextureCache *sino_cache,
+    const float  *d_sinogram,
+    float        *d_volume,
+    const float  *d_cos_a,
+    const float  *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+void forward_project_rotmat_cuda_cached(
+    TextureCache *vol_cache,
+    const float  *d_volume,
+    float        *d_sinogram,
+    const float  *d_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+void back_project_rotmat_cuda_cached(
+    TextureCache *sino_cache,
+    const float  *d_sinogram,
+    float        *d_volume,
+    const float  *d_matrices,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream

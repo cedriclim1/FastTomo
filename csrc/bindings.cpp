@@ -8,6 +8,7 @@
 
 #ifdef FASTTOMO_CUDA
 #include "cuda/ops.h"
+#include "cuda/texture_cache.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -407,6 +408,89 @@ static void py_grad_angle_cuda(
     );
 }
 
+/* ── texture cache (opaque pointer exposed as Python int) ──────────────── */
+
+static long py_tc_create(int kind, int dim_a, int dim_b, int dim_c) {
+    if (kind < 0 || kind > 2)
+        throw std::invalid_argument("tc_create: kind must be 0..2");
+    TextureCache *tc = tc_create(static_cast<tc_kind_t>(kind), dim_a, dim_b, dim_c);
+    return reinterpret_cast<long>(tc);
+}
+
+static void py_tc_destroy(long handle) {
+    tc_destroy(reinterpret_cast<TextureCache *>(handle));
+}
+
+/* ── cached FP/BP entry points ─────────────────────────────────────────── */
+
+static void py_forward_project_cuda_cached(
+    long cache_ptr,
+    long volume_ptr, long sinogram_ptr,
+    long cos_ptr, long sin_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    forward_project_cuda_cached(
+        reinterpret_cast<TextureCache *>(cache_ptr),
+        reinterpret_cast<const float *>(volume_ptr),
+        reinterpret_cast<float *>(sinogram_ptr),
+        reinterpret_cast<const float *>(cos_ptr),
+        reinterpret_cast<const float *>(sin_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_back_project_cuda_cached(
+    long cache_ptr,
+    long sinogram_ptr, long volume_ptr,
+    long cos_ptr, long sin_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    back_project_cuda_cached(
+        reinterpret_cast<TextureCache *>(cache_ptr),
+        reinterpret_cast<const float *>(sinogram_ptr),
+        reinterpret_cast<float *>(volume_ptr),
+        reinterpret_cast<const float *>(cos_ptr),
+        reinterpret_cast<const float *>(sin_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_forward_project_rotmat_cuda_cached(
+    long cache_ptr,
+    long vol_ptr, long sino_ptr, long matrices_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    forward_project_rotmat_cuda_cached(
+        reinterpret_cast<TextureCache *>(cache_ptr),
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(sino_ptr),
+        reinterpret_cast<const float *>(matrices_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_back_project_rotmat_cuda_cached(
+    long cache_ptr,
+    long sino_ptr, long vol_ptr, long matrices_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    back_project_rotmat_cuda_cached(
+        reinterpret_cast<TextureCache *>(cache_ptr),
+        reinterpret_cast<const float *>(sino_ptr),
+        reinterpret_cast<float *>(vol_ptr),
+        reinterpret_cast<const float *>(matrices_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
 static void py_genfire_gridding_2d_cuda(
     long fk_real_ptr, long fk_imag_ptr,
     long cos_ptr,     long sin_ptr,
@@ -553,6 +637,57 @@ PYBIND11_MODULE(_core, m) {
           py::arg("vol_ptr"), py::arg("grad_sino_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("grad_angles_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("tc_create", &py_tc_create,
+          "Allocate a persistent cudaArray + cudaTextureObject. "
+          "kind: 0=TC_VOL_LAYERED (FP scalar), 1=TC_SINO_LAYERED (BP scalar/rotmat), "
+          "2=TC_VOL_3D (FP rotmat). dim_a/b/c match the source-tensor dims in C order: "
+          "vol is (Ny,Nz,Nx); sino is (n_angles,Ny,N_det). "
+          "Returns an opaque integer handle — pass to tc_destroy when done.",
+          py::arg("kind"), py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"));
+
+    m.def("tc_destroy", &py_tc_destroy,
+          "Release a TextureCache handle returned by tc_create.",
+          py::arg("handle"));
+
+    m.def("forward_project_cuda_cached", &py_forward_project_cuda_cached,
+          "Forward projection (CUDA, cached). cache_ptr: TC_VOL_LAYERED handle "
+          "sized to (Ny, Nz, Nx). Uploads volume into the cache's cudaArray and "
+          "launches the kernel — no per-call cudaMalloc3DArray.",
+          py::arg("cache_ptr"),
+          py::arg("volume_ptr"), py::arg("sinogram_ptr"),
+          py::arg("cos_ptr"),    py::arg("sin_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("back_project_cuda_cached", &py_back_project_cuda_cached,
+          "Back-projection (CUDA, cached). cache_ptr: TC_SINO_LAYERED handle "
+          "sized to (n_angles, Ny, N_det).",
+          py::arg("cache_ptr"),
+          py::arg("sinogram_ptr"), py::arg("volume_ptr"),
+          py::arg("cos_ptr"),      py::arg("sin_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("forward_project_rotmat_cuda_cached", &py_forward_project_rotmat_cuda_cached,
+          "3D rotmat forward projection (CUDA, cached). cache_ptr: TC_VOL_3D handle "
+          "sized to (Ny, Nz, Nx).",
+          py::arg("cache_ptr"),
+          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("back_project_rotmat_cuda_cached", &py_back_project_rotmat_cuda_cached,
+          "3D rotmat back-projection (CUDA, cached). cache_ptr: TC_SINO_LAYERED handle "
+          "sized to (n_angles, Ny, N_det).",
+          py::arg("cache_ptr"),
+          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);

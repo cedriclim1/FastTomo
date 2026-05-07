@@ -23,7 +23,7 @@ set(CORE_SOURCES
 )
 
 if(FASTTOMO_CUDA)
-    list(APPEND CORE_SOURCES csrc/cuda/ops.cu)
+    list(APPEND CORE_SOURCES csrc/cuda/ops.cu csrc/cuda/texture_cache.cu)
 endif()
 
 pybind11_add_module(_core ${CORE_SOURCES})
