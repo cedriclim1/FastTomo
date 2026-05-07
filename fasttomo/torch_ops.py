@@ -709,14 +709,18 @@ def run_genfire(
     cos_a = np.cos(angles_np).astype(np.float32)
     sin_a = np.sin(angles_np).astype(np.float32)
 
-    # ── 1D FFT of zero-padded projections (fftshifted) ─────────────────────
+    # ── 1D FFT of zero-padded projections (centred convention) ─────────────
     pad_l = (bigN - N_det) // 2
     pad_r = bigN - N_det - pad_l
     proj_pad = F.pad(sinogram.float(), (pad_l, pad_r))   # [n_ang, Ny, bigN]
-    # fftshift(fft(x))[half+ξ] = fft(x)[ξ], which equals F_2D[ξ·sinθ, ξ·cosθ]
-    # by the Fourier slice theorem — correct convention for the C gridding kernel.
+    # The pulse is centred at array index bigN/2, not at 0.  Without an
+    # ifftshift before the FFT, fft(proj_pad)[ξ] picks up a (-1)^ξ phase that
+    # systematically flips signs at off-axis grid cells (where ξ ≠ ikz+ikx
+    # mod 2 after rounding ξ·cosθ, ξ·sinθ).  The *centred* FT removes that
+    # phase, giving the literal Fourier-slice-theorem identity
+    # fk_shifted[half+ξ] = F_2D(ξ·cosθ/bigN, ξ·sinθ/bigN).
     fk_shifted = torch.fft.fftshift(
-        torch.fft.fft(proj_pad, dim=-1),
+        torch.fft.fft(torch.fft.ifftshift(proj_pad, dim=-1), dim=-1),
         dim=-1,
     )                                                     # DC at bigN//2
     fk_r = fk_shifted.real.contiguous()
@@ -806,8 +810,10 @@ def run_genfire(
         else:
             enforce_us = known_us                               # [bigN, bigN]
 
-        # IFFT → real space volume
-        vol = torch.fft.ifftn(current_F, dim=(-2, -1)).real    # [Ny, bigN, bigN]
+        # IFFT → real-space volume (centred convention: signal at array index half)
+        vol = torch.fft.fftshift(
+            torch.fft.ifftn(current_F, dim=(-2, -1)), dim=(-2, -1),
+        ).real                                                # [Ny, bigN, bigN]
 
         # real-space constraints
         if sparsity > 0.0:
@@ -816,8 +822,10 @@ def run_genfire(
             vol.clamp_(min=0.0)
         vol = vol * support.unsqueeze(0)
 
-        # FFT back to Fourier space
-        F_cur = torch.fft.fftn(vol, dim=(-2, -1))
+        # FFT back to Fourier space (centred convention: ifftshift before fft)
+        F_cur = torch.fft.fftn(
+            torch.fft.ifftshift(vol, dim=(-2, -1)), dim=(-2, -1),
+        )
 
         # track best-error iterate (L1 on all known voxels, not just enforce_us)
         err = (F_cur[:, known_us] - measured_K[:, known_us]).abs().mean().item()
@@ -830,8 +838,10 @@ def run_genfire(
         F_cur[:, enforce_us] = measured_K[:, enforce_us]
         current_F = F_cur
 
-    # final IFFT of best iterate
-    vol = torch.fft.ifftn(best_F, dim=(-2, -1)).real           # [Ny, bigN, bigN]
+    # final IFFT of best iterate (centred convention)
+    vol = torch.fft.fftshift(
+        torch.fft.ifftn(best_F, dim=(-2, -1)), dim=(-2, -1),
+    ).real                                                      # [Ny, bigN, bigN]
     if positivity:
         vol.clamp_(min=0.0)
 

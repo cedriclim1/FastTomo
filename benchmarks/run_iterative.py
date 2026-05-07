@@ -9,6 +9,8 @@ positivity enforced. SSIM/NMSE vs the ground-truth phantom.
 * FastTomo AD with pose, RotmatProjector cached
 * FastTomo run_sirt (no Adam/optimizer — pure SIRT)
 * FastTomo run_sirt with ParallelProjector (cached SIRT)
+* FastTomo run_resire (projected gradient, RESIRE 4-pt scatter projector)
+* FastTomo run_genfire (Fourier gridding + real-space constraint iteration)
 * ASTRA SIRT_CUDA with MinConstraint=0
 * TorchRadon iterative-FBP (per ``sirt_recon_ex.py``) with positivity
 
@@ -51,16 +53,30 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--ad-iter", type=int, default=1000)
-    parser.add_argument("--sirt-iter", type=int, default=100)
+    parser.add_argument("--sirt-iter", type=int, default=1000)
+    parser.add_argument("--resire-iter", type=int, default=None,
+                        help="iterations for run_resire (default: --sirt-iter)")
+    parser.add_argument("--genfire-iter", type=int, default=None,
+                        help="iterations for run_genfire (default: --sirt-iter)")
     parser.add_argument("--tv-weight", type=float, default=1.0)
     parser.add_argument("--skip-astra", action="store_true")
+    # TorchRadon's iterative-FBP loop semi-converges on missing-wedge data: per
+    # wiki/analyses/torch-radon-sirt-semi-convergence.md the SSIM peak is iter 1
+    # with sigma=2.0, step=0.05 (SSIM 0.857). 1000 iter at the same hyperparams
+    # would decay to ~0.74 — not a fair comparison.
+    parser.add_argument("--tr-iter", type=int, default=10,
+                        help="iterations for TorchRadon iterative-FBP (default: 10; "
+                             "the SSIM peak is iter 1 at 0.857, iter 10 is 0.831 — "
+                             "10 is used so it/s isn't dominated by warm-up overhead)")
     parser.add_argument(
         "--tr-smoothing-sigma",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Gaussian smoothing sigma for TorchRadon SIRT (per sirt_recon_ex.py). "
         "Pass 0 to disable.",
     )
+    parser.add_argument("--tr-step", type=float, default=0.05,
+                        help="step size for TorchRadon iterative-FBP")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -158,6 +174,28 @@ def main() -> None:
         )
     record("ft-sirt-cached", t[0], rec_sirt_c, args.sirt_iter)
 
+    # --- FastTomo run_resire (RESIRE 4-pt scatter projector, projected GD) ---
+    resire_iter = args.resire_iter if args.resire_iter is not None else args.sirt_iter
+    print(f"\n[FastTomo] run_resire (n_iter={resire_iter}, positivity)")
+    _ = ft.run_resire(sino[:, :1, :], ang_deg, n_iter=2, positivity=True)  # warm-up
+    with cuda_timer(device) as t:
+        rec_resire = ft.run_resire(
+            sino, ang_deg, n_iter=resire_iter, positivity=True
+        )
+    record("ft-resire", t[0], rec_resire, resire_iter)
+
+    # --- FastTomo run_genfire (Fourier gridding + IFFT/FFT iteration) ---
+    genfire_iter = args.genfire_iter if args.genfire_iter is not None else args.sirt_iter
+    print(f"\n[FastTomo] run_genfire (n_iter={genfire_iter}, positivity, mask)")
+    _ = ft.run_genfire(sino[:, :1, :], ang_deg, n_iter=2,
+                       positivity=True, mask=True)  # warm-up
+    with cuda_timer(device) as t:
+        rec_genfire = ft.run_genfire(
+            sino, ang_deg, n_iter=genfire_iter,
+            positivity=True, mask=True, resolution_extension=True,
+        )
+    record("ft-genfire", t[0], rec_genfire, genfire_iter)
+
     # --- ASTRA SIRT ---
     print(f"\n[ASTRA] SIRT_CUDA (num_iter={args.sirt_iter}, MinConstraint=0)")
     if not args.skip_astra and _try_import("astra") is not None:
@@ -172,20 +210,24 @@ def main() -> None:
     sigma = args.tr_smoothing_sigma if args.tr_smoothing_sigma > 0 else None
     sigma_tag = f"sigma={sigma}" if sigma is not None else "no-smoothing"
     print(
-        f"\n[TorchRadon] iterative-FBP (num_iter={args.sirt_iter}, positivity, {sigma_tag})"
+        f"\n[TorchRadon] iterative-FBP (num_iter={args.tr_iter}, step={args.tr_step}, "
+        f"positivity, {sigma_tag})"
     )
     if _try_import("torch_radon") is not None:
         from benchmarks.torch_radon_wrapper import TorchRadonParallelBeam
         tr_w = TorchRadonParallelBeam(N_det, ang_rad)
-        _ = tr_w.sirt(sino[:, :1, :], num_iter=2, smoothing_sigma=sigma)  # warm-up
+        _ = tr_w.sirt(
+            sino[:, :1, :], num_iter=2, step_size=args.tr_step, smoothing_sigma=sigma,
+        )  # warm-up
         with cuda_timer(device) as t:
             rec_tr = tr_w.sirt(
                 sino,
-                num_iter=args.sirt_iter,
+                num_iter=args.tr_iter,
+                step_size=args.tr_step,
                 positivity=True,
                 smoothing_sigma=sigma,
             )
-        record("torch_radon-sirt", t[0], rec_tr, args.sirt_iter)
+        record("torch_radon-sirt", t[0], rec_tr, args.tr_iter)
 
     # --- table ---
     print("\nResults:")

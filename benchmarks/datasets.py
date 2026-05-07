@@ -37,7 +37,13 @@ def load_phantom_tilt_series(
     ang_np = np.load(data_dir / "tilt_angles_1_deg_tilt_axis.npy").astype(np.float32)
 
     # Reorient phantom from quantem axes to FastTomo's [Ny, Nz, Nx].
-    phantom_np = phantom_np.transpose(2, 0, 1)
+    # The per-projection np.rot90 below + the .transpose(2, 0, 1) leave the
+    # phantom's tilt axis pointing opposite to what every reconstruction method
+    # produces from the rot90'd sinogram (verified across SIRT/RESIRE/GENFIRE/
+    # ASTRA/TorchRadon — every recon needed flip(0) to align). Flip the
+    # phantom here once so SSIM/NMSE are computed against the matching
+    # orientation across all methods.
+    phantom_np = phantom_np.transpose(2, 0, 1)[::-1].copy()
     ts_np = np.stack([np.rot90(img) for img in ts_np])
 
     phantom = torch.from_numpy(phantom_np).to(device)
