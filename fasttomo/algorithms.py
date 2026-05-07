@@ -819,11 +819,11 @@ def run_grad_descent(
     positivity: bool = False,
     mask: bool = False,
     tv_weight: float = 0.0,
-    tv_eps: float = 1e-8,
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — 3D mode (CUDA)
     use_resire_projector: bool = False,
     return_loss: bool = False,
     num_threads: int | None = None,             # CPU 3D path only
+    tv_eps: float = 1e-8,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Reference autograd-based reconstruction.
@@ -856,13 +856,13 @@ def run_grad_descent(
                         Dispatches to a fused CUDA kernel via
                         ``fasttomo.tv_loss_3d`` (CPU falls back to pure
                         PyTorch). 0.0 disables the regularizer.
-        tv_eps:         smoothing constant inside the TV sqrt (default
-                        1e-8); only used when ``tv_weight > 0``.
         euler_zyz_deg:  [n_angles, 3] — switches to the 3D rotmat projector
                         (CUDA only). Mutually exclusive with ``angles_deg``.
         use_resire_projector: with ``euler_zyz_deg``, use the RESIRE 4-pt
                         scatter projector instead of the rotmat tex3D one.
         return_loss:    if True, also return the per-iteration loss history.
+        tv_eps:         smoothing constant inside the TV sqrt (default
+                        1e-8); only used when ``tv_weight > 0``.
 
     Constraints (positivity, mask) are applied **inside torch.no_grad()** on
     the leaf tensor — the autograd-correct way to project. Users hand-rolling
