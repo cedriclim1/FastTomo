@@ -4,18 +4,22 @@
 # — this is what lets one wheel work across PyTorch's CUDA versions.
 import torch  # noqa: F401
 
-from fasttomo.torch_ops import (
+from fasttomo.projection import (
     forward_project,
     back_project,
     forward_project_3d,
     back_project_3d,
     forward_project_resire,
     back_project_resire,
+)
+from fasttomo.utilities import (
     apply_shifts,
     apply_shifts_2d,
     estimate_shifts_xcorr,
     ramp_filter,
     cylindrical_mask,
+)
+from fasttomo.algorithms import (
     run_fbp,
     run_weighted_backprojection,
     run_sirt,

@@ -2,6 +2,20 @@
 #define FASTTOMO_CUDA_TEXTURE_CACHE_H
 
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
+
+/* Shared CUDA error-check macro. Included by texture_cache.cu and ops.cu so
+ * both TUs use an identical definition without duplicating it. */
+#ifndef FASTTOMO_CUDA_CHECK
+#define FASTTOMO_CUDA_CHECK(call) do {                                        \
+    cudaError_t _err = (call);                                                \
+    if (_err != cudaSuccess) {                                                \
+        throw std::runtime_error(std::string("CUDA error at " __FILE__ ":") \
+            + std::to_string(__LINE__) + ": " + cudaGetErrorString(_err));   \
+    }                                                                          \
+} while (0)
+#endif /* FASTTOMO_CUDA_CHECK */
 
 /* Persistent cudaArray + cudaTextureObject pair, sized once and reused across
  * many forward/back-projection calls of the same shape. The hot path becomes

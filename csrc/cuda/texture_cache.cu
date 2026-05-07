@@ -6,15 +6,6 @@
 #include <string>
 #include <cstdlib>
 
-/* Same error macro as ops.cu — kept private to this TU. */
-#define TC_CUDA_CHECK(call) do {                                              \
-    cudaError_t _err = (call);                                                \
-    if (_err != cudaSuccess) {                                                \
-        throw std::runtime_error(std::string("CUDA error at " __FILE__ ":")   \
-            + std::to_string(__LINE__) + ": " + cudaGetErrorString(_err));    \
-    }                                                                          \
-} while (0)
-
 static cudaChannelFormatDesc tc_channel_desc(tc_dtype_t dtype, int channels) {
     /* cudaCreateChannelDesc<__half> is not specialized in stock CUDA
      * headers; route fp16 through explicit (16,16,16,16) for 4-channel
@@ -107,7 +98,7 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
      * surf2DLayeredwrite). cudaArraySurfaceLoadStore enables that. */
     if (channels == 4) flags |= cudaArraySurfaceLoadStore;
 
-    TC_CUDA_CHECK(cudaMalloc3DArray(&tc->array, &fmt, extent, flags));
+    FASTTOMO_CUDA_CHECK(cudaMalloc3DArray(&tc->array, &fmt, extent, flags));
 
     cudaResourceDesc rd = {};
     rd.resType         = cudaResourceTypeArray;
@@ -121,10 +112,10 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
     td.readMode         = cudaReadModeElementType;
     td.normalizedCoords = 0;
 
-    TC_CUDA_CHECK(cudaCreateTextureObject(&tc->tex, &rd, &td, nullptr));
+    FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tc->tex, &rd, &td, nullptr));
 
     if (channels == 4) {
-        TC_CUDA_CHECK(cudaCreateSurfaceObject(&tc->surf, &rd));
+        FASTTOMO_CUDA_CHECK(cudaCreateSurfaceObject(&tc->surf, &rd));
     }
     return tc;
 }
@@ -203,7 +194,7 @@ void tc_upload(TextureCache *tc, const void *src, cudaStream_t stream) {
         cp.dstArray = tc->array;
         cp.extent   = make_cudaExtent(tc->dim_c, tc->dim_b, tc->dim_a);
         cp.kind     = cudaMemcpyDeviceToDevice;
-        TC_CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
+        FASTTOMO_CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
         return;
     }
 
@@ -226,7 +217,7 @@ void tc_upload(TextureCache *tc, const void *src, cudaStream_t stream) {
     } else {
         throw std::runtime_error("tc_upload: unknown kind");
     }
-    TC_CUDA_CHECK(cudaGetLastError());
+    FASTTOMO_CUDA_CHECK(cudaGetLastError());
 }
 
 void tc_destroy(TextureCache *tc) {

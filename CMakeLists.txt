@@ -36,6 +36,8 @@ find_package(OpenMP REQUIRED)
 
 set(CORE_SOURCES
     csrc/bindings.cpp
+    csrc/bindings_cpu.cpp
+    csrc/bindings_cuda.cpp
     csrc/cpu/ops.c
 )
 
