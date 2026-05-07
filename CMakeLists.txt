@@ -38,11 +38,20 @@ set(CORE_SOURCES
     csrc/bindings.cpp
     csrc/bindings_cpu.cpp
     csrc/bindings_cuda.cpp
-    csrc/cpu/ops.c
+    csrc/cpu/projection_2d.c
+    csrc/cpu/projection_3d.c
+    csrc/cpu/genfire.c
 )
 
 if(FASTTOMO_CUDA)
-    list(APPEND CORE_SOURCES csrc/cuda/ops.cu csrc/cuda/texture_cache.cu)
+    list(APPEND CORE_SOURCES
+        csrc/cuda/projection_2d.cu
+        csrc/cuda/projection_3d.cu
+        csrc/cuda/projection_resire.cu
+        csrc/cuda/genfire.cu
+        csrc/cuda/grad_angle.cu
+        csrc/cuda/texture_cache.cu
+    )
 endif()
 
 pybind11_add_module(_core ${CORE_SOURCES})
