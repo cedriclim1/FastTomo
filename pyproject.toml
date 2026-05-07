@@ -11,10 +11,11 @@ dependencies = ["torch", "numpy", "tqdm"]
 [project.optional-dependencies]
 bench = ["scikit-image", "astra-toolbox"]
 
+[project.urls]
+Homepage = "https://github.com/cedriclim1/FastTomo"
+Repository = "https://github.com/cedriclim1/FastTomo"
+
 [tool.scikit-build]
+cmake.version = ">=3.18"
 cmake.build-type = "Release"
 wheel.packages = ["fasttomo"]
-
-[tool.scikit-build.cmake.define]
-CMAKE_CUDA_COMPILER = "/home/cedlim/miniforge3/envs/FastTomo/bin/nvcc"
-pybind11_DIR = "/home/cedlim/miniforge3/envs/FastTomo/lib/python3.14/site-packages/pybind11/share/cmake/pybind11"
