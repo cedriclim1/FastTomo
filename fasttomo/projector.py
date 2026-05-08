@@ -284,6 +284,10 @@ class RotmatProjector(_ProjectorBase):
             n_angles=int(n_angles),
             device=device,
         )
+        # Monotonic token for the current contents of _vol_handle.
+        # Every _fp_raw upload increments this so autograd can detect when a
+        # saved forward volume has been overwritten by a later forward call.
+        self._vol_cache_epoch = 0
 
     def _ensure_vol_cache(self) -> None:
         # Rotmat kernels need continuous Y interpolation (tex3D), so they
@@ -319,6 +323,7 @@ class RotmatProjector(_ProjectorBase):
             self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
             torch.cuda.current_stream(self.device).cuda_stream,
         )
+        self._vol_cache_epoch += 1
         return sino
 
     def _bp_raw(self, sinogram: torch.Tensor, mats_flat: torch.Tensor) -> torch.Tensor:
