@@ -1206,6 +1206,52 @@ class TestRunSirtCudaGraph:
             f"expected 1 cached graph, got {len(proj._sirt_graph_cache)}"
         )
 
+    def test_graph_cache_uses_latest_inputs(self):
+        """
+        Cached graph replay must respect call-time sinogram and omega values.
+
+        Regression guard: reusing a cached graph on the same projector must not
+        silently keep stale tensors/scalars from the first capture.
+        """
+        N = 32
+        n_angles = 20
+        angles = make_angles(n_angles)
+        proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+
+        vol_a = phantom_2d(N).unsqueeze(0)
+        vol_b = torch.flip(vol_a, dims=[-1])  # intentionally different target
+        sino_a = ft.forward_project(vol_a, angles)
+        sino_b = ft.forward_project(vol_b, angles)
+
+        # Build cache entry.
+        _ = ft.run_sirt(sino_a, angles, n_iter=6, Nz=N, omega=1.0, projector=proj)
+
+        # Same omega, different sinogram should still match eager output.
+        rec_graph_same_omega = ft.run_sirt(
+            sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj
+        )
+        rec_eager_same_omega, _ = ft.run_sirt(
+            sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj,
+            return_loss=True,
+        )
+        rmse_same_omega = ((rec_graph_same_omega - rec_eager_same_omega) ** 2).mean().sqrt().item()
+        assert rmse_same_omega < 1e-5, (
+            f"cached graph ignored updated sinogram: RMSE={rmse_same_omega:.2e}"
+        )
+
+        # Different omega should also match eager output.
+        rec_graph_new_omega = ft.run_sirt(
+            sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj
+        )
+        rec_eager_new_omega, _ = ft.run_sirt(
+            sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj,
+            return_loss=True,
+        )
+        rmse_new_omega = ((rec_graph_new_omega - rec_eager_new_omega) ** 2).mean().sqrt().item()
+        assert rmse_new_omega < 1e-5, (
+            f"cached graph ignored updated omega: RMSE={rmse_new_omega:.2e}"
+        )
+
     def test_graph_handles_positivity_sparsity_mask(self):
         """Smoke-test representative flag combinations via the graph path."""
         sino, angles = self._make_inputs(N=32, n_angles=20)
