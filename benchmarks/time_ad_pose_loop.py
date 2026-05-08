@@ -6,8 +6,15 @@ Goal: decide whether `vol.clamp_(min=0); vol *= mask` is worth fusing into a
 single CUDA kernel. Prints a per-section ms/iter and % breakdown, with the
 clamp+mask combined number called out at the bottom.
 
+--grad-mode {both,vol,mats}
+  both  — vol+euler+shifts all require grad (original behaviour)
+  vol   — only vol requires grad; BP kernel runs, grad_rotmat is gated off
+  mats  — only euler requires grad; grad_rotmat kernel runs, BP is gated off
+
 Usage:
     python benchmarks/time_ad_pose_loop.py [--device cuda:1] [--measure 200]
+    python benchmarks/time_ad_pose_loop.py --device cuda:3 --grad-mode vol
+    python benchmarks/time_ad_pose_loop.py --device cuda:3 --grad-mode mats
 """
 
 from __future__ import annotations
@@ -42,27 +49,47 @@ def main() -> None:
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--measure", type=int, default=200)
     p.add_argument("--vol", type=int, default=210, help="volume edge length")
+    p.add_argument(
+        "--grad-mode",
+        choices=["both", "vol", "mats"],
+        default="both",
+        help=(
+            "both=vol+euler+shifts all require_grad (default); "
+            "vol=only vol requires grad (BP kernel only); "
+            "mats=only euler requires grad (grad_rotmat kernel only)"
+        ),
+    )
     args = p.parse_args()
 
     device = torch.device(args.device)
     if device.type != "cuda":
         raise SystemExit("this script requires a CUDA device")
 
+    grad_mode = args.grad_mode
+
     tilt_series, tilt_angles = _load_atomic_dataset(device)
     n_angles = len(tilt_angles)
     N = args.vol
 
-    vol = torch.zeros(N, N, N, device=device, requires_grad=True)
+    # Set requires_grad per mode
+    vol_requires_grad = grad_mode in ("both", "vol")
+    euler_requires_grad = grad_mode in ("both", "mats")
+    shifts_requires_grad = grad_mode == "both"
+
+    vol = torch.zeros(N, N, N, device=device, requires_grad=vol_requires_grad)
     euler = torch.zeros(n_angles, 3, device=device)
     euler[:, 1] = tilt_angles
-    euler.requires_grad = True
-    shifts = torch.zeros(n_angles, 2, device=device, requires_grad=True)
+    euler.requires_grad = euler_requires_grad
+    shifts = torch.zeros(n_angles, 2, device=device, requires_grad=shifts_requires_grad)
     mask = ft.cylindrical_mask(N, N, device=device)
 
     proj_rot = ft.RotmatProjector((N, N, N), n_angles=n_angles,
                                   device=device, N_det=N)
 
     n_total = args.warmup + args.measure
+    # Optimisers are always created for all params so the loop structure is
+    # unchanged.  In vol/mats mode the optimisers for the non-grad params
+    # will no-op at step() time (no .grad set).
     opt_v = torch.optim.Adam([vol],    lr=0.05)
     opt_e = torch.optim.Adam([euler],  lr=1e-2)
     opt_s = torch.optim.Adam([shifts], lr=1e-2)
@@ -111,11 +138,16 @@ def main() -> None:
         toc("mse")
 
         tic("sparsity")
-        loss = loss + sparsity_weight * vol.mean()
+        # In mats mode vol has no grad path — adding vol.mean() would be a
+        # constant w.r.t. the only differentiable param (euler) and wastes
+        # time building a graph leaf.  Only add when vol is differentiable.
+        if vol_requires_grad:
+            loss = loss + sparsity_weight * vol.mean()
         toc("sparsity")
 
         tic("tv")
-        loss = loss + tv_weight * ft.tv_loss_3d(vol)
+        if vol_requires_grad:
+            loss = loss + tv_weight * ft.tv_loss_3d(vol)
         toc("tv")
 
         tic("backward")
@@ -139,6 +171,15 @@ def main() -> None:
             vol.mul_(mask)
             toc("mask")
 
+    # Print configuration header before warmup so logs are unambiguous.
+    print()
+    print(f"grad-mode={grad_mode}  device={args.device}  vol={N}^3  "
+          f"n_angles={n_angles}  warmup={args.warmup}  measure={args.measure}")
+    print(f"vol.requires_grad={vol_requires_grad}  "
+          f"euler.requires_grad={euler_requires_grad}  "
+          f"shifts.requires_grad={shifts_requires_grad}")
+    print()
+
     for _ in range(args.warmup):
         step(record=False)
 
@@ -156,10 +197,6 @@ def main() -> None:
     iter_ms = wall_total_ms / args.measure
     section_sum_ms = sum(totals_ms.values()) / args.measure
 
-    print()
-    print(f"device={args.device}  vol={N}^3  n_angles={n_angles}  "
-          f"warmup={args.warmup}  measure={args.measure}")
-    print()
     print(f"{'section':<16} {'ms/iter':>9} {'% iter':>8}")
     print("-" * 36)
     for s in sections:
