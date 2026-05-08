@@ -6,13 +6,17 @@ All public functions accept and return `torch.Tensor` (float32). Forward and bac
 
 ## Requirements
 
-- Python ≥ 3.9
-- A C/C++ compiler with OpenMP (Linux: gcc; macOS: `brew install libomp`)
+- Python ≥ 3.9 (tested on 3.12)
+- A C/C++ compiler with OpenMP (Linux: **GCC 13** — see note below; macOS: `brew install libomp`)
 - CMake ≥ 3.18
-- PyTorch (`pip install torch`)
-- **For the CUDA backend only:** `nvcc` on `PATH` and matching CUDA runtime headers. The simplest way is conda: `conda install -c nvidia cuda-nvcc cuda-cudart-dev`. Both CUDA 12.x and 13.x toolkits are supported for source builds; the released wheels are built with CUDA 13.0.
+- PyTorch ≥ 2.11 (`pip install torch`) — bundles `cudart 13.0`
+- **For the CUDA backend only:** `nvcc 13.0` on `PATH` and matching CUDA runtime headers.
 
 The build auto-detects CUDA: if `nvcc` is found it builds the CUDA backend, otherwise it falls back to a CPU-only build silently.
+
+> **Supported CUDA toolkit:** **only CUDA 13.0** for now. PyTorch 2.11's wheels bundle `cudart 13.0`; an `nvcc 13.x` newer than 13.0 (e.g. 13.2) will produce PTX that errors at runtime with `the provided PTX was compiled with an unsupported toolchain`. Pin nvcc to **13.0** explicitly.
+>
+> **Host compiler:** **GCC 13** (not 14). CUDA 13's nvcc only supports up to GCC 13. With GCC 14 the configure step fails with `error: identifier "__is_array" is undefined` from libstdc++ headers. If your conda env defaults to GCC 14, pin it down: `conda install -c conda-forge gxx_linux-64=13 gcc_linux-64=13`.
 
 ## Install
 
@@ -26,9 +30,25 @@ uv pip install -e .
 
 ### CUDA (from source)
 
+Recommended: use a fresh conda env so version pins don't conflict with prior installs.
+
 ```bash
-# Ensure nvcc is on PATH (system toolkit, or `conda install -c nvidia cuda-nvcc cuda-cudart-dev`)
-pip install -e .
+conda create -n FastTomo python=3.12 -y
+conda activate FastTomo
+
+# Pinned versions matching PyTorch 2.11's bundled cudart and nvcc-13's GCC support
+conda install -c conda-forge gxx_linux-64=13 gcc_linux-64=13 cmake -y
+conda install -c nvidia 'cuda-nvcc=13.0' 'cuda-cudart-dev=13.0' -y
+
+pip install torch numpy tqdm scikit-build-core pybind11
+pip install -e . --no-build-isolation
+```
+
+Then verify:
+
+```bash
+python -c "import fasttomo._core as c; print('CUDA:', c.cuda_available)"  # expect: True
+pytest tests/test_cuda.py
 ```
 
 To force the CUDA build to fail loudly if no toolkit is present (instead of silently falling back to CPU):
