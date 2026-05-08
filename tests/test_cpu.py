@@ -6,7 +6,6 @@ Run with:  pytest tests/test_cpu.py -v
 
 import pytest
 import torch
-import numpy as np
 
 import fasttomo as ft
 
