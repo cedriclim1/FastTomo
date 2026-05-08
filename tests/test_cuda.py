@@ -1154,5 +1154,83 @@ class TestRunAdRecon:
         assert losses.dtype == torch.float32
 
 
+# ── CUDA Graph capture for run_sirt ──────────────────────────────────────────
+
+
+class TestRunSirtCudaGraph:
+    """Verify the CUDA-Graph-accelerated path in run_sirt.
+
+    Gate: auto-skip if no GPU is available (handled by module-level pytestmark).
+    """
+
+    def _make_inputs(self, N: int = 32, n_angles: int = 20):
+        """Return (sinogram, angles_deg) on CUDA for a simple phantom."""
+        angles = make_angles(n_angles)
+        vol    = phantom_2d(N).unsqueeze(0)
+        sino   = ft.forward_project(vol, angles)
+        return sino, angles
+
+    def test_graph_matches_eager(self):
+        """Graph path must produce volumes within 1e-5 RMSE of the eager path."""
+        sino, angles = self._make_inputs(N=32, n_angles=20)
+        n_iter = 20
+
+        # Eager path: return_loss=True forces the eager loop regardless.
+        rec_eager, _ = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
+                                   return_loss=True)
+
+        # Graph path: default CUDA path with return_loss=False.
+        rec_graph = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
+                                return_loss=False)
+
+        rmse = ((rec_eager - rec_graph) ** 2).mean().sqrt().item()
+        assert rmse < 1e-5, (
+            f"Graph path differs from eager path: RMSE={rmse:.2e} (threshold 1e-5)"
+        )
+
+    def test_graph_cache_reuse(self):
+        """Second call with matching shape on the same projector must not recapture."""
+        N        = 32
+        n_angles = 20
+        sino, angles = self._make_inputs(N=N, n_angles=n_angles)
+        proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+
+        ft.run_sirt(sino, angles, n_iter=5, Nz=N, projector=proj)
+        ft.run_sirt(sino, angles, n_iter=5, Nz=N, projector=proj)
+
+        # Should have exactly one cached graph regardless of how many calls.
+        assert hasattr(proj, "_sirt_graph_cache"), (
+            "projector has no _sirt_graph_cache after run_sirt"
+        )
+        assert len(proj._sirt_graph_cache) == 1, (
+            f"expected 1 cached graph, got {len(proj._sirt_graph_cache)}"
+        )
+
+    def test_graph_handles_positivity_sparsity_mask(self):
+        """Smoke-test representative flag combinations via the graph path."""
+        sino, angles = self._make_inputs(N=32, n_angles=20)
+        n_iter = 5
+
+        combos = [
+            dict(positivity=False, sparsity=0.0, mask=False),
+            dict(positivity=True,  sparsity=0.0, mask=False),
+            dict(positivity=False, sparsity=0.01, mask=False),
+            dict(positivity=True,  sparsity=0.01, mask=True),
+        ]
+        for kwargs in combos:
+            rec = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
+                              return_loss=False, **kwargs)
+            assert rec.shape == (1, 32, 32), (
+                f"wrong shape {rec.shape} for kwargs={kwargs}"
+            )
+            assert torch.isfinite(rec).all(), (
+                f"non-finite values in reconstruction for kwargs={kwargs}"
+            )
+            if kwargs.get("positivity"):
+                assert rec.min().item() >= -1e-6, (
+                    f"positivity violated for kwargs={kwargs}"
+                )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
