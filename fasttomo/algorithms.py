@@ -10,7 +10,9 @@ Angles: 1-D tensor, degrees.
 
 from __future__ import annotations
 
+import logging
 import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -26,8 +28,10 @@ from fasttomo.projection import (
     forward_project_resire,
     back_project_resire,
 )
-from fasttomo.utilities import cylindrical_mask, ramp_filter, tv_loss_3d
+from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
 from fasttomo.projector import ParallelProjector, RotmatProjector
+
+_log = logging.getLogger(__name__)
 
 
 # ── module-level constants ─────────────────────────────────────────────────
@@ -306,7 +310,35 @@ def run_sirt(
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     losses: list[float] = []
 
-    # --- iteration loop ---
+    # --- CUDA Graph capture path ----------------------------------------
+    # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
+    # If capture fails, fall back to the eager loop below.
+    _active_proj = projector if projector is not None else _internal_proj
+    if sinogram.is_cuda and not return_loss and n_iter > 1:
+        graph_result = _run_sirt_cuda_graph(
+            volume=volume,
+            sinogram=sinogram,
+            n_iter=n_iter,
+            omega=omega,
+            C_vol=C_vol,
+            R_sino=R_sino,
+            _fp=_fp,
+            _bp=_bp,
+            sparsity=sparsity,
+            positivity=positivity,
+            _mask=_mask,
+            projector=_active_proj,
+            key=(Ny, Nz, Nx, n_angles, N_det,
+                 sinogram.dtype,
+                 positivity,
+                 sparsity > 0.0,
+                 _mask is not None,
+                 euler_zyz_deg is not None),
+        )
+        if graph_result is not None:
+            return graph_result
+
+    # --- eager iteration loop (fallback / CPU / return_loss path) --------
     for _ in range(n_iter):
         raw_res  = sinogram - _fp(volume)
         if return_loss:
@@ -323,6 +355,513 @@ def run_sirt(
     if return_loss:
         return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+def run_sart(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    n_iter: int = 5,
+    subset_size: int = 1,
+    omega: float = 1.0,
+    Nz: int = -1,
+    positivity: bool = False,
+    mask: bool = False,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
+    return_loss: bool = False,
+    sparsity: float = 0.0,
+    num_threads: int | None = None,             # CPU 3D path only
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
+
+    Per-subset ordered-subsets update:
+
+        for each subset S of size subset_size:
+            r_S  = b_S - A_S · x
+            x   += ω · A_Sᵀ(r_S / R_S) · C_S
+
+    where:
+        R_S = A_S(1)    (row normalisation per subset — safeguarded against /0)
+        C_S = 1/A_Sᵀ(1) (column normalisation per subset — safeguarded against /0)
+
+    With subset_size=1 this is plain SART (Andersen & Kak 1984).
+    With subset_size=n_angles this is equivalent to one SIRT outer step
+    (Wang & Yu 2007 OS-SART degenerate case).
+
+    Subsets are formed by sequential splitting of the angle index:
+    [0:subset_size], [subset_size:2*subset_size], …, remainder.
+    The last subset may be smaller than subset_size.
+
+    sparsity / positivity / mask are applied once per outer iteration
+    (after all subsets have been processed), mirroring run_sirt.
+
+    return_loss: if True, returns (volume, loss_history) where loss_history
+    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
+    ||b - A·x||² / numel evaluated over the *full* sinogram after each
+    outer iteration.
+
+    euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
+    (forward_project_3d / back_project_3d) instead of the scalar-angle
+    single-axis projector. num_threads is forwarded to the CPU 3D kernels.
+
+    This is a frozen baseline — no projector caching, no CUDA-Graph capture.
+    Use run_sirt (or the AD path) for performance-critical workloads.
+
+    Returns volume [Ny, Nz, Nx].
+    """
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+
+    device = sinogram.device
+    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
+
+    # Build functional closures that accept an index list so we can slice
+    # both the angles tensor and the sinogram for each subset.
+    if euler_zyz_deg is not None:
+        def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return forward_project_3d(v, euler_zyz_deg[idx], N_det=N_det, num_threads=num_threads)
+
+        def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return back_project_3d(s, euler_zyz_deg[idx], Nz=Nz, num_threads=num_threads)
+
+        def _fp_full(v: torch.Tensor) -> torch.Tensor:
+            return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
+    else:
+        def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return forward_project(v, angles_deg[idx], N_det=N_det)
+
+        def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return back_project(s, angles_deg[idx], Nz=Nz)
+
+        def _fp_full(v: torch.Tensor) -> torch.Tensor:
+            return forward_project(v, angles_deg, N_det=N_det)
+
+    # Build subsets: list of index tensors
+    clamp = max(1, min(subset_size, n_angles))
+    all_idx = torch.arange(n_angles, dtype=torch.long)
+    subsets = list(torch.split(all_idx, clamp))
+
+    # Pre-compute per-subset normalisations (done once, outside the outer loop).
+    ones_vol = torch.ones(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    R_list: list[torch.Tensor] = []  # row normalisers [|S|, Ny, N_det]
+    C_list: list[torch.Tensor] = []  # col normalisers [Ny, Nz, Nx]
+    for idx in subsets:
+        R_s = _fp_subset(ones_vol, idx)
+        R_s = torch.where(R_s > 0, 1.0 / R_s, torch.zeros_like(R_s))
+        R_list.append(R_s)
+
+        # ones_sino for this subset
+        ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=torch.float32, device=device)
+        C_s = _bp_subset(ones_sino_s, idx)
+        C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
+        C_list.append(C_s)
+
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    losses: list[float] = []
+
+    # --- outer iteration loop ---
+    for _ in range(n_iter):
+        # --- inner subset loop ---
+        for idx, R_s, C_s in zip(subsets, R_list, C_list):
+            sino_s = sinogram[idx]                   # [|S|, Ny, N_det]
+            pred_s = _fp_subset(volume, idx)         # [|S|, Ny, N_det]
+            r_s    = sino_s - pred_s                 # [|S|, Ny, N_det]
+            volume = volume + omega * C_s * _bp_subset(r_s * R_s, idx)
+
+        if return_loss:
+            with torch.no_grad():
+                raw_res = sinogram - _fp_full(volume)
+                losses.append(raw_res.pow(2).mean().item())
+
+        if sparsity > 0.0:
+            volume = _apply_sparsity(volume, sparsity)
+        if positivity:
+            volume.clamp_(min=0.0)
+        if _mask is not None:
+            volume = volume * _mask
+
+    if return_loss:
+        return volume, torch.tensor(losses, dtype=torch.float32)
+    return volume
+
+
+def run_ad_recon(
+    sinogram: torch.Tensor,            # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,          # [n_angles] degrees
+    *,
+    n_iter: int = 1000,
+    refine_pose: bool = False,
+    refine_shifts: bool = False,
+    Nz: int = -1,
+    lr_volume: float = 0.05,
+    lr_angles: float = 1e-2,
+    lr_shifts: float = 1e-2,
+    tv_weight: float = 0.0,
+    sparsity: float = 0.0,
+    positivity: bool = False,
+    mask: bool = False,
+    loss_fn: str = "mse",
+    cosine_schedule: bool = True,
+    return_loss: bool = False,
+    return_pose: bool = False,
+    projector: object | None = None,
+) -> torch.Tensor | tuple:
+    """
+    Autograd-based reconstruction with optional pose and shift refinement.
+
+    ``run_ad_recon`` packages the autograd reconstruction loop demonstrated in
+    ``Notebooks/test.ipynb`` (cells 5d13fa07, acadca5a). It is the AD path's
+    library entry point; it is not a new algorithm.
+
+    The loop optimises a volume (and optionally ZYZ Euler angles and/or 2-D
+    per-tilt shifts) by minimising the sinogram data-fit loss with Adam.  A
+    persistent :class:`ParallelProjector` or :class:`RotmatProjector` is built
+    once before the loop so the underlying ``TextureCache`` is reused across all
+    iterations — exactly as in the notebook.
+
+    Args:
+        sinogram:        [n_angles, Ny, N_det] float32 CUDA tensor.
+        angles_deg:      [n_angles] tilt angles in degrees.
+        n_iter:          Number of Adam steps (default 1000).
+        refine_pose:     If True, also optimise ZYZ Euler angles (requires
+                         RotmatProjector internally). Default False.
+        refine_shifts:   If True, also optimise per-tilt 2-D shifts via
+                         ``apply_shifts_2d`` after each FP. Independent of
+                         ``refine_pose``; both may be True simultaneously.
+        Nz:              Reconstruction depth; defaults to N_det.
+        lr_volume:       Adam learning rate for the volume (default 0.05).
+        lr_angles:       Adam learning rate for Euler angles (default 1e-2).
+        lr_shifts:       Adam learning rate for shifts (default 1e-2).
+        tv_weight:       3-D isotropic TV regularisation weight; added as
+                         ``tv_weight * tv_loss_3d(volume)`` each iteration.
+                         0.0 disables it.
+        sparsity:        Sparsity weight; adds ``sparsity * volume.mean()``
+                         to the loss each iteration (L1-style, as used in the
+                         notebook for atomic-resolution data). 0.0 disables it.
+        positivity:      If True, clamps ``volume`` to ``[0, ∞)`` after each
+                         step inside ``torch.no_grad()``.
+        mask:            If True, builds ``cylindrical_mask(Nz, Nx)`` once and
+                         multiplies ``volume`` by it inside ``torch.no_grad()``
+                         after each step.
+        loss_fn:         ``"mse"`` (default) or ``"l1"`` — data-fit loss
+                         between predicted and measured sinogram.
+        cosine_schedule: If True, attaches a
+                         :class:`~torch.optim.lr_scheduler.CosineAnnealingLR`
+                         to each Adam optimiser (mirrors notebook defaults).
+        return_loss:     If True, also return the per-iteration loss history
+                         as ``torch.tensor(losses)``.
+        return_pose:     If True, also return the refined pose parameters as
+                         ``(euler_zyz_deg, shifts)`` where each is ``None``
+                         if the corresponding refinement was disabled.
+        projector:       Optional pre-built :class:`RotmatProjector` (when
+                         ``refine_pose=True``) or :class:`ParallelProjector`
+                         (when ``refine_pose=False``). Passing a projector
+                         whose class does not match the requested mode raises
+                         ``ValueError``. If ``None``, a projector is built
+                         internally and torn down on return.
+
+    Returns:
+        * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
+        * if ``return_loss`` only  — ``(volume, loss_history)``
+        * if ``return_pose`` only  — ``(volume, euler_or_None, shifts_or_None)``
+        * if both                  — ``(volume, loss_history, euler_or_None, shifts_or_None)``
+
+    Note:
+        This function requires a CUDA device.  The underlying projectors are
+        CUDA-only; passing CPU tensors will raise a ``RuntimeError`` from the
+        projector constructor.
+    """
+    if loss_fn not in ("mse", "l1"):
+        raise ValueError(f"loss_fn must be 'mse' or 'l1', got {loss_fn!r}")
+
+    # Projector class/mode mismatch validation
+    if projector is not None:
+        if refine_pose and not isinstance(projector, RotmatProjector):
+            raise ValueError(
+                f"refine_pose=True requires a RotmatProjector, but got "
+                f"{type(projector).__name__}. Either pass a RotmatProjector "
+                f"or set refine_pose=False."
+            )
+        if not refine_pose and not isinstance(projector, ParallelProjector):
+            raise ValueError(
+                f"refine_pose=False requires a ParallelProjector, but got "
+                f"{type(projector).__name__}. Either pass a ParallelProjector "
+                f"or set refine_pose=True."
+            )
+
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+    device = sinogram.device
+
+    sinogram = sinogram.float()
+    angles_deg = angles_deg.float().to(device)
+
+    # ── initialise volume ──────────────────────────────────────────────────
+    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
+                         requires_grad=True)
+
+    # ── build projector ────────────────────────────────────────────────────
+    _internal_proj: object | None = None
+    if projector is not None:
+        _proj = projector
+    elif refine_pose:
+        _internal_proj = RotmatProjector(
+            (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
+        )
+        _proj = _internal_proj
+    else:
+        _internal_proj = ParallelProjector(
+            (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
+        )
+        _proj = _internal_proj
+
+    # ── initialise pose / shift parameters ────────────────────────────────
+    tilt_angle_opt: torch.Tensor | None = None
+    shifts: torch.Tensor | None = None
+
+    if refine_pose:
+        tilt_angle_opt = torch.zeros(n_angles, 3, dtype=torch.float32, device=device)
+        tilt_angle_opt[:, 1] = angles_deg
+        tilt_angle_opt.requires_grad_(True)
+
+    if refine_shifts:
+        shifts = torch.zeros(n_angles, 2, dtype=torch.float32, device=device,
+                             requires_grad=True)
+
+    # ── build optimiser list ───────────────────────────────────────────────
+    opt_vol = torch.optim.Adam([volume], lr=lr_volume)
+    optimisers = [opt_vol]
+
+    opt_angles: torch.optim.Optimizer | None = None
+    opt_shifts: torch.optim.Optimizer | None = None
+
+    if refine_pose and tilt_angle_opt is not None:
+        opt_angles = torch.optim.Adam([tilt_angle_opt], lr=lr_angles)
+        optimisers.append(opt_angles)
+    if refine_shifts and shifts is not None:
+        opt_shifts = torch.optim.Adam([shifts], lr=lr_shifts)
+        optimisers.append(opt_shifts)
+
+    # ── cosine LR schedulers ───────────────────────────────────────────────
+    schedulers: list = []
+    if cosine_schedule:
+        schedulers = [
+            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_iter)
+            for opt in optimisers
+        ]
+
+    # ── cylindrical mask (built once) ─────────────────────────────────────
+    _cmask: torch.Tensor | None = None
+    if mask:
+        _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
+
+    # ── iteration ─────────────────────────────────────────────────────────
+    losses: list[float] = []
+
+    for _ in range(n_iter):
+        for opt in optimisers:
+            opt.zero_grad()
+
+        # forward project
+        if refine_pose and tilt_angle_opt is not None:
+            mats = _euler_zyz_to_rotmat(tilt_angle_opt)
+            pred = _proj.forward(volume, mats)  # type: ignore[arg-type]
+        else:
+            pred = _proj.forward(volume)  # type: ignore[arg-type]
+
+        # optional shift correction
+        if refine_shifts and shifts is not None:
+            pred = apply_shifts_2d(pred, shifts)
+
+        # data-fit loss
+        if loss_fn == "mse":
+            loss = F.mse_loss(pred, sinogram)
+        else:
+            loss = F.l1_loss(pred, sinogram)
+
+        # regularisation
+        if tv_weight > 0.0:
+            loss = loss + tv_weight * tv_loss_3d(volume)
+        if sparsity > 0.0:
+            loss = loss + sparsity * volume.mean()
+
+        losses.append(loss.item())
+        loss.backward()
+
+        for opt in optimisers:
+            opt.step()
+        for sched in schedulers:
+            sched.step()
+
+        # constraints applied inside no_grad (leaf-tensor safe)
+        with torch.no_grad():
+            if positivity:
+                volume.clamp_(min=0.0)
+            if _cmask is not None:
+                volume.mul_(_cmask.unsqueeze(0))
+
+    out = volume.detach()
+
+    # ── build return tuple ─────────────────────────────────────────────────
+    if not return_loss and not return_pose:
+        return out
+
+    result: list = [out]
+    if return_loss:
+        result.append(torch.tensor(losses, dtype=torch.float32))
+    if return_pose:
+        refined_euler = tilt_angle_opt.detach().cpu() if tilt_angle_opt is not None else None
+        refined_shifts = shifts.detach().cpu() if shifts is not None else None
+        result.append(refined_euler)
+        result.append(refined_shifts)
+
+    return tuple(result)
+
+
+# ---------------------------------------------------------------------------
+# CUDA Graph helper for run_sirt
+# ---------------------------------------------------------------------------
+
+# Module-level cache for graphs when no persistent projector is supplied.
+# Keyed by the same tuple as projector._sirt_graph_cache.
+_sirt_graph_module_cache: dict = {}
+
+# Set of keys known to fail graph capture — skip recapture on subsequent calls.
+_sirt_graph_bad_keys: set = set()
+
+
+def _run_sirt_cuda_graph(
+    volume: torch.Tensor,
+    sinogram: torch.Tensor,
+    n_iter: int,
+    omega: float,
+    C_vol: torch.Tensor,
+    R_sino: torch.Tensor,
+    _fp,
+    _bp,
+    sparsity: float,
+    positivity: bool,
+    _mask,
+    projector,
+    key: tuple,
+) -> torch.Tensor | None:
+    """
+    Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
+
+    Returns the reconstructed volume tensor, or ``None`` if capture was
+    skipped / failed (caller should fall back to the eager loop).
+
+    The graph is cached:
+      - On ``projector._sirt_graph_cache[key]`` when a projector is supplied.
+      - On the module-level ``_sirt_graph_module_cache[key]`` otherwise.
+
+    Keys that previously failed capture are remembered in
+    ``_sirt_graph_bad_keys`` so subsequent calls skip capture directly.
+    """
+    global _sirt_graph_module_cache, _sirt_graph_bad_keys
+
+    if key in _sirt_graph_bad_keys:
+        return None
+
+    # Select cache dict.
+    if projector is not None:
+        if not hasattr(projector, "_sirt_graph_cache"):
+            projector._sirt_graph_cache = {}
+        cache = projector._sirt_graph_cache
+    else:
+        cache = _sirt_graph_module_cache
+
+    Ny, Nz, Nx = volume.shape
+
+    if key not in cache:
+        # --- build a new graph for this key ---
+        try:
+            # Allocate persistent static buffers.
+            vol_static = volume.clone()
+
+            # Warmup: one eager iteration with the static buffer.
+            # Populates cuFFT plans, allocator pool, projector texture caches.
+            with torch.no_grad():
+                _sirt_iter_inplace(
+                    vol_static, sinogram, C_vol, R_sino, omega,
+                    _fp, _bp, sparsity, positivity, _mask,
+                )
+
+            # Capture the iteration body.
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(g):
+                _sirt_iter_inplace(
+                    vol_static, sinogram, C_vol, R_sino, omega,
+                    _fp, _bp, sparsity, positivity, _mask,
+                )
+            torch.cuda.synchronize()
+
+            cache[key] = (g, vol_static)
+
+        except Exception as exc:
+            _log.warning(
+                "run_sirt: CUDA Graph capture failed for key %s (%s). "
+                "Falling back to eager loop for this and future calls "
+                "with this configuration.",
+                key, exc,
+            )
+            _sirt_graph_bad_keys.add(key)
+            return None
+
+    g, vol_static = cache[key]
+
+    # Reset the captured static buffer to the caller's starting volume so the
+    # warmup iteration that ran inside the cache-build branch above does not
+    # advance the reconstruction. After this copy each replay applies one
+    # SIRT iteration, yielding exactly n_iter updates for both first-call
+    # and cache-hit paths.
+    vol_static.copy_(volume)
+
+    for _ in range(n_iter):
+        g.replay()
+    torch.cuda.synchronize()
+
+    return vol_static.clone()
+
+
+def _sirt_iter_inplace(
+    vol_static: torch.Tensor,
+    sinogram: torch.Tensor,
+    C_vol: torch.Tensor,
+    R_sino: torch.Tensor,
+    omega: float,
+    _fp,
+    _bp,
+    sparsity: float,
+    positivity: bool,
+    _mask,
+) -> None:
+    """
+    One in-place SIRT iteration on ``vol_static``.
+
+    All writes go through in-place ops (``add_``, ``mul_``, ``clamp_``,
+    ``copy_``) so that ``vol_static``'s memory address is stable —
+    a requirement for CUDA Graph capture to replay correctly.
+    """
+    raw_res  = sinogram - _fp(vol_static)
+    residual = raw_res * R_sino
+    update   = _bp(residual)
+    # Avoid creating a temporary for `update * C_vol` to keep allocations
+    # inside the graph's memory pool.
+    update.mul_(C_vol)
+    vol_static.add_(update, alpha=omega)
+    if sparsity > 0.0:
+        # Copy result of out-of-place soft-threshold back in-place.
+        vol_static.copy_(_apply_sparsity(vol_static, sparsity))
+    if positivity:
+        vol_static.clamp_(min=0.0)
+    if _mask is not None:
+        vol_static.mul_(_mask)
 
 
 def _genfire_hermitian_sym(
