@@ -312,9 +312,11 @@ def run_sirt(
 
     # --- CUDA Graph capture path ----------------------------------------
     # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
+    # Rotmat mode (euler_zyz_deg) is kept on eager path because the per-call
+    # matrix tensor can vary, while cached graphs assume fixed captured inputs.
     # If capture fails, fall back to the eager loop below.
     _active_proj = projector if projector is not None else _internal_proj
-    if sinogram.is_cuda and not return_loss and n_iter > 1:
+    if sinogram.is_cuda and not return_loss and n_iter > 1 and euler_zyz_deg is None:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
             sinogram=sinogram,
@@ -330,8 +332,9 @@ def run_sirt(
             projector=_active_proj,
             key=(Ny, Nz, Nx, n_angles, N_det,
                  sinogram.dtype,
+                 float(omega),
                  positivity,
-                 sparsity > 0.0,
+                 float(sparsity),
                  _mask is not None,
                  euler_zyz_deg is not None),
         )
@@ -726,10 +729,6 @@ def run_ad_recon(
 # CUDA Graph helper for run_sirt
 # ---------------------------------------------------------------------------
 
-# Module-level cache for graphs when no persistent projector is supplied.
-# Keyed by the same tuple as projector._sirt_graph_cache.
-_sirt_graph_module_cache: dict = {}
-
 # Set of keys known to fail graph capture — skip recapture on subsequent calls.
 _sirt_graph_bad_keys: set = set()
 
@@ -755,39 +754,36 @@ def _run_sirt_cuda_graph(
     Returns the reconstructed volume tensor, or ``None`` if capture was
     skipped / failed (caller should fall back to the eager loop).
 
-    The graph is cached:
-      - On ``projector._sirt_graph_cache[key]`` when a projector is supplied.
-      - On the module-level ``_sirt_graph_module_cache[key]`` otherwise.
+    The graph is cached on ``projector._sirt_graph_cache[key]``.
 
     Keys that previously failed capture are remembered in
     ``_sirt_graph_bad_keys`` so subsequent calls skip capture directly.
     """
-    global _sirt_graph_module_cache, _sirt_graph_bad_keys
+    global _sirt_graph_bad_keys
 
     if key in _sirt_graph_bad_keys:
         return None
 
-    # Select cache dict.
-    if projector is not None:
-        if not hasattr(projector, "_sirt_graph_cache"):
-            projector._sirt_graph_cache = {}
-        cache = projector._sirt_graph_cache
-    else:
-        cache = _sirt_graph_module_cache
-
-    Ny, Nz, Nx = volume.shape
+    if projector is None:
+        return None
+    if not hasattr(projector, "_sirt_graph_cache"):
+        projector._sirt_graph_cache = {}
+    cache = projector._sirt_graph_cache
 
     if key not in cache:
         # --- build a new graph for this key ---
         try:
             # Allocate persistent static buffers.
             vol_static = volume.clone()
+            sino_static = sinogram.clone()
+            C_static = C_vol.clone()
+            R_static = R_sino.clone()
 
             # Warmup: one eager iteration with the static buffer.
             # Populates cuFFT plans, allocator pool, projector texture caches.
             with torch.no_grad():
                 _sirt_iter_inplace(
-                    vol_static, sinogram, C_vol, R_sino, omega,
+                    vol_static, sino_static, C_static, R_static, omega,
                     _fp, _bp, sparsity, positivity, _mask,
                 )
 
@@ -796,12 +792,12 @@ def _run_sirt_cuda_graph(
             g = torch.cuda.CUDAGraph()
             with torch.no_grad(), torch.cuda.graph(g):
                 _sirt_iter_inplace(
-                    vol_static, sinogram, C_vol, R_sino, omega,
+                    vol_static, sino_static, C_static, R_static, omega,
                     _fp, _bp, sparsity, positivity, _mask,
                 )
             torch.cuda.synchronize()
 
-            cache[key] = (g, vol_static)
+            cache[key] = (g, vol_static, sino_static, C_static, R_static)
 
         except Exception as exc:
             _log.warning(
@@ -813,7 +809,7 @@ def _run_sirt_cuda_graph(
             _sirt_graph_bad_keys.add(key)
             return None
 
-    g, vol_static = cache[key]
+    g, vol_static, sino_static, C_static, R_static = cache[key]
 
     # Reset the captured static buffer to the caller's starting volume so the
     # warmup iteration that ran inside the cache-build branch above does not
@@ -821,6 +817,12 @@ def _run_sirt_cuda_graph(
     # SIRT iteration, yielding exactly n_iter updates for both first-call
     # and cache-hit paths.
     vol_static.copy_(volume)
+    # Keep graph inputs fresh on cache hits; captured CUDA graphs replay with
+    # pointer-stable tensors, so dynamic call-time tensors must be copied into
+    # those static buffers before replay.
+    sino_static.copy_(sinogram)
+    C_static.copy_(C_vol)
+    R_static.copy_(R_sino)
 
     for _ in range(n_iter):
         g.replay()
