@@ -595,5 +595,80 @@ def test_fp3d_default_is_serial(monkeypatch):
     assert _resolve_num_threads(2) == 2   # explicit kwarg wins over env
 
 
+# ── SART ──────────────────────────────────────────────────────────────────
+
+class TestRunSart:
+    """Tests for run_sart (SART / OS-SART baseline)."""
+
+    def _make_fixture(self, N: int = 16):
+        """Return a (sinogram, angles) pair produced by FP of a small phantom."""
+        angles = make_angles(20, max_deg=60.0)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+        return sino, angles, vol
+
+    def test_shape(self):
+        """Output volume has shape [Ny, Nz, Nx] and dtype float32."""
+        N = 16
+        sino, angles, vol = self._make_fixture(N)
+        rec = ft.run_sart(sino, angles, n_iter=2, Nz=N)
+        assert rec.shape == vol.shape, f"expected {vol.shape}, got {rec.shape}"
+        assert rec.dtype == torch.float32
+
+    def test_convergence(self):
+        """SART residual MSE decreases over 5 iterations (subset_size=1)."""
+        N = 16
+        sino, angles, _ = self._make_fixture(N)
+        _, losses = ft.run_sart(sino, angles, n_iter=5, subset_size=1, Nz=N,
+                                return_loss=True)
+        assert losses[0].item() > losses[-1].item(), (
+            f"SART did not reduce loss: {losses.tolist()}"
+        )
+
+    def test_sirt_equivalence(self):
+        """
+        With subset_size=n_angles and omega=1.0, run_sart should produce
+        RMSE within 1e-3 of run_sirt on the same fixture and iteration count.
+
+        Both algorithms reduce to the same update equation when all angles form
+        a single subset — the only numerical difference is floating-point
+        ordering inside the update accumulation.
+        """
+        N = 16
+        k = 3
+        sino, angles, vol = self._make_fixture(N)
+        n_angles = len(angles)
+
+        rec_sirt = ft.run_sirt(sino, angles, n_iter=k, Nz=N)
+        rec_sart = ft.run_sart(sino, angles, n_iter=k, subset_size=n_angles, Nz=N)
+
+        rmse = ((rec_sirt - rec_sart).pow(2).mean()).sqrt().item()
+        assert rmse < 1e-3, (
+            f"SART (subset_size=n_angles) vs SIRT RMSE = {rmse:.2e} (threshold 1e-3)"
+        )
+
+    def test_subset_size_smoke(self):
+        """subset_size=4, n_iter=2 produces finite, shape-correct output."""
+        N = 16
+        sino, angles, vol = self._make_fixture(N)
+        rec = ft.run_sart(sino, angles, n_iter=2, subset_size=4, Nz=N)
+        assert rec.shape == vol.shape
+        assert torch.isfinite(rec).all().item(), "output contains NaN or Inf"
+
+    def test_return_loss(self):
+        """return_loss=True returns (volume, loss_history) with len == n_iter."""
+        N = 16
+        sino, angles, vol = self._make_fixture(N)
+        n_iter = 4
+        result = ft.run_sart(sino, angles, n_iter=n_iter, Nz=N, return_loss=True)
+        assert isinstance(result, tuple) and len(result) == 2
+        rec, losses = result
+        assert rec.shape == vol.shape
+        assert losses.shape == torch.Size([n_iter]), (
+            f"expected loss_history length {n_iter}, got {losses.shape}"
+        )
+        assert torch.isfinite(losses).all().item()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
