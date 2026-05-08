@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -39,7 +37,7 @@ def test_parallel_projector_forward_matches_functional(workload):
 
 def test_parallel_projector_back_matches_functional(workload):
     _, sino, ang = workload
-    Ny, n_angles, N_det = sino.shape[1], sino.shape[0], sino.shape[2]
+    Ny, N_det = sino.shape[1], sino.shape[2]
     proj = ft.ParallelProjector((Ny, N_det, N_det), ang, device=sino.device)
     vol_func = ft.back_project(sino, ang)
     for _ in range(5):
