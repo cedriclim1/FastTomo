@@ -219,10 +219,7 @@ __marimo__/
 
 # Claude Code
 CLAUDE.md
-!CLAUDE.md
 .claude/
-!.claude/tasks/
-!.claude/tasks/**
 fasttomo-wiki/
 
 Notebooks/
