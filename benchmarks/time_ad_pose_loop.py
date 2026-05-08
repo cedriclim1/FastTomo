@@ -64,6 +64,12 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type != "cuda":
         raise SystemExit("this script requires a CUDA device")
+    # torch.cuda.Event(enable_timing=True) records on the *current* CUDA device,
+    # not the device of the tensors being timed. Without setting the current
+    # device explicitly, events get created on cuda:0 even when our work runs
+    # on cuda:1+, which corrupts kernel state and surfaces as illegal memory
+    # access in subsequent launches.
+    torch.cuda.set_device(device)
 
     grad_mode = args.grad_mode
 
