@@ -4,6 +4,19 @@
 # — this is what lets one wheel work across PyTorch's CUDA versions.
 import torch  # noqa: F401
 
+import warnings as _warnings
+from fasttomo import _core as _core_mod
+if (not getattr(_core_mod, "cuda_available", False)) and torch.cuda.is_available():
+    _warnings.warn(
+        "fasttomo was built without CUDA support but torch.cuda.is_available() is True. "
+        "CPU kernels will be used; passing CUDA tensors will raise RuntimeError. "
+        "Rebuild with `pip install -e . --config-settings=cmake.define.FASTTOMO_USE_CUDA=ON` "
+        "after activating the conda env that ships nvcc.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+del _warnings, _core_mod
+
 from fasttomo.projection import (
     forward_project,
     back_project,

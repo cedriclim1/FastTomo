@@ -68,6 +68,45 @@ for base in nvidia.__path__:
     endif()
 endif()
 
+# Conda env CUDA toolkit fallback. If no pip wheel was found and the user is
+# inside a conda env that ships nvcc (e.g. `conda activate FastTomo`), use
+# that. Without this, cron jobs that don't run conda activate silently get a
+# CPU-only build.
+if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED CUDAToolkit_ROOT)
+    set(_CONDA_ENV_ROOT "$ENV{CONDA_PREFIX}")
+    if(_CONDA_ENV_ROOT AND EXISTS "${_CONDA_ENV_ROOT}/bin/nvcc")
+        message(STATUS "Detected conda env CUDA toolkit at ${_CONDA_ENV_ROOT}")
+        set(CUDAToolkit_ROOT "${_CONDA_ENV_ROOT}" CACHE PATH "")
+        set(CMAKE_CUDA_COMPILER "${_CONDA_ENV_ROOT}/bin/nvcc" CACHE FILEPATH "")
+    endif()
+endif()
+
+# nvcc 13.x rejects host compilers newer than GCC 13. If the default C++
+# compiler is conda-forge's GCC 14+ and the user hasn't supplied a host
+# compiler, fall back to /usr/bin/g++-13 when available.
+if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER
+   AND NOT DEFINED ENV{CMAKE_CUDA_HOST_COMPILER}
+   AND NOT DEFINED ENV{CUDAHOSTCXX})
+    find_program(_FASTTOMO_CXX_PROBE NAMES c++ g++ x86_64-conda-linux-gnu-g++)
+    if(_FASTTOMO_CXX_PROBE)
+        execute_process(
+            COMMAND ${_FASTTOMO_CXX_PROBE} -dumpversion
+            OUTPUT_VARIABLE _HOST_GCC_VER
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_HOST_GCC_VER MATCHES "^([0-9]+)")
+            set(_HOST_GCC_MAJOR "${CMAKE_MATCH_1}")
+            if(_HOST_GCC_MAJOR GREATER 13 AND EXISTS "/usr/bin/g++-13")
+                message(STATUS
+                    "Default host C++ compiler is GCC ${_HOST_GCC_MAJOR}; nvcc 13 caps host at GCC 13 — "
+                    "setting CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13.")
+                set(CMAKE_CUDA_HOST_COMPILER "/usr/bin/g++-13" CACHE FILEPATH "")
+            endif()
+        endif()
+    endif()
+endif()
+
 # Tri-state CUDA selection: AUTO (detect), ON (require), OFF (CPU-only).
 # Override at configure time via -DFASTTOMO_USE_CUDA=ON|OFF|AUTO
 # or, with pip/uv: --config-settings=cmake.define.FASTTOMO_USE_CUDA=OFF
@@ -82,7 +121,11 @@ if(FASTTOMO_USE_CUDA STREQUAL "AUTO")
         message(STATUS "CUDA compiler found: ${CMAKE_CUDA_COMPILER}")
     else()
         set(FASTTOMO_CUDA OFF)
-        message(STATUS "No CUDA compiler found — building CPU-only")
+        message(WARNING
+            "FastTomo: no CUDA compiler found — building CPU-only.\n"
+            "    To force CUDA: pip install -e . --config-settings=cmake.define.FASTTOMO_USE_CUDA=ON\n"
+            "    If nvcc lives in a conda env, run `conda activate <env>` before pip install.\n"
+            "    If host GCC > 13, also pass --config-settings=cmake.define.CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13.")
     endif()
 elseif(FASTTOMO_USE_CUDA)
     set(FASTTOMO_CUDA ON)
