@@ -815,17 +815,13 @@ def _run_sirt_cuda_graph(
 
     g, vol_static = cache[key]
 
-    # Seed the static buffer with the current (zero) volume.
+    # Reset the captured static buffer to the caller's starting volume so the
+    # warmup iteration that ran inside the cache-build branch above does not
+    # advance the reconstruction. After this copy each replay applies one
+    # SIRT iteration, yielding exactly n_iter updates for both first-call
+    # and cache-hit paths.
     vol_static.copy_(volume)
 
-    # The warmup iteration already ran once during capture setup —
-    # we need n_iter total, and the warmup counts as one.
-    # On subsequent calls (cache hit) we still want n_iter iterations.
-    # Strategy: replay (n_iter - 1) times after seeding, then one more replay.
-    # That gives exactly n_iter iterations for both first-call and cache-hit.
-    #
-    # Wait — on cache-hit the warmup already happened in the past (during
-    # the capture session). We just need n_iter replays now.
     for _ in range(n_iter):
         g.replay()
     torch.cuda.synchronize()
