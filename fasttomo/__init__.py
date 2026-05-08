@@ -71,6 +71,7 @@ from fasttomo.algorithms import (
     run_genfire,
     run_resire,
     run_grad_descent,
+    run_ad_recon,
     refine_angles,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
@@ -96,6 +97,7 @@ __all__ = [
     "run_genfire",
     "run_resire",
     "run_grad_descent",
+    "run_ad_recon",
     "refine_angles",
     "ParallelProjector",
     "RotmatProjector",
