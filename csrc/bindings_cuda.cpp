@@ -143,6 +143,26 @@ static void py_grad_rotmat_cuda(
     );
 }
 
+static void py_grad_rotmat_cuda_cached(
+    int io_dtype,
+    long cache_ptr,
+    long grad_sino_ptr, long matrices_ptr, long grad_matrices_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    validate_cache(reinterpret_cast<const TextureCache *>(cache_ptr),
+                   TC_VOL_3D, io_dtype, Ny, Nz, Nx);
+    grad_rotmat_cuda_cached(
+        io_dtype,
+        reinterpret_cast<TextureCache *>(cache_ptr),
+        reinterpret_cast<const float *>(grad_sino_ptr),
+        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<float *>(grad_matrices_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
 static void py_grad_angle_cuda(
     long vol_ptr, long grad_sino_ptr,
     long cos_ptr, long sin_ptr,
@@ -382,6 +402,19 @@ void register_cuda(py::module_ &m) {
           "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
           py::arg("vol_ptr"), py::arg("grad_sino_ptr"),
           py::arg("matrices_ptr"), py::arg("grad_matrices_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("grad_rotmat_cuda_cached", &py_grad_rotmat_cuda_cached,
+          "Cached gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CUDA). "
+          "cache_ptr: TC_VOL_3D handle already populated by forward_project_rotmat_cuda_cached. "
+          "Uses the cache's point-filter tex_point for bit-exact corner reads. "
+          "io_dtype: 0=fp32, 1=fp16. "
+          "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
+          py::arg("io_dtype"),
+          py::arg("cache_ptr"),
+          py::arg("grad_sino_ptr"), py::arg("matrices_ptr"), py::arg("grad_matrices_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);

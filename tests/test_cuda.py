@@ -901,5 +901,49 @@ def test_tv_loss_iso_3d_rejects_wrong_ndim():
         ft.tv_loss_3d(vol)
 
 
+def test_grad_rotmat_cached_matches_uncached():
+    """grad_rotmat cached path (via RotmatProjector._grad_mats_raw) must match
+    the uncached path (_grad_rotmat_raw) to within 1e-5 relative error."""
+    from fasttomo.autograd import _grad_rotmat_raw, _euler_zyz_to_rotmat
+
+    torch.manual_seed(0)
+    N        = 32
+    n_angles = 24
+    device   = DEVICE
+
+    volume   = torch.randn(N, N, N, device=device, dtype=torch.float32)
+    grad_sino = torch.randn(n_angles, N, N, device=device, dtype=torch.float32)
+
+    # Pure-Y ZYZ Euler angles
+    euler = torch.zeros(n_angles, 3)
+    euler[:, 1] = torch.linspace(-60.0, 60.0, n_angles)
+    euler = euler.to(device)
+    mats = _euler_zyz_to_rotmat(euler)                 # [n_angles, 3, 3]
+    mats_flat = mats.reshape(n_angles, 9).contiguous().float()
+
+    # Uncached path (now routes through a transient cache internally, but is
+    # the reference since it was tested independently)
+    g_old = _grad_rotmat_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
+
+    # Cached path via RotmatProjector
+    from fasttomo.projector import RotmatProjector
+    proj = RotmatProjector((N, N, N), n_angles=n_angles, device=device)
+    # Populate _vol_handle by running forward()
+    _ = proj.forward(volume, mats_flat)
+    g_new = proj._grad_mats_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
+
+    assert g_old.shape == g_new.shape, f"shape mismatch: {g_old.shape} vs {g_new.shape}"
+    denom = g_old.abs().max()
+    if denom < 1e-8:
+        # Absolute fallback when denominator is near zero
+        assert (g_new - g_old).abs().max().item() < 1e-5, \
+            "absolute error too large (denominator near zero)"
+    else:
+        rel_err = (g_new - g_old).abs().max().item() / denom.item()
+        assert rel_err < 1e-5, (
+            f"grad_rotmat cached vs uncached max rel error: {rel_err:.2e} (threshold 1e-5)"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

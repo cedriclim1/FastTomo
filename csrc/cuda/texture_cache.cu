@@ -56,9 +56,10 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
     tc->dim_a    = dim_a;
     tc->dim_b    = dim_b;
     tc->dim_c    = dim_c;
-    tc->array    = nullptr;
-    tc->tex      = 0;
-    tc->surf     = 0;
+    tc->array     = nullptr;
+    tc->tex       = 0;
+    tc->tex_point = 0;
+    tc->surf      = 0;
 
     cudaChannelFormatDesc fmt = tc_channel_desc(dtype, channels);
 
@@ -113,6 +114,16 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
     td.normalizedCoords = 0;
 
     FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tc->tex, &rd, &td, nullptr));
+
+    /* For TC_VOL_3D single-channel caches, create a point-filter view of the
+     * same array. grad_rotmat_kernel uses this for bit-exact corner reads:
+     * with cudaFilterModePoint, tex3D returns the exact texel at the integer-
+     * (coord-0.5)-rounded position, equivalent to a global memory load. */
+    if (kind == TC_VOL_3D && channels == 1) {
+        cudaTextureDesc td_point = td;               /* copy all fields */
+        td_point.filterMode = cudaFilterModePoint;
+        FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tc->tex_point, &rd, &td_point, nullptr));
+    }
 
     if (channels == 4) {
         FASTTOMO_CUDA_CHECK(cudaCreateSurfaceObject(&tc->surf, &rd));
@@ -227,6 +238,14 @@ void tc_destroy(TextureCache *tc) {
         if (e != cudaSuccess) {
             std::free(tc);
             throw std::runtime_error(std::string("tc_destroy: ")
+                + cudaGetErrorString(e));
+        }
+    }
+    if (tc->tex_point) {
+        cudaError_t e = cudaDestroyTextureObject(tc->tex_point);
+        if (e != cudaSuccess) {
+            std::free(tc);
+            throw std::runtime_error(std::string("tc_destroy: tex_point: ")
                 + cudaGetErrorString(e));
         }
     }

@@ -672,7 +672,13 @@ class _FP3DCached(torch.autograd.Function):
             grad_vol = proj._bp_raw(grad_sino, mats_flat)
         grad_mats = None
         if ctx.needs_input_grad[1]:
-            grad_mats = _grad_rotmat_raw(volume, grad_sino, mats_flat)
+            # Use the cached path: forward() populated proj._vol_handle this
+            # iteration; PyTorch autograd guarantees `volume` (saved via
+            # save_for_backward) hasn't been mutated since, so the cache's
+            # content is bit-exact equivalent to `volume`. This avoids a
+            # redundant cudaMemcpy3DAsync + cudaArray alloc vs _grad_rotmat_raw.
+            # mats_flat is [n_angles, 9], so the gradient must also be [n_angles, 9].
+            grad_mats = proj._grad_mats_raw(volume, grad_sino, mats_flat)
         return grad_vol, grad_mats, None
 
 

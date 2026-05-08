@@ -350,9 +350,15 @@ void back_project_rotmat_cuda_cached(
  * ∂tx/∂M[{0,3,6}] = {u, v, s}, ∂ty/∂M[{1,4,7}] = {u, v, s},
  * ∂tz/∂M[{2,5,8}] = {u, v, s}. Spatial derivatives ∂vol/∂{x,y,z}
  * computed analytically from trilinear interpolation weights.
+ *
+ * T is the volume dtype (float or __half). The 8 corner reads are done with
+ * tex3D<float> and cudaFilterModePoint so the result is bit-exact equivalent
+ * to a global-memory load (hardware promotes fp16 texels to fp32 on read).
+ * The output grad_matrices always accumulates in fp32 regardless of T.
  */
+template <typename T>
 __global__ static void grad_rotmat_kernel(
-    const float *__restrict__ volume,        /* [Ny, Nz, Nx] */
+    cudaTextureObject_t  vol_tex,            /* TC_VOL_3D, point-filter view */
     const float *__restrict__ grad_sino,     /* [n_angles, Ny, N_det] */
     const float *__restrict__ matrices,      /* [n_angles*9] row-major */
     float       *__restrict__ grad_matrices, /* [n_angles*9] (zeroed by caller) */
@@ -400,17 +406,20 @@ __global__ static void grad_rotmat_kernel(
                 float wz = fz - (float)iz0;
                 float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
 
-                /* volume[iy][iz][ix] linearised */
-                size_t row_y0 = (size_t)iy0 * Nz;
-                size_t row_y1 = (size_t)iy1 * Nz;
-                float v000 = volume[(row_y0 + iz0) * Nx + ix0];
-                float v001 = volume[(row_y0 + iz0) * Nx + ix1];
-                float v010 = volume[(row_y0 + iz1) * Nx + ix0];
-                float v011 = volume[(row_y0 + iz1) * Nx + ix1];
-                float v100 = volume[(row_y1 + iz0) * Nx + ix0];
-                float v101 = volume[(row_y1 + iz0) * Nx + ix1];
-                float v110 = volume[(row_y1 + iz1) * Nx + ix0];
-                float v111 = volume[(row_y1 + iz1) * Nx + ix1];
+                /* Point-filter tex3D reads: +0.5f offset maps integer index i
+                 * to the texel centre coordinate i+0.5, which with
+                 * cudaFilterModePoint rounds back to texel i.  The hardware
+                 * promotes fp16 texels to fp32, so tex3D<float> is correct
+                 * for both T=float and T=__half.
+                 * tex3D axis mapping: (x→Nx width, z→Nz height, y→Ny depth). */
+                float v000 = tex3D<float>(vol_tex, ix0+0.5f, iz0+0.5f, iy0+0.5f);
+                float v001 = tex3D<float>(vol_tex, ix1+0.5f, iz0+0.5f, iy0+0.5f);
+                float v010 = tex3D<float>(vol_tex, ix0+0.5f, iz1+0.5f, iy0+0.5f);
+                float v011 = tex3D<float>(vol_tex, ix1+0.5f, iz1+0.5f, iy0+0.5f);
+                float v100 = tex3D<float>(vol_tex, ix0+0.5f, iz0+0.5f, iy1+0.5f);
+                float v101 = tex3D<float>(vol_tex, ix1+0.5f, iz0+0.5f, iy1+0.5f);
+                float v110 = tex3D<float>(vol_tex, ix0+0.5f, iz1+0.5f, iy1+0.5f);
+                float v111 = tex3D<float>(vol_tex, ix1+0.5f, iz1+0.5f, iy1+0.5f);
 
                 /* analytic derivatives of trilinear interpolation */
                 float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
@@ -447,6 +456,54 @@ __global__ static void grad_rotmat_kernel(
         atomicAdd(&grad_matrices[(size_t)ia * 9 + tid], smem[tid * nthreads]);
 }
 
+void grad_rotmat_cuda_cached(
+    int io_dtype,
+    TextureCache *vol_cache,
+    const float *d_grad_sino,
+    const float *d_matrices,
+    float       *d_grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+) {
+    if (!vol_cache)
+        throw std::runtime_error("grad_rotmat_cuda_cached: null cache");
+    if (vol_cache->kind  != TC_VOL_3D ||
+        vol_cache->dim_a != Ny || vol_cache->dim_b != Nz || vol_cache->dim_c != Nx)
+        throw std::runtime_error("grad_rotmat_cuda_cached: cache shape mismatch");
+    int cache_dtype = (vol_cache->dtype == TC_DTYPE_FP32) ? 0 : 1;
+    if (cache_dtype != io_dtype)
+        throw std::runtime_error("grad_rotmat_cuda_cached: cache dtype mismatch");
+    if (vol_cache->tex_point == 0)
+        throw std::runtime_error("grad_rotmat_cuda_cached: tex_point not initialised "
+                                 "(cache was not created as TC_VOL_3D with channels==1)");
+
+    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
+
+    dim3 block(16, 16, 1);
+    dim3 grid((g.N_det + 15) / 16,
+              (g.Ny    + 15) / 16,
+              g.n_angles);
+    size_t smem = 9 * (size_t)(block.x * block.y) * sizeof(float);
+
+    if (io_dtype == 0) {
+        enable_extended_smem_if_needed((const void *)grad_rotmat_kernel<float>, smem);
+        grad_rotmat_kernel<float><<<grid, block, smem, stream>>>(
+            vol_cache->tex_point, d_grad_sino, d_matrices, d_grad_matrices,
+            g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
+            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+        );
+    } else {
+        enable_extended_smem_if_needed((const void *)grad_rotmat_kernel<__half>, smem);
+        grad_rotmat_kernel<__half><<<grid, block, smem, stream>>>(
+            vol_cache->tex_point, d_grad_sino, d_matrices, d_grad_matrices,
+            g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
+            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+        );
+    }
+    CUDA_CHECK_KERNEL();
+}
+
 void grad_rotmat_cuda(
     const float *d_volume,
     const float *d_grad_sino,
@@ -456,20 +513,20 @@ void grad_rotmat_cuda(
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
+    /* Build a transient TC_VOL_3D cache (creates tex_point automatically),
+     * upload the volume, then delegate to the cached entry point. */
+    TextureCache *tc = tc_create(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx);
+    tc_upload(tc, d_volume, stream);
 
-    dim3 block(16, 16, 1);
-    dim3 grid((g.N_det + 15) / 16,
-              (g.Ny    + 15) / 16,
-              g.n_angles);
-    size_t smem = 9 * (size_t)(block.x * block.y) * sizeof(float);
-
-    enable_extended_smem_if_needed((const void *)grad_rotmat_kernel, smem);
-
-    grad_rotmat_kernel<<<grid, block, smem, stream>>>(
-        d_volume, d_grad_sino, d_matrices, d_grad_matrices,
-        g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-        g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+    grad_rotmat_cuda_cached(
+        0, tc,
+        d_grad_sino, d_matrices, d_grad_matrices,
+        Ny, Nz, Nx, n_angles, N_det,
+        stream
     );
-    CUDA_CHECK_KERNEL();
+
+    /* Synchronise on the stream before destroying the transient cache so
+     * the kernel finishes reading before we free the cudaArray. */
+    cudaStreamSynchronize(stream);
+    tc_destroy(tc);
 }
