@@ -6,17 +6,17 @@ All public functions accept and return `torch.Tensor` (float32). Forward and bac
 
 ## Requirements
 
-- Python ≥ 3.9 (tested on 3.12)
-- A C/C++ compiler with OpenMP (Linux: **GCC 13** — see note below; macOS: `brew install libomp`)
+- Python ≥ 3.10
+- A C/C++ compiler with OpenMP (Linux: **GCC ≥ 10**; macOS: `brew install libomp`)
 - CMake ≥ 3.18
-- PyTorch ≥ 2.11 (`pip install torch`) — bundles `cudart 13.0`
-- **For the CUDA backend only:** `nvcc 13.0` reachable either on `PATH` or inside the active conda env (`$CONDA_PREFIX/bin/nvcc`), with matching CUDA runtime headers.
+- PyTorch ≥ 2.11 (`pip install 'torch>=2.11'`) — bundles `cudart 13.0`
+- **For the CUDA backend only:** `nvcc` **exactly 13.0** reachable either on `PATH` or inside the active conda env (`$CONDA_PREFIX/bin/nvcc`), with matching CUDA runtime headers.
 
-The build auto-detects CUDA: if `nvcc` is on `PATH` or in `$CONDA_PREFIX/bin`, it builds the CUDA backend; otherwise it falls back to CPU-only and emits a CMake `WARNING` at configure time. If a CPU-only build is later imported on a CUDA-equipped machine, `import fasttomo` raises a `RuntimeWarning` once.
+The build auto-detects CUDA. If `nvcc` is reachable, it builds the CUDA backend. If `nvcc` is *not* present anywhere CMake can find it, the build falls back to CPU-only with a loud multi-line `WARNING`. If `nvcc` *is* visible but the toolchain is broken (e.g. host-compiler / CUDA mismatch), the build now **fails at configure time** rather than silently producing a CPU-only wheel — pass `--config-settings=cmake.define.FASTTOMO_USE_CUDA=OFF` to opt out explicitly. If a CPU-only build is later imported on a CUDA-equipped machine, `import fasttomo` raises a `RuntimeWarning` once.
 
-> **Supported CUDA toolkit:** **only CUDA 13.0** for now. PyTorch 2.11's wheels bundle `cudart 13.0`; an `nvcc 13.x` newer than 13.0 (e.g. 13.2) will produce PTX that errors at runtime with `the provided PTX was compiled with an unsupported toolchain`. Pin nvcc to **13.0** explicitly.
+> **Supported CUDA toolkit:** **CUDA 13.0 exactly.** PyTorch 2.11's wheels are built only against CUDA 13.0; an `nvcc 13.x` newer than 13.0 (e.g. 13.2) produces PTX that errors at runtime with `the provided PTX was compiled with an unsupported toolchain`. The build now hard-fails at configure time if `CUDAToolkit_VERSION` ≠ 13.0.
 >
-> **Host compiler:** **GCC 13** (not 14). CUDA 13's nvcc only supports up to GCC 13. The build auto-picks `/usr/bin/g++-13` as the CUDA host compiler when the env's default C++ compiler is GCC ≥14 and `g++-13` exists. Otherwise install GCC 13 first: `conda install -c conda-forge gxx_linux-64=13 gcc_linux-64=13` (or `apt install g++-13` on Ubuntu).
+> **Host compiler:** **GCC ≥ 10** for CUDA builds (NVIDIA's CUDA 13 install guide supports GCC 6–15; FastTomo standardises on the 10+ range). The previous auto-downgrade to `/usr/bin/g++-13` has been removed — if your conda-forge GCC 14.x clashes with `nvcc 13.0` (the well-known `__type_pack_element` bug), explicitly pin `gxx_linux-64=13` in your env or pass `--config-settings=cmake.define.CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13`.
 
 ## Install
 
@@ -36,11 +36,12 @@ Recommended: use a fresh conda env so version pins don't conflict with prior ins
 conda create -n FastTomo python=3.12 -y
 conda activate FastTomo
 
-# Pinned versions matching PyTorch 2.11's bundled cudart and nvcc-13's GCC support
-conda install -c conda-forge gxx_linux-64=13 gcc_linux-64=13 cmake -y
+# GCC >= 10 satisfies CUDA 13.0; pin to <=13 if you hit the conda-forge
+# GCC 14.x / nvcc 13.0 `__type_pack_element` issue.
+conda install -c conda-forge gxx_linux-64 gcc_linux-64 cmake -y
 conda install -c nvidia 'cuda-nvcc=13.0' 'cuda-cudart-dev=13.0' -y
 
-pip install torch numpy tqdm scikit-build-core pybind11
+pip install 'torch>=2.11' numpy tqdm scikit-build-core pybind11 packaging
 pip install -e . --no-build-isolation
 ```
 
