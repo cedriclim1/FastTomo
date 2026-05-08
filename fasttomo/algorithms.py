@@ -10,7 +10,9 @@ Angles: 1-D tensor, degrees.
 
 from __future__ import annotations
 
+import logging
 import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -28,6 +30,8 @@ from fasttomo.projection import (
 )
 from fasttomo.utilities import cylindrical_mask, ramp_filter, tv_loss_3d
 from fasttomo.projector import ParallelProjector, RotmatProjector
+
+_log = logging.getLogger(__name__)
 
 
 # ── module-level constants ─────────────────────────────────────────────────
@@ -306,7 +310,35 @@ def run_sirt(
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     losses: list[float] = []
 
-    # --- iteration loop ---
+    # --- CUDA Graph capture path ----------------------------------------
+    # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
+    # If capture fails, fall back to the eager loop below.
+    _active_proj = projector if projector is not None else _internal_proj
+    if sinogram.is_cuda and not return_loss and n_iter > 1:
+        graph_result = _run_sirt_cuda_graph(
+            volume=volume,
+            sinogram=sinogram,
+            n_iter=n_iter,
+            omega=omega,
+            C_vol=C_vol,
+            R_sino=R_sino,
+            _fp=_fp,
+            _bp=_bp,
+            sparsity=sparsity,
+            positivity=positivity,
+            _mask=_mask,
+            projector=_active_proj,
+            key=(Ny, Nz, Nx, n_angles, N_det,
+                 sinogram.dtype,
+                 positivity,
+                 sparsity > 0.0,
+                 _mask is not None,
+                 euler_zyz_deg is not None),
+        )
+        if graph_result is not None:
+            return graph_result
+
+    # --- eager iteration loop (fallback / CPU / return_loss path) --------
     for _ in range(n_iter):
         raw_res  = sinogram - _fp(volume)
         if return_loss:
@@ -323,6 +355,152 @@ def run_sirt(
     if return_loss:
         return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+# ---------------------------------------------------------------------------
+# CUDA Graph helper for run_sirt
+# ---------------------------------------------------------------------------
+
+# Module-level cache for graphs when no persistent projector is supplied.
+# Keyed by the same tuple as projector._sirt_graph_cache.
+_sirt_graph_module_cache: dict = {}
+
+# Set of keys known to fail graph capture — skip recapture on subsequent calls.
+_sirt_graph_bad_keys: set = set()
+
+
+def _run_sirt_cuda_graph(
+    volume: torch.Tensor,
+    sinogram: torch.Tensor,
+    n_iter: int,
+    omega: float,
+    C_vol: torch.Tensor,
+    R_sino: torch.Tensor,
+    _fp,
+    _bp,
+    sparsity: float,
+    positivity: bool,
+    _mask,
+    projector,
+    key: tuple,
+) -> torch.Tensor | None:
+    """
+    Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
+
+    Returns the reconstructed volume tensor, or ``None`` if capture was
+    skipped / failed (caller should fall back to the eager loop).
+
+    The graph is cached:
+      - On ``projector._sirt_graph_cache[key]`` when a projector is supplied.
+      - On the module-level ``_sirt_graph_module_cache[key]`` otherwise.
+
+    Keys that previously failed capture are remembered in
+    ``_sirt_graph_bad_keys`` so subsequent calls skip capture directly.
+    """
+    global _sirt_graph_module_cache, _sirt_graph_bad_keys
+
+    if key in _sirt_graph_bad_keys:
+        return None
+
+    # Select cache dict.
+    if projector is not None:
+        if not hasattr(projector, "_sirt_graph_cache"):
+            projector._sirt_graph_cache = {}
+        cache = projector._sirt_graph_cache
+    else:
+        cache = _sirt_graph_module_cache
+
+    Ny, Nz, Nx = volume.shape
+
+    if key not in cache:
+        # --- build a new graph for this key ---
+        try:
+            # Allocate persistent static buffers.
+            vol_static = volume.clone()
+
+            # Warmup: one eager iteration with the static buffer.
+            # Populates cuFFT plans, allocator pool, projector texture caches.
+            with torch.no_grad():
+                _sirt_iter_inplace(
+                    vol_static, sinogram, C_vol, R_sino, omega,
+                    _fp, _bp, sparsity, positivity, _mask,
+                )
+
+            # Capture the iteration body.
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(g):
+                _sirt_iter_inplace(
+                    vol_static, sinogram, C_vol, R_sino, omega,
+                    _fp, _bp, sparsity, positivity, _mask,
+                )
+            torch.cuda.synchronize()
+
+            cache[key] = (g, vol_static)
+
+        except Exception as exc:
+            _log.warning(
+                "run_sirt: CUDA Graph capture failed for key %s (%s). "
+                "Falling back to eager loop for this and future calls "
+                "with this configuration.",
+                key, exc,
+            )
+            _sirt_graph_bad_keys.add(key)
+            return None
+
+    g, vol_static = cache[key]
+
+    # Seed the static buffer with the current (zero) volume.
+    vol_static.copy_(volume)
+
+    # The warmup iteration already ran once during capture setup —
+    # we need n_iter total, and the warmup counts as one.
+    # On subsequent calls (cache hit) we still want n_iter iterations.
+    # Strategy: replay (n_iter - 1) times after seeding, then one more replay.
+    # That gives exactly n_iter iterations for both first-call and cache-hit.
+    #
+    # Wait — on cache-hit the warmup already happened in the past (during
+    # the capture session). We just need n_iter replays now.
+    for _ in range(n_iter):
+        g.replay()
+    torch.cuda.synchronize()
+
+    return vol_static.clone()
+
+
+def _sirt_iter_inplace(
+    vol_static: torch.Tensor,
+    sinogram: torch.Tensor,
+    C_vol: torch.Tensor,
+    R_sino: torch.Tensor,
+    omega: float,
+    _fp,
+    _bp,
+    sparsity: float,
+    positivity: bool,
+    _mask,
+) -> None:
+    """
+    One in-place SIRT iteration on ``vol_static``.
+
+    All writes go through in-place ops (``add_``, ``mul_``, ``clamp_``,
+    ``copy_``) so that ``vol_static``'s memory address is stable —
+    a requirement for CUDA Graph capture to replay correctly.
+    """
+    raw_res  = sinogram - _fp(vol_static)
+    residual = raw_res * R_sino
+    update   = _bp(residual)
+    # Avoid creating a temporary for `update * C_vol` to keep allocations
+    # inside the graph's memory pool.
+    update.mul_(C_vol)
+    vol_static.add_(update, alpha=omega)
+    if sparsity > 0.0:
+        # Copy result of out-of-place soft-threshold back in-place.
+        vol_static.copy_(_apply_sparsity(vol_static, sparsity))
+    if positivity:
+        vol_static.clamp_(min=0.0)
+    if _mask is not None:
+        vol_static.mul_(_mask)
 
 
 def _genfire_hermitian_sym(

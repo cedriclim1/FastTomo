@@ -148,6 +148,10 @@ class ParallelProjector(_ProjectorBase):
     The functional ``forward_project`` / ``back_project`` API stays for
     one-shot calls and for differentiable-angle optimisation. Use this class
     when angles are fixed and FP/BP run many times on the same volume shape.
+
+    ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
+    configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
+    by ``run_sirt`` for constant-time replay of the SIRT iteration body.
     """
 
     def __init__(
@@ -261,6 +265,10 @@ class RotmatProjector(_ProjectorBase):
     caches are persistent; the matrix tensor is consumed via its ``.data_ptr()``
     on each FP/BP. Differentiable w.r.t. ``volume``, ``sinogram``, and
     ``matrices`` (the ∂/∂M kernel doesn't use a texture so it stays uncached).
+
+    ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
+    configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
+    by ``run_sirt`` for constant-time replay of the SIRT iteration body.
     """
 
     def __init__(
