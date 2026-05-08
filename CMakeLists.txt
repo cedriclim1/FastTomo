@@ -81,32 +81,6 @@ if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED CUDAToolkit_ROOT)
     endif()
 endif()
 
-# nvcc 13.x rejects host compilers newer than GCC 13. If the default C++
-# compiler is conda-forge's GCC 14+ and the user hasn't supplied a host
-# compiler, fall back to /usr/bin/g++-13 when available.
-if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER
-   AND NOT DEFINED ENV{CMAKE_CUDA_HOST_COMPILER}
-   AND NOT DEFINED ENV{CUDAHOSTCXX})
-    find_program(_FASTTOMO_CXX_PROBE NAMES c++ g++ x86_64-conda-linux-gnu-g++)
-    if(_FASTTOMO_CXX_PROBE)
-        execute_process(
-            COMMAND ${_FASTTOMO_CXX_PROBE} -dumpversion
-            OUTPUT_VARIABLE _HOST_GCC_VER
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(_HOST_GCC_VER MATCHES "^([0-9]+)")
-            set(_HOST_GCC_MAJOR "${CMAKE_MATCH_1}")
-            if(_HOST_GCC_MAJOR GREATER 13 AND EXISTS "/usr/bin/g++-13")
-                message(STATUS
-                    "Default host C++ compiler is GCC ${_HOST_GCC_MAJOR}; nvcc 13 caps host at GCC 13 — "
-                    "setting CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13.")
-                set(CMAKE_CUDA_HOST_COMPILER "/usr/bin/g++-13" CACHE FILEPATH "")
-            endif()
-        endif()
-    endif()
-endif()
-
 # Tri-state CUDA selection: AUTO (detect), ON (require), OFF (CPU-only).
 # Override at configure time via -DFASTTOMO_USE_CUDA=ON|OFF|AUTO
 # or, with pip/uv: --config-settings=cmake.define.FASTTOMO_USE_CUDA=OFF
@@ -114,18 +88,47 @@ set(FASTTOMO_USE_CUDA "AUTO" CACHE STRING "Enable CUDA backend: ON, OFF, or AUTO
 set_property(CACHE FASTTOMO_USE_CUDA PROPERTY STRINGS AUTO ON OFF)
 
 if(FASTTOMO_USE_CUDA STREQUAL "AUTO")
+    # Probe whether nvcc is reachable from the user's environment. If it is
+    # but `check_language(CUDA)` still fails, we treat that as a real
+    # toolchain error and abort — silently producing a CPU-only wheel when
+    # the user clearly *wants* CUDA was the cause of past build incidents.
+    set(_FASTTOMO_NVCC_VISIBLE FALSE)
+    if(DEFINED CMAKE_CUDA_COMPILER OR DEFINED CUDAToolkit_ROOT
+       OR DEFINED ENV{CUDA_HOME} OR DEFINED ENV{CUDA_PATH})
+        set(_FASTTOMO_NVCC_VISIBLE TRUE)
+    elseif(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/bin/nvcc")
+        set(_FASTTOMO_NVCC_VISIBLE TRUE)
+    else()
+        find_program(_FASTTOMO_NVCC_PATH nvcc)
+        if(_FASTTOMO_NVCC_PATH)
+            set(_FASTTOMO_NVCC_VISIBLE TRUE)
+        endif()
+    endif()
+
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
         set(FASTTOMO_CUDA ON)
         message(STATUS "CUDA compiler found: ${CMAKE_CUDA_COMPILER}")
+    elseif(_FASTTOMO_NVCC_VISIBLE)
+        message(FATAL_ERROR
+            "FastTomo: nvcc was detected on this system but CMake could not "
+            "enable the CUDA language. This usually means a host-compiler / "
+            "CUDA toolchain mismatch (e.g. unsupported GCC version, missing "
+            "cudart, broken conda env).\n"
+            "    To diagnose: re-run with "
+            "--config-settings=cmake.define.CMAKE_VERBOSE_MAKEFILE=ON\n"
+            "    To bypass and build CPU-only: pass "
+            "--config-settings=cmake.define.FASTTOMO_USE_CUDA=OFF")
     else()
         set(FASTTOMO_CUDA OFF)
         message(WARNING
-            "FastTomo: no CUDA compiler found — building CPU-only.\n"
-            "    To force CUDA: pip install -e . --config-settings=cmake.define.FASTTOMO_USE_CUDA=ON\n"
-            "    If nvcc lives in a conda env, run `conda activate <env>` before pip install.\n"
-            "    If host GCC > 13, also pass --config-settings=cmake.define.CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13.")
+            "==================================================================\n"
+            "  FastTomo: no CUDA toolchain detected — building CPU-only.\n"
+            "  To enable CUDA: install CUDA 13.0 (e.g. nvidia-cuda-nvcc==13.0.*\n"
+            "  via pip, or a conda env shipping nvcc 13.0), then re-run\n"
+            "  pip install with --config-settings=cmake.define.FASTTOMO_USE_CUDA=ON\n"
+            "==================================================================")
     endif()
 elseif(FASTTOMO_USE_CUDA)
     set(FASTTOMO_CUDA ON)
@@ -144,6 +147,17 @@ endif()
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
+
+# Host C++ compiler floor: GCC >= 10 (NVIDIA's CUDA 13 install guide
+# supports GCC 6-15, but FastTomo standardises on GCC >= 10 — older
+# toolchains miss C++17 polish and aren't tested).
+if(FASTTOMO_CUDA AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
+    message(FATAL_ERROR
+        "FastTomo requires GCC >= 10 for CUDA builds (found "
+        "${CMAKE_CXX_COMPILER_VERSION}). Install a newer GCC or pass "
+        "-DCMAKE_CXX_COMPILER=/path/to/g++-N.")
+endif()
 
 set(CORE_SOURCES
     csrc/bindings.cpp
@@ -172,6 +186,16 @@ target_link_libraries(_core PRIVATE OpenMP::OpenMP_C)
 
 if(FASTTOMO_CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # PyTorch 2.11 wheels are built only against CUDA 13.0 — pin the toolkit
+    # to that exact (major, minor) so a 13.1+ nvcc doesn't silently produce
+    # a runtime that mismatches torch's libcudart at import time.
+    if(NOT (CUDAToolkit_VERSION_MAJOR EQUAL 13 AND CUDAToolkit_VERSION_MINOR EQUAL 0))
+        message(FATAL_ERROR
+            "FastTomo requires CUDA exactly 13.0 (found ${CUDAToolkit_VERSION}). "
+            "PyTorch 2.11 ships against CUDA 13.0 only. Install "
+            "nvidia-cuda-nvcc==13.0.* or activate a conda env shipping "
+            "nvcc 13.0.")
+    endif()
     target_compile_definitions(_core PRIVATE FASTTOMO_CUDA)
     target_link_libraries(_core PRIVATE CUDA::cudart)
     # Force shared libcudart so the symbol resolves to the libcudart already
