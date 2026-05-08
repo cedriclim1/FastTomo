@@ -10,13 +10,13 @@ All public functions accept and return `torch.Tensor` (float32). Forward and bac
 - A C/C++ compiler with OpenMP (Linux: **GCC 13** — see note below; macOS: `brew install libomp`)
 - CMake ≥ 3.18
 - PyTorch ≥ 2.11 (`pip install torch`) — bundles `cudart 13.0`
-- **For the CUDA backend only:** `nvcc 13.0` on `PATH` and matching CUDA runtime headers.
+- **For the CUDA backend only:** `nvcc 13.0` reachable either on `PATH` or inside the active conda env (`$CONDA_PREFIX/bin/nvcc`), with matching CUDA runtime headers.
 
-The build auto-detects CUDA: if `nvcc` is found it builds the CUDA backend, otherwise it falls back to a CPU-only build silently.
+The build auto-detects CUDA: if `nvcc` is on `PATH` or in `$CONDA_PREFIX/bin`, it builds the CUDA backend; otherwise it falls back to CPU-only and emits a CMake `WARNING` at configure time. If a CPU-only build is later imported on a CUDA-equipped machine, `import fasttomo` raises a `RuntimeWarning` once.
 
 > **Supported CUDA toolkit:** **only CUDA 13.0** for now. PyTorch 2.11's wheels bundle `cudart 13.0`; an `nvcc 13.x` newer than 13.0 (e.g. 13.2) will produce PTX that errors at runtime with `the provided PTX was compiled with an unsupported toolchain`. Pin nvcc to **13.0** explicitly.
 >
-> **Host compiler:** **GCC 13** (not 14). CUDA 13's nvcc only supports up to GCC 13. With GCC 14 the configure step fails with `error: identifier "__is_array" is undefined` from libstdc++ headers. If your conda env defaults to GCC 14, pin it down: `conda install -c conda-forge gxx_linux-64=13 gcc_linux-64=13`.
+> **Host compiler:** **GCC 13** (not 14). CUDA 13's nvcc only supports up to GCC 13. The build auto-picks `/usr/bin/g++-13` as the CUDA host compiler when the env's default C++ compiler is GCC ≥14 and `g++-13` exists. Otherwise install GCC 13 first: `conda install -c conda-forge gxx_linux-64=13 gcc_linux-64=13` (or `apt install g++-13` on Ubuntu).
 
 ## Install
 
