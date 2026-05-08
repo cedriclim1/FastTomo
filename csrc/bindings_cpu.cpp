@@ -38,7 +38,8 @@ static void compute_trig(const f32arr &angles,
 static f32arr py_forward_project_cpu(
     const f32arr &volume,   /* [Ny, Nz, Nx] */
     const f32arr &angles,   /* [n_angles] radians */
-    int N_det               /* detector width; -1 → use Nx */
+    int N_det,              /* detector width; -1 → use Nx */
+    int num_threads         /* threads for the OpenMP-parallel outer loops */
 ) {
     check_f32(volume, "volume");
     if (volume.ndim() != 3)
@@ -49,6 +50,7 @@ static f32arr py_forward_project_cpu(
     int Nx       = (int)volume.shape(2);
     int n_angles = (int)angles.size();
     if (N_det < 0) N_det = Nx;
+    if (num_threads < 1) num_threads = 1;
 
     std::vector<float> cos_a, sin_a;
     compute_trig(angles, cos_a, sin_a);
@@ -60,7 +62,8 @@ static f32arr py_forward_project_cpu(
         static_cast<const float *>(volume.request().ptr),
         static_cast<float *>(out_buf.ptr),
         cos_a.data(), sin_a.data(),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
     );
     return sinogram;
 }
@@ -68,7 +71,8 @@ static f32arr py_forward_project_cpu(
 static f32arr py_back_project_cpu(
     const f32arr &sinogram,  /* [n_angles, Ny, N_det] */
     const f32arr &angles,    /* [n_angles] radians */
-    int Nz                   /* reconstruction depth; -1 → use N_det */
+    int Nz,                  /* reconstruction depth; -1 → use N_det */
+    int num_threads
 ) {
     check_f32(sinogram, "sinogram");
     if (sinogram.ndim() != 3)
@@ -79,6 +83,7 @@ static f32arr py_back_project_cpu(
     int N_det    = (int)sinogram.shape(2);
     int Nx       = N_det;
     if (Nz < 0) Nz = N_det;
+    if (num_threads < 1) num_threads = 1;
 
     std::vector<float> cos_a, sin_a;
     compute_trig(angles, cos_a, sin_a);
@@ -90,7 +95,8 @@ static f32arr py_back_project_cpu(
         static_cast<const float *>(sinogram.request().ptr),
         static_cast<float *>(out_buf.ptr),
         cos_a.data(), sin_a.data(),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
     );
     return volume;
 }
@@ -99,7 +105,8 @@ static f32arr py_grad_angle_cpu(
     const f32arr &volume,    /* [Ny, Nz, Nx] */
     const f32arr &grad_sino, /* [n_angles, Ny, N_det] */
     const f32arr &angles,    /* [n_angles] radians */
-    int N_det
+    int N_det,
+    int num_threads
 ) {
     check_f32(volume, "volume");
     check_f32(grad_sino, "grad_sino");
@@ -114,6 +121,7 @@ static f32arr py_grad_angle_cpu(
     int n_angles = (int)grad_sino.shape(0);
     int N_det_gs = (int)grad_sino.shape(2);
     if (N_det < 0) N_det = N_det_gs;
+    if (num_threads < 1) num_threads = 1;
 
     std::vector<float> cos_a, sin_a;
     compute_trig(angles, cos_a, sin_a);
@@ -126,7 +134,8 @@ static f32arr py_grad_angle_cpu(
         static_cast<const float *>(grad_sino.request().ptr),
         static_cast<float *>(out_buf.ptr),
         cos_a.data(), sin_a.data(),
-        Ny, Nz, Nx, n_angles, N_det
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
     );
     return grad_angles;
 }
@@ -275,20 +284,26 @@ void register_cpu(py::module_ &m) {
     m.def("forward_project_cpu", &py_forward_project_cpu,
           "Parallel-beam forward projection (CPU). "
           "volume: [Ny,Nz,Nx] float32. angles: [n_angles] radians. "
+          "num_threads: OpenMP thread count (default 1 — serial). "
           "Returns sinogram [n_angles, Ny, N_det].",
-          py::arg("volume"), py::arg("angles"), py::arg("N_det") = -1);
+          py::arg("volume"), py::arg("angles"), py::arg("N_det") = -1,
+          py::arg("num_threads") = 1);
 
     m.def("back_project_cpu", &py_back_project_cpu,
           "Parallel-beam back-projection (CPU). "
           "sinogram: [n_angles,Ny,N_det] float32. angles: [n_angles] radians. "
+          "num_threads: OpenMP thread count (default 1 — serial). "
           "Returns volume [Ny, Nz, Nx].",
-          py::arg("sinogram"), py::arg("angles"), py::arg("Nz") = -1);
+          py::arg("sinogram"), py::arg("angles"), py::arg("Nz") = -1,
+          py::arg("num_threads") = 1);
 
     m.def("grad_angle_cpu", &py_grad_angle_cpu,
           "Gradient of forward projection w.r.t. tilt angles (CPU). "
           "volume: [Ny,Nz,Nx], grad_sino: [n_angles,Ny,N_det], angles: [n_angles] radians. "
+          "num_threads: OpenMP thread count (default 1 — serial). "
           "Returns [n_angles] gradient in radians.",
-          py::arg("volume"), py::arg("grad_sino"), py::arg("angles"), py::arg("N_det") = -1);
+          py::arg("volume"), py::arg("grad_sino"), py::arg("angles"), py::arg("N_det") = -1,
+          py::arg("num_threads") = 1);
 
     m.def("forward_project_3d_cpu", &py_forward_project_3d_cpu,
           "3D rotation-matrix forward projection (CPU). "

@@ -26,7 +26,8 @@ void forward_project_cpu(
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 );
 
 /*
@@ -44,7 +45,8 @@ void back_project_cpu(
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 );
 
 /*
@@ -78,7 +80,8 @@ void grad_angle_cpu(
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 );
 
 /*
