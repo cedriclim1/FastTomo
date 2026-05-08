@@ -986,5 +986,125 @@ def test_rotmat_cached_backward_stale_volume_falls_back_uncached():
     assert rel_b < 1e-5, f"latest branch gradient mismatch: rel_err={rel_b:.2e}"
 
 
+# ── run_ad_recon ──────────────────────────────────────────────────────────
+
+class TestRunAdRecon:
+    """Tests for run_ad_recon — the AD-with-pose library wrapper."""
+
+    def test_no_pose_converges(self):
+        """No-pose AD on a 16³ phantom: final loss < initial loss."""
+        N = 16
+        angles = make_angles(20)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+
+        _, losses = ft.run_ad_recon(
+            sino, angles,
+            n_iter=200,
+            refine_pose=False,
+            lr_volume=0.05,
+            return_loss=True,
+        )
+        assert losses[-1].item() < losses[0].item(), (
+            f"run_ad_recon (no pose) did not reduce loss: "
+            f"{losses[0].item():.4f} -> {losses[-1].item():.4f}"
+        )
+
+    def test_with_pose_recovers_perturbed_euler(self):
+        """With-pose AD: angles are updated from a perturbed starting point.
+
+        The test verifies that run_ad_recon(refine_pose=True) actually
+        optimises the angle parameters (they move from their initial values)
+        and that the refined angles are closer to ground truth than the
+        perturbation.
+
+        To give the angle gradient a meaningful signal, the test uses a proper
+        3-D [N, N, N] phantom (not a single-slice [1, N, N] volume).  The 3-D
+        rotmat gradient kernel produces zero gradient on Ny=1 volumes because
+        there is no Y-axis variation to differentiate with respect to the
+        rotation matrix.
+        """
+        torch.manual_seed(42)
+        N = 16
+        n_angles = 10
+        true_angles = torch.linspace(-30.0, 30.0, n_angles, device=DEVICE)
+        true_euler = torch.zeros(n_angles, 3, device=DEVICE)
+        true_euler[:, 1] = true_angles
+
+        # 3-D phantom — required so the grad_rotmat kernel is non-zero
+        vol = torch.zeros(N, N, N, device=DEVICE, dtype=torch.float32)
+        q = N // 4
+        vol[q:3*q, q:3*q, q:3*q] = 1.0
+        sino = ft.forward_project_3d(vol, true_euler)
+
+        # Perturb tilt angles by up to 2°
+        perturbation = (torch.rand(n_angles, device=DEVICE) * 2.0 - 1.0) * 2.0
+        perturbed_angles = true_angles + perturbation
+        perturbed_angles_cpu = perturbed_angles.cpu()
+        error_before = perturbation.abs().max().item()
+
+        result = ft.run_ad_recon(
+            sino, perturbed_angles_cpu,
+            n_iter=300,
+            refine_pose=True,
+            lr_volume=0.05,
+            lr_angles=1e-2,
+            positivity=True,
+            return_pose=True,
+        )
+        # result = (volume, euler_or_None, shifts_or_None)
+        _, refined_euler, _ = result
+        assert refined_euler is not None
+
+        # The angles must have changed from their initial (perturbed) values
+        angle_delta = (refined_euler[:, 1] - perturbed_angles_cpu).abs().max().item()
+        assert angle_delta > 0.0, (
+            "run_ad_recon(refine_pose=True) did not update angle parameters"
+        )
+
+        # The refined angles must be closer to ground truth than the perturbation
+        error_after = (refined_euler[:, 1] - true_angles.cpu()).abs().max().item()
+        assert error_after < error_before, (
+            f"run_ad_recon pose refinement worsened angle accuracy: "
+            f"error_before={error_before:.3f}°, error_after={error_after:.3f}°"
+        )
+
+    def test_projector_mismatch_raises(self):
+        """Passing a RotmatProjector with refine_pose=False raises ValueError."""
+        N = 16
+        n_angles = 10
+        angles = make_angles(n_angles)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+
+        wrong_proj = ft.RotmatProjector(
+            (1, N, N), n_angles=n_angles, device=DEVICE, N_det=N,
+        )
+        with pytest.raises(ValueError, match="ParallelProjector"):
+            ft.run_ad_recon(sino, angles, refine_pose=False, projector=wrong_proj,
+                            n_iter=1)
+
+        parallel_proj = ft.ParallelProjector(
+            (1, N, N), angles, device=DEVICE, N_det=N,
+        )
+        with pytest.raises(ValueError, match="RotmatProjector"):
+            ft.run_ad_recon(sino, angles, refine_pose=True, projector=parallel_proj,
+                            n_iter=1)
+
+    def test_return_loss_shape(self):
+        """return_loss=True: loss history length equals n_iter."""
+        N = 16
+        angles = make_angles(10)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+
+        n_iter = 50
+        _, losses = ft.run_ad_recon(sino, angles, n_iter=n_iter, return_loss=True)
+        assert losses.shape == (n_iter,), (
+            f"Expected loss history of length {n_iter}, got {losses.shape}"
+        )
+        assert losses.dtype == torch.float32
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
