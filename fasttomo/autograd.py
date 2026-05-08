@@ -660,7 +660,10 @@ class _FP3DCached(torch.autograd.Function):
     def forward(ctx, volume, mats_flat, projector):
         ctx.projector = projector
         ctx.save_for_backward(volume.detach(), mats_flat.detach())
-        return projector._fp_raw(volume, mats_flat)
+        sino = projector._fp_raw(volume, mats_flat)
+        # Snapshot which volume upload the cache currently holds.
+        ctx.vol_cache_epoch = getattr(projector, "_vol_cache_epoch", None)
+        return sino
 
     @staticmethod
     def backward(ctx, grad_sino):
@@ -672,7 +675,13 @@ class _FP3DCached(torch.autograd.Function):
             grad_vol = proj._bp_raw(grad_sino, mats_flat)
         grad_mats = None
         if ctx.needs_input_grad[1]:
-            grad_mats = _grad_rotmat_raw(volume, grad_sino, mats_flat)
+            # Fast path only if this backward still corresponds to the most
+            # recent volume upload. Otherwise fall back to the uncached kernel
+            # so multi-forward single-backward graphs stay correct.
+            if getattr(ctx, "vol_cache_epoch", None) == getattr(proj, "_vol_cache_epoch", None):
+                grad_mats = proj._grad_mats_raw(volume, grad_sino, mats_flat)
+            else:
+                grad_mats = _grad_rotmat_raw(volume, grad_sino, mats_flat)
         return grad_vol, grad_mats, None
 
 

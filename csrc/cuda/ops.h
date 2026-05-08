@@ -168,6 +168,24 @@ void grad_rotmat_cuda(
 );
 
 /*
+ * Cached variant of grad_rotmat_cuda. vol_cache must be a TC_VOL_3D cache
+ * already uploaded by a preceding forward_project_rotmat_cuda_cached call.
+ * Uses vol_cache->tex_point (point-filter view) for bit-exact corner reads.
+ * io_dtype: 0=fp32, 1=fp16 (controls which kernel template is instantiated).
+ * d_grad_matrices must be zeroed by the caller; result is accumulated via atomicAdd.
+ */
+void grad_rotmat_cuda_cached(
+    int io_dtype,
+    TextureCache *vol_cache,
+    const float *d_grad_sino,
+    const float *d_matrices,
+    float       *d_grad_matrices,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+/*
  * Gradient of forward projection w.r.t. tilt angles.
  * d_grad_angles must be zeroed by the caller; result is in radians.
  */

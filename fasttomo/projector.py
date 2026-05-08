@@ -284,6 +284,10 @@ class RotmatProjector(_ProjectorBase):
             n_angles=int(n_angles),
             device=device,
         )
+        # Monotonic token for the current contents of _vol_handle.
+        # Every _fp_raw upload increments this so autograd can detect when a
+        # saved forward volume has been overwritten by a later forward call.
+        self._vol_cache_epoch = 0
 
     def _ensure_vol_cache(self) -> None:
         # Rotmat kernels need continuous Y interpolation (tex3D), so they
@@ -319,6 +323,7 @@ class RotmatProjector(_ProjectorBase):
             self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
             torch.cuda.current_stream(self.device).cuda_stream,
         )
+        self._vol_cache_epoch += 1
         return sino
 
     def _bp_raw(self, sinogram: torch.Tensor, mats_flat: torch.Tensor) -> torch.Tensor:
@@ -338,6 +343,38 @@ class RotmatProjector(_ProjectorBase):
             torch.cuda.current_stream(self.device).cuda_stream,
         )
         return vol
+
+    def _grad_mats_raw(
+        self,
+        volume: torch.Tensor,
+        grad_sino: torch.Tensor,
+        mats_flat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cached ∂L/∂M kernel. Requires _vol_handle to be already populated by a
+        prior forward(). Saves the volume upload that _grad_rotmat_raw would do.
+
+        Invariant: forward() populated _vol_handle this iteration; PyTorch autograd
+        guarantees `volume` (saved via save_for_backward) hasn't been mutated;
+        therefore the cache's content matches `volume`."""
+        assert self._vol_handle is not None, (
+            "_grad_mats_raw requires forward() to have been called this iteration"
+        )
+        io_dtype = _io_dtype_code(volume)
+        n_angles = mats_flat.shape[0]
+        Ny, Nz, Nx = volume.shape
+        _, _, N_det = grad_sino.shape
+        grad_mats = torch.zeros(n_angles, 9, dtype=torch.float32, device=volume.device)
+        # grad_sino comes from the BP path's autograd; force fp32 to match the kernel's
+        # current accumulator. (Future fp16 grad_rotmat would template this.)
+        gs = grad_sino.contiguous().float()
+        _core.grad_rotmat_cuda_cached(
+            io_dtype,
+            self._vol_handle,
+            gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            torch.cuda.current_stream(self.device).cuda_stream,
+        )
+        return grad_mats
 
     def forward(self, volume: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
         # accept either [n_angles, 3, 3] (default API) or [n_angles, 9]

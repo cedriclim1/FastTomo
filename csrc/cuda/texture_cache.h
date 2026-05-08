@@ -63,6 +63,11 @@ typedef enum {
 typedef struct {
     cudaArray_t           array;
     cudaTextureObject_t   tex;
+    /* tex_point is non-zero only for TC_VOL_3D 1-channel caches; it samples the
+     * same cudaArray with cudaFilterModePoint so kernels needing analytic-derivative
+     * bit-exact corner reads can use it. grad_rotmat_kernel uses this field so that
+     * the 8 trilinear corner reads are bit-exact equivalent to global-memory loads. */
+    cudaTextureObject_t   tex_point;
     cudaSurfaceObject_t   surf;     /* used by 4-channel half upload kernel */
     int                   dim_a;
     int                   dim_b;

@@ -901,5 +901,90 @@ def test_tv_loss_iso_3d_rejects_wrong_ndim():
         ft.tv_loss_3d(vol)
 
 
+def test_grad_rotmat_cached_matches_uncached():
+    """grad_rotmat cached path (via RotmatProjector._grad_mats_raw) must match
+    the uncached path (_grad_rotmat_raw) to within 1e-5 relative error."""
+    from fasttomo.autograd import _grad_rotmat_raw, _euler_zyz_to_rotmat
+
+    torch.manual_seed(0)
+    N        = 32
+    n_angles = 24
+    device   = DEVICE
+
+    volume   = torch.randn(N, N, N, device=device, dtype=torch.float32)
+    grad_sino = torch.randn(n_angles, N, N, device=device, dtype=torch.float32)
+
+    # Pure-Y ZYZ Euler angles
+    euler = torch.zeros(n_angles, 3)
+    euler[:, 1] = torch.linspace(-60.0, 60.0, n_angles)
+    euler = euler.to(device)
+    mats = _euler_zyz_to_rotmat(euler)                 # [n_angles, 3, 3]
+    mats_flat = mats.reshape(n_angles, 9).contiguous().float()
+
+    # Uncached path (now routes through a transient cache internally, but is
+    # the reference since it was tested independently)
+    g_old = _grad_rotmat_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
+
+    # Cached path via RotmatProjector
+    from fasttomo.projector import RotmatProjector
+    proj = RotmatProjector((N, N, N), n_angles=n_angles, device=device)
+    # Populate _vol_handle by running forward()
+    _ = proj.forward(volume, mats_flat)
+    g_new = proj._grad_mats_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
+
+    assert g_old.shape == g_new.shape, f"shape mismatch: {g_old.shape} vs {g_new.shape}"
+    denom = g_old.abs().max()
+    if denom < 1e-8:
+        # Absolute fallback when denominator is near zero
+        assert (g_new - g_old).abs().max().item() < 1e-5, \
+            "absolute error too large (denominator near zero)"
+    else:
+        rel_err = (g_new - g_old).abs().max().item() / denom.item()
+        assert rel_err < 1e-5, (
+            f"grad_rotmat cached vs uncached max rel error: {rel_err:.2e} (threshold 1e-5)"
+        )
+
+
+def test_rotmat_cached_backward_stale_volume_falls_back_uncached():
+    """If the cache volume was overwritten by a later forward, backward must
+    still return correct pose gradients for earlier graph branches."""
+    from fasttomo.autograd import _grad_rotmat_raw, _euler_zyz_to_rotmat
+    from fasttomo.projector import RotmatProjector
+
+    torch.manual_seed(123)
+    N        = 24
+    n_angles = 12
+
+    proj = RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+    vol_a = torch.randn(N, N, N, device=DEVICE, requires_grad=True)
+    vol_b = torch.randn(N, N, N, device=DEVICE, requires_grad=True)
+
+    euler = torch.zeros(n_angles, 3, device=DEVICE)
+    euler[:, 1] = torch.linspace(-55.0, 55.0, n_angles, device=DEVICE)
+    mats_base = _euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous().float()
+    mats_a = mats_base.clone().requires_grad_(True)
+    mats_b = mats_base.clone().requires_grad_(True)
+
+    # Distinct loss weights produce branch-specific grad_sino tensors.
+    w_a = torch.randn(n_angles, N, N, device=DEVICE, dtype=torch.float32)
+    w_b = torch.randn(n_angles, N, N, device=DEVICE, dtype=torch.float32)
+
+    # Two forward calls on the same projector overwrite the internal volume cache.
+    sino_a = proj.forward(vol_a, mats_a)
+    sino_b = proj.forward(vol_b, mats_b)
+    loss = (sino_a * w_a).sum() + (sino_b * w_b).sum()
+    loss.backward()
+
+    assert mats_a.grad is not None and mats_b.grad is not None
+
+    ref_a = _grad_rotmat_raw(vol_a.detach(), w_a.detach(), mats_a.detach())
+    ref_b = _grad_rotmat_raw(vol_b.detach(), w_b.detach(), mats_b.detach())
+
+    rel_a = (mats_a.grad - ref_a).abs().max().item() / ref_a.abs().max().clamp_min(1e-12).item()
+    rel_b = (mats_b.grad - ref_b).abs().max().item() / ref_b.abs().max().clamp_min(1e-12).item()
+    assert rel_a < 1e-5, f"stale-cache branch gradient mismatch: rel_err={rel_a:.2e}"
+    assert rel_b < 1e-5, f"latest branch gradient mismatch: rel_err={rel_b:.2e}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
