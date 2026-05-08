@@ -1206,6 +1206,26 @@ class TestRunSirtCudaGraph:
             f"expected 1 cached graph, got {len(proj._sirt_graph_cache)}"
         )
 
+    def test_graph_accepts_fp16_sinogram_input(self):
+        """
+        FP16 sinogram input must not trip projector dtype lock-in mismatch.
+
+        Regression guard: run_sirt keeps internal numerics in fp32, so the
+        CUDA projector must not be first locked by fp16 normaliser tensors and
+        then fail when the fp32 volume normaliser is projected.
+        """
+        N = 32
+        n_angles = 20
+        sino, angles = self._make_inputs(N=N, n_angles=n_angles)
+        proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+
+        rec = ft.run_sirt(
+            sino.half(), angles, n_iter=4, Nz=N, projector=proj
+        )
+        assert rec.shape == (1, N, N)
+        assert rec.dtype == torch.float32
+        assert torch.isfinite(rec).all(), "run_sirt produced NaN/Inf from fp16 input"
+
     def test_graph_cache_uses_latest_inputs(self):
         """
         Cached graph replay must respect call-time sinogram and omega values.

@@ -257,6 +257,10 @@ def run_sirt(
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
+    # Keep SIRT numerics in fp32 regardless of input dtype. This avoids
+    # projector dtype lock-in mismatches when callers provide fp16 sinograms.
+    sinogram = sinogram.float()
+
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
