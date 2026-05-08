@@ -93,8 +93,13 @@ if(FASTTOMO_USE_CUDA STREQUAL "AUTO")
     # toolchain error and abort — silently producing a CPU-only wheel when
     # the user clearly *wants* CUDA was the cause of past build incidents.
     set(_FASTTOMO_NVCC_VISIBLE FALSE)
-    if(DEFINED CMAKE_CUDA_COMPILER OR DEFINED CUDAToolkit_ROOT
-       OR DEFINED ENV{CUDA_HOME} OR DEFINED ENV{CUDA_PATH})
+    if(DEFINED CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_CUDA_COMPILER}")
+        set(_FASTTOMO_NVCC_VISIBLE TRUE)
+    elseif(DEFINED CUDAToolkit_ROOT AND EXISTS "${CUDAToolkit_ROOT}/bin/nvcc")
+        set(_FASTTOMO_NVCC_VISIBLE TRUE)
+    elseif(DEFINED ENV{CUDA_HOME} AND EXISTS "$ENV{CUDA_HOME}/bin/nvcc")
+        set(_FASTTOMO_NVCC_VISIBLE TRUE)
+    elseif(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/bin/nvcc")
         set(_FASTTOMO_NVCC_VISIBLE TRUE)
     elseif(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/bin/nvcc")
         set(_FASTTOMO_NVCC_VISIBLE TRUE)
