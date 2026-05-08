@@ -12,26 +12,29 @@ void forward_project_cpu(
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 ) {
+    if (num_threads < 1) num_threads = 1;
     ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
 
+    /* Each (ia, iy, id) ray writes to a unique sinogram entry — collapse(2)
+     * over the two outer loops parallelizes 29*200 = 5800 work units (more
+     * than enough for 32 threads) without any race. */
+    #pragma omp parallel for collapse(2) schedule(static) num_threads(num_threads)
     for (int ia = 0; ia < n_angles; ia++) {
-        float ca = cos_a[ia], sa = sin_a[ia];
-
         for (int iy = 0; iy < Ny; iy++) {
+            float ca = cos_a[ia], sa = sin_a[ia];
             const float *slice = volume + (size_t)iy * Nz * Nx;
 
             for (int id = 0; id < N_det; id++) {
-                float t   = id - g.half_det;   /* detector coord (pixels, centred) */
+                float t   = id - g.half_det;
                 float sum = 0.0f;
 
                 for (int step = -g.ray_len; step <= g.ray_len; step++) {
                     float s  = (float)step;
-                    /* point on ray at parameter s */
                     float x  = t * ca - s * sa;
                     float z  = t * sa + s * ca;
-                    /* convert to 0-based array indices */
                     float fx = x + g.half_x;
                     float fz = z + g.half_z;
 
@@ -61,23 +64,26 @@ void back_project_cpu(
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 ) {
+    if (num_threads < 1) num_threads = 1;
     ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
 
     memset(volume, 0, (size_t)Ny * Nz * Nx * sizeof(float));
 
     /*
-     * Ray-driven scatter — strict adjoint of the ray-driven forward projection.
-     * For each ray (ia, iy, id) and each step along the ray, scatter
-     * sinogram[ia,iy,id] into the four neighbouring voxels with the same
-     * bilinear weights used in the forward pass.
+     * Ray-driven scatter — strict adjoint of the forward pass. Different Y
+     * slices are disjoint memory regions, so parallelism is safe over `iy`.
+     * Within a slice, scatter across angles + detector + step would race, so
+     * the inner triple loop stays serial within each thread.
      */
-    for (int ia = 0; ia < n_angles; ia++) {
-        float ca = cos_a[ia], sa = sin_a[ia];
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
+    for (int iy = 0; iy < Ny; iy++) {
+        float *slice = volume + (size_t)iy * Nz * Nx;
 
-        for (int iy = 0; iy < Ny; iy++) {
-            float *slice = volume + (size_t)iy * Nz * Nx;
+        for (int ia = 0; ia < n_angles; ia++) {
+            float ca = cos_a[ia], sa = sin_a[ia];
 
             for (int id = 0; id < N_det; id++) {
                 float t    = id - g.half_det;
@@ -113,21 +119,29 @@ void grad_angle_cpu(
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
-    int n_angles, int N_det
+    int n_angles, int N_det,
+    int num_threads
 ) {
+    if (num_threads < 1) num_threads = 1;
     ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
 
     for (int ia = 0; ia < n_angles; ia++)
         grad_angles[ia] = 0.0f;
 
+    /*
+     * One scalar accumulator per angle; the outer ia loop is small (≈ tilt
+     * series length) so we parallelize the inner (iy, id) work with a
+     * reduction. This scales for the typical case where Ny, N_det >> n_angles.
+     */
     for (int ia = 0; ia < n_angles; ia++) {
         float ca = cos_a[ia], sa = sin_a[ia];
         float g_theta = 0.0f;
 
+        #pragma omp parallel for collapse(2) schedule(static) \
+                                 num_threads(num_threads) reduction(+:g_theta)
         for (int iy = 0; iy < Ny; iy++) {
-            const float *slice = volume + (size_t)iy * Nz * Nx;
-
             for (int id = 0; id < N_det; id++) {
+                const float *slice = volume + (size_t)iy * Nz * Nx;
                 float t  = id - g.half_det;
                 float gs = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
                 if (gs == 0.0f) continue;
@@ -139,7 +153,6 @@ void grad_angle_cpu(
                     float fx = x + g.half_x;
                     float fz = z + g.half_z;
 
-                    /* bounds check mirrors forward_project_cpu exactly */
                     if (fx < 0.0f || fx >= (float)(Nx - 1) ||
                         fz < 0.0f || fz >= (float)(Nz - 1))
                         continue;

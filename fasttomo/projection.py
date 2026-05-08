@@ -25,6 +25,7 @@ def forward_project(
     volume: torch.Tensor,          # [Ny, Nz, Nx]
     angles_deg: torch.Tensor,      # [n_angles] degrees
     N_det: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Forward-project volume → sinogram.
@@ -32,30 +33,40 @@ def forward_project(
     Returns [n_angles, Ny, N_det] float32 on the same device as volume.
     N_det defaults to Nx.
 
+    The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in. Default
+    is serial. Resolution order: kwarg → ``OMP_NUM_THREADS`` env → 1. The CUDA
+    path ignores ``num_threads`` (the kernel manages its own grid).
+
     Differentiable w.r.t. ``volume`` and ``angles_deg``.  Volume gradient
     calls back_project (the discrete adjoint). Angle gradient uses
     ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x at each ray step (CPU + CUDA).
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    return _FP2D.apply(volume, angles_deg, N_det)
+    nt = _resolve_num_threads(num_threads)
+    return _FP2D.apply(volume, angles_deg, N_det, nt)
 
 
 def back_project(
     sinogram: torch.Tensor,        # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,      # [n_angles] degrees
     Nz: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Back-project sinogram → volume [Ny, Nz, Nx].
 
     Nz defaults to N_det (square reconstruction).
 
+    The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in (default
+    serial; resolution order kwarg → ``OMP_NUM_THREADS`` env → 1).
+
     Differentiable w.r.t. ``sinogram``: backward calls forward_project.
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    return _BP2D.apply(sinogram, angles_deg, Nz)
+    nt = _resolve_num_threads(num_threads)
+    return _BP2D.apply(sinogram, angles_deg, Nz, nt)
 
 
 def forward_project_3d(

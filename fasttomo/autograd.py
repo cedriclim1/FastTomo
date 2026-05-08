@@ -148,6 +148,7 @@ def _forward_project_raw(
     volume: torch.Tensor,
     angles_deg: torch.Tensor,
     N_det: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     io_dtype = _io_dtype_code(volume)
     if volume.is_cuda:
@@ -171,9 +172,10 @@ def _forward_project_raw(
         return sino
 
     # CPU: kernel is fp32-only; upcast on entry, downcast on exit.
+    nt = _resolve_num_threads(num_threads)
     angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
     vol_np  = volume.detach().float().numpy()
-    sino_np = _core.forward_project_cpu(vol_np, angles_np, N_det)
+    sino_np = _core.forward_project_cpu(vol_np, angles_np, N_det, nt)
     out = torch.from_numpy(sino_np)
     return out.to(volume.dtype) if volume.dtype != torch.float32 else out
 
@@ -182,6 +184,7 @@ def _back_project_raw(
     sinogram: torch.Tensor,
     angles_deg: torch.Tensor,
     Nz: int = -1,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     io_dtype = _io_dtype_code(sinogram)
     if sinogram.is_cuda:
@@ -205,9 +208,10 @@ def _back_project_raw(
         return vol
 
     # CPU: fp32-only; upcast on entry, downcast on exit.
+    nt = _resolve_num_threads(num_threads)
     angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy()
     sino_np = sinogram.detach().float().numpy()
-    vol_np  = _core.back_project_cpu(sino_np, angles_np, Nz)
+    vol_np  = _core.back_project_cpu(sino_np, angles_np, Nz, nt)
     out = torch.from_numpy(vol_np)
     return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
 
@@ -425,6 +429,7 @@ def _grad_angle_raw(
     volume: torch.Tensor,
     grad_sino: torch.Tensor,
     angles_deg: torch.Tensor,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Returns [n_angles] gradient of the loss w.r.t. tilt angles in degrees.
@@ -448,43 +453,50 @@ def _grad_angle_raw(
         )
         return grad_a * (math.pi / 180.0)
 
+    nt = _resolve_num_threads(num_threads)
     angles_np = (angles_deg.detach().cpu().float() * (math.pi / 180.0)).numpy().astype(np.float32)
     vol_np = volume.detach().float().numpy()
     gs_np  = grad_sino.detach().float().numpy()
-    grad_np = _core.grad_angle_cpu(vol_np, gs_np, angles_np, N_det)
+    grad_np = _core.grad_angle_cpu(vol_np, gs_np, angles_np, N_det, nt)
     return torch.from_numpy(grad_np) * (math.pi / 180.0)
 
 
 class _FP2D(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, volume, angles_deg, N_det):
+    def forward(ctx, volume, angles_deg, N_det, num_threads):
         ctx.save_for_backward(volume.detach(), angles_deg)
         ctx.Nz = volume.shape[-2]
-        return _forward_project_raw(volume, angles_deg, N_det)
+        ctx.num_threads = num_threads
+        return _forward_project_raw(volume, angles_deg, N_det, num_threads)
 
     @staticmethod
     def backward(ctx, grad_sino):
         volume, angles_deg = ctx.saved_tensors
         grad_sino = grad_sino.contiguous()
-        grad_vol = _back_project_raw(grad_sino, angles_deg, Nz=ctx.Nz)
+        grad_vol = _back_project_raw(grad_sino, angles_deg, Nz=ctx.Nz,
+                                     num_threads=ctx.num_threads)
         grad_angles = None
         if ctx.needs_input_grad[1]:
-            grad_angles = _grad_angle_raw(volume, grad_sino, angles_deg)
-        return grad_vol, grad_angles, None
+            grad_angles = _grad_angle_raw(volume, grad_sino, angles_deg,
+                                          num_threads=ctx.num_threads)
+        return grad_vol, grad_angles, None, None
 
 
 class _BP2D(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sinogram, angles_deg, Nz):
+    def forward(ctx, sinogram, angles_deg, Nz, num_threads):
         ctx.save_for_backward(angles_deg)
         ctx.N_det = sinogram.shape[-1]
-        return _back_project_raw(sinogram, angles_deg, Nz)
+        ctx.num_threads = num_threads
+        return _back_project_raw(sinogram, angles_deg, Nz, num_threads)
 
     @staticmethod
     def backward(ctx, grad_vol):
         (angles_deg,) = ctx.saved_tensors
-        grad_sino = _forward_project_raw(grad_vol.contiguous(), angles_deg, N_det=ctx.N_det)
-        return grad_sino, None, None
+        grad_sino = _forward_project_raw(grad_vol.contiguous(), angles_deg,
+                                         N_det=ctx.N_det,
+                                         num_threads=ctx.num_threads)
+        return grad_sino, None, None, None
 
 
 class _FP3D(torch.autograd.Function):
