@@ -325,6 +325,136 @@ def run_sirt(
     return volume
 
 
+def run_sart(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    n_iter: int = 5,
+    subset_size: int = 1,
+    omega: float = 1.0,
+    Nz: int = -1,
+    positivity: bool = False,
+    mask: bool = False,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
+    return_loss: bool = False,
+    sparsity: float = 0.0,
+    num_threads: int | None = None,             # CPU 3D path only
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
+
+    Per-subset ordered-subsets update:
+
+        for each subset S of size subset_size:
+            r_S  = b_S - A_S · x
+            x   += ω · A_Sᵀ(r_S / R_S) · C_S
+
+    where:
+        R_S = A_S(1)    (row normalisation per subset — safeguarded against /0)
+        C_S = 1/A_Sᵀ(1) (column normalisation per subset — safeguarded against /0)
+
+    With subset_size=1 this is plain SART (Andersen & Kak 1984).
+    With subset_size=n_angles this is equivalent to one SIRT outer step
+    (Wang & Yu 2007 OS-SART degenerate case).
+
+    Subsets are formed by sequential splitting of the angle index:
+    [0:subset_size], [subset_size:2*subset_size], …, remainder.
+    The last subset may be smaller than subset_size.
+
+    sparsity / positivity / mask are applied once per outer iteration
+    (after all subsets have been processed), mirroring run_sirt.
+
+    return_loss: if True, returns (volume, loss_history) where loss_history
+    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
+    ||b - A·x||² / numel evaluated over the *full* sinogram after each
+    outer iteration.
+
+    euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
+    (forward_project_3d / back_project_3d) instead of the scalar-angle
+    single-axis projector. num_threads is forwarded to the CPU 3D kernels.
+
+    This is a frozen baseline — no projector caching, no CUDA-Graph capture.
+    Use run_sirt (or the AD path) for performance-critical workloads.
+
+    Returns volume [Ny, Nz, Nx].
+    """
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+
+    device = sinogram.device
+    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
+
+    # Build functional closures that accept an index list so we can slice
+    # both the angles tensor and the sinogram for each subset.
+    if euler_zyz_deg is not None:
+        def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return forward_project_3d(v, euler_zyz_deg[idx], N_det=N_det, num_threads=num_threads)
+
+        def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return back_project_3d(s, euler_zyz_deg[idx], Nz=Nz, num_threads=num_threads)
+
+        def _fp_full(v: torch.Tensor) -> torch.Tensor:
+            return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
+    else:
+        def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return forward_project(v, angles_deg[idx], N_det=N_det)
+
+        def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            return back_project(s, angles_deg[idx], Nz=Nz)
+
+        def _fp_full(v: torch.Tensor) -> torch.Tensor:
+            return forward_project(v, angles_deg, N_det=N_det)
+
+    # Build subsets: list of index tensors
+    clamp = max(1, min(subset_size, n_angles))
+    all_idx = torch.arange(n_angles, dtype=torch.long)
+    subsets = list(torch.split(all_idx, clamp))
+
+    # Pre-compute per-subset normalisations (done once, outside the outer loop).
+    ones_vol = torch.ones(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    R_list: list[torch.Tensor] = []  # row normalisers [|S|, Ny, N_det]
+    C_list: list[torch.Tensor] = []  # col normalisers [Ny, Nz, Nx]
+    for idx in subsets:
+        R_s = _fp_subset(ones_vol, idx)
+        R_s = torch.where(R_s > 0, 1.0 / R_s, torch.zeros_like(R_s))
+        R_list.append(R_s)
+
+        # ones_sino for this subset
+        ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=torch.float32, device=device)
+        C_s = _bp_subset(ones_sino_s, idx)
+        C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
+        C_list.append(C_s)
+
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    losses: list[float] = []
+
+    # --- outer iteration loop ---
+    for _ in range(n_iter):
+        # --- inner subset loop ---
+        for idx, R_s, C_s in zip(subsets, R_list, C_list):
+            sino_s = sinogram[idx]                   # [|S|, Ny, N_det]
+            pred_s = _fp_subset(volume, idx)         # [|S|, Ny, N_det]
+            r_s    = sino_s - pred_s                 # [|S|, Ny, N_det]
+            volume = volume + omega * C_s * _bp_subset(r_s * R_s, idx)
+
+        if return_loss:
+            with torch.no_grad():
+                raw_res = sinogram - _fp_full(volume)
+                losses.append(raw_res.pow(2).mean().item())
+
+        if sparsity > 0.0:
+            volume = _apply_sparsity(volume, sparsity)
+        if positivity:
+            volume.clamp_(min=0.0)
+        if _mask is not None:
+            volume = volume * _mask
+
+    if return_loss:
+        return volume, torch.tensor(losses, dtype=torch.float32)
+    return volume
+
+
 def _genfire_hermitian_sym(
     grid_real: torch.Tensor,   # [Ny, bigN, bigN]
     grid_imag: torch.Tensor,
