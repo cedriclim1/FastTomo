@@ -29,6 +29,14 @@ class AstraParallelBeam:
         self.proj_geom = astra.create_proj_geom(
             "parallel", 1.0, n_det, self.angles_rad
         )
+        self._cpu_proj_id: int | None = None  # lazy strip-kernel projector
+
+    def _ensure_cpu_proj(self) -> int:
+        if self._cpu_proj_id is None:
+            self._cpu_proj_id = astra.create_projector(
+                "strip", self.proj_geom, self.vol_geom
+            )
+        return self._cpu_proj_id
 
     # --- internal helpers ----------------------------------------------------
 
@@ -87,6 +95,59 @@ class AstraParallelBeam:
         for y in range(Ny):
             sino_id, rec_id = self._alloc_slice(sinogram[:, y, :])
             cfg = astra.astra_dict("SIRT_CUDA")
+            cfg["ProjectionDataId"] = sino_id
+            cfg["ReconstructionDataId"] = rec_id
+            if positivity:
+                cfg["option"] = {"MinConstraint": 0.0}
+            alg_id = astra.algorithm.create(cfg)
+            try:
+                astra.algorithm.run(alg_id, num_iter)
+                rec[y] = astra.data2d.get(rec_id)
+            finally:
+                astra.algorithm.delete(alg_id)
+                self._free(sino_id, rec_id)
+        return rec
+
+    def fbp_cpu(self, sinogram: np.ndarray, positivity: bool = False) -> np.ndarray:
+        """ASTRA CPU FBP per Y-slice (strip-kernel projector)."""
+        n_angles, Ny, N_det = sinogram.shape
+        if N_det != self.n_det:
+            raise ValueError(f"detector size {N_det} != wrapper {self.n_det}")
+        proj_id = self._ensure_cpu_proj()
+        rec = np.empty((Ny, N_det, N_det), dtype=np.float32)
+        for y in range(Ny):
+            sino_id, rec_id = self._alloc_slice(sinogram[:, y, :])
+            cfg = astra.astra_dict("FBP")
+            cfg["ProjectorId"] = proj_id
+            cfg["ProjectionDataId"] = sino_id
+            cfg["ReconstructionDataId"] = rec_id
+            alg_id = astra.algorithm.create(cfg)
+            try:
+                astra.algorithm.run(alg_id)
+                rec[y] = astra.data2d.get(rec_id)
+            finally:
+                astra.algorithm.delete(alg_id)
+                self._free(sino_id, rec_id)
+        if positivity:
+            np.clip(rec, 0.0, None, out=rec)
+        return rec
+
+    def sirt_cpu(
+        self,
+        sinogram: np.ndarray,
+        num_iter: int = 50,
+        positivity: bool = True,
+    ) -> np.ndarray:
+        """ASTRA CPU SIRT per Y-slice (strip-kernel projector)."""
+        n_angles, Ny, N_det = sinogram.shape
+        if N_det != self.n_det:
+            raise ValueError(f"detector size {N_det} != wrapper {self.n_det}")
+        proj_id = self._ensure_cpu_proj()
+        rec = np.empty((Ny, N_det, N_det), dtype=np.float32)
+        for y in range(Ny):
+            sino_id, rec_id = self._alloc_slice(sinogram[:, y, :])
+            cfg = astra.astra_dict("SIRT")
+            cfg["ProjectorId"] = proj_id
             cfg["ProjectionDataId"] = sino_id
             cfg["ReconstructionDataId"] = rec_id
             if positivity:
