@@ -945,5 +945,46 @@ def test_grad_rotmat_cached_matches_uncached():
         )
 
 
+def test_rotmat_cached_backward_stale_volume_falls_back_uncached():
+    """If the cache volume was overwritten by a later forward, backward must
+    still return correct pose gradients for earlier graph branches."""
+    from fasttomo.autograd import _grad_rotmat_raw, _euler_zyz_to_rotmat
+    from fasttomo.projector import RotmatProjector
+
+    torch.manual_seed(123)
+    N        = 24
+    n_angles = 12
+
+    proj = RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+    vol_a = torch.randn(N, N, N, device=DEVICE, requires_grad=True)
+    vol_b = torch.randn(N, N, N, device=DEVICE, requires_grad=True)
+
+    euler = torch.zeros(n_angles, 3, device=DEVICE)
+    euler[:, 1] = torch.linspace(-55.0, 55.0, n_angles, device=DEVICE)
+    mats_base = _euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous().float()
+    mats_a = mats_base.clone().requires_grad_(True)
+    mats_b = mats_base.clone().requires_grad_(True)
+
+    # Distinct loss weights produce branch-specific grad_sino tensors.
+    w_a = torch.randn(n_angles, N, N, device=DEVICE, dtype=torch.float32)
+    w_b = torch.randn(n_angles, N, N, device=DEVICE, dtype=torch.float32)
+
+    # Two forward calls on the same projector overwrite the internal volume cache.
+    sino_a = proj.forward(vol_a, mats_a)
+    sino_b = proj.forward(vol_b, mats_b)
+    loss = (sino_a * w_a).sum() + (sino_b * w_b).sum()
+    loss.backward()
+
+    assert mats_a.grad is not None and mats_b.grad is not None
+
+    ref_a = _grad_rotmat_raw(vol_a.detach(), w_a.detach(), mats_a.detach())
+    ref_b = _grad_rotmat_raw(vol_b.detach(), w_b.detach(), mats_b.detach())
+
+    rel_a = (mats_a.grad - ref_a).abs().max().item() / ref_a.abs().max().clamp_min(1e-12).item()
+    rel_b = (mats_b.grad - ref_b).abs().max().item() / ref_b.abs().max().clamp_min(1e-12).item()
+    assert rel_a < 1e-5, f"stale-cache branch gradient mismatch: rel_err={rel_a:.2e}"
+    assert rel_b < 1e-5, f"latest branch gradient mismatch: rel_err={rel_b:.2e}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
