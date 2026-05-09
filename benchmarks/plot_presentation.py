@@ -27,7 +27,9 @@ DISPLAY = {
     "ft-resire":              "FastTomo RESIRE",
     "ft-genfire":             "FastTomo GENFIRE",
     "ft-ad-cached":           "FastTomo AD",
-    "ft-ad-with-pose-cached": "FastTomo AD + pose",
+    "ft-ad-with-pose-cached": "FastTomo AD + Pose + TV",
+    "ft-ad-pose-notv":        "FastTomo AD + Pose (no TV)",
+    "ft-ad-pose-tv-ssim":     "FastTomo AD + Pose + TV + SSIM",
     "astra-sirt":             "ASTRA SIRT",
     "astra-fbp":              "ASTRA FBP",
     "torch_radon-sirt":       "TorchRadon iter-FBP",
@@ -172,16 +174,20 @@ ssim_methods = [
     "ft-resire",
     "ft-sirt-cached",
     "ft-ad-cached",
+    "ft-ad-pose-notv",
     "ft-ad-with-pose-cached",
+    "ft-ad-pose-tv-ssim",
 ]
-fig, ax = plt.subplots(figsize=(9.0, 5.0))
-ssim_vals = [_by_method(rows, m)["ssim"] for m in ssim_methods]
-labels    = [DISPLAY[m] for m in ssim_methods]
-colors    = [color_for(m) for m in ssim_methods]
+fig, ax = plt.subplots(figsize=(9.0, 5.5))
+ssim_methods_avail = [m for m in ssim_methods if _by_method(rows, m) is not None]
+ssim_vals = [_by_method(rows, m)["ssim"] for m in ssim_methods_avail]
+labels    = [DISPLAY[m] for m in ssim_methods_avail]
+colors    = [color_for(m) for m in ssim_methods_avail]
 order = np.argsort(ssim_vals)
 ssim_s   = [ssim_vals[i] for i in order]
 labels_s = [labels[i]    for i in order]
 colors_s = [colors[i]    for i in order]
+ssim_methods_s = [ssim_methods_avail[i] for i in order]
 
 bars = ax.barh(range(len(ssim_s)), ssim_s, color=colors_s,
                edgecolor="black", linewidth=0.5)
