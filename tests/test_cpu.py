@@ -145,6 +145,17 @@ def test_sirt_positivity():
     assert rec.min().item() >= -1e-6
 
 
+def test_sirt_warm_start_shape_mismatch_raises():
+    """Warm-start volume shape must exactly match [Ny, Nz, Nx]."""
+    n_angles, Ny, N = 12, 4, 16
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = make_angles(n_angles)
+    warm = torch.zeros(1, N, N, dtype=torch.float32)  # Ny mismatch
+
+    with pytest.raises(ValueError, match="volume must have shape"):
+        ft.run_sirt(sino, angles, n_iter=1, Nz=N, volume=warm)
+
+
 # ── W-BP ──────────────────────────────────────────────────────────────────
 
 def test_wbp_shape():
@@ -668,6 +679,16 @@ class TestRunSart:
             f"expected loss_history length {n_iter}, got {losses.shape}"
         )
         assert torch.isfinite(losses).all().item()
+
+    def test_warm_start_shape_mismatch_raises(self):
+        """Warm-start volume shape must match [Ny, Nz, Nx] exactly."""
+        n_angles, Ny, N = 12, 4, 16
+        sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+        angles = make_angles(n_angles)
+        warm = torch.zeros(1, N, N, dtype=torch.float32)  # Ny mismatch
+
+        with pytest.raises(ValueError, match="volume must have shape"):
+            ft.run_sart(sino, angles, n_iter=1, Nz=N, volume=warm)
 
 
 if __name__ == "__main__":
