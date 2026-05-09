@@ -28,7 +28,8 @@ from fasttomo.projection import (
     forward_project_resire,
     back_project_resire,
 )
-from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
+from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter
+from fasttomo.regularizers import tv_loss_3d
 from fasttomo.projector import ParallelProjector, RotmatProjector
 
 _log = logging.getLogger(__name__)

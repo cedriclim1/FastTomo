@@ -60,7 +60,13 @@ from fasttomo.utilities import (
     estimate_shifts_xcorr,
     ramp_filter,
     cylindrical_mask,
+)
+from fasttomo.regularizers import (
     tv_loss_3d,
+    logsum_sparsity,
+    tilt_ssim_loss,
+    atom_red_loss,
+    gaussian_atom_project,
 )
 from fasttomo.algorithms import (
     run_fbp,
@@ -89,6 +95,10 @@ __all__ = [
     "ramp_filter",
     "cylindrical_mask",
     "tv_loss_3d",
+    "logsum_sparsity",
+    "tilt_ssim_loss",
+    "atom_red_loss",
+    "gaussian_atom_project",
     "run_fbp",
     "run_weighted_backprojection",
     "run_sirt",
