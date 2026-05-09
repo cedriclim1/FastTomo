@@ -84,6 +84,27 @@ def _assert_warm_start_shape(
         )
 
 
+def _assert_projector_output_shape(
+    tensor: torch.Tensor,
+    expected_shape: tuple[int, ...],
+    tensor_name: str,
+    op_name: str,
+) -> None:
+    """Validate projector outputs before downstream arithmetic can broadcast.
+
+    Cached projectors are user-supplied and may be built for a different
+    geometry. Without this guard, singleton dimensions (e.g. Ny=1) can
+    silently broadcast across the target tensor and corrupt reconstruction
+    updates with no explicit error.
+    """
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(
+            f"{op_name}: projector returned {tensor_name} with shape "
+            f"{tuple(tensor.shape)}, expected {expected_shape}. "
+            "Ensure projector geometry matches the current sinogram/volume."
+        )
+
+
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
 
 def _compute_exact_wf(
@@ -338,10 +359,12 @@ def run_sirt(
     # --- normalisation matrices (computed once with the chosen projector) ---
     ones_sino = torch.ones_like(sinogram)
     C_vol     = _bp(ones_sino)
+    _assert_projector_output_shape(C_vol, (Ny, Nz, Nx), "back-projection", "run_sirt")
     C_vol     = torch.where(C_vol > 0, 1.0 / C_vol, torch.zeros_like(C_vol))
 
     ones_vol  = torch.ones_like(volume)
     R_sino    = _fp(ones_vol)
+    _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)

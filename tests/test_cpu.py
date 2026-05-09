@@ -157,6 +157,40 @@ def test_sirt_warm_start_shape_mismatch_raises():
         ft.run_sirt(sino, angles, n_iter=1, Nz=N, volume=warm)
 
 
+def test_sirt_projector_shape_mismatch_raises():
+    """Projector outputs must match the active reconstruction geometry.
+
+    Regression guard for silent broadcasting: if a user reuses a projector
+    built for Ny=1 with a Ny>1 sinogram, SIRT used to broadcast normalisers
+    and updates across Y without raising."""
+
+    class MismatchedProjector:
+        def __init__(self, n_angles: int, N: int):
+            self.n_angles = n_angles
+            self.N = N
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            # Wrong Ny (=1 instead of caller Ny=4).
+            return torch.zeros(self.n_angles, 1, self.N, dtype=volume.dtype)
+
+        def back(self, sinogram: torch.Tensor) -> torch.Tensor:
+            # Wrong Ny (=1 instead of caller Ny=4).
+            return torch.zeros(1, self.N, self.N, dtype=sinogram.dtype)
+
+    n_angles, Ny, N = 12, 4, 16
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = make_angles(n_angles)
+
+    with pytest.raises(ValueError, match="projector returned"):
+        ft.run_sirt(
+            sino,
+            angles,
+            n_iter=1,
+            Nz=N,
+            projector=MismatchedProjector(n_angles=n_angles, N=N),
+        )
+
+
 # ── W-BP ──────────────────────────────────────────────────────────────────
 
 def test_wbp_shape():
