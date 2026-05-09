@@ -66,6 +66,24 @@ def _maybe_cylindrical_mask(
     return cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
 
 
+def _assert_warm_start_shape(
+    volume: torch.Tensor,
+    expected_shape: tuple[int, int, int],
+    op_name: str,
+) -> None:
+    """Validate warm-start volume shape before arithmetic can broadcast it.
+
+    Without this guard, a volume with wrong leading-dim (e.g. ``[1, N, N]``
+    when the sinogram has ``Ny > 1``) would silently broadcast inside
+    ``volume + omega * C_vol * _bp(...)`` and produce a corrupted
+    reconstruction with no warning."""
+    if tuple(volume.shape) != expected_shape:
+        raise ValueError(
+            f"{op_name}: volume must have shape {expected_shape}, "
+            f"got {tuple(volume.shape)}."
+        )
+
+
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
 
 def _compute_exact_wf(
@@ -279,6 +297,7 @@ def run_sirt(
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
+        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_sirt")
         _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_sirt")
         volume = volume.to(device=device).contiguous().clone()
     compute_dtype = volume.dtype
@@ -445,6 +464,7 @@ def run_sart(
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
+        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_sart")
         _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_sart")
         volume = volume.to(device=device).contiguous().clone()
     compute_dtype = volume.dtype
