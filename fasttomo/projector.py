@@ -50,7 +50,10 @@ import math
 import torch
 
 import fasttomo._core as _core
-from fasttomo.autograd import _FP2DCached, _BP2DCached, _FP3DCached, _BP3DCached, _io_dtype_code
+from fasttomo.autograd import (
+    _FP2DCached, _BP2DCached, _FP3DCached, _BP3DCached, _io_dtype_code,
+    _on_device,
+)
 
 
 # Texture-cache kind enum mirrors texture_cache.h:
@@ -103,6 +106,13 @@ class _ProjectorBase:
         self.Nx       = Nx
         self.N_det    = N_det
         self.n_angles = n_angles
+        # Normalise the device so torch.device("cuda") becomes torch.device("cuda:N")
+        # — needed for unambiguous device comparison in _check_device. The cudaArray
+        # this projector will hold is bound to whichever index resolves now, so
+        # capturing it explicitly is also more correct than carrying an unindexed
+        # alias around.
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self.device   = device
         self.dtype: torch.dtype | None = dtype
         self._vol_handle:  int | None = None
@@ -123,16 +133,41 @@ class _ProjectorBase:
             )
         return code
 
+    def _check_device(self, t: torch.Tensor, name: str) -> None:
+        """Raise ValueError if ``t`` does not live on ``self.device``.
+
+        Catches the device-mismatch case early with a clear message instead of
+        letting a downstream kernel hit ``cudaErrorIllegalAddress``. Cached
+        textures are tied to the projector's construction device; mixing
+        devices on the same projector is never legal.
+        """
+        if t.device != self.device:
+            raise ValueError(
+                f"{type(self).__name__}: {name} tensor on {t.device} but "
+                f"projector was built on {self.device}. Move the tensor with "
+                f".to({self.device}) or rebuild the projector on the right "
+                f"device."
+            )
+
     def __del__(self) -> None:
         # Tear down explicitly.  tc_destroy is safe-on-null and frees both the
-        # cudaArray and the textureObject.
+        # cudaArray and the textureObject. GC may fire while a different CUDA
+        # device is current (e.g. the user has since switched to cuda:0), so
+        # pin the current device to the projector's construction device first.
         try:
-            if getattr(self, "_vol_handle", None) is not None:
-                _core.tc_destroy(self._vol_handle)
-                self._vol_handle = None
-            if getattr(self, "_sino_handle", None) is not None:
-                _core.tc_destroy(self._sino_handle)
-                self._sino_handle = None
+            has_handles = (
+                getattr(self, "_vol_handle", None) is not None
+                or getattr(self, "_sino_handle", None) is not None
+            )
+            if not has_handles:
+                return
+            with torch.cuda.device(self.device):
+                if getattr(self, "_vol_handle", None) is not None:
+                    _core.tc_destroy(self._vol_handle)
+                    self._vol_handle = None
+                if getattr(self, "_sino_handle", None) is not None:
+                    _core.tc_destroy(self._sino_handle)
+                    self._sino_handle = None
         except Exception:
             pass
 
@@ -199,61 +234,67 @@ class ParallelProjector(_ProjectorBase):
     def _ensure_vol_cache(self) -> None:
         if self._vol_handle is None:
             assert self.dtype is not None, "_lock_dtype must be called first"
-            self._vol_handle = int(_core.tc_create(
-                _TC_VOL_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
-                self.Ny, self.Nz, self.Nx,
-            ))
+            with torch.cuda.device(self.device):
+                self._vol_handle = int(_core.tc_create(
+                    _TC_VOL_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
+                    self.Ny, self.Nz, self.Nx,
+                ))
 
     def _ensure_sino_cache(self) -> None:
         if self._sino_handle is None:
             assert self.dtype is not None, "_lock_dtype must be called first"
-            self._sino_handle = int(_core.tc_create(
-                _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
-                self.n_angles, self.Ny, self.N_det,
-            ))
+            with torch.cuda.device(self.device):
+                self._sino_handle = int(_core.tc_create(
+                    _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
+                    self.n_angles, self.Ny, self.N_det,
+                ))
 
     # ── raw (non-autograd) entry points used by the autograd Function ──
     def _fp_raw(self, volume: torch.Tensor) -> torch.Tensor:
         io_dtype = self._lock_dtype(volume)
-        self._ensure_vol_cache()
-        vol = volume.contiguous()
-        sino = torch.empty(
-            self.n_angles, self.Ny, self.N_det,
-            dtype=self.dtype, device=self.device,
-        )
-        _core.forward_project_cuda_cached(
-            io_dtype,
-            self._vol_handle,
-            vol.data_ptr(), sino.data_ptr(),
-            self._cos.data_ptr(), self._sin.data_ptr(),
-            self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-            torch.cuda.current_stream(self.device).cuda_stream,
-        )
+        with torch.cuda.device(self.device):
+            self._ensure_vol_cache()
+            vol = volume.contiguous()
+            sino = torch.empty(
+                self.n_angles, self.Ny, self.N_det,
+                dtype=self.dtype, device=self.device,
+            )
+            _core.forward_project_cuda_cached(
+                io_dtype,
+                self._vol_handle,
+                vol.data_ptr(), sino.data_ptr(),
+                self._cos.data_ptr(), self._sin.data_ptr(),
+                self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
+                torch.cuda.current_stream(self.device).cuda_stream,
+            )
         return sino
 
     def _bp_raw(self, sinogram: torch.Tensor) -> torch.Tensor:
         io_dtype = self._lock_dtype(sinogram)
-        self._ensure_sino_cache()
-        sino = sinogram.contiguous()
-        vol = torch.empty(
-            self.Ny, self.Nz, self.Nx,
-            dtype=self.dtype, device=self.device,
-        )
-        _core.back_project_cuda_cached(
-            io_dtype,
-            self._sino_handle,
-            sino.data_ptr(), vol.data_ptr(),
-            self._cos.data_ptr(), self._sin.data_ptr(),
-            self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-            torch.cuda.current_stream(self.device).cuda_stream,
-        )
+        with torch.cuda.device(self.device):
+            self._ensure_sino_cache()
+            sino = sinogram.contiguous()
+            vol = torch.empty(
+                self.Ny, self.Nz, self.Nx,
+                dtype=self.dtype, device=self.device,
+            )
+            _core.back_project_cuda_cached(
+                io_dtype,
+                self._sino_handle,
+                sino.data_ptr(), vol.data_ptr(),
+                self._cos.data_ptr(), self._sin.data_ptr(),
+                self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
+                torch.cuda.current_stream(self.device).cuda_stream,
+            )
         return vol
 
     # ── public differentiable API ──
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        self._check_device(volume, "volume")
         return _FP2DCached.apply(volume, self)
 
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
+        self._check_device(sinogram, "sinogram")
         return _BP2DCached.apply(sinogram, self)
 
 
@@ -302,54 +343,58 @@ class RotmatProjector(_ProjectorBase):
         # can't pack 4 Y-slices into channels — channels stays 1.
         if self._vol_handle is None:
             assert self.dtype is not None, "_lock_dtype must be called first"
-            self._vol_handle = int(_core.tc_create(
-                _TC_VOL_3D, _dtype_to_tc_code(self.dtype), 1,
-                self.Ny, self.Nz, self.Nx,
-            ))
+            with torch.cuda.device(self.device):
+                self._vol_handle = int(_core.tc_create(
+                    _TC_VOL_3D, _dtype_to_tc_code(self.dtype), 1,
+                    self.Ny, self.Nz, self.Nx,
+                ))
 
     def _ensure_sino_cache(self) -> None:
         if self._sino_handle is None:
             assert self.dtype is not None, "_lock_dtype must be called first"
-            self._sino_handle = int(_core.tc_create(
-                _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), 1,
-                self.n_angles, self.Ny, self.N_det,
-            ))
+            with torch.cuda.device(self.device):
+                self._sino_handle = int(_core.tc_create(
+                    _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), 1,
+                    self.n_angles, self.Ny, self.N_det,
+                ))
 
     def _fp_raw(self, volume: torch.Tensor, mats_flat: torch.Tensor) -> torch.Tensor:
         io_dtype = self._lock_dtype(volume)
-        self._ensure_vol_cache()
-        vol = volume.contiguous()
-        mats = mats_flat.detach().contiguous()
-        sino = torch.empty(
-            self.n_angles, self.Ny, self.N_det,
-            dtype=self.dtype, device=self.device,
-        )
-        _core.forward_project_rotmat_cuda_cached(
-            io_dtype,
-            self._vol_handle,
-            vol.data_ptr(), sino.data_ptr(), mats.data_ptr(),
-            self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-            torch.cuda.current_stream(self.device).cuda_stream,
-        )
+        with torch.cuda.device(self.device):
+            self._ensure_vol_cache()
+            vol = volume.contiguous()
+            mats = mats_flat.detach().contiguous()
+            sino = torch.empty(
+                self.n_angles, self.Ny, self.N_det,
+                dtype=self.dtype, device=self.device,
+            )
+            _core.forward_project_rotmat_cuda_cached(
+                io_dtype,
+                self._vol_handle,
+                vol.data_ptr(), sino.data_ptr(), mats.data_ptr(),
+                self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
+                torch.cuda.current_stream(self.device).cuda_stream,
+            )
         self._vol_cache_epoch += 1
         return sino
 
     def _bp_raw(self, sinogram: torch.Tensor, mats_flat: torch.Tensor) -> torch.Tensor:
         io_dtype = self._lock_dtype(sinogram)
-        self._ensure_sino_cache()
-        sino = sinogram.contiguous()
-        mats = mats_flat.detach().contiguous()
-        vol = torch.empty(
-            self.Ny, self.Nz, self.Nx,
-            dtype=self.dtype, device=self.device,
-        )
-        _core.back_project_rotmat_cuda_cached(
-            io_dtype,
-            self._sino_handle,
-            sino.data_ptr(), vol.data_ptr(), mats.data_ptr(),
-            self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-            torch.cuda.current_stream(self.device).cuda_stream,
-        )
+        with torch.cuda.device(self.device):
+            self._ensure_sino_cache()
+            sino = sinogram.contiguous()
+            mats = mats_flat.detach().contiguous()
+            vol = torch.empty(
+                self.Ny, self.Nz, self.Nx,
+                dtype=self.dtype, device=self.device,
+            )
+            _core.back_project_rotmat_cuda_cached(
+                io_dtype,
+                self._sino_handle,
+                sino.data_ptr(), vol.data_ptr(), mats.data_ptr(),
+                self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
+                torch.cuda.current_stream(self.device).cuda_stream,
+            )
         return vol
 
     def _grad_mats_raw(
@@ -375,20 +420,25 @@ class RotmatProjector(_ProjectorBase):
         # grad_sino comes from the BP path's autograd; force fp32 to match the kernel's
         # current accumulator. (Future fp16 grad_rotmat would template this.)
         gs = grad_sino.contiguous().float()
-        _core.grad_rotmat_cuda_cached(
-            io_dtype,
-            self._vol_handle,
-            gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            torch.cuda.current_stream(self.device).cuda_stream,
-        )
+        with torch.cuda.device(self.device):
+            _core.grad_rotmat_cuda_cached(
+                io_dtype,
+                self._vol_handle,
+                gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                torch.cuda.current_stream(self.device).cuda_stream,
+            )
         return grad_mats
 
     def forward(self, volume: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
+        self._check_device(volume, "volume")
+        self._check_device(mats, "mats")
         # accept either [n_angles, 3, 3] (default API) or [n_angles, 9]
         mats_flat = mats.reshape(self.n_angles, 9) if mats.ndim == 3 else mats
         return _FP3DCached.apply(volume, mats_flat, self)
 
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
+        self._check_device(sinogram, "sinogram")
+        self._check_device(mats, "mats")
         mats_flat = mats.reshape(self.n_angles, 9) if mats.ndim == 3 else mats
         return _BP3DCached.apply(sinogram, mats_flat, self)

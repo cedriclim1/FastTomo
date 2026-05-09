@@ -1403,6 +1403,174 @@ class TestRunSirtCudaGraph:
                     f"positivity violated for kwargs={kwargs}"
                 )
 
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 2,
+        reason="cross-device graph capture needs >=2 GPUs",
+    )
+    def test_graph_capture_on_non_default_device(self):
+        """Regression: torch.cuda.graph(g) must capture on the tensor's
+        device, not the process-default device. Reproduces the case where
+        run_sirt on cuda:1 with default cuda:0 raised
+        'illegal memory access at texture_cache.cu:208'.
+        """
+        device = torch.device("cuda:1")
+        N = 32
+        n_angles = 20
+        angles = make_angles(n_angles).to(device)
+        vol = phantom_2d(N).unsqueeze(0).to(device)
+        sino = ft.forward_project(vol, angles)
+
+        rec = ft.run_sirt(sino, angles, n_iter=6, Nz=N)
+        torch.cuda.synchronize(device)
+        assert rec.device == device
+        assert torch.isfinite(rec).all()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="cross-device tests need >=2 GPUs",
+)
+class TestCrossDevice:
+    """Regression tests for running CUDA ops on a non-default device.
+
+    Default device stays cuda:0 throughout; tensors live on cuda:1. Without
+    the ``with torch.cuda.device(t.device)`` guards in the autograd helpers,
+    projector raw paths, and projector ``__del__``, every one of these would
+    crash with ``cudaErrorIllegalAddress``.
+    """
+
+    DEV = torch.device("cuda:1")
+
+    def _angles(self, n: int = 20) -> torch.Tensor:
+        return torch.linspace(-60, 60, n).to(self.DEV)
+
+    def _phantom(self, N: int = 32) -> torch.Tensor:
+        v = torch.zeros(1, N, N, device=self.DEV)
+        v[:, N // 4:3 * N // 4, N // 4:3 * N // 4] = 1.0
+        return v
+
+    def _euler(self, n: int = 20) -> torch.Tensor:
+        e = torch.zeros(n, 3, dtype=torch.float32, device=self.DEV)
+        e[:, 1] = torch.linspace(-60, 60, n)
+        return e
+
+    # ── functional projection ops ────────────────────────────────────────
+
+    def test_forward_project(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        torch.cuda.synchronize(self.DEV)
+        assert sino.device == self.DEV and torch.isfinite(sino).all()
+
+    def test_back_project(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.back_project(sino, self._angles())
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_forward_project_3d(self):
+        sino = ft.forward_project_3d(self._phantom(), self._euler())
+        torch.cuda.synchronize(self.DEV)
+        assert sino.device == self.DEV and torch.isfinite(sino).all()
+
+    def test_back_project_3d(self):
+        sino = ft.forward_project_3d(self._phantom(), self._euler())
+        rec = ft.back_project_3d(sino, self._euler())
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_forward_project_resire(self):
+        sino = ft.forward_project_resire(self._phantom(), self._euler())
+        torch.cuda.synchronize(self.DEV)
+        assert sino.device == self.DEV and torch.isfinite(sino).all()
+
+    def test_back_project_resire(self):
+        sino = ft.forward_project_resire(self._phantom(), self._euler())
+        rec = ft.back_project_resire(sino, self._euler())
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    # ── algorithm wrappers ───────────────────────────────────────────────
+
+    def test_run_fbp(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.run_fbp(sino, self._angles())
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_run_sirt(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.run_sirt(sino, self._angles(), n_iter=5)
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_run_sart(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.run_sart(sino, self._angles(), n_iter=2, subset_size=5)
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_run_resire(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.run_resire(sino, self._angles(), n_iter=5)
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_run_genfire(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.run_genfire(sino, self._angles(), n_iter=4,
+                             resolution_extension=False)
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    def test_run_grad_descent(self):
+        sino = ft.forward_project(self._phantom(), self._angles())
+        rec = ft.run_grad_descent(sino, self._angles(), n_iter=5, lr=1e-2)
+        torch.cuda.synchronize(self.DEV)
+        assert rec.device == self.DEV and torch.isfinite(rec).all()
+
+    # ── projector lifecycle (GC must run tc_destroy on the right device) ─
+
+    def test_projector_gc_after_device_switch(self):
+        import gc
+        proj = ft.ParallelProjector((1, 32, 32), self._angles(), device=self.DEV)
+        sino = proj.forward(self._phantom(N=32))
+        rec = proj.back(sino)
+        torch.cuda.synchronize(self.DEV)
+        # Drop the only reference, then run any work on cuda:0 and force GC.
+        # Without the device guard in __del__, the trailing tc_destroy on the
+        # cuda:1-owned cudaArray runs while cuda:0 is current and crashes.
+        del proj, sino, rec
+        _ = torch.randn(8, device="cuda:0") * 2.0
+        gc.collect()
+        torch.cuda.synchronize(torch.device("cuda:0"))
+
+    # ── input-device validation (clear ValueError, not illegal access) ───
+
+    def test_projector_rejects_wrong_device_volume(self):
+        angles_d0 = torch.linspace(-60, 60, 20).to("cuda:0")
+        proj = ft.ParallelProjector((1, 32, 32), angles_d0, device="cuda:0")
+        vol_d1 = torch.zeros(1, 32, 32, device=self.DEV)
+        with pytest.raises(ValueError, match="cuda:0"):
+            proj.forward(vol_d1)
+
+    def test_projector_rejects_wrong_device_sinogram(self):
+        angles_d0 = torch.linspace(-60, 60, 20).to("cuda:0")
+        proj = ft.ParallelProjector((1, 32, 32), angles_d0, device="cuda:0")
+        sino_d1 = torch.zeros(20, 1, 32, device=self.DEV)
+        with pytest.raises(ValueError, match="cuda:0"):
+            proj.back(sino_d1)
+
+    # ── sequential cross-device usage in the same process ─────────────────
+
+    def test_sequential_devices(self):
+        for dev in [torch.device("cuda:0"), self.DEV, torch.device("cuda:0")]:
+            v = torch.zeros(1, 32, 32, device=dev)
+            v[:, 8:24, 8:24] = 1.0
+            a = torch.linspace(-60, 60, 20).to(dev)
+            sino = ft.forward_project(v, a)
+            _ = ft.run_sirt(sino, a, n_iter=3)
+            torch.cuda.synchronize(dev)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
