@@ -278,24 +278,35 @@ def _peak_nn_distances(peaks_bool: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 def _cull_isolated_peaks(peaks_bool: torch.Tensor,
                          max_neighbor_dist: float) -> torch.Tensor:
-    """Drop peaks whose nearest neighbour is farther than a fixed
-    ``max_neighbor_dist`` voxels (Euclidean).
+    """Drop peaks with no other peak within ``max_neighbor_dist`` voxels.
 
-    Use ``_cull_isolated_peaks_zscore`` instead when the absolute lattice
-    spacing isn't known a priori.
+    Uses a single ``F.conv3d`` with a spherical kernel — O(V) memory,
+    CUDA-safe, no pairwise distance matrix. A peak is kept iff the
+    sphere of radius ``max_neighbor_dist`` around it contains at least
+    one *other* peak (i.e., the neighbourhood count ≥ 2, since the
+    peak counts itself).
     """
-    coords, nn_d = _peak_nn_distances(peaks_bool)
-    if nn_d.numel() == 0:
+    if not bool(peaks_bool.any()):
         return peaks_bool
-    keep = nn_d <= max_neighbor_dist
-    if bool(keep.all()):
-        return peaks_bool
-    out = torch.zeros_like(peaks_bool)
-    kept = coords[keep]
-    if kept.numel() > 0:
-        out[kept[:, 0], kept[:, 1], kept[:, 2]] = True
-    return out
 
+    R = int(math.ceil(max_neighbor_dist))
+    coords_1d = torch.arange(-R, R + 1, device=peaks_bool.device,
+                              dtype=torch.float32)
+    zz, yy, xx = torch.meshgrid(coords_1d, coords_1d, coords_1d,
+                                 indexing="ij")
+    sphere_kernel = ((zz ** 2 + yy ** 2 + xx ** 2)
+                     <= max_neighbor_dist ** 2).float()
+    sphere_kernel = sphere_kernel[None, None]   # [1, 1, K, K, K]
+
+    x = peaks_bool.float()[None, None]          # [1, 1, Ny, Nz, Nx]
+    x = F.pad(x, (R,) * 6, mode="constant", value=0.0)
+    count = F.conv3d(x, sphere_kernel)          # [1, 1, Ny, Nz, Nx]
+    # count >= 2: the peak itself + at least one neighbour
+    has_neighbor = (count[0, 0] >= 2.0) & peaks_bool
+    return has_neighbor
+
+
+_ZSCORE_CULL_MAX_PEAKS = 8_000
 
 def _cull_isolated_peaks_zscore(peaks_bool: torch.Tensor,
                                 k_sigma: float) -> torch.Tensor:
@@ -306,9 +317,16 @@ def _cull_isolated_peaks_zscore(peaks_bool: torch.Tensor,
     voxel pitch / bond length isn't known a priori but the cluster of
     true atoms forms a coherent NN-distance distribution. Typical
     ``k_sigma`` values are 2.0 (aggressive) to 3.0 (loose).
+
+    Silently skips culling when the peak count exceeds
+    ``_ZSCORE_CULL_MAX_PEAKS`` to avoid an O(N²) allocation on noisy
+    volumes (use ``_cull_isolated_peaks`` with a physical Å threshold
+    in that regime instead).
     """
     coords, nn_d = _peak_nn_distances(peaks_bool)
     if nn_d.numel() <= 2:
+        return peaks_bool
+    if coords.shape[0] > _ZSCORE_CULL_MAX_PEAKS:
         return peaks_bool
     mu = nn_d.mean()
     sigma = nn_d.std()
@@ -334,6 +352,8 @@ def atom_red_loss(
     threshold_rel: float = 0.05,
     cull_max_neighbor_dist: float | None = None,
     cull_nn_zscore: float | None = None,
+    voxel_size_angstrom: float | None = None,
+    max_nn_dist_angstrom: float | None = None,
 ) -> torch.Tensor:
     """RED-style atom-prior regulariser for atomic electron tomography.
 
@@ -367,6 +387,13 @@ def atom_red_loss(
         cull_max_neighbor_dist: If set, drop peaks whose nearest neighbour
                        is farther than this many voxels before building
                        the support mask (isolated-atom culling).
+        voxel_size_angstrom: Ångströms per voxel. When set together with
+                       ``max_nn_dist_angstrom``, that physical distance
+                       overrides ``cull_max_neighbor_dist``.
+        max_nn_dist_angstrom: Maximum allowed nearest-neighbour distance
+                       in Å. Ghost atoms beyond this distance from any
+                       other peak are culled. Requires
+                       ``voxel_size_angstrom`` to convert to voxels.
 
     Returns:
         Scalar tensor on the same device as ``volume``.
@@ -376,6 +403,10 @@ def atom_red_loss(
     if volume.ndim != 3:
         raise ValueError(f"atom_red_loss expects a 3-D [Ny, Nz, Nx] tensor, "
                          f"got shape {tuple(volume.shape)}")
+
+    if (voxel_size_angstrom is not None and max_nn_dist_angstrom is not None
+            and voxel_size_angstrom > 0 and max_nn_dist_angstrom > 0):
+        cull_max_neighbor_dist = max_nn_dist_angstrom / voxel_size_angstrom
 
     v = volume.detach()
     vmax = float(v.max())
@@ -410,6 +441,8 @@ def gaussian_atom_project(
     cull_max_neighbor_dist: float | None = None,
     cull_nn_zscore: float | None = None,
     mass_conserving: bool = False,
+    voxel_size_angstrom: float | None = None,
+    max_nn_dist_angstrom: float | None = None,
 ) -> torch.Tensor:
     """Snap-render projection onto the Gaussian-atom manifold.
 
@@ -455,6 +488,10 @@ def gaussian_atom_project(
     if volume.ndim != 3:
         raise ValueError(f"gaussian_atom_project expects a 3-D tensor, "
                          f"got shape {tuple(volume.shape)}")
+
+    if (voxel_size_angstrom is not None and max_nn_dist_angstrom is not None
+            and voxel_size_angstrom > 0 and max_nn_dist_angstrom > 0):
+        cull_max_neighbor_dist = max_nn_dist_angstrom / voxel_size_angstrom
 
     v = volume.detach()
     vmax = float(v.max())
