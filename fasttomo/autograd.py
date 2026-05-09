@@ -46,6 +46,15 @@ def _ensure_fp32(t, op_name):
                         "Cast your tensor to float32 first.")
 
 
+def _assert_dtype_match(a: torch.Tensor, b: torch.Tensor,
+                        a_name: str, b_name: str, op_name: str) -> None:
+    if a.dtype != b.dtype:
+        raise TypeError(
+            f"{op_name}: {a_name} ({a.dtype}) and {b_name} ({b.dtype}) "
+            "must have the same dtype. Cast one to match the other."
+        )
+
+
 # ── thread-count resolution ──────────────────────────────────────────────────
 #
 # Resolution order for the CPU 3D rotmat kernels:

@@ -821,6 +821,132 @@ def test_resire_rejects_fp16():
         ft.forward_project_resire(vol, euler)
 
 
+# ── algorithm-level dtype contract ────────────────────────────────────────
+#
+# Each public reconstruction algorithm honours the dtype of its sinogram
+# (and warm-start volume, when supplied). Algorithms whose underlying
+# kernels do not have an fp16 path (run_genfire, run_resire, run_wsirt)
+# raise an explicit TypeError on non-fp32 sinograms instead of crashing
+# inside the projector with a dtype-lock-mismatch.
+
+def test_run_sirt_fp16_matches_fp32():
+    """run_sirt with fp16 sinogram returns an fp16 volume that matches
+    the fp32 reference within ~5% relative — same tolerance band as
+    test_run_fbp_fp16_matches_fp32. Regression for PR #25 / #26: this
+    used to crash with `ParallelProjector dtype lock-in mismatch` because
+    the volume was hardcoded fp32 while ones_sino inherited fp16 from the
+    sinogram."""
+    N        = 64
+    n_angles = 30
+    angles   = make_angles(n_angles)
+    vol      = phantom_2d(N).unsqueeze(0)
+    sino     = ft.forward_project(vol, angles)
+
+    rec_fp32 = ft.run_sirt(sino,        angles, n_iter=20, Nz=N, positivity=True)
+    rec_fp16 = ft.run_sirt(sino.half(), angles, n_iter=20, Nz=N, positivity=True)
+    assert rec_fp16.dtype == torch.float16
+    assert torch.isfinite(rec_fp16).all()
+    assert _rel_err(rec_fp16, rec_fp32) < 5e-2
+
+
+def test_run_sirt_fp16_with_cached_projector():
+    """fp16 sinogram + a freshly-built ParallelProjector must lock the
+    projector to fp16 and reconstruct without dtype mismatch. Regression
+    guard for the original crash site (`_bp(ones_sino)` followed by
+    `_fp(ones_vol)`)."""
+    N        = 32
+    n_angles = 20
+    angles   = make_angles(n_angles)
+    sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
+    proj     = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+    rec      = ft.run_sirt(sino, angles, n_iter=4, Nz=N, projector=proj)
+    assert rec.dtype == torch.float16
+    assert torch.isfinite(rec).all()
+
+
+def test_run_sirt_warm_start_volume_controls_dtype():
+    """When a warm-start volume is passed in, its dtype controls the
+    compute dtype. Sinogram must match — a mismatch raises TypeError."""
+    N        = 32
+    n_angles = 20
+    angles   = make_angles(n_angles)
+    vol      = phantom_2d(N).unsqueeze(0)
+    sino     = ft.forward_project(vol, angles)
+    warm     = torch.zeros(1, N, N, device=DEVICE)               # fp32
+
+    rec = ft.run_sirt(sino, angles, n_iter=4, Nz=N, volume=warm)
+    assert rec.dtype == torch.float32
+
+    warm_half = torch.zeros(1, N, N, device=DEVICE, dtype=torch.float16)
+    rec_half  = ft.run_sirt(sino.half(), angles, n_iter=4, Nz=N, volume=warm_half)
+    assert rec_half.dtype == torch.float16
+
+    with pytest.raises(TypeError, match="must have the same dtype"):
+        ft.run_sirt(sino, angles, n_iter=4, Nz=N, volume=warm_half)
+
+
+def test_run_sart_fp16_matches_fp32():
+    """run_sart with fp16 sinogram returns an fp16 volume matching fp32
+    within ~5% relative."""
+    N        = 64
+    n_angles = 30
+    angles   = make_angles(n_angles)
+    vol      = phantom_2d(N).unsqueeze(0)
+    sino     = ft.forward_project(vol, angles)
+
+    rec_fp32 = ft.run_sart(sino,        angles, n_iter=5, subset_size=5,
+                            Nz=N, positivity=True)
+    rec_fp16 = ft.run_sart(sino.half(), angles, n_iter=5, subset_size=5,
+                            Nz=N, positivity=True)
+    assert rec_fp16.dtype == torch.float16
+    assert torch.isfinite(rec_fp16).all()
+    assert _rel_err(rec_fp16, rec_fp32) < 5e-2
+
+
+def test_run_genfire_rejects_fp16():
+    """GENFIRE gridding kernel is fp32-only — calling with fp16 sinogram
+    must raise an explicit TypeError instead of crashing inside the
+    gridding kernel or producing a silent fp32 cast."""
+    N        = 32
+    n_angles = 20
+    angles   = make_angles(n_angles)
+    sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
+    with pytest.raises(TypeError, match="fp32-only"):
+        ft.run_genfire(sino, angles, Nz=N, n_iter=2)
+
+
+def test_run_resire_rejects_fp16():
+    """RESIRE FP/BP kernels are fp32-only — explicit TypeError on fp16."""
+    N        = 32
+    n_angles = 20
+    angles   = make_angles(n_angles)
+    sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
+    with pytest.raises(TypeError, match="fp32-only"):
+        ft.run_resire(sino, angles, Nz=N, n_iter=2)
+
+
+def test_run_wsirt_rejects_fp16():
+    """run_wsirt's exact-WF construction runs in fp32 (PSF + rfft2).
+    Explicit TypeError on fp16 sinogram."""
+    N        = 32
+    n_angles = 20
+    angles   = make_angles(n_angles)
+    sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
+    with pytest.raises(TypeError, match="fp32-only"):
+        ft.run_wsirt(sino, angles, Nz=N, n_iter=2)
+
+
+def test_refine_angles_dtype_mismatch_raises():
+    """refine_angles takes both volume and sinogram; their dtypes must match."""
+    N        = 32
+    n_angles = 6
+    angles   = make_angles(n_angles)
+    vol      = phantom_2d(N).unsqueeze(0)             # fp32
+    sino     = ft.forward_project(vol, angles).half() # fp16
+    with pytest.raises(TypeError, match="must have the same dtype"):
+        ft.refine_angles(vol, sino, angles_deg=angles)
+
+
 # ── 3-D isotropic TV loss ──────────────────────────────────────────────────
 
 def _tv_reference(vol: torch.Tensor, eps: float) -> torch.Tensor:
