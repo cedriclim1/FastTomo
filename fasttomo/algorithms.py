@@ -771,6 +771,14 @@ def _run_sirt_cuda_graph(
         projector._sirt_graph_cache = {}
     cache = projector._sirt_graph_cache
 
+    # CUDA Graph capture is rooted on the *current* CUDA device. When the
+    # caller's tensors live on a non-default device (e.g. cuda:1 while the
+    # process default is cuda:0), torch.cuda.graph(g) captures on the wrong
+    # device's stream — the graph captures nothing and the failed capture
+    # leaves the runtime in a state that crashes the eager fallback. Pin
+    # the current device to the tensor's device for capture and replay.
+    target_device = volume.device
+
     if key not in cache:
         # --- build a new graph for this key ---
         try:
@@ -788,15 +796,21 @@ def _run_sirt_cuda_graph(
                     _fp, _bp, sparsity, positivity, _mask,
                 )
 
-            # Capture the iteration body.
-            torch.cuda.synchronize()
-            g = torch.cuda.CUDAGraph()
-            with torch.no_grad(), torch.cuda.graph(g):
-                _sirt_iter_inplace(
-                    vol_static, sino_static, C_static, R_static, omega,
-                    _fp, _bp, sparsity, positivity, _mask,
-                )
-            torch.cuda.synchronize()
+            # Capture the iteration body on the correct device. Use an
+            # explicit Stream pinned to the target device so torch.cuda.graph
+            # captures on the right device — the implicit side stream is
+            # created lazily on the first call's device and reused for later
+            # calls, which corrupts cross-device captures.
+            with torch.cuda.device(target_device):
+                torch.cuda.synchronize(target_device)
+                capture_stream = torch.cuda.Stream(device=target_device)
+                g = torch.cuda.CUDAGraph()
+                with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
+                    _sirt_iter_inplace(
+                        vol_static, sino_static, C_static, R_static, omega,
+                        _fp, _bp, sparsity, positivity, _mask,
+                    )
+                torch.cuda.synchronize(target_device)
 
             cache[key] = (g, vol_static, sino_static, C_static, R_static)
 
@@ -825,9 +839,10 @@ def _run_sirt_cuda_graph(
     C_static.copy_(C_vol)
     R_static.copy_(R_sino)
 
-    for _ in range(n_iter):
-        g.replay()
-    torch.cuda.synchronize()
+    with torch.cuda.device(target_device):
+        for _ in range(n_iter):
+            g.replay()
+        torch.cuda.synchronize(target_device)
 
     return vol_static.clone()
 
@@ -973,13 +988,14 @@ def run_genfire(
         grid_w = sinogram.new_zeros(Ny, bigN, bigN)
         cos_t = torch.Tensor(cos_a).to(device)
         sin_t = torch.Tensor(sin_a).to(device)
-        _core.genfire_gridding_2d_cuda(
-            fk_r.data_ptr(), fk_i.data_ptr(),
-            cos_t.data_ptr(), sin_t.data_ptr(),
-            grid_r.data_ptr(), grid_i.data_ptr(), grid_w.data_ptr(),
-            bigN, Ny, n_angles, cutoff_dist,
-            torch.cuda.current_stream(device).cuda_stream,
-        )
+        with torch.cuda.device(device):
+            _core.genfire_gridding_2d_cuda(
+                fk_r.data_ptr(), fk_i.data_ptr(),
+                cos_t.data_ptr(), sin_t.data_ptr(),
+                grid_r.data_ptr(), grid_i.data_ptr(), grid_w.data_ptr(),
+                bigN, Ny, n_angles, cutoff_dist,
+                torch.cuda.current_stream(device).cuda_stream,
+            )
     else:
         gr_np, gi_np, gw_np = _core.genfire_gridding_2d_cpu(
             fk_r.numpy(), fk_i.numpy(), cos_a, sin_a, cutoff_dist,

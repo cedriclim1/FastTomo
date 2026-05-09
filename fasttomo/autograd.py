@@ -25,6 +25,7 @@ See: fasttomo-wiki/wiki/concepts/autograd-projectors.md
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 
@@ -32,6 +33,18 @@ import numpy as np
 import torch
 
 import fasttomo._core as _core
+
+
+def _on_device(t: torch.Tensor):
+    """Pin the current CUDA device to ``t.device`` for the enclosed block.
+
+    Any CUDA allocation or kernel launch issued by ``_core.*_cuda*`` runs on
+    the *current* device, not the device of the data pointer. Without this
+    guard, calling a CUDA op on cuda:1 while the process default is cuda:0
+    allocates textures on cuda:0 and crashes the kernel with
+    ``cudaErrorIllegalAddress``. No-op on CPU tensors.
+    """
+    return torch.cuda.device(t.device) if t.is_cuda else contextlib.nullcontext()
 
 
 # ── private guards ───────────────────────────────────────────────────────────
@@ -162,13 +175,14 @@ def _forward_project_raw(
         sino = torch.empty(n_angles, Ny, N_det,
                            dtype=volume.dtype, device=volume.device)
         cos_t, sin_t = _trig_on_device(angles_deg, volume.device)
-        _core.forward_project_cuda(
-            io_dtype,
-            vol.data_ptr(), sino.data_ptr(),
-            cos_t.data_ptr(), sin_t.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            _stream_ptr(volume.device),
-        )
+        with _on_device(volume):
+            _core.forward_project_cuda(
+                io_dtype,
+                vol.data_ptr(), sino.data_ptr(),
+                cos_t.data_ptr(), sin_t.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                _stream_ptr(volume.device),
+            )
         return sino
 
     # CPU: kernel is fp32-only; upcast on entry, downcast on exit.
@@ -198,13 +212,14 @@ def _back_project_raw(
         vol  = torch.empty(Ny, Nz, Nx,
                            dtype=sinogram.dtype, device=sinogram.device)
         cos_t, sin_t = _trig_on_device(angles_deg, sinogram.device)
-        _core.back_project_cuda(
-            io_dtype,
-            sino.data_ptr(), vol.data_ptr(),
-            cos_t.data_ptr(), sin_t.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            _stream_ptr(sinogram.device),
-        )
+        with _on_device(sinogram):
+            _core.back_project_cuda(
+                io_dtype,
+                sino.data_ptr(), vol.data_ptr(),
+                cos_t.data_ptr(), sin_t.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                _stream_ptr(sinogram.device),
+            )
         return vol
 
     # CPU: fp32-only; upcast on entry, downcast on exit.
@@ -264,12 +279,13 @@ def _forward_project_3d_mats_raw(
             raise RuntimeError("fasttomo was compiled without CUDA support")
         vol  = volume.contiguous()
         sino = torch.empty(n_angles, Ny, N_det, dtype=volume.dtype, device=vol.device)
-        _core.forward_project_rotmat_cuda(
-            io_dtype,
-            vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            _stream_ptr(vol.device),
-        )
+        with _on_device(vol):
+            _core.forward_project_rotmat_cuda(
+                io_dtype,
+                vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                _stream_ptr(vol.device),
+            )
         return sino
 
     nt = _resolve_num_threads(num_threads)
@@ -301,12 +317,13 @@ def _back_project_3d_mats_raw(
             raise RuntimeError("fasttomo was compiled without CUDA support")
         sino = sinogram.contiguous()
         vol  = torch.empty(Ny, Nz, Nx, dtype=sinogram.dtype, device=sino.device)
-        _core.back_project_rotmat_cuda(
-            io_dtype,
-            sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            _stream_ptr(sino.device),
-        )
+        with _on_device(sino):
+            _core.back_project_rotmat_cuda(
+                io_dtype,
+                sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                _stream_ptr(sino.device),
+            )
         return vol
 
     nt = _resolve_num_threads(num_threads)
@@ -344,11 +361,12 @@ def _grad_rotmat_raw(
         vol  = volume.contiguous().float()
         gs   = grad_sino.contiguous().float()
         grad_mats = torch.zeros(n_angles, 9, dtype=torch.float32, device=vol.device)
-        _core.grad_rotmat_cuda(
-            vol.data_ptr(), gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            _stream_ptr(vol.device),
-        )
+        with _on_device(vol):
+            _core.grad_rotmat_cuda(
+                vol.data_ptr(), gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                _stream_ptr(vol.device),
+            )
         return grad_mats
 
     nt = _resolve_num_threads(num_threads)
@@ -380,11 +398,12 @@ def _forward_project_resire_raw(
     mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=vol.device)
     mats_flat = mats.reshape(n_angles, 9).contiguous()
 
-    _core.forward_project_resire_cuda(
-        vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(vol.device),
-    )
+    with _on_device(vol):
+        _core.forward_project_resire_cuda(
+            vol.data_ptr(), sino.data_ptr(), mats_flat.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            _stream_ptr(vol.device),
+        )
     return sino * 0.25
 
 
@@ -409,11 +428,12 @@ def _back_project_resire_raw(
     mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=sino.device)
     mats_flat = mats.reshape(n_angles, 9).contiguous()
 
-    _core.back_project_resire_cuda(
-        sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
-        Ny, Nz, Nx, n_angles, N_det,
-        _stream_ptr(sino.device),
-    )
+    with _on_device(sino):
+        _core.back_project_resire_cuda(
+            sino.data_ptr(), vol.data_ptr(), mats_flat.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            _stream_ptr(sino.device),
+        )
     return vol * 0.25
 
 
@@ -445,12 +465,13 @@ def _grad_angle_raw(
             raise RuntimeError("fasttomo was compiled without CUDA support")
         cos_t, sin_t = _trig_on_device(angles_deg, volume.device)
         grad_a = torch.zeros(n_angles, dtype=torch.float32, device=volume.device)
-        _core.grad_angle_cuda(
-            volume.data_ptr(), grad_sino.data_ptr(),
-            cos_t.data_ptr(), sin_t.data_ptr(), grad_a.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            _stream_ptr(volume.device),
-        )
+        with _on_device(volume):
+            _core.grad_angle_cuda(
+                volume.data_ptr(), grad_sino.data_ptr(),
+                cos_t.data_ptr(), sin_t.data_ptr(), grad_a.data_ptr(),
+                Ny, Nz, Nx, n_angles, N_det,
+                _stream_ptr(volume.device),
+            )
         return grad_a * (math.pi / 180.0)
 
     nt = _resolve_num_threads(num_threads)
@@ -584,10 +605,11 @@ def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
     Ny, Nz, Nx = vol.shape
     acc = torch.zeros(1, dtype=torch.float32, device=vol.device)
     stream = torch.cuda.current_stream(vol.device).cuda_stream
-    _core.tv_loss_iso_3d_cuda(
-        vol.data_ptr(), acc.data_ptr(),
-        Ny, Nz, Nx, float(eps), stream,
-    )
+    with _on_device(vol):
+        _core.tv_loss_iso_3d_cuda(
+            vol.data_ptr(), acc.data_ptr(),
+            Ny, Nz, Nx, float(eps), stream,
+        )
     N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))
     return acc.squeeze(0) / float(N)
 
@@ -601,10 +623,11 @@ def _tv_loss_iso_3d_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
                 .reshape(1).contiguous() / float(N))
     grad_vol = torch.zeros_like(vol)
     stream = torch.cuda.current_stream(vol.device).cuda_stream
-    _core.tv_loss_iso_3d_grad_cuda(
-        vol.data_ptr(), g_scaled.data_ptr(), grad_vol.data_ptr(),
-        Ny, Nz, Nx, float(eps), stream,
-    )
+    with _on_device(vol):
+        _core.tv_loss_iso_3d_grad_cuda(
+            vol.data_ptr(), g_scaled.data_ptr(), grad_vol.data_ptr(),
+            Ny, Nz, Nx, float(eps), stream,
+        )
     return grad_vol
 
 
