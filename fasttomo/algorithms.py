@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that import from here
 
 import fasttomo._core as _core
-from fasttomo.autograd import _euler_zyz_to_rotmat
+from fasttomo.autograd import _assert_dtype_match, _ensure_fp32, _euler_zyz_to_rotmat
 from fasttomo.projection import (
     forward_project,
     back_project,
@@ -54,11 +54,16 @@ def _maybe_cylindrical_mask(
     Nx: int,
     device: torch.device,
     apply: bool,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor | None:
-    """Return a [1, Nz, Nx] cylindrical mask if apply=True, else None."""
+    """Return a [1, Nz, Nx] cylindrical mask if apply=True, else None.
+
+    The mask is cast to ``dtype`` so callers can multiply it against a
+    volume in any supported precision (fp16 / fp32) without an upcast.
+    """
     if not apply:
         return None
-    return cylindrical_mask(Nz, Nx, device=device).unsqueeze(0)
+    return cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -224,6 +229,7 @@ def run_sirt(
     sparsity: float = 0.0,
     num_threads: int | None = None,             # CPU 3D path only
     projector: object | None = None,            # ParallelProjector / RotmatProjector for cached FP/BP
+    volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
@@ -254,6 +260,13 @@ def run_sirt(
     sparsity: L1 soft-threshold applied after each update (proximal operator
     of sparsity·‖x‖₁). 0.0 disables it.
 
+    volume: optional warm-start [Ny, Nz, Nx]. When provided, ``volume.dtype``
+    sets the compute dtype (and must match the sinogram). When None, the
+    algorithm zero-initialises in ``sinogram.dtype`` (fp32 or fp16). All
+    internal tensors (normalisers, residuals, masks) inherit the compute
+    dtype so the projector locks consistently. Output preserves the compute
+    dtype — fp16 in, fp16 out.
+
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
@@ -263,7 +276,12 @@ def run_sirt(
         Nz = N_det
 
     device = sinogram.device
-    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    if volume is None:
+        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
+    else:
+        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_sirt")
+        volume = volume.to(device=device).contiguous().clone()
+    compute_dtype = volume.dtype
 
     # Build closures _fp / _bp. On CUDA we always go through a cached projector
     # (built locally if the caller didn't pass one); on CPU we use the
@@ -307,7 +325,7 @@ def run_sirt(
     R_sino    = _fp(ones_vol)
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
     losses: list[float] = []
 
     # --- CUDA Graph capture path ----------------------------------------
@@ -373,6 +391,7 @@ def run_sart(
     return_loss: bool = False,
     sparsity: float = 0.0,
     num_threads: int | None = None,             # CPU 3D path only
+    volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
@@ -410,6 +429,11 @@ def run_sart(
     This is a frozen baseline — no projector caching, no CUDA-Graph capture.
     Use run_sirt (or the AD path) for performance-critical workloads.
 
+    volume: optional warm-start [Ny, Nz, Nx]. When provided, ``volume.dtype``
+    sets the compute dtype (and must match the sinogram). When None, the
+    algorithm zero-initialises in ``sinogram.dtype`` (fp32 or fp16). Output
+    preserves the compute dtype.
+
     Returns volume [Ny, Nz, Nx].
     """
     n_angles, Ny, N_det = sinogram.shape
@@ -418,7 +442,12 @@ def run_sart(
         Nz = N_det
 
     device = sinogram.device
-    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    if volume is None:
+        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
+    else:
+        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_sart")
+        volume = volume.to(device=device).contiguous().clone()
+    compute_dtype = volume.dtype
 
     # Build functional closures that accept an index list so we can slice
     # both the angles tensor and the sinogram for each subset.
@@ -447,7 +476,7 @@ def run_sart(
     subsets = list(torch.split(all_idx, clamp))
 
     # Pre-compute per-subset normalisations (done once, outside the outer loop).
-    ones_vol = torch.ones(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    ones_vol = torch.ones(Ny, Nz, Nx, dtype=compute_dtype, device=device)
     R_list: list[torch.Tensor] = []  # row normalisers [|S|, Ny, N_det]
     C_list: list[torch.Tensor] = []  # col normalisers [Ny, Nz, Nx]
     for idx in subsets:
@@ -456,12 +485,12 @@ def run_sart(
         R_list.append(R_s)
 
         # ones_sino for this subset
-        ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=torch.float32, device=device)
+        ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=compute_dtype, device=device)
         C_s = _bp_subset(ones_sino_s, idx)
         C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
         C_list.append(C_s)
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
     losses: list[float] = []
 
     # --- outer iteration loop ---
@@ -929,7 +958,12 @@ def run_genfire(
 
     Returns volume [Ny, Nz, Nx].
     mask=True inscribes a cylindrical support in the reconstruction plane.
+
+    fp32 only — the GENFIRE gridding kernel (`csrc/cuda/genfire.cu`) has no
+    half-precision path. Cast your sinogram to ``torch.float32`` first.
     """
+    _ensure_fp32(sinogram, "run_genfire")
+
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
@@ -1118,7 +1152,13 @@ def run_wsirt(
     of sparsity·‖x‖₁). 0.0 disables it.
 
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
+
+    fp32 only — the exact WF construction goes through `_compute_exact_wf`
+    which builds the PSF in fp32 and applies a 2-D rfft, both fp32-pinned.
+    Cast your sinogram to ``torch.float32`` first.
     """
+    _ensure_fp32(sinogram, "run_wsirt")
+
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
     if Nz < 0:
@@ -1201,6 +1241,8 @@ def refine_angles(
             vol   = ft.run_resire(sino, None, n_iter=100, euler_zyz_deg=euler)
             euler = ft.refine_angles(vol, sino, euler_zyz_deg=euler)
     """
+    _assert_dtype_match(sinogram, volume, "sinogram", "volume", "refine_angles")
+
     if angles_deg is not None and euler_zyz_deg is None:
         # ── single-axis mode ──────────────────────────────────────────────
         n_angles, Ny, N_det = sinogram.shape
@@ -1298,10 +1340,14 @@ def run_resire(
     operator of sparsity·‖x‖₁, as noted in Algorithm 1 of the RESIRE paper).
     0.0 disables it.
 
+    fp32 only — the RESIRE FP/BP kernels (`csrc/cuda/projection_resire.cu`)
+    have no half-precision path. Cast your sinogram to ``torch.float32`` first.
+
     Returns volume [Ny, Nz, Nx].
     """
     if not sinogram.is_cuda:
         raise RuntimeError("run_resire requires CUDA — move sinogram to GPU first")
+    _ensure_fp32(sinogram, "run_resire")
 
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det
