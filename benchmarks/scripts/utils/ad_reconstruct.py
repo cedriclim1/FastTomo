@@ -175,6 +175,7 @@ def ad_reconstruct_cached(
     n_iter: int = 1000,
     lr: float = 0.05,
     tv_weight: float = 1.0,
+    ssim_weight: float = 0.0,
     tv_fn: TVFn = _tv_charbonnier,
 ) -> ADResult:
     """Same as :func:`ad_reconstruct` but routes FP/BP through ``ParallelProjector``.
@@ -182,6 +183,9 @@ def ad_reconstruct_cached(
     The projector owns a persistent ``cudaArray`` + ``cudaTextureObject``, so
     each iteration pays only ``cudaMemcpy3DAsync`` and the kernel launch
     instead of a fresh array allocation. Identical numerics; faster.
+
+    ``ssim_weight > 0`` adds a per-tilt SSIM loss (``ft.tilt_ssim_loss``) scaled
+    by ``ssim_weight`` alongside the MSE and TV terms.
     """
     device = sinogram.device
     n_angles, Ny, N_det = sinogram.shape
@@ -201,6 +205,8 @@ def ad_reconstruct_cached(
         opt.zero_grad()
         pred = proj.forward(vol)
         loss = F.mse_loss(pred, sinogram) + tv_weight * tv_fn(vol)
+        if ssim_weight:
+            loss = loss + ssim_weight * ft.tilt_ssim_loss(pred, sinogram)
         losses.append(float(loss.item()))
         loss.backward()
         opt.step()

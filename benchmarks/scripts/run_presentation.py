@@ -24,15 +24,15 @@ import numpy as np
 import torch
 
 import fasttomo as ft
-from benchmarks.ad_reconstruct import (
+from benchmarks.scripts.utils.ad_reconstruct import (
     ad_reconstruct,
     ad_reconstruct_cached,
     ad_reconstruct_with_pose,
     ad_reconstruct_with_pose_cached,
 )
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import nmse, ssim
-from benchmarks.timing import cuda_timer
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import nmse, ssim
+from benchmarks.scripts.utils.timing import cuda_timer
 
 
 def _try_import(name: str):
@@ -54,7 +54,7 @@ def main() -> None:
                              "wiki/analyses/torch-radon-sirt-semi-convergence.md)")
     parser.add_argument("--tr-step", type=float, default=0.05)
     parser.add_argument("--tr-smoothing-sigma", type=float, default=2.0)
-    parser.add_argument("--out", default="benchmarks/presentation_results.json")
+    parser.add_argument("--out", default="benchmarks/results/presentation_results.json")
     parser.add_argument("--no-cpu", action="store_true",
                         help="skip the CPU benchmark section")
     parser.add_argument("--cpu-iter", type=int, default=20,
@@ -155,7 +155,7 @@ def main() -> None:
     # ------- ASTRA SIRT_CUDA -------
     print(f"\n[ASTRA] SIRT_CUDA ({args.sirt_iter} iter, MinConstraint=0)")
     if _try_import("astra") is not None:
-        from benchmarks.astra_wrapper import AstraParallelBeam
+        from benchmarks.scripts.utils.astra_wrapper import AstraParallelBeam
         astra_w = AstraParallelBeam(N_det, ang_rad)
         _ = astra_w.sirt(sino_np[:, :1, :], num_iter=2)
         with cuda_timer(device) as t:
@@ -174,7 +174,7 @@ def main() -> None:
     sigma = args.tr_smoothing_sigma if args.tr_smoothing_sigma > 0 else None
     print(f"\n[TorchRadon] iterative-FBP ({args.tr_iter} iter, step={args.tr_step})")
     if _try_import("torch_radon") is not None:
-        from benchmarks.torch_radon_wrapper import TorchRadonParallelBeam
+        from benchmarks.scripts.utils.torch_radon_wrapper import TorchRadonParallelBeam
         tr_w = TorchRadonParallelBeam(N_det, ang_rad)
         _ = tr_w.sirt(sino[:, :1, :], num_iter=2, step_size=args.tr_step,
                       smoothing_sigma=sigma)
@@ -240,7 +240,7 @@ def main() -> None:
 
         # ASTRA CPU FBP / SIRT
         if _try_import("astra") is not None:
-            from benchmarks.astra_wrapper import AstraParallelBeam
+            from benchmarks.scripts.utils.astra_wrapper import AstraParallelBeam
             astra_w_cpu = AstraParallelBeam(N_det, ang_rad)
 
             print("\n[ASTRA CPU] FBP (strip)")

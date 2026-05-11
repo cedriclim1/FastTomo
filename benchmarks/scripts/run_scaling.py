@@ -30,8 +30,8 @@ import numpy as np
 import torch
 
 import fasttomo as ft
-from benchmarks.ad_reconstruct import ad_reconstruct_with_pose_cached
-from benchmarks.timing import cuda_timer
+from benchmarks.scripts.utils.ad_reconstruct import ad_reconstruct_with_pose_cached
+from benchmarks.scripts.utils.timing import cuda_timer
 
 
 def shepp_logan_3d(N: int, device: torch.device) -> torch.Tensor:
@@ -115,7 +115,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(__file__).parent / "scaling_results.json",
+        default=Path(__file__).parent.parent / "results" / "scaling_results.json",
     )
     parser.add_argument(
         "--skip", choices=["ad", "sirt", "none"], default="none",

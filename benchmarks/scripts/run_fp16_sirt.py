@@ -17,8 +17,8 @@ import torch
 
 import fasttomo as ft
 
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import ssim, nmse
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import ssim, nmse
 
 
 def sirt_run(
