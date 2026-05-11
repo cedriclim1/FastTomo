@@ -175,6 +175,157 @@ def test_sirt_positivity_cuda():
     assert rec.min().item() >= -1e-6
 
 
+# ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
+
+def test_fista_shape_cuda():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista(sino, angles, n_iter=5, Nz=N)
+    assert rec.shape == vol.shape
+    assert rec.device.type == "cuda"
+
+
+def test_fista_converges_cuda():
+    N      = 64
+    angles = make_angles(60)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec, losses = ft.run_fista(sino, angles, n_iter=40, Nz=N, return_loss=True)
+    assert losses.shape == (40,)
+    assert losses[-1].item() < losses[0].item() * 0.1, (
+        f"FISTA loss did not decrease: first={losses[0].item():.4e}, "
+        f"last={losses[-1].item():.4e}"
+    )
+
+
+def test_fista_positivity_cuda():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista(sino, angles, n_iter=10, Nz=N, positivity=True)
+    assert rec.min().item() >= -1e-6
+
+
+def test_fista_tv_shape_cuda():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista_tv(sino, angles, tv_weight=0.01, n_iter=5, Nz=N)
+    assert rec.shape == vol.shape
+    assert rec.device.type == "cuda"
+
+
+def test_fista_tv_positivity_inside_prox_cuda():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista_tv(
+        sino, angles, tv_weight=0.05, n_iter=20, Nz=N, positivity=True,
+    )
+    assert rec.min().item() >= -1e-6
+
+
+def test_fista_tv_reduces_tv_vs_fista_cuda():
+    """3-D phantom — verifies the prox actually smooths along all three axes."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = torch.zeros(N, N, N, device=DEVICE)
+    vol[N//4:3*N//4, N//4:3*N//4, N//4:3*N//4] = 1.0
+    sino   = ft.forward_project(vol, angles)
+
+    rec    = ft.run_fista(sino, angles, n_iter=40, Nz=N)
+    rec_tv = ft.run_fista_tv(sino, angles, tv_weight=0.1, n_iter=40, Nz=N)
+
+    tv_fista    = ft.tv_loss_3d(rec).item()
+    tv_fista_tv = ft.tv_loss_3d(rec_tv).item()
+    assert tv_fista_tv < tv_fista, (
+        f"FISTA-TV did not reduce TV (FISTA={tv_fista:.4f}, "
+        f"FISTA-TV={tv_fista_tv:.4f})"
+    )
+
+
+def test_fista_tv_chambolle_matches_fgp_at_convergence_cuda():
+    """FGP and Chambolle solve the same prox; at enough inner iters the
+    reconstructions should agree closely."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec_fgp = ft.run_fista_tv(
+        sino, angles, tv_weight=0.05, n_iter=30, Nz=N,
+        tv_inner="fgp", tv_inner_iter=40,
+    )
+    rec_cha = ft.run_fista_tv(
+        sino, angles, tv_weight=0.05, n_iter=30, Nz=N,
+        tv_inner="chambolle", tv_inner_iter=100,
+    )
+    diff = (rec_fgp - rec_cha).pow(2).mean().sqrt().item()
+    scale = rec_fgp.abs().mean().item() + 1e-12
+    assert diff / scale < 0.05, (
+        f"FGP and Chambolle disagree more than 5% rel-RMSE: "
+        f"diff={diff:.4e}, scale={scale:.4e}"
+    )
+
+
+def test_fista_3d_zyz_cuda():
+    """run_fista with euler_zyz_deg = single-axis ZYZ should match scalar."""
+    N      = 32
+    angles = make_angles(30)
+    euler  = make_euler_pure_y(angles).to(DEVICE)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project_3d(vol, euler)
+
+    rec_zyz = ft.run_fista(sino, angles, n_iter=30, Nz=N, euler_zyz_deg=euler)
+    rec_sa  = ft.run_fista(sino, angles, n_iter=30, Nz=N)
+    rel = (rec_zyz - rec_sa).pow(2).mean().sqrt().item() / (rec_sa.abs().mean().item() + 1e-12)
+    assert rel < 0.1, f"ZYZ path diverges from scalar (rel-RMSE={rel:.3f})"
+
+
+def test_fista_with_parallel_projector_cuda():
+    """Passing a pre-built ParallelProjector should produce the same output
+    as letting run_fista build one internally."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec_internal = ft.run_fista(sino, angles, n_iter=20, Nz=N)
+
+    proj = ft.ParallelProjector(
+        (1, N, N), angles, device=DEVICE, N_det=N,
+    )
+    rec_supplied = ft.run_fista(sino, angles, n_iter=20, Nz=N, projector=proj)
+
+    diff = (rec_internal - rec_supplied).abs().max().item()
+    assert diff < 1e-4, f"Supplied projector diverges (max abs diff={diff:.2e})"
+
+
+def test_fista_warm_start_continues_cuda():
+    """Warm-starting from a converged volume with n_iter=1 should change
+    the result only slightly (already near the optimum)."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    converged = ft.run_fista(sino, angles, n_iter=50, Nz=N)
+    one_more  = ft.run_fista(sino, angles, n_iter=1, Nz=N, volume=converged)
+
+    # Should still be a near-optimum reconstruction
+    final_err = (one_more - vol).pow(2).mean().item()
+    converged_err = (converged - vol).pow(2).mean().item()
+    assert final_err < converged_err * 2.0, (
+        f"Warm-start blew up: {final_err:.4e} vs {converged_err:.4e}"
+    )
+
+
 # ── W-BP ──────────────────────────────────────────────────────────────────
 
 def test_wbp_shape_cuda():

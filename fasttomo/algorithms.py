@@ -397,6 +397,419 @@ def run_sirt(
     return volume
 
 
+# ── FISTA helpers (Beck & Teboulle 2009) ──────────────────────────────────
+
+def _estimate_lipschitz(
+    _fp,
+    _bp,
+    vol_shape: tuple[int, int, int],
+    device: torch.device,
+    dtype: torch.dtype,
+    n_iter: int = 10,
+) -> float:
+    """Spectral norm ||A^T A||_op = L (= Lipschitz constant of ∇(½||Ax-b||²)).
+
+    Power iteration. Returns a Python float with a 1.01 safety margin so the
+    FISTA step size 1/L sits strictly inside the contraction region even if
+    the iteration hasn't fully converged.
+    """
+    v = torch.randn(vol_shape, device=device, dtype=dtype)
+    v = v / (v.norm() + 1e-30)
+    L = 0.0
+    for _ in range(n_iter):
+        AtAv = _bp(_fp(v))
+        L = float(AtAv.norm())
+        v = AtAv / (L + 1e-30)
+    return L * 1.01
+
+
+def _tv_grad(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward differences along (Ny, Nz, Nx) — discrete L = grad operator."""
+    return (
+        v[1:, :, :] - v[:-1, :, :],
+        v[:, 1:, :] - v[:, :-1, :],
+        v[:, :, 1:] - v[:, :, :-1],
+    )
+
+
+def _tv_div(
+    p_y: torch.Tensor, p_z: torch.Tensor, p_x: torch.Tensor,
+    Ny: int, Nz: int, Nx: int,
+) -> torch.Tensor:
+    """Positive adjoint of _tv_grad: ⟨grad(v), p⟩ = ⟨v, _tv_div(p)⟩.
+
+    Used as ``v* = z − _tv_div(p, ...)`` for the unconstrained TV-l2 prox
+    primal recovery. Zero-padded at the boundary (Neumann).
+    """
+    out = torch.zeros(Ny, Nz, Nx, dtype=p_y.dtype, device=p_y.device)
+    if p_y.numel() > 0:
+        out[1:, :, :] += p_y
+        out[:-1, :, :] -= p_y
+    if p_z.numel() > 0:
+        out[:, 1:, :] += p_z
+        out[:, :-1, :] -= p_z
+    if p_x.numel() > 0:
+        out[:, :, 1:] += p_x
+        out[:, :, :-1] -= p_x
+    return out
+
+
+def _project_dual_ball(
+    q_y: torch.Tensor, q_z: torch.Tensor, q_x: torch.Tensor, lam: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Isotropic per-voxel projection onto the ℓ₂ ball of radius ``lam``.
+
+    The three q tensors have mismatched shapes (each one short by 1 along its
+    own diff axis); zero-pad each to the full grid before computing the
+    per-voxel norm, divide, then slice back.
+    """
+    Ny = q_z.shape[0]
+    Nz = q_y.shape[1]
+    Nx = q_y.shape[2]
+    full_y = F.pad(q_y, (0, 0, 0, 0, 0, 1))  # pad +1 at end of dim -3 (Ny)
+    full_z = F.pad(q_z, (0, 0, 0, 1, 0, 0))  # pad +1 at end of dim -2 (Nz)
+    full_x = F.pad(q_x, (0, 1, 0, 0, 0, 0))  # pad +1 at end of dim -1 (Nx)
+    norm = (full_y * full_y + full_z * full_z + full_x * full_x).sqrt()
+    denom = (norm / lam).clamp(min=1.0)
+    full_y = full_y / denom
+    full_z = full_z / denom
+    full_x = full_x / denom
+    return full_y[:-1, :, :], full_z[:, :-1, :], full_x[:, :, :-1]
+
+
+def _tv_prox_3d(
+    z: torch.Tensor,
+    lam: float,
+    positivity: bool,
+    mask: torch.Tensor | None,
+    n_iter: int = 20,
+    mode: str = "fgp",
+) -> torch.Tensor:
+    """3-D isotropic TV proximal operator with optional box constraint.
+
+    Solves:
+
+        argmin_v  (1/2) ‖v − z‖²  +  lam · TV(v)  +  ι_C(v)
+
+    where ``C = {v ≥ 0 if positivity} ∩ {v · mask = v}``. TV is the discrete
+    isotropic total variation built from forward differences.
+
+    ``mode="fgp"`` uses Beck-Teboulle 2009b Fast Gradient Projection
+    (Nesterov-accelerated dual projection, O(1/k²) on the dual). ``mode=
+    "chambolle"`` uses Chambolle 2004's first-order dual projection
+    (O(1/k)). Dual step size 1/12 — the upper bound on ||grad ∘ div||_op in
+    3-D (8 in 2-D, 12 in 3-D).
+    """
+    if mode not in ("fgp", "chambolle"):
+        raise ValueError(
+            f"_tv_prox_3d: unknown mode {mode!r}; expected 'fgp' or 'chambolle'."
+        )
+    Ny, Nz_, Nx = z.shape
+    device, dtype = z.device, z.dtype
+
+    p_y = torch.zeros(max(Ny - 1, 0), Nz_, Nx, device=device, dtype=dtype)
+    p_z = torch.zeros(Ny, max(Nz_ - 1, 0), Nx, device=device, dtype=dtype)
+    p_x = torch.zeros(Ny, Nz_, max(Nx - 1, 0), device=device, dtype=dtype)
+    p_prev_y, p_prev_z, p_prev_x = p_y, p_z, p_x
+    r_y, r_z, r_x = p_y, p_z, p_x
+    t = 1.0
+    step = 1.0 / 12.0
+
+    for _ in range(n_iter):
+        v = z - _tv_div(r_y, r_z, r_x, Ny, Nz_, Nx)
+        if positivity:
+            v = v.clamp(min=0.0)
+        if mask is not None:
+            v = v * mask
+
+        gy, gz, gx = _tv_grad(v)
+        q_y = r_y + step * gy
+        q_z = r_z + step * gz
+        q_x = r_x + step * gx
+        p_y_new, p_z_new, p_x_new = _project_dual_ball(q_y, q_z, q_x, lam)
+
+        if mode == "fgp":
+            t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+            beta = (t - 1.0) / t_new
+            r_y = p_y_new + beta * (p_y_new - p_prev_y)
+            r_z = p_z_new + beta * (p_z_new - p_prev_z)
+            r_x = p_x_new + beta * (p_x_new - p_prev_x)
+            t = t_new
+        else:  # chambolle
+            r_y, r_z, r_x = p_y_new, p_z_new, p_x_new
+
+        p_prev_y, p_prev_z, p_prev_x = p_y_new, p_z_new, p_x_new
+
+    v = z - _tv_div(p_prev_y, p_prev_z, p_prev_x, Ny, Nz_, Nx)
+    if positivity:
+        v = v.clamp(min=0.0)
+    if mask is not None:
+        v = v * mask
+    return v
+
+
+def _project_box(
+    u: torch.Tensor, positivity: bool, mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Projection prox for ``run_fista`` — applies positivity and/or mask."""
+    if positivity:
+        u = u.clamp(min=0.0)
+    if mask is not None:
+        u = u * mask
+    return u
+
+
+def _fista_loop(
+    volume: torch.Tensor,
+    sinogram: torch.Tensor,
+    _fp,
+    _bp,
+    n_iter: int,
+    L: float,
+    prox_fn,
+    return_loss: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Shared Beck-Teboulle FISTA outer loop.
+
+    ``prox_fn(u)`` is called once per iteration on ``u = y_k - (1/L) ∇f(y_k)``
+    and must return the next iterate ``x_{k+1}``. For pure FISTA it's just the
+    constraint projection; for FISTA-TV it's the TV+constraint prox.
+
+    ``return_loss`` records ``||b − A·y_k||²`` (data-fit MSE at the momentum
+    point, which is free) at each iteration — a tight surrogate for the loss
+    at ``x_k``.
+    """
+    inv_L = 1.0 / L
+    t = 1.0
+    x_prev = volume.clone()
+    y = volume.clone()
+    losses: list[float] = []
+    for _ in range(n_iter):
+        fp_y = _fp(y)
+        if return_loss:
+            losses.append((sinogram - fp_y).pow(2).mean().item())
+        grad = _bp(fp_y - sinogram)
+        x_new = prox_fn(y - inv_L * grad)
+        t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+        beta = (t - 1.0) / t_new
+        y = x_new + beta * (x_new - x_prev)
+        x_prev = x_new
+        t = t_new
+    if return_loss:
+        return x_prev, torch.tensor(losses, dtype=torch.float32)
+    return x_prev
+
+
+def _build_fp_bp(
+    sinogram: torch.Tensor,
+    angles_deg: torch.Tensor,
+    vol_shape: tuple[int, int, int],
+    N_det: int,
+    n_angles: int,
+    device: torch.device,
+    num_threads: int | None,
+    projector: object | None,
+    euler_zyz_deg: torch.Tensor | None,
+):
+    """Build (_fp, _bp, _internal_proj) closures — mirrors run_sirt:305-336.
+
+    Caller must hold ``_internal_proj`` until the algorithm finishes so the
+    texture cache stays alive.
+    """
+    Ny, Nz, Nx = vol_shape
+    _internal_proj = None
+    if projector is not None:
+        if euler_zyz_deg is not None:
+            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+            _fp = lambda v: projector.forward(v, mats)
+            _bp = lambda s: projector.back(s, mats)
+        else:
+            _fp = lambda v: projector.forward(v)
+            _bp = lambda s: projector.back(s)
+    elif sinogram.is_cuda:
+        if euler_zyz_deg is not None:
+            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+            _internal_proj = RotmatProjector(
+                (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
+            )
+            _fp = lambda v: _internal_proj.forward(v, mats)
+            _bp = lambda s: _internal_proj.back(s, mats)
+        else:
+            _internal_proj = ParallelProjector(
+                (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
+            )
+            _fp = lambda v: _internal_proj.forward(v)
+            _bp = lambda s: _internal_proj.back(s)
+    elif euler_zyz_deg is not None:
+        _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
+        _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
+    else:
+        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
+        _bp = lambda s: back_project(s, angles_deg, Nz=Nz)
+    return _fp, _bp, _internal_proj
+
+
+def run_fista(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    n_iter: int = 50,
+    Nz: int = -1,
+    positivity: bool = False,
+    mask: bool = False,
+    euler_zyz_deg: torch.Tensor | None = None,
+    return_loss: bool = False,
+    n_power_iter: int = 10,
+    L: float | None = None,
+    num_threads: int | None = None,
+    projector: object | None = None,
+    volume: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    FISTA (Beck & Teboulle 2009) on the smooth least-squares problem
+    ``f(x) = ½ ‖A·x − b‖²``.
+
+        y_k     = x_k + ((t_{k-1} - 1) / t_k) · (x_k − x_{k-1})  (momentum)
+        x_{k+1} = P_C( y_k − (1/L) · A^T (A·y_k − b) )
+        t_{k+1} = (1 + √(1 + 4·t_k²)) / 2
+
+    where ``L = ||A^T A||_op`` is estimated by power iteration and ``P_C`` is
+    the projection onto positivity and/or cylindrical mask. Achieves
+    O(1/k²) convergence on the data-fit objective vs. SIRT's O(1/k).
+
+    Args:
+        sinogram:     [n_angles, Ny, N_det] — measured tilt series.
+        angles_deg:   [n_angles] — single-axis tilt angles.
+        n_iter:       outer FISTA iterations.
+        Nz:           reconstruction depth; defaults to N_det.
+        positivity:   project onto ``x ≥ 0`` each iteration.
+        mask:         apply inscribed-cylinder support each iteration.
+        euler_zyz_deg: [n_angles, 3] — switches to the 3-D rotmat projector
+                      (matches ``run_sirt``'s ZYZ branch).
+        return_loss:  if True, also return a float32 CPU tensor of shape
+                      [n_iter] containing ``||b − A·y_k||²`` (data-fit MSE at
+                      the momentum point — zero extra cost; a tight surrogate
+                      for the MSE at ``x_k``).
+        n_power_iter: power-iteration steps for the Lipschitz estimate.
+        L:            user-supplied Lipschitz constant ``||A^T A||_op``;
+                      ``None`` triggers power iteration.
+        num_threads:  CPU 3-D path only.
+        projector:    optional cached :class:`ParallelProjector` /
+                      :class:`RotmatProjector` (CUDA reuse).
+        volume:       optional warm-start ``[Ny, Nz, Nx]``.
+
+    Returns the reconstructed volume (or ``(volume, loss_history)`` when
+    ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
+    ``t_k`` changes every iteration.
+    """
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+
+    device = sinogram.device
+    if volume is None:
+        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
+    else:
+        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_fista")
+        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_fista")
+        volume = volume.to(device=device).contiguous().clone()
+    compute_dtype = volume.dtype
+
+    _fp, _bp, _internal_proj = _build_fp_bp(
+        sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
+        device, num_threads, projector, euler_zyz_deg,
+    )
+
+    L_eff = (
+        float(L) if L is not None
+        else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
+    )
+
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
+    prox = lambda u: _project_box(u, positivity, _mask)
+
+    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, return_loss)
+
+
+def run_fista_tv(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    tv_weight: float,
+    n_iter: int = 50,
+    Nz: int = -1,
+    positivity: bool = False,
+    mask: bool = False,
+    euler_zyz_deg: torch.Tensor | None = None,
+    return_loss: bool = False,
+    n_power_iter: int = 10,
+    L: float | None = None,
+    tv_inner_iter: int = 20,
+    tv_inner: str = "fgp",
+    num_threads: int | None = None,
+    projector: object | None = None,
+    volume: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    FISTA-TV (Beck & Teboulle 2009 + 2009b) on the composite problem
+    ``½ ‖A·x − b‖² + tv_weight · TV(x) + ι_C(x)``.
+
+    Same outer Nesterov loop as :func:`run_fista`; the projection prox is
+    swapped for the TV-l2 proximal operator (:func:`_tv_prox_3d`), solved on
+    the dual by either Beck-Teboulle 2009b Fast Gradient Projection
+    (``tv_inner="fgp"``) or Chambolle 2004 (``tv_inner="chambolle"``).
+    Positivity and cylindrical mask are baked into the prox itself so the
+    composite-convex theory applies.
+
+    Args:
+        sinogram, angles_deg, n_iter, Nz, positivity, mask, euler_zyz_deg,
+        return_loss, n_power_iter, L, num_threads, projector, volume:
+                      see :func:`run_fista`.
+        tv_weight:    isotropic TV regularisation weight (required, > 0).
+                      Pass ``tv_weight=0`` and use :func:`run_fista` directly.
+        tv_inner_iter: inner dual-projection iterations (default 20).
+        tv_inner:     ``"fgp"`` (default; O(1/k²) inner) or ``"chambolle"``
+                      (O(1/k) inner).
+
+    Returns same shape/format as :func:`run_fista`. Loss history records
+    ``||b − A·y_k||²``, *not* the composite objective.
+    """
+    if tv_weight <= 0.0:
+        raise ValueError(
+            f"run_fista_tv requires tv_weight > 0 (got {tv_weight}). "
+            "Use run_fista for the unregularised problem."
+        )
+
+    n_angles, Ny, N_det = sinogram.shape
+    Nx = N_det
+    if Nz < 0:
+        Nz = N_det
+
+    device = sinogram.device
+    if volume is None:
+        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
+    else:
+        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_fista_tv")
+        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_fista_tv")
+        volume = volume.to(device=device).contiguous().clone()
+    compute_dtype = volume.dtype
+
+    _fp, _bp, _internal_proj = _build_fp_bp(
+        sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
+        device, num_threads, projector, euler_zyz_deg,
+    )
+
+    L_eff = (
+        float(L) if L is not None
+        else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
+    )
+
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
+    lam = tv_weight / L_eff
+    prox = lambda u: _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
+
+    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, return_loss)
+
+
 def run_sart(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
