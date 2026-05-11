@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 import fasttomo as ft
-from benchmarks.timing import benchmark_function
+from benchmarks.scripts.utils.timing import benchmark_function
 
 
 def _try_import(name: str):

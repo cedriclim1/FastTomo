@@ -30,15 +30,15 @@ import numpy as np
 import torch
 
 import fasttomo as ft
-from benchmarks.ad_reconstruct import (
+from benchmarks.scripts.utils.ad_reconstruct import (
     ad_reconstruct,
     ad_reconstruct_cached,
     ad_reconstruct_with_pose,
     ad_reconstruct_with_pose_cached,
 )
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import nmse, ssim
-from benchmarks.timing import cuda_timer
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import nmse, ssim
+from benchmarks.scripts.utils.timing import cuda_timer
 
 
 def _try_import(name: str):
@@ -199,7 +199,7 @@ def main() -> None:
     # --- ASTRA SIRT ---
     print(f"\n[ASTRA] SIRT_CUDA (num_iter={args.sirt_iter}, MinConstraint=0)")
     if not args.skip_astra and _try_import("astra") is not None:
-        from benchmarks.astra_wrapper import AstraParallelBeam
+        from benchmarks.scripts.utils.astra_wrapper import AstraParallelBeam
         astra_w = AstraParallelBeam(N_det, ang_rad)
         _ = astra_w.sirt(sino_np[:, :1, :], num_iter=2)  # warm-up (2 iters, single slice)
         with cuda_timer(device) as t:
@@ -214,7 +214,7 @@ def main() -> None:
         f"positivity, {sigma_tag})"
     )
     if _try_import("torch_radon") is not None:
-        from benchmarks.torch_radon_wrapper import TorchRadonParallelBeam
+        from benchmarks.scripts.utils.torch_radon_wrapper import TorchRadonParallelBeam
         tr_w = TorchRadonParallelBeam(N_det, ang_rad)
         _ = tr_w.sirt(
             sino[:, :1, :], num_iter=2, step_size=args.tr_step, smoothing_sigma=sigma,

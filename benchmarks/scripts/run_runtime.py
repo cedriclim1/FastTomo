@@ -15,10 +15,10 @@ import argparse
 
 import torch
 
-from benchmarks.ad_reconstruct import ad_reconstruct, ad_reconstruct_with_pose
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import nmse, ssim
-from benchmarks.timing import cuda_timer
+from benchmarks.scripts.utils.ad_reconstruct import ad_reconstruct, ad_reconstruct_with_pose
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import nmse, ssim
+from benchmarks.scripts.utils.timing import cuda_timer
 
 
 def main() -> None:

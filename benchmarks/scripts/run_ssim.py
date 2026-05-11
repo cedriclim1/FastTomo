@@ -19,9 +19,9 @@ import numpy as np
 import torch
 
 import fasttomo as ft
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import nmse, ssim
-from benchmarks.timing import benchmark_function
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import nmse, ssim
+from benchmarks.scripts.utils.timing import benchmark_function
 
 
 _SAMPLES = 30
@@ -98,7 +98,7 @@ def main() -> None:
     # --- ASTRA FBP_CUDA per slice ---
     print("\n[ASTRA] FBP_CUDA per Y-slice")
     if _try_import("astra") is not None:
-        from benchmarks.astra_wrapper import AstraParallelBeam
+        from benchmarks.scripts.utils.astra_wrapper import AstraParallelBeam
         astra_w = AstraParallelBeam(N_det, ang_rad)
         fn_a = lambda x: astra_w.fbp(x, positivity=True)
         t_a = benchmark_function(fn_a, sino_np, samples=args.samples,
@@ -119,7 +119,7 @@ def main() -> None:
     # --- TorchRadon FBP ---
     print("\n[TorchRadon] filter_sinogram + backprojection")
     if _try_import("torch_radon") is not None:
-        from benchmarks.torch_radon_wrapper import TorchRadonParallelBeam
+        from benchmarks.scripts.utils.torch_radon_wrapper import TorchRadonParallelBeam
         tr_w = TorchRadonParallelBeam(N_det, ang_rad)
         fn_tr = lambda x: tr_w.fbp(x, positivity=True)
         t_tr = benchmark_function(fn_tr, sino, samples=args.samples,

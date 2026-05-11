@@ -18,9 +18,9 @@ import numpy as np
 import torch
 
 import fasttomo as ft
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import nmse, ssim
-from benchmarks.torch_radon_wrapper import TorchRadonParallelBeam
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import nmse, ssim
+from benchmarks.scripts.utils.torch_radon_wrapper import TorchRadonParallelBeam
 
 
 # ---------------------------------------------------------------------------

@@ -15,9 +15,9 @@ import torch.nn.functional as F
 
 import fasttomo as ft
 
-from benchmarks.ad_reconstruct import _tv_charbonnier
-from benchmarks.datasets import load_phantom_tilt_series
-from benchmarks.metrics import ssim, nmse
+from benchmarks.scripts.utils.ad_reconstruct import _tv_charbonnier
+from benchmarks.scripts.utils.datasets import load_phantom_tilt_series
+from benchmarks.scripts.utils.metrics import ssim, nmse
 
 
 def ad_run(
