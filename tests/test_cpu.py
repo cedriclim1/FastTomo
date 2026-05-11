@@ -157,6 +157,152 @@ def test_sirt_warm_start_shape_mismatch_raises():
         ft.run_sirt(sino, angles, n_iter=1, Nz=N, volume=warm)
 
 
+# ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
+
+def test_fista_shape():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista(sino, angles, n_iter=5, Nz=N)
+    assert rec.shape == vol.shape
+
+
+def test_fista_converges():
+    """FISTA data-fit MSE history should be (roughly) non-increasing."""
+    N      = 64
+    angles = make_angles(60)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec, losses = ft.run_fista(sino, angles, n_iter=30, Nz=N, return_loss=True)
+    assert losses.shape == (30,)
+    # FISTA can oscillate slightly (Nesterov momentum); 10% slack over window
+    assert losses[-1].item() < losses[0].item() * 0.1, (
+        f"FISTA loss did not decrease: first={losses[0].item():.4e}, "
+        f"last={losses[-1].item():.4e}"
+    )
+
+
+def test_fista_positivity():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista(sino, angles, n_iter=10, Nz=N, positivity=True)
+    assert rec.min().item() >= -1e-6
+
+
+def test_fista_mask_zeros_corners():
+    """mask=True must zero the inscribed-cylinder corners."""
+    N      = 32
+    angles = make_angles(20)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista(sino, angles, n_iter=5, Nz=N, mask=True)
+    corners = torch.stack([
+        rec[0,  0,  0], rec[0,  0, -1],
+        rec[0, -1,  0], rec[0, -1, -1],
+    ])
+    assert corners.abs().max().item() < 1e-6
+
+
+def test_fista_warm_start_shape_mismatch_raises():
+    n_angles, Ny, N = 12, 4, 16
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = make_angles(n_angles)
+    warm = torch.zeros(1, N, N, dtype=torch.float32)  # Ny mismatch
+    with pytest.raises(ValueError, match="volume must have shape"):
+        ft.run_fista(sino, angles, n_iter=1, Nz=N, volume=warm)
+
+
+def test_fista_user_L_skips_power_iteration():
+    """L= kwarg must produce the same shape and a sane reconstruction."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista(sino, angles, n_iter=10, Nz=N, L=20.0)
+    assert rec.shape == vol.shape
+    assert torch.isfinite(rec).all()
+
+
+def test_fista_tv_shape():
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista_tv(sino, angles, tv_weight=0.01, n_iter=5, Nz=N)
+    assert rec.shape == vol.shape
+
+
+def test_fista_tv_reduces_tv_vs_fista():
+    """At matched n_iter, FISTA-TV must produce a less-TV reconstruction."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+
+    rec        = ft.run_fista(sino, angles, n_iter=40, Nz=N)
+    rec_tv     = ft.run_fista_tv(sino, angles, tv_weight=0.05, n_iter=40, Nz=N)
+
+    # CPU pure-PyTorch TV (tv_loss_3d's CUDA path is fp32-only and Ny=1 hits an
+    # empty Y-diff; recompute here for portability)
+    def tv(v):
+        dy = v[1:, :, :] - v[:-1, :, :]
+        dz = v[:, 1:, :] - v[:, :-1, :]
+        dx = v[:, :, 1:] - v[:, :, :-1]
+        return (dz[:, :, :-1].pow(2) + dx[:, :-1, :].pow(2) + 1e-8).sqrt().mean().item()
+
+    tv_fista    = tv(rec)
+    tv_fista_tv = tv(rec_tv)
+    assert tv_fista_tv < tv_fista, (
+        f"FISTA-TV did not reduce TV (FISTA={tv_fista:.4f}, FISTA-TV={tv_fista_tv:.4f})"
+    )
+
+
+def test_fista_tv_positivity_inside_prox():
+    """positivity=True is baked into the TV prox — output must be ≥ 0
+    without any after-step clamp."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista_tv(
+        sino, angles, tv_weight=0.05, n_iter=20, Nz=N, positivity=True,
+    )
+    assert rec.min().item() >= -1e-6
+
+
+def test_fista_tv_chambolle_mode():
+    """tv_inner='chambolle' must run and produce a finite reconstruction."""
+    N      = 32
+    angles = make_angles(30)
+    vol    = phantom_2d(N).unsqueeze(0)
+    sino   = ft.forward_project(vol, angles)
+    rec    = ft.run_fista_tv(
+        sino, angles, tv_weight=0.05, n_iter=20, Nz=N, tv_inner="chambolle",
+    )
+    assert rec.shape == vol.shape
+    assert torch.isfinite(rec).all()
+
+
+def test_fista_tv_zero_weight_raises():
+    N      = 16
+    angles = make_angles(10)
+    sino   = torch.zeros(len(angles), 1, N)
+    with pytest.raises(ValueError, match="tv_weight > 0"):
+        ft.run_fista_tv(sino, angles, tv_weight=0.0, n_iter=1, Nz=N)
+
+
+def test_fista_tv_unknown_inner_mode_raises():
+    N      = 16
+    angles = make_angles(10)
+    sino   = torch.zeros(len(angles), 1, N)
+    with pytest.raises(ValueError, match="unknown mode"):
+        ft.run_fista_tv(sino, angles, tv_weight=0.01, n_iter=1, Nz=N, tv_inner="bogus")
+
+
 # ── W-BP ──────────────────────────────────────────────────────────────────
 
 def test_wbp_shape():
