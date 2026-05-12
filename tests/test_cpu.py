@@ -106,6 +106,25 @@ def test_fbp_better_than_plain_backproject():
     )
 
 
+def test_fbp_mask_uses_projector_output_shape():
+    """mask=True must follow the projector output geometry.
+
+    Cached-projector FBP can reconstruct with Nz != N_det. The mask must be
+    built from the reconstructed volume shape, not from the input sinogram.
+    """
+    n_angles, Ny, N_det = 7, 2, 16
+    Nz_proj = 20
+    sino = torch.randn(n_angles, Ny, N_det)
+    angles = make_angles(n_angles)
+
+    class DummyProjector:
+        def back(self, _sino: torch.Tensor) -> torch.Tensor:
+            return torch.ones(Ny, Nz_proj, N_det, dtype=_sino.dtype, device=_sino.device)
+
+    rec = ft.run_fbp(sino, angles, Nz=-1, mask=True, projector=DummyProjector())
+    assert rec.shape == (Ny, Nz_proj, N_det)
+
+
 # ── SIRT ──────────────────────────────────────────────────────────────────
 
 def test_sirt_shape():
