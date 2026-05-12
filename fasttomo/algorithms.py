@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that import from here
 
 import fasttomo._core as _core
-from fasttomo.autograd import _assert_dtype_match, _ensure_fp32, _euler_zyz_to_rotmat
+from fasttomo.autograd import _assert_dtype_match, _check_inputs, _euler_zyz_to_rotmat
 from fasttomo.projection import (
     forward_project,
     back_project,
@@ -161,21 +161,24 @@ def run_fbp(
     to fp32 on visualization-grade reconstructions but visibly noisier
     on edges — use fp32 for quantitative work. bf16 raises.
     """
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_fbp",
+    )
     filtered = ramp_filter(sinogram)
     if projector is not None:
         volume = projector.back(filtered)
     elif sinogram.is_cuda:
-        n_angles, Ny, N_det = sinogram.shape
-        Nz_resolved = N_det if Nz < 0 else Nz
         _proj = ParallelProjector(
-            (Ny, Nz_resolved, N_det), angles_deg,
-            device=sinogram.device, N_det=N_det,
+            (Ny, Nz, N_det), angles_deg,
+            device=device, N_det=N_det,
         )
         volume = _proj.back(filtered)
     else:
         volume = back_project(filtered, angles_deg, Nz=Nz)
     # angular sampling normalisation: π / n_angles
-    volume   = volume * (math.pi / len(angles_deg))
+    volume   = volume * (math.pi / n_angles)
     if positivity:
         volume.clamp_(min=0.0)
     if mask:
@@ -202,12 +205,12 @@ def run_weighted_backprojection(
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_weighted_backprojection",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
 
     # compute WF once for this tilt geometry [Nz, Nx//2+1] (amplitudes)
     WF_amp = _compute_exact_wf(
@@ -288,12 +291,12 @@ def run_sirt(
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_sirt",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -701,12 +704,12 @@ def run_fista(
     ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
     ``t_k`` changes every iteration.
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_fista",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -779,12 +782,12 @@ def run_fista_tv(
             "Use run_fista for the unregularised problem."
         )
 
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_fista_tv",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -868,12 +871,12 @@ def run_sart(
 
     Returns volume [Ny, Nz, Nx].
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_sart",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -1056,13 +1059,13 @@ def run_ad_recon(
                 f"or set refine_pose=True."
             )
 
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_ad_recon",
+        require_cuda=True,
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-    device = sinogram.device
-
-    sinogram = sinogram.float()
     angles_deg = angles_deg.float().to(device)
 
     # ── initialise volume ──────────────────────────────────────────────────
@@ -1410,14 +1413,12 @@ def run_genfire(
     fp32 only — the GENFIRE gridding kernel (`csrc/cuda/genfire.cu`) has no
     half-precision path. Cast your sinogram to ``torch.float32`` first.
     """
-    _ensure_fp32(sinogram, "run_genfire")
-
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_genfire",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
 
     # oversampled grid size (must be even)
     bigN = int(round(N_det * oversampling_ratio))
@@ -1431,7 +1432,7 @@ def run_genfire(
     # ── 1D FFT of zero-padded projections (centred convention) ─────────────
     pad_l = (bigN - N_det) // 2
     pad_r = bigN - N_det - pad_l
-    proj_pad = F.pad(sinogram.float(), (pad_l, pad_r))   # [n_ang, Ny, bigN]
+    proj_pad = F.pad(sinogram, (pad_l, pad_r))            # [n_ang, Ny, bigN]
     # The pulse is centred at array index bigN/2, not at 0.  Without an
     # ifftshift before the FFT, fft(proj_pad)[ξ] picks up a (-1)^ξ phase that
     # systematically flips signs at off-axis grid cells (where ξ ≠ ikz+ikx
@@ -1606,14 +1607,12 @@ def run_wsirt(
     which builds the PSF in fp32 and applies a 2-D rfft, both fp32-pinned.
     Cast your sinogram to ``torch.float32`` first.
     """
-    _ensure_fp32(sinogram, "run_wsirt")
-
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_wsirt",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
     # pre-compute exact WF (once per tilt geometry)
@@ -1794,16 +1793,13 @@ def run_resire(
 
     Returns volume [Ny, Nz, Nx].
     """
-    if not sinogram.is_cuda:
-        raise RuntimeError("run_resire requires CUDA — move sinogram to GPU first")
-    _ensure_fp32(sinogram, "run_resire")
-
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_resire",
+        require_cuda=True,
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
     # step size: matches RESIRE's dt = step_size / Num_pjs / dimz
@@ -1917,11 +1913,12 @@ def run_grad_descent(
             "euler_zyz_deg (3D ZYZ), not both or neither."
         )
 
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_grad_descent",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-    device = sinogram.device
 
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
                          requires_grad=True)

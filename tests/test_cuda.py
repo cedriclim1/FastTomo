@@ -1062,7 +1062,7 @@ def test_run_genfire_rejects_fp16():
     n_angles = 20
     angles   = make_angles(n_angles)
     sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
-    with pytest.raises(TypeError, match="fp32-only"):
+    with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_genfire(sino, angles, Nz=N, n_iter=2)
 
 
@@ -1072,7 +1072,7 @@ def test_run_resire_rejects_fp16():
     n_angles = 20
     angles   = make_angles(n_angles)
     sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
-    with pytest.raises(TypeError, match="fp32-only"):
+    with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_resire(sino, angles, Nz=N, n_iter=2)
 
 
@@ -1083,7 +1083,7 @@ def test_run_wsirt_rejects_fp16():
     n_angles = 20
     angles   = make_angles(n_angles)
     sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
-    with pytest.raises(TypeError, match="fp32-only"):
+    with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_wsirt(sino, angles, Nz=N, n_iter=2)
 
 
