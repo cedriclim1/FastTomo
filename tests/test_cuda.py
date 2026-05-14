@@ -258,10 +258,12 @@ def test_fista_tv_chambolle_matches_fgp_at_convergence_cuda():
     vol    = phantom_2d(N).unsqueeze(0)
     sino   = ft.forward_project(vol, angles)
 
+    torch.cuda.manual_seed(0)
     rec_fgp = ft.run_fista_tv(
         sino, angles, tv_weight=0.05, n_iter=30, Nz=N,
         tv_inner="fgp", tv_inner_iter=40,
     )
+    torch.cuda.manual_seed(0)
     rec_cha = ft.run_fista_tv(
         sino, angles, tv_weight=0.05, n_iter=30, Nz=N,
         tv_inner="chambolle", tv_inner_iter=100,
@@ -282,7 +284,9 @@ def test_fista_3d_zyz_cuda():
     vol    = phantom_2d(N).unsqueeze(0)
     sino   = ft.forward_project_3d(vol, euler)
 
+    torch.cuda.manual_seed(0)
     rec_zyz = ft.run_fista(sino, angles, n_iter=30, Nz=N, euler_zyz_deg=euler)
+    torch.cuda.manual_seed(0)
     rec_sa  = ft.run_fista(sino, angles, n_iter=30, Nz=N)
     rel = (rec_zyz - rec_sa).pow(2).mean().sqrt().item() / (rec_sa.abs().mean().item() + 1e-12)
     assert rel < 0.1, f"ZYZ path diverges from scalar (rel-RMSE={rel:.3f})"
@@ -296,11 +300,15 @@ def test_fista_with_parallel_projector_cuda():
     vol    = phantom_2d(N).unsqueeze(0)
     sino   = ft.forward_project(vol, angles)
 
+    # Seed CUDA RNG before each call so _estimate_lipschitz draws the same
+    # random starting vector → identical L_eff → identical FISTA trajectories.
+    torch.cuda.manual_seed(0)
     rec_internal = ft.run_fista(sino, angles, n_iter=20, Nz=N)
 
     proj = ft.ParallelProjector(
         (1, N, N), angles, device=DEVICE, N_det=N,
     )
+    torch.cuda.manual_seed(0)
     rec_supplied = ft.run_fista(sino, angles, n_iter=20, Nz=N, projector=proj)
 
     diff = (rec_internal - rec_supplied).abs().max().item()
@@ -1062,7 +1070,7 @@ def test_run_genfire_rejects_fp16():
     n_angles = 20
     angles   = make_angles(n_angles)
     sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
-    with pytest.raises(TypeError, match="fp32-only"):
+    with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_genfire(sino, angles, Nz=N, n_iter=2)
 
 
@@ -1072,7 +1080,7 @@ def test_run_resire_rejects_fp16():
     n_angles = 20
     angles   = make_angles(n_angles)
     sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
-    with pytest.raises(TypeError, match="fp32-only"):
+    with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_resire(sino, angles, Nz=N, n_iter=2)
 
 
@@ -1083,7 +1091,7 @@ def test_run_wsirt_rejects_fp16():
     n_angles = 20
     angles   = make_angles(n_angles)
     sino     = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
-    with pytest.raises(TypeError, match="fp32-only"):
+    with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_wsirt(sino, angles, Nz=N, n_iter=2)
 
 

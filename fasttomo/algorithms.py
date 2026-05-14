@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -19,7 +20,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that import from here
 
 import fasttomo._core as _core
-from fasttomo.autograd import _assert_dtype_match, _ensure_fp32, _euler_zyz_to_rotmat
+from fasttomo.autograd import _assert_dtype_match, _check_inputs, _euler_zyz_to_rotmat
 from fasttomo.projection import (
     forward_project,
     back_project,
@@ -82,6 +83,50 @@ def _assert_warm_start_shape(
             f"{op_name}: volume must have shape {expected_shape}, "
             f"got {tuple(volume.shape)}."
         )
+
+
+@dataclass
+class ConstraintSet:
+    """Reconstruction constraints applied once per iteration.
+
+    Construct once before the iteration loop so the mask tensor is precomputed.
+    ``apply`` is out-of-place (returns new tensor); ``apply_inplace_`` mutates
+    in place for leaf tensors and CUDA Graph paths.
+
+    Application order: mask → positivity → sparsity.
+    """
+    positivity: bool = False
+    mask: torch.Tensor | None = None   # precomputed [1, Nz, Nx] or None
+    sparsity: float = 0.0
+
+    def apply(self, volume: torch.Tensor) -> torch.Tensor:
+        if self.mask is not None:
+            volume = volume * self.mask
+        if self.positivity:
+            volume = volume.clamp(min=0.0)
+        if self.sparsity > 0.0:
+            volume = _apply_sparsity(volume, self.sparsity)
+        return volume
+
+    def apply_inplace_(self, volume: torch.Tensor) -> None:
+        """In-place variant for leaf tensors and CUDA Graph paths."""
+        if self.mask is not None:
+            volume.mul_(self.mask)
+        if self.positivity:
+            volume.clamp_(min=0.0)
+        if self.sparsity > 0.0:
+            volume.copy_(_apply_sparsity(volume, self.sparsity))
+
+
+def _finish_iters(
+    volume: torch.Tensor,
+    losses: list[float],
+    return_loss: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Standardised return for iterative reconstruction algorithms."""
+    if return_loss:
+        return volume, torch.tensor(losses, dtype=torch.float32)
+    return volume
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -161,28 +206,26 @@ def run_fbp(
     to fp32 on visualization-grade reconstructions but visibly noisier
     on edges — use fp32 for quantitative work. bf16 raises.
     """
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_fbp",
+    )
     filtered = ramp_filter(sinogram)
     if projector is not None:
         volume = projector.back(filtered)
     elif sinogram.is_cuda:
-        n_angles, Ny, N_det = sinogram.shape
-        Nz_resolved = N_det if Nz < 0 else Nz
         _proj = ParallelProjector(
-            (Ny, Nz_resolved, N_det), angles_deg,
-            device=sinogram.device, N_det=N_det,
+            (Ny, Nz, N_det), angles_deg,
+            device=device, N_det=N_det,
         )
         volume = _proj.back(filtered)
     else:
         volume = back_project(filtered, angles_deg, Nz=Nz)
     # angular sampling normalisation: π / n_angles
-    volume   = volume * (math.pi / len(angles_deg))
-    if positivity:
-        volume.clamp_(min=0.0)
-    if mask:
-        _mask = cylindrical_mask(volume.shape[1], volume.shape[2],
-                                 device=volume.device).to(volume.dtype)
-        volume = volume * _mask.unsqueeze(0)
-    return volume
+    volume = volume * (math.pi / n_angles)
+    _mask = _maybe_cylindrical_mask(Nz, N_det, device, mask, dtype=volume.dtype)
+    return ConstraintSet(positivity=positivity, mask=_mask).apply(volume)
 
 
 def run_weighted_backprojection(
@@ -202,12 +245,12 @@ def run_weighted_backprojection(
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_weighted_backprojection",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
 
     # compute WF once for this tilt geometry [Nz, Nx//2+1] (amplitudes)
     WF_amp = _compute_exact_wf(
@@ -226,12 +269,8 @@ def run_weighted_backprojection(
         F_out   = phase * (F_slice.abs() * WF_amp)
         volume[iy] = torch.fft.irfft2(F_out, s=(Nz, Nx))
 
-    if positivity:
-        volume.clamp_(min=0.0)
-    if mask:
-        _mask = cylindrical_mask(Nz, Nx, device=device)
-        volume = volume * _mask.unsqueeze(0)
-    return volume
+    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    return ConstraintSet(positivity=positivity, mask=_mask).apply(volume)
 
 
 def run_sirt(
@@ -288,12 +327,12 @@ def run_sirt(
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_sirt",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -302,38 +341,10 @@ def run_sirt(
         volume = volume.to(device=device).contiguous().clone()
     compute_dtype = volume.dtype
 
-    # Build closures _fp / _bp. On CUDA we always go through a cached projector
-    # (built locally if the caller didn't pass one); on CPU we use the
-    # functional API. Numerics match across both paths.
-    _internal_proj = None  # held to keep texture caches alive across iterations
-    if projector is not None:
-        if euler_zyz_deg is not None:
-            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
-            _fp = lambda v: projector.forward(v, mats)
-            _bp = lambda s: projector.back(s, mats)
-        else:
-            _fp = lambda v: projector.forward(v)
-            _bp = lambda s: projector.back(s)
-    elif sinogram.is_cuda:
-        if euler_zyz_deg is not None:
-            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
-            _internal_proj = RotmatProjector(
-                (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
-            )
-            _fp = lambda v: _internal_proj.forward(v, mats)
-            _bp = lambda s: _internal_proj.back(s, mats)
-        else:
-            _internal_proj = ParallelProjector(
-                (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
-            )
-            _fp = lambda v: _internal_proj.forward(v)
-            _bp = lambda s: _internal_proj.back(s)
-    elif euler_zyz_deg is not None:
-        _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
-        _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
-    else:
-        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
-        _bp = lambda s: back_project(s, angles_deg, Nz=Nz)
+    _fp, _bp, _internal_proj = _build_fp_bp(
+        sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
+        device, num_threads, projector, euler_zyz_deg,
+    )
 
     # --- normalisation matrices (computed once with the chosen projector) ---
     ones_sino = torch.ones_like(sinogram)
@@ -345,6 +356,7 @@ def run_sirt(
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
+    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     # --- CUDA Graph capture path ----------------------------------------
@@ -363,16 +375,14 @@ def run_sirt(
             R_sino=R_sino,
             _fp=_fp,
             _bp=_bp,
-            sparsity=sparsity,
-            positivity=positivity,
-            _mask=_mask,
+            constraints=constraints,
             projector=_active_proj,
             key=(Ny, Nz, Nx, n_angles, N_det,
                  sinogram.dtype,
                  float(omega),
-                 positivity,
-                 float(sparsity),
-                 _mask is not None,
+                 constraints.positivity,
+                 float(constraints.sparsity),
+                 constraints.mask is not None,
                  euler_zyz_deg is not None),
         )
         if graph_result is not None:
@@ -385,16 +395,9 @@ def run_sirt(
             losses.append(raw_res.pow(2).mean().item())
         residual = raw_res * R_sino
         volume   = volume + omega * C_vol * _bp(residual)
-        if sparsity > 0.0:
-            volume = _apply_sparsity(volume, sparsity)
-        if positivity:
-            volume.clamp_(min=0.0)
-        if _mask is not None:
-            volume = volume * _mask
+        volume   = constraints.apply(volume)
 
-    if return_loss:
-        return volume, torch.tensor(losses, dtype=torch.float32)
-    return volume
+    return _finish_iters(volume, losses, return_loss)
 
 
 # ── FISTA helpers (Beck & Teboulle 2009) ──────────────────────────────────
@@ -548,17 +551,6 @@ def _tv_prox_3d(
     return v
 
 
-def _project_box(
-    u: torch.Tensor, positivity: bool, mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Projection prox for ``run_fista`` — applies positivity and/or mask."""
-    if positivity:
-        u = u.clamp(min=0.0)
-    if mask is not None:
-        u = u * mask
-    return u
-
-
 def _fista_loop(
     volume: torch.Tensor,
     sinogram: torch.Tensor,
@@ -595,9 +587,7 @@ def _fista_loop(
         y = x_new + beta * (x_new - x_prev)
         x_prev = x_new
         t = t_new
-    if return_loss:
-        return x_prev, torch.tensor(losses, dtype=torch.float32)
-    return x_prev
+    return _finish_iters(x_prev, losses, return_loss)
 
 
 def _build_fp_bp(
@@ -611,7 +601,7 @@ def _build_fp_bp(
     projector: object | None,
     euler_zyz_deg: torch.Tensor | None,
 ):
-    """Build (_fp, _bp, _internal_proj) closures — mirrors run_sirt:305-336.
+    """Build (_fp, _bp, _internal_proj) closures for iterative algorithms.
 
     Caller must hold ``_internal_proj`` until the algorithm finishes so the
     texture cache stays alive.
@@ -701,12 +691,12 @@ def run_fista(
     ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
     ``t_k`` changes every iteration.
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_fista",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -726,9 +716,9 @@ def run_fista(
     )
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    prox = lambda u: _project_box(u, positivity, _mask)
+    constraints = ConstraintSet(positivity=positivity, mask=_mask)
 
-    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, return_loss)
+    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, constraints.apply, return_loss)
 
 
 def run_fista_tv(
@@ -779,12 +769,12 @@ def run_fista_tv(
             "Use run_fista for the unregularised problem."
         )
 
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_fista_tv",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -868,12 +858,12 @@ def run_sart(
 
     Returns volume [Ny, Nz, Nx].
     """
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32, torch.float16),
+        op_name="run_sart",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     if volume is None:
         volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
     else:
@@ -924,6 +914,7 @@ def run_sart(
         C_list.append(C_s)
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
+    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     # --- outer iteration loop ---
@@ -940,16 +931,9 @@ def run_sart(
                 raw_res = sinogram - _fp_full(volume)
                 losses.append(raw_res.pow(2).mean().item())
 
-        if sparsity > 0.0:
-            volume = _apply_sparsity(volume, sparsity)
-        if positivity:
-            volume.clamp_(min=0.0)
-        if _mask is not None:
-            volume = volume * _mask
+        volume = constraints.apply(volume)
 
-    if return_loss:
-        return volume, torch.tensor(losses, dtype=torch.float32)
-    return volume
+    return _finish_iters(volume, losses, return_loss)
 
 
 def run_ad_recon(
@@ -1056,13 +1040,13 @@ def run_ad_recon(
                 f"or set refine_pose=True."
             )
 
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_ad_recon",
+        require_cuda=True,
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-    device = sinogram.device
-
-    sinogram = sinogram.float()
     angles_deg = angles_deg.float().to(device)
 
     # ── initialise volume ──────────────────────────────────────────────────
@@ -1204,9 +1188,7 @@ def _run_sirt_cuda_graph(
     R_sino: torch.Tensor,
     _fp,
     _bp,
-    sparsity: float,
-    positivity: bool,
-    _mask,
+    constraints: ConstraintSet,
     projector,
     key: tuple,
 ) -> torch.Tensor | None:
@@ -1254,7 +1236,7 @@ def _run_sirt_cuda_graph(
             with torch.no_grad():
                 _sirt_iter_inplace(
                     vol_static, sino_static, C_static, R_static, omega,
-                    _fp, _bp, sparsity, positivity, _mask,
+                    _fp, _bp, constraints,
                 )
 
             # Capture the iteration body on the correct device. Use an
@@ -1269,7 +1251,7 @@ def _run_sirt_cuda_graph(
                 with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
                     _sirt_iter_inplace(
                         vol_static, sino_static, C_static, R_static, omega,
-                        _fp, _bp, sparsity, positivity, _mask,
+                        _fp, _bp, constraints,
                     )
                 torch.cuda.synchronize(target_device)
 
@@ -1316,9 +1298,7 @@ def _sirt_iter_inplace(
     omega: float,
     _fp,
     _bp,
-    sparsity: float,
-    positivity: bool,
-    _mask,
+    constraints: ConstraintSet,
 ) -> None:
     """
     One in-place SIRT iteration on ``vol_static``.
@@ -1334,13 +1314,7 @@ def _sirt_iter_inplace(
     # inside the graph's memory pool.
     update.mul_(C_vol)
     vol_static.add_(update, alpha=omega)
-    if sparsity > 0.0:
-        # Copy result of out-of-place soft-threshold back in-place.
-        vol_static.copy_(_apply_sparsity(vol_static, sparsity))
-    if positivity:
-        vol_static.clamp_(min=0.0)
-    if _mask is not None:
-        vol_static.mul_(_mask)
+    constraints.apply_inplace_(vol_static)
 
 
 def _genfire_hermitian_sym(
@@ -1410,14 +1384,12 @@ def run_genfire(
     fp32 only — the GENFIRE gridding kernel (`csrc/cuda/genfire.cu`) has no
     half-precision path. Cast your sinogram to ``torch.float32`` first.
     """
-    _ensure_fp32(sinogram, "run_genfire")
-
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_genfire",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
 
     # oversampled grid size (must be even)
     bigN = int(round(N_det * oversampling_ratio))
@@ -1431,7 +1403,7 @@ def run_genfire(
     # ── 1D FFT of zero-padded projections (centred convention) ─────────────
     pad_l = (bigN - N_det) // 2
     pad_r = bigN - N_det - pad_l
-    proj_pad = F.pad(sinogram.float(), (pad_l, pad_r))   # [n_ang, Ny, bigN]
+    proj_pad = F.pad(sinogram, (pad_l, pad_r))            # [n_ang, Ny, bigN]
     # The pulse is centred at array index bigN/2, not at 0.  Without an
     # ifftshift before the FFT, fft(proj_pad)[ξ] picks up a (-1)^ξ phase that
     # systematically flips signs at off-axis grid cells (where ξ ≠ ikz+ikx
@@ -1517,6 +1489,9 @@ def run_genfire(
         res_ind_us = torch.fft.ifftshift(res_ind)               # unshifted
 
     # ── iteration ───────────────────────────────────────────────────────────
+    _inner_constraints = ConstraintSet(
+        positivity=positivity, mask=support.unsqueeze(0), sparsity=sparsity,
+    )
     current_F = measured_K.clone()
     best_F = current_F
     best_err = float("inf")
@@ -1535,12 +1510,8 @@ def run_genfire(
             torch.fft.ifftn(current_F, dim=(-2, -1)), dim=(-2, -1),
         ).real                                                # [Ny, bigN, bigN]
 
-        # real-space constraints
-        if sparsity > 0.0:
-            vol = _apply_sparsity(vol, sparsity)
-        if positivity:
-            vol.clamp_(min=0.0)
-        vol = vol * support.unsqueeze(0)
+        # real-space constraints: support → positivity → sparsity
+        vol = _inner_constraints.apply(vol)
 
         # FFT back to Fourier space (centred convention: ifftshift before fft)
         F_cur = torch.fft.fftn(
@@ -1562,14 +1533,11 @@ def run_genfire(
     vol = torch.fft.fftshift(
         torch.fft.ifftn(best_F, dim=(-2, -1)), dim=(-2, -1),
     ).real                                                      # [Ny, bigN, bigN]
-    if positivity:
-        vol.clamp_(min=0.0)
+    vol = ConstraintSet(positivity=positivity).apply(vol)
 
     # crop to [Ny, Nz, Nx]
     vol = vol[:, z0:z1, x0:x1]
-    if return_loss:
-        return vol, torch.tensor(losses, dtype=torch.float32)
-    return vol
+    return _finish_iters(vol, losses, return_loss)
 
 
 def run_wsirt(
@@ -1606,14 +1574,12 @@ def run_wsirt(
     which builds the PSF in fp32 and applies a 2-D rfft, both fp32-pinned.
     Cast your sinogram to ``torch.float32`` first.
     """
-    _ensure_fp32(sinogram, "run_wsirt")
-
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_wsirt",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
     # pre-compute exact WF (once per tilt geometry)
@@ -1632,6 +1598,7 @@ def run_wsirt(
         return out
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -1640,16 +1607,9 @@ def run_wsirt(
         if return_loss:
             losses.append(residual.pow(2).mean().item())
         volume   = volume + omega * _wbp(residual)
-        if sparsity > 0.0:
-            volume = _apply_sparsity(volume, sparsity)
-        if positivity:
-            volume.clamp_(min=0.0)
-        if _mask is not None:
-            volume = volume * _mask
+        volume   = constraints.apply(volume)
 
-    if return_loss:
-        return volume, torch.tensor(losses, dtype=torch.float32)
-    return volume
+    return _finish_iters(volume, losses, return_loss)
 
 
 def refine_angles(
@@ -1794,16 +1754,13 @@ def run_resire(
 
     Returns volume [Ny, Nz, Nx].
     """
-    if not sinogram.is_cuda:
-        raise RuntimeError("run_resire requires CUDA — move sinogram to GPU first")
-    _ensure_fp32(sinogram, "run_resire")
-
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_resire",
+        require_cuda=True,
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-
-    device = sinogram.device
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
     # step size: matches RESIRE's dt = step_size / Num_pjs / dimz
@@ -1823,7 +1780,7 @@ def run_resire(
         _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0)  # [1, Nz, Nx]
     else:
         _mask = None
-
+    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -1831,16 +1788,9 @@ def run_resire(
         if return_loss:
             losses.append(residual.pow(2).mean().item())
         volume   = volume + alpha * _bp(residual)
-        if sparsity > 0.0:
-            volume = _apply_sparsity(volume, sparsity)
-        if positivity:
-            volume.clamp_(min=0.0)
-        if _mask is not None:
-            volume = volume * _mask
+        volume   = constraints.apply(volume)
 
-    if return_loss:
-        return volume, torch.tensor(losses, dtype=torch.float32)
-    return volume
+    return _finish_iters(volume, losses, return_loss)
 
 
 # ── autograd-based reference reconstruction ──────────────────────────────
@@ -1917,11 +1867,12 @@ def run_grad_descent(
             "euler_zyz_deg (3D ZYZ), not both or neither."
         )
 
-    n_angles, Ny, N_det = sinogram.shape
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=(torch.float32,),
+        op_name="run_grad_descent",
+    )
     Nx = N_det
-    if Nz < 0:
-        Nz = N_det
-    device = sinogram.device
 
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
                          requires_grad=True)
@@ -1936,6 +1887,7 @@ def run_grad_descent(
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
+    constraints = ConstraintSet(positivity=positivity, mask=_mask)
     losses: list[float] = []
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
@@ -1957,12 +1909,7 @@ def run_grad_descent(
             opt.step()
         losses.append(float(loss_val.detach()))
         with torch.no_grad():
-            if positivity:
-                volume.clamp_(min=0.0)
-            if _mask is not None:
-                volume.mul_(_mask)
+            constraints.apply_inplace_(volume)
 
     out = volume.detach()
-    if return_loss:
-        return out, torch.tensor(losses, dtype=torch.float32)
-    return out
+    return _finish_iters(out, losses, return_loss)
