@@ -1864,6 +1864,53 @@ class TestAdRecon:
                 anchor_reference=True,
             )
 
+    def test_in_plane_weight_drives_alpha_to_zero(self):
+        """in_plane_weight suppresses α/γ drift that would otherwise occur at high lr_angles."""
+        common = dict(
+            n_iter=100,
+            refine_pose=True,
+            antisymmetric_z=False,  # let col0 and col2 evolve independently
+            tilt_bound_deg=None,
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        # Baseline: no penalty — α/γ should drift substantially
+        _, euler_free, _ = ft.run_ad_recon(
+            self._sino(), self._angles(), in_plane_weight=0.0, **common
+        )
+        baseline_drift = max(
+            euler_free[:, 0].abs().max().item(),
+            euler_free[:, 2].abs().max().item(),
+        )
+        assert baseline_drift > 1.0, (
+            f"Baseline (no penalty) should drift >1°, but max α/γ = "
+            f"{baseline_drift:.4f}°; raise lr_angles or n_iter if flaky"
+        )
+        # With a strong penalty: α and γ should stay small
+        _, euler_reg, _ = ft.run_ad_recon(
+            self._sino(), self._angles(), in_plane_weight=10.0, **common
+        )
+        reg_drift = max(
+            euler_reg[:, 0].abs().max().item(),
+            euler_reg[:, 2].abs().max().item(),
+        )
+        assert reg_drift < 0.5, (
+            f"With in_plane_weight=10.0, max |α|/|γ| = {reg_drift:.4f}° "
+            f"(expected < 0.5°)"
+        )
+
+    def test_in_plane_weight_skipped_without_pose(self):
+        """in_plane_weight is silently ignored when refine_pose=False."""
+        vol = ft.run_ad_recon(
+            self._sino(), self._angles(),
+            n_iter=5,
+            refine_pose=False,
+            in_plane_weight=1e-2,
+        )
+        assert vol.shape == (self.NY, self.NZ, self.N)
+        assert torch.isfinite(vol).all()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

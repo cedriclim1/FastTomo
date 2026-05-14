@@ -955,6 +955,7 @@ def run_ad_recon(
     lr_shifts: float = 1e-2,
     tv_weight: float = 0.0,
     sparsity: float = 0.0,
+    in_plane_weight: float = 0.0,
     positivity: bool = False,
     mask: bool = False,
     loss_fn: str = "mse",
@@ -998,6 +999,16 @@ def run_ad_recon(
         sparsity:        Sparsity weight; adds ``sparsity * volume.mean()``
                          to the loss each iteration (L1-style, as used in the
                          notebook for atomic-resolution data). 0.0 disables it.
+        in_plane_weight: Soft L2 regularisation weight on the in-plane Euler
+                         columns α (col0) and γ (col2); adds
+                         ``in_plane_weight * (α² + γ²).mean()`` (deg²) to the
+                         loss each iteration. Only active when
+                         ``refine_pose=True`` and the weight is > 0. With
+                         ``antisymmetric_z=True`` (default), γ = −α so this is
+                         effectively ``2 · α².mean()``. With
+                         ``antisymmetric_z=False`` it applies independently to
+                         both columns. Off by default (0.0); typical values for
+                         single-tilt data are 1e-4 to 1e-2.
         positivity:      If True, clamps ``volume`` to ``[0, ∞)`` after each
                          step inside ``torch.no_grad()``.
         mask:            If True, builds ``cylindrical_mask(Nz, Nx)`` once and
@@ -1176,6 +1187,11 @@ def run_ad_recon(
             loss = loss + tv_weight * tv_loss_3d(volume)
         if sparsity > 0.0:
             loss = loss + sparsity * volume.mean()
+        if in_plane_weight > 0.0 and tilt_angle_opt is not None:
+            loss = loss + in_plane_weight * (
+                tilt_angle_opt[:, 0].pow(2).mean()
+                + tilt_angle_opt[:, 2].pow(2).mean()
+            )
 
         losses.append(loss.item())
         loss.backward()
