@@ -224,7 +224,15 @@ def run_fbp(
         volume = back_project(filtered, angles_deg, Nz=Nz)
     # angular sampling normalisation: π / n_angles
     volume = volume * (math.pi / n_angles)
-    _mask = _maybe_cylindrical_mask(Nz, N_det, device, mask, dtype=volume.dtype)
+    # Respect the actual reconstruction geometry returned by the projector.
+    # User-supplied projectors may legally use Nx != N_det.
+    _mask = _maybe_cylindrical_mask(
+        volume.shape[1],
+        volume.shape[2],
+        volume.device,
+        mask,
+        dtype=volume.dtype,
+    )
     return ConstraintSet(positivity=positivity, mask=_mask).apply(volume)
 
 

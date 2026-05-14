@@ -87,6 +87,26 @@ def test_fbp_shape():
     assert rec.shape == vol.shape
 
 
+def test_fbp_mask_uses_projector_output_geometry():
+    """mask=True should follow the returned volume shape, not N_det."""
+
+    class _DummyProjector:
+        def __init__(self, ny: int, nz: int, nx: int):
+            self._shape = (ny, nz, nx)
+
+        def back(self, filtered: torch.Tensor) -> torch.Tensor:
+            return torch.ones(self._shape, dtype=filtered.dtype, device=filtered.device)
+
+    n_angles, Ny, N_det = 12, 2, 32
+    Nz, Nx = 24, 40  # intentionally Nx != N_det
+    angles = make_angles(n_angles)
+    sino = torch.randn(n_angles, Ny, N_det, dtype=torch.float32)
+
+    rec = ft.run_fbp(sino, angles, Nz=Nz, mask=True, projector=_DummyProjector(Ny, Nz, Nx))
+
+    assert rec.shape == (Ny, Nz, Nx)
+
+
 def test_fbp_better_than_plain_backproject():
     """FBP reconstruction MSE should beat raw (unfiltered) back-projection."""
     N      = 64
