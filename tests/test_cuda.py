@@ -1731,5 +1731,103 @@ class TestCrossDevice:
             torch.cuda.synchronize(dev)
 
 
+# ── run_ad_recon: anchor_reference + tilt_bound_deg ───────────────────────
+
+class TestAdRecon:
+    """Tests for run_ad_recon anchor_reference and tilt_bound_deg features."""
+
+    # Ny=4 gives the 3D projector real depth along the tilt axis so that
+    # Y-Euler gradients are non-zero — needed for the drift behavioural test.
+    N        = 8
+    NZ       = 8
+    NY       = 4
+    N_ANGLES = 5
+
+    def _angles(self) -> torch.Tensor:
+        return torch.tensor([-30., -15., 0., 15., 30.], device=DEVICE)
+
+    def _sino(self) -> torch.Tensor:
+        vol = torch.zeros(self.NY, self.NZ, self.N, device=DEVICE)
+        # Asymmetric fill: only first half of Y slices so Y-Euler gradients
+        # are non-zero (needed for the drift behavioural test).
+        vol[:self.NY // 2, 2:6, 2:6] = 1.0
+        return ft.forward_project(vol, self._angles())  # [n_angles, NY, N_det]
+
+    def test_smoke_default_flags(self):
+        """Existing default call (no new flags) still returns correct shape/dtype."""
+        vol = ft.run_ad_recon(self._sino(), self._angles(), n_iter=5)
+        assert vol.shape == (self.NY, self.NZ, self.N)
+        assert vol.dtype == torch.float32
+        assert vol.device.type == "cuda"
+
+    def test_anchor_reference_row_frozen(self):
+        """Reference row of euler and shifts is byte-identical to its initial value."""
+        angles = self._angles()
+        vol, euler, shifts = ft.run_ad_recon(
+            self._sino(), angles,
+            n_iter=50,
+            refine_pose=True,
+            refine_shifts=True,
+            anchor_reference=True,
+            lr_angles=1.0,
+            lr_shifts=1.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        ref_idx = int(angles.cpu().abs().argmin())
+        expected_euler = torch.tensor([0.0, angles[ref_idx].item(), 0.0])
+        assert torch.equal(euler[ref_idx], expected_euler), (
+            f"Reference euler row drifted: {euler[ref_idx]} != {expected_euler}"
+        )
+        assert torch.equal(shifts[ref_idx], torch.zeros(2)), (
+            f"Reference shift row drifted: {shifts[ref_idx]}"
+        )
+
+    def test_tilt_bound_respected(self):
+        """Y-Euler stays within nominal ± tilt_bound_deg under very high lr_angles."""
+        angles = self._angles()
+        bound  = 1.0
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), angles,
+            n_iter=50,
+            refine_pose=True,
+            tilt_bound_deg=bound,
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        max_drift = (euler[:, 1] - angles.cpu()).abs().max().item()
+        assert max_drift <= bound + 1e-5, (
+            f"Y-Euler drifted {max_drift:.4f}° beyond bound {bound}°"
+        )
+
+    def test_tilt_bound_none_allows_drift(self):
+        """Without the bound, high lr_angles drives Y-Euler beyond ±1° of nominal."""
+        angles = self._angles()
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), angles,
+            n_iter=100,
+            refine_pose=True,
+            tilt_bound_deg=None,
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        max_drift = (euler[:, 1] - angles.cpu()).abs().max().item()
+        assert max_drift > 1.0, (
+            f"Expected Y-Euler drift > 1° with tilt_bound_deg=None and lr_angles=5.0, "
+            f"but max drift was {max_drift:.4f}°"
+        )
+
+    def test_anchor_raises_without_refine(self):
+        """anchor_reference=True without any refinement raises ValueError."""
+        with pytest.raises(ValueError, match="anchor_reference"):
+            ft.run_ad_recon(
+                self._sino(), self._angles(),
+                n_iter=1,
+                anchor_reference=True,
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

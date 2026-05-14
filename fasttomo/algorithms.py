@@ -962,6 +962,8 @@ def run_ad_recon(
     return_loss: bool = False,
     return_pose: bool = False,
     projector: object | None = None,
+    anchor_reference: bool = False,
+    tilt_bound_deg: float | None = 1.0,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -1016,6 +1018,18 @@ def run_ad_recon(
                          whose class does not match the requested mode raises
                          ``ValueError``. If ``None``, a projector is built
                          internally and torn down on return.
+        anchor_reference: If True, the projection whose tilt angle is closest
+                         to 0° is used as a gauge anchor — its pose row is
+                         frozen at ``(0, θ_ref, 0)`` and its shift row at
+                         ``(0, 0)`` for the entire run by zeroing that row's
+                         gradient before every Adam step. Requires at least
+                         one of ``refine_pose`` or ``refine_shifts`` to be
+                         True (raises ``ValueError`` otherwise). Default False.
+        tilt_bound_deg:  If not None, clamps the Y-Euler column (tilt axis)
+                         to ``[angles_deg ± tilt_bound_deg]`` after each Adam
+                         step. Only active when ``refine_pose=True``. Pass
+                         ``None`` to disable and let Y optimise freely.
+                         Default 1.0.
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
@@ -1030,6 +1044,12 @@ def run_ad_recon(
     """
     if loss_fn not in ("mse", "l1"):
         raise ValueError(f"loss_fn must be 'mse' or 'l1', got {loss_fn!r}")
+
+    if anchor_reference and not (refine_pose or refine_shifts):
+        raise ValueError(
+            "anchor_reference=True requires refine_pose=True or "
+            "refine_shifts=True; nothing to anchor otherwise."
+        )
 
     # Projector class/mode mismatch validation
     if projector is not None:
@@ -1054,6 +1074,10 @@ def run_ad_recon(
     )
     Nx = N_det
     angles_deg = angles_deg.float().to(device)
+
+    ref_idx: int | None = None
+    if anchor_reference:
+        ref_idx = int(angles_deg.abs().argmin())
 
     # ── initialise volume ──────────────────────────────────────────────────
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
@@ -1147,6 +1171,12 @@ def run_ad_recon(
         losses.append(loss.item())
         loss.backward()
 
+        if ref_idx is not None:
+            if tilt_angle_opt is not None and tilt_angle_opt.grad is not None:
+                tilt_angle_opt.grad[ref_idx] = 0.0
+            if shifts is not None and shifts.grad is not None:
+                shifts.grad[ref_idx] = 0.0
+
         for opt in optimisers:
             opt.step()
         for sched in schedulers:
@@ -1158,6 +1188,11 @@ def run_ad_recon(
                 volume.clamp_(min=0.0)
             if _cmask is not None:
                 volume.mul_(_cmask.unsqueeze(0))
+            if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
+                tilt_angle_opt[:, 1].clamp_(
+                    min=angles_deg - tilt_bound_deg,
+                    max=angles_deg + tilt_bound_deg,
+                )
 
     out = volume.detach()
 
