@@ -963,7 +963,7 @@ def run_ad_recon(
     return_pose: bool = False,
     projector: object | None = None,
     anchor_reference: bool = False,
-    tilt_bound_deg: float | None = 1.0,
+    tilt_bound_deg: float | None = None,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -1029,7 +1029,7 @@ def run_ad_recon(
                          to ``[angles_deg ± tilt_bound_deg]`` after each Adam
                          step. Only active when ``refine_pose=True``. Pass
                          ``None`` to disable and let Y optimise freely.
-                         Default 1.0.
+                         Default ``None`` (disabled).
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]

@@ -1819,6 +1819,31 @@ class TestAdRecon:
             f"but max drift was {max_drift:.4f}°"
         )
 
+    def test_tilt_bound_default_matches_none(self):
+        """Default call should keep legacy unbounded Y-Euler behaviour."""
+        angles = self._angles()
+        _, euler_default, _ = ft.run_ad_recon(
+            self._sino(), angles,
+            n_iter=100,
+            refine_pose=True,
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        _, euler_none, _ = ft.run_ad_recon(
+            self._sino(), angles,
+            n_iter=100,
+            refine_pose=True,
+            tilt_bound_deg=None,
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        max_diff = (euler_default[:, 1] - euler_none[:, 1]).abs().max().item()
+        assert max_diff < 1e-4, (
+            f"Default tilt bound diverged from tilt_bound_deg=None by {max_diff:.6f}°"
+        )
+
     def test_anchor_raises_without_refine(self):
         """anchor_reference=True without any refinement raises ValueError."""
         with pytest.raises(ValueError, match="anchor_reference"):
