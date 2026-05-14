@@ -30,7 +30,7 @@ from fasttomo.projection import (
     back_project_resire,
 )
 from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
-from fasttomo.regularizers import s3im_loss
+from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
 
 _log = logging.getLogger(__name__)
@@ -955,9 +955,11 @@ def run_ad_recon(
     lr_angles: float = 1e-2,
     lr_shifts: float = 1e-2,
     tv_weight: float = 0.0,
+    tv_xz_weight: float = 0.0,
     sparsity: float = 0.0,
     in_plane_weight: float = 0.0,
     s3im_weight: float = 0.0,
+    tilt_ssim_weight: float = 0.0,
     positivity: bool = False,
     mask: bool = False,
     loss_fn: str = "mse",
@@ -997,7 +999,17 @@ def run_ad_recon(
         lr_shifts:       Adam learning rate for shifts (default 1e-2).
         tv_weight:       3-D isotropic TV regularisation weight; added as
                          ``tv_weight * tv_loss_3d(volume)`` each iteration.
+                         Includes a Y-gradient term that can produce horizontal-
+                         band artefacts in axis-2 projections at long runs;
+                         prefer ``tv_xz_weight`` for single-axis tilt data.
                          0.0 disables it.
+        tv_xz_weight:    XZ-plane 2-D isotropic TV weight; added as
+                         ``tv_xz_weight * tv_loss_xz(volume)`` each iteration.
+                         Penalises only X and Z gradients — no Y-gradient term —
+                         so adjacent Y-slices are never coupled and horizontal-
+                         band artefacts cannot form. Physically appropriate for
+                         single-axis tilt where each Y-slice is an independent
+                         XZ cross-section. 0.0 disables it (default).
         sparsity:        Sparsity weight; adds ``sparsity * volume.mean()``
                          to the loss each iteration (L1-style, as used in the
                          notebook for atomic-resolution data). 0.0 disables it.
@@ -1018,6 +1030,14 @@ def run_ad_recon(
                          suppresses missing-wedge streaks without the ring
                          artefact that TV can introduce at high weights.
                          0.0 disables it (default). Typical values: 1e-5–1e-3.
+        tilt_ssim_weight: Wang-2004 per-tilt SSIM regularisation weight; adds
+                         ``tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)``
+                         to the loss each iteration. Penalises local structural
+                         dissimilarity within each 2-D projection image.
+                         Deterministic (unlike S3IM); enforces smooth, locally
+                         coherent projections without the Y-slab banding that
+                         3-D TV can introduce. 0.0 disables it (default).
+                         Typical values: 1e-3–1e-1.
         positivity:      If True, clamps ``volume`` to ``[0, ∞)`` after each
                          step inside ``torch.no_grad()``.
         mask:            If True, builds ``cylindrical_mask(Nz, Nx)`` once and
@@ -1199,6 +1219,8 @@ def run_ad_recon(
         # regularisation
         if tv_weight > 0.0:
             loss = loss + tv_weight * tv_loss_3d(volume)
+        if tv_xz_weight > 0.0:
+            loss = loss + tv_xz_weight * tv_loss_xz(volume)
         if sparsity > 0.0:
             loss = loss + sparsity * volume.mean()
         if in_plane_weight > 0.0 and tilt_angle_opt is not None:
@@ -1208,6 +1230,8 @@ def run_ad_recon(
             )
         if s3im_weight > 0.0:
             loss = loss + s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
+        if tilt_ssim_weight > 0.0:
+            loss = loss + tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
 
         losses.append(loss.item())
         loss.backward()

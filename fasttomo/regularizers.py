@@ -1,20 +1,25 @@
-"""SSIM-based losses for the AD reconstruction path.
+"""Differentiable regularisers for the AD reconstruction path.
 
-Two flavours of structural-similarity loss for stacks of 2-D projection images
-``[n_angles, Ny, N_det]``:
+Each function returns a scalar tensor; add ``weight * regularizer(...)``
+to the data-fidelity loss and call ``.backward()`` as usual.
+
+* :func:`logsum_sparsity` — Log-Sum L0-proxy sparsity penalty (Candès–Wakin–Boyd
+  2008). Smoother than L1; gradient *shrinks* for large |ρ| so true signal peaks
+  are barely penalised while background voxels are driven aggressively toward zero.
 
 * :func:`tilt_ssim_loss` — Wang-2004 single-scale SSIM applied per tilt on the
-  actual 2-D projection image (local neighbourhoods). The standard SSIM you'd
-  reach for when comparing two real images.
+  actual 2-D projection image (local neighbourhoods). Deterministic; penalises
+  local structural dissimilarity within each projection without the Y-slab banding
+  risk of 3-D TV.
 
 * :func:`s3im_loss` — Stochastic Structural SIMilarity (Xie et al. 2023,
   ``fasttomo-wiki/raw/papers/S3IM.pdf``). Each step, randomly samples B
   sinogram entries from anywhere in ``pred``/``target``, reshapes them into a
-  fake √B × √B "patch", and applies SSIM with a K×K kernel at stride K. The
-  paper's "multiplex" loss is simply ``MSE + λ · s3im_loss``. Captures
-  *non-local* structural information the per-tilt local SSIM cannot reach.
+  fake √B × √B "patch", and applies SSIM with a K×K kernel at stride K.
+  Captures *non-local* sinogram structure; stochastic noise at small lr can
+  cause hot-pixel speckling in the volume.
 
-Both return scalar tensors that drop directly into any autograd loop.
+All return scalar tensors that drop directly into any autograd loop.
 ``tv_loss_3d`` (3-D isotropic total-variation regularisation on the volume)
 lives separately in ``fasttomo.utilities``; combine the three additively in the
 loss expression as needed.
@@ -26,6 +31,61 @@ import math
 
 import torch
 import torch.nn.functional as F
+
+
+# ── XZ-plane 2-D isotropic TV (no Y-coupling) ────────────────────────────
+
+def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Isotropic 2-D total-variation in the XZ plane, summed over Y-slices.
+
+        loss = mean( sqrt( dz² + dx² + eps ) )
+
+    Only penalises X and Z gradients — Y-gradients are **never** touched.
+    This is the physically appropriate TV for single-axis tilt tomography:
+    each Y-slice reconstructs an independent XZ cross-section, so smoothing
+    should operate within that plane. 3-D isotropic TV includes a Y term
+    that drives adjacent Y-slices toward identical values, producing
+    horizontal-band artefacts in axis-2 projections; this function avoids
+    that by construction.
+
+    Args:
+        volume: [Ny, Nz, Nx] float32 tensor.
+        eps:    smoothing constant inside the sqrt (default 1e-8).
+
+    Returns:
+        Scalar tensor (shape ``[]``) on the same device as ``volume``.
+    """
+    if volume.dtype != torch.float32:
+        raise TypeError(f"tv_loss_xz is fp32-only (got {volume.dtype}).")
+    if volume.ndim != 3:
+        raise ValueError(f"tv_loss_xz expects [Ny, Nz, Nx], got {tuple(volume.shape)}")
+    dz = volume[:, 1:, :]  - volume[:, :-1, :]   # [Ny, Nz-1, Nx]
+    dx = volume[:, :, 1:]  - volume[:, :, :-1]    # [Ny, Nz, Nx-1]
+    return (dz[:, :, :-1].pow(2) + dx[:, :-1, :].pow(2) + eps).sqrt().mean()
+
+
+# ── Log-Sum L0-proxy sparsity ─────────────────────────────────────────────
+
+def logsum_sparsity(volume: torch.Tensor, eps: float = 1e-2) -> torch.Tensor:
+    """Log-Sum L0-proxy sparsity penalty (Candès–Wakin–Boyd, 2008).
+
+        loss = mean( log(1 + |volume| / eps) )
+        ∂loss/∂ρ = sign(ρ) / (eps + |ρ|) / N
+
+    Smoother than L1; the gradient *shrinks* for large |ρ|, so true signal
+    peaks are barely shrunk while background voxels are driven aggressively
+    toward zero. Recommended over L1 soft-thresholding when the volume has
+    a sparse signal on a near-zero background.
+
+    Args:
+        volume: float tensor (any shape, CPU or CUDA).
+        eps:    smoothing scale. Set near 0.1 × the expected peak amplitude.
+                Smaller eps = more aggressive zeroing.
+
+    Returns:
+        Scalar tensor on the same device as ``volume``.
+    """
+    return torch.log1p(volume.abs() / eps).mean()
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────
