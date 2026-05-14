@@ -30,6 +30,7 @@ from fasttomo.projection import (
     back_project_resire,
 )
 from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
+from fasttomo.regularizers import s3im_loss
 from fasttomo.projector import ParallelProjector, RotmatProjector
 
 _log = logging.getLogger(__name__)
@@ -956,6 +957,7 @@ def run_ad_recon(
     tv_weight: float = 0.0,
     sparsity: float = 0.0,
     in_plane_weight: float = 0.0,
+    s3im_weight: float = 0.0,
     positivity: bool = False,
     mask: bool = False,
     loss_fn: str = "mse",
@@ -1009,6 +1011,13 @@ def run_ad_recon(
                          ``antisymmetric_z=False`` it applies independently to
                          both columns. Off by default (0.0); typical values for
                          single-tilt data are 1e-4 to 1e-2.
+        s3im_weight:     Stochastic Structural Similarity (S3IM) regularisation
+                         weight; adds ``s3im_weight * s3im_loss(pred, sinogram)``
+                         to the loss each iteration. S3IM captures non-local
+                         sinogram structure that MSE/L1 misses, and empirically
+                         suppresses missing-wedge streaks without the ring
+                         artefact that TV can introduce at high weights.
+                         0.0 disables it (default). Typical values: 1e-5–1e-3.
         positivity:      If True, clamps ``volume`` to ``[0, ∞)`` after each
                          step inside ``torch.no_grad()``.
         mask:            If True, builds ``cylindrical_mask(Nz, Nx)`` once and
@@ -1158,6 +1167,11 @@ def run_ad_recon(
     if mask:
         _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
 
+    # ── S3IM generator (seeded once; reused each iteration) ───────────────
+    _s3im_gen: torch.Generator | None = None
+    if s3im_weight > 0.0:
+        _s3im_gen = torch.Generator(device=device).manual_seed(42)
+
     # ── iteration ─────────────────────────────────────────────────────────
     losses: list[float] = []
 
@@ -1192,6 +1206,8 @@ def run_ad_recon(
                 tilt_angle_opt[:, 0].pow(2).mean()
                 + tilt_angle_opt[:, 2].pow(2).mean()
             )
+        if s3im_weight > 0.0:
+            loss = loss + s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
 
         losses.append(loss.item())
         loss.backward()
