@@ -964,6 +964,7 @@ def run_ad_recon(
     projector: object | None = None,
     anchor_reference: bool = False,
     tilt_bound_deg: float | None = 1.0,
+    antisymmetric_z: bool = True,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -1030,6 +1031,14 @@ def run_ad_recon(
                          step. Only active when ``refine_pose=True``. Pass
                          ``None`` to disable and let Y optimise freely.
                          Default 1.0.
+        antisymmetric_z: If True (default), enforces ``γ = −α`` (ZY(-Z) form)
+                         after every Adam step — the third ZYZ angle is always
+                         the negative of the first. This removes a degree of
+                         freedom per projection and prevents unrealistic
+                         in-plane rotation drift on single-tilt data. Only
+                         active when ``refine_pose=True``; silently ignored
+                         otherwise. Pass ``False`` to let α and γ optimise
+                         independently.
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
@@ -1177,6 +1186,10 @@ def run_ad_recon(
             if shifts is not None and shifts.grad is not None:
                 shifts.grad[ref_idx] = 0.0
 
+        if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
+            if tilt_angle_opt.grad is not None:
+                tilt_angle_opt.grad[:, 2] = 0.0
+
         for opt in optimisers:
             opt.step()
         for sched in schedulers:
@@ -1193,6 +1206,8 @@ def run_ad_recon(
                     min=angles_deg - tilt_bound_deg,
                     max=angles_deg + tilt_bound_deg,
                 )
+            if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
+                tilt_angle_opt[:, 2] = -tilt_angle_opt[:, 0]
 
     out = volume.detach()
 

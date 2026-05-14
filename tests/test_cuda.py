@@ -1819,6 +1819,42 @@ class TestAdRecon:
             f"but max drift was {max_drift:.4f}°"
         )
 
+    def test_antisymmetric_z_enforced(self):
+        """Default antisymmetric_z=True keeps col2 == -col0 exactly after each step."""
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), self._angles(),
+            n_iter=50,
+            refine_pose=True,
+            tilt_bound_deg=None,   # let Y drift freely so gradients are non-trivial
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+            # antisymmetric_z=True is the default
+        )
+        residual = (euler[:, 2] + euler[:, 0]).abs().max().item()
+        assert residual < 1e-5, (
+            f"ZY(-Z) constraint violated: max |col2 + col0| = {residual:.2e}"
+        )
+
+    def test_antisymmetric_z_false_allows_drift(self):
+        """antisymmetric_z=False lets col2 diverge from -col0 under high lr_angles."""
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), self._angles(),
+            n_iter=100,
+            refine_pose=True,
+            tilt_bound_deg=None,
+            antisymmetric_z=False,
+            lr_angles=5.0,
+            return_pose=True,
+            cosine_schedule=False,
+        )
+        # col0 and col2 start at 0; verify they evolve independently (col2 + col0 ≠ 0)
+        residual = (euler[:, 2] + euler[:, 0]).abs().max().item()
+        assert residual > 1e-3, (
+            f"Expected col2 != -col0 with antisymmetric_z=False, "
+            f"but max |col2 + col0| = {residual:.2e}"
+        )
+
     def test_anchor_raises_without_refine(self):
         """anchor_reference=True without any refinement raises ValueError."""
         with pytest.raises(ValueError, match="anchor_reference"):
