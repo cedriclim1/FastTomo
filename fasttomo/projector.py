@@ -149,6 +149,25 @@ class _ProjectorBase:
                 f"device."
             )
 
+    def _check_shape(
+        self,
+        t: torch.Tensor,
+        name: str,
+        expected: tuple[int, ...],
+    ) -> None:
+        actual = tuple(int(v) for v in t.shape)
+        if actual != expected:
+            raise ValueError(
+                f"{type(self).__name__}: {name} must have shape {expected}, "
+                f"got {actual}."
+            )
+
+    def _check_volume_shape(self, volume: torch.Tensor) -> None:
+        self._check_shape(volume, "volume", (self.Ny, self.Nz, self.Nx))
+
+    def _check_sinogram_shape(self, sinogram: torch.Tensor) -> None:
+        self._check_shape(sinogram, "sinogram", (self.n_angles, self.Ny, self.N_det))
+
     def __del__(self) -> None:
         # Tear down explicitly.  tc_destroy is safe-on-null and frees both the
         # cudaArray and the textureObject. GC may fire while a different CUDA
@@ -291,10 +310,12 @@ class ParallelProjector(_ProjectorBase):
     # ── public differentiable API ──
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
         self._check_device(volume, "volume")
+        self._check_volume_shape(volume)
         return _FP2DCached.apply(volume, self)
 
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
         self._check_device(sinogram, "sinogram")
+        self._check_sinogram_shape(sinogram)
         return _BP2DCached.apply(sinogram, self)
 
 
@@ -430,15 +451,29 @@ class RotmatProjector(_ProjectorBase):
             )
         return grad_mats
 
+    def _normalize_and_validate_mats(self, mats: torch.Tensor) -> torch.Tensor:
+        if mats.ndim == 3:
+            self._check_shape(mats, "mats", (self.n_angles, 3, 3))
+            return mats.reshape(self.n_angles, 9)
+        if mats.ndim == 2:
+            self._check_shape(mats, "mats", (self.n_angles, 9))
+            return mats
+        raise ValueError(
+            f"{type(self).__name__}: mats must have shape "
+            f"({self.n_angles}, 3, 3) or ({self.n_angles}, 9), "
+            f"got {tuple(int(v) for v in mats.shape)}."
+        )
+
     def forward(self, volume: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
         self._check_device(volume, "volume")
+        self._check_volume_shape(volume)
         self._check_device(mats, "mats")
-        # accept either [n_angles, 3, 3] (default API) or [n_angles, 9]
-        mats_flat = mats.reshape(self.n_angles, 9) if mats.ndim == 3 else mats
+        mats_flat = self._normalize_and_validate_mats(mats)
         return _FP3DCached.apply(volume, mats_flat, self)
 
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
         self._check_device(sinogram, "sinogram")
+        self._check_sinogram_shape(sinogram)
         self._check_device(mats, "mats")
-        mats_flat = mats.reshape(self.n_angles, 9) if mats.ndim == 3 else mats
+        mats_flat = self._normalize_and_validate_mats(mats)
         return _BP3DCached.apply(sinogram, mats_flat, self)

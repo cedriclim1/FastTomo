@@ -1023,6 +1023,34 @@ def test_run_sirt_fp16_with_cached_projector():
     assert torch.isfinite(rec).all()
 
 
+def test_parallel_projector_rejects_wrong_volume_shape():
+    N = 32
+    angles = make_angles(10)
+    proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+    wrong = torch.zeros(2, N, N, device=DEVICE)
+    with pytest.raises(ValueError, match="volume must have shape"):
+        proj.forward(wrong)
+
+
+def test_parallel_projector_rejects_wrong_sinogram_shape():
+    N = 32
+    angles = make_angles(10)
+    proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+    wrong = torch.zeros(angles.numel() - 1, 1, N, device=DEVICE)
+    with pytest.raises(ValueError, match="sinogram must have shape"):
+        proj.back(wrong)
+
+
+def test_rotmat_projector_rejects_wrong_mats_shape():
+    N = 24
+    n_angles = 12
+    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=DEVICE, N_det=N)
+    vol = phantom_2d(N).unsqueeze(0)
+    bad_mats = torch.zeros(n_angles - 1, 3, 3, device=DEVICE)
+    with pytest.raises(ValueError, match="mats must have shape"):
+        proj.forward(vol, bad_mats)
+
+
 def test_run_sirt_warm_start_volume_controls_dtype():
     """When a warm-start volume is passed in, its dtype controls the
     compute dtype. Sinogram must match — a mismatch raises TypeError."""
