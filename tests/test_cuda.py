@@ -1731,5 +1731,151 @@ class TestCrossDevice:
             torch.cuda.synchronize(dev)
 
 
+# ── MBIR (Model-Based Iterative Reconstruction) ──────────────────────────
+#
+# All MBIR tests use the project's own voxel-driven bilinear scatter forward
+# model (`mbir_forward_project_cuda`) to generate the input sinogram. This
+# is the same A used inside the ICD column updates, so the algorithm is
+# being tested as a self-adjoint MAP estimator under its own forward
+# model — the cleanest possible correctness check.
+
+
+def _mbir_sino_self(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Tensor:
+    """Forward-project using MBIR's own A (voxel-driven bilinear scatter)
+    rather than FastTomo's ray-marching `forward_project`. This is what
+    the ICD column updates are inverting, so tests using this FP can
+    expect near-perfect recovery of the input phantom."""
+    import math
+    import fasttomo._core as _core
+    Ny, Nz, Nx = phantom.shape
+    n_angles = angles_deg.shape[0]
+    N_det = Nx
+    sino = torch.zeros(n_angles, Ny, N_det, device=phantom.device, dtype=torch.float32)
+    angles_rad = (angles_deg.float().to(phantom.device) * (math.pi / 180.0)).contiguous()
+    cos_a = torch.cos(angles_rad).contiguous()
+    sin_a = torch.sin(angles_rad).contiguous()
+    _core.mbir_forward_project_cuda(
+        phantom.contiguous().data_ptr(), sino.data_ptr(),
+        cos_a.data_ptr(), sin_a.data_ptr(),
+        Ny, Nz, Nx, n_angles, N_det,
+        torch.cuda.current_stream(phantom.device).cuda_stream,
+    )
+    return sino
+
+
+def test_mbir_perfect_data_recovers_phantom():
+    """Conventional MBIR (T=∞, no anomaly modeling) on a noiseless solid
+    cube should recover the phantom to high accuracy. Validates the
+    surrogate-MM ICD inner loop + qGGMRF prior + variance auto-tuning."""
+    Ny = Nz = Nx = 32
+    n_angles = 40
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[8:24, 8:24, 8:24] = 1.0
+    angles = make_angles(n_angles, max_deg=70.0)
+
+    sino = _mbir_sino_self(phantom, angles)
+    vol = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1,
+        huber_T=float("inf"),
+        estimate_offset=False,
+        estimate_variance=True,
+        outer_iters=80,
+        multires_levels=1,
+    )
+    rel_err = (vol - phantom).norm().item() / phantom.norm().item()
+    assert rel_err < 0.10, f"MBIR rel error {rel_err:.4f} > 0.10"
+
+
+def test_mbir_pe_rejects_bragg_streak():
+    """The whole point of MBIR-AM-PE: with anomaly modeling, a single
+    high-magnitude Bragg-style streak in one tilt's detector strip is
+    suppressed in the reconstruction. Without anomaly modeling, the
+    streak corrupts the volume.
+
+    We assert MBIR-AM has lower RMSE than conventional MBIR on the
+    Bragg-corrupted data — the qualitative paper result, scaled to
+    32³ so it runs in a few seconds. """
+    Ny = Nz = Nx = 32
+    n_angles = 40
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[8:24, 8:24, 8:24] = 1.0
+    angles = make_angles(n_angles, max_deg=70.0)
+
+    sino_clean = _mbir_sino_self(phantom, angles)
+
+    # Inject a Bragg-like streak: at one tilt, multiply a 4-pixel-wide
+    # detector strip by 5× across all Y rows. This corrupts that
+    # projection at known coordinates.
+    sino_corrupt = sino_clean.clone()
+    angle_idx = n_angles // 3
+    sino_corrupt[angle_idx, :, 14:18] *= 5.0
+
+    # Conventional MBIR — no anomaly handling.
+    vol_conv = ft.run_mbir(
+        sino_corrupt, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=80, multires_levels=1,
+    )
+    err_conv = (vol_conv - phantom).norm().item()
+
+    # MBIR-AM-PE — Bragg anomaly modeling on.
+    vol_am = ft.run_mbir(
+        sino_corrupt, angles,
+        sigma_f=0.1, huber_T=3.0, huber_delta=0.5,
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=80, multires_levels=1,
+    )
+    err_am = (vol_am - phantom).norm().item()
+
+    # AM should beat conventional MBIR on this corrupted data.
+    assert err_am < err_conv, (
+        f"MBIR-AM error {err_am:.4f} not lower than conventional MBIR "
+        f"{err_conv:.4f} — anomaly modeling not effective"
+    )
+
+
+def test_mbir_seed_reproducibility():
+    """The voxel-update permutation is the only stochastic step. With a
+    fixed seed two runs must produce bitwise-identical reconstructions."""
+    Ny = Nz = Nx = 16
+    angles = make_angles(20, max_deg=60.0)
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    sino = _mbir_sino_self(phantom, angles)
+
+    kw = dict(
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        outer_iters=20, multires_levels=1, sigma_init=0.1,
+    )
+    v1 = ft.run_mbir(sino, angles, seed=42, **kw)
+    v2 = ft.run_mbir(sino, angles, seed=42, **kw)
+    assert torch.equal(v1, v2), "MBIR not reproducible with the same seed"
+
+
+def test_mbir_estimate_offset_disabled_keeps_d_zero():
+    """When estimate_offset=False, the per-tilt offset must remain at its
+    initial value (zero). The kernel still receives the offset pointer but
+    the host wrapper bypasses the closed-form update."""
+    Ny = Nz = Nx = 16
+    angles = make_angles(20, max_deg=60.0)
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    sino = _mbir_sino_self(phantom, angles)
+
+    _, d_offsets, _, _ = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        outer_iters=10, multires_levels=1, sigma_init=0.1,
+        return_history=True,
+    )
+    assert torch.all(d_offsets == 0.0), (
+        f"d_offsets non-zero when estimate_offset=False: {d_offsets}"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

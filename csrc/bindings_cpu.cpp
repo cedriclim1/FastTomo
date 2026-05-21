@@ -280,6 +280,104 @@ static py::tuple py_genfire_gridding_2d_cpu(
     return py::make_tuple(grid_real, grid_imag, weight_grid);
 }
 
+/* ── MBIR (Model-Based Iterative Reconstruction) bindings ─────────────── */
+
+using i32arr = py::array_t<int>;
+
+static f32arr py_mbir_forward_project_cpu(
+    const f32arr &volume,    /* [Ny, Nz, Nx] */
+    const f32arr &angles,    /* [n_angles] radians */
+    int N_det,
+    int num_threads
+) {
+    if (volume.ndim() != 3)
+        throw std::invalid_argument("mbir_forward_project_cpu: volume must be 3-D [Ny, Nz, Nx]");
+    int Ny = (int)volume.shape(0);
+    int Nz = (int)volume.shape(1);
+    int Nx = (int)volume.shape(2);
+    int n_angles = (int)angles.size();
+    if (N_det < 0) N_det = Nx;
+
+    std::vector<float> cos_a, sin_a;
+    compute_trig(angles, cos_a, sin_a);
+
+    auto sinogram = py::array_t<float>({n_angles, Ny, N_det});
+    mbir_forward_project_cpu(
+        static_cast<const float *>(volume.request().ptr),
+        static_cast<float *>(sinogram.request().ptr),
+        cos_a.data(), sin_a.data(),
+        Ny, Nz, Nx, n_angles, N_det,
+        num_threads
+    );
+    return sinogram;
+}
+
+static float py_mbir_icd_sweep_cpu(
+    f32arr volume,              /* [Ny, Nz, Nx] in-place */
+    f32arr e_sino,              /* [n_angles, Ny, N_det] in-place */
+    py::object d_offsets,       /* [n_angles] f32 numpy or None */
+    py::object lambdas,         /* [n_angles, Ny, N_det] f32 numpy or None */
+    const f32arr &volume_snapshot,
+    const i32arr &perm,         /* [Ny, Nz*Nx] int32 permutation */
+    const f32arr &angles,       /* [n_angles] radians */
+    float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
+    float huber_T, float huber_delta,
+    float sigma, float sigma_min,
+    bool estimate_offset, bool estimate_variance,
+    int num_threads
+) {
+    if (volume.ndim() != 3) throw std::invalid_argument("volume must be 3-D");
+    if (e_sino.ndim() != 3) throw std::invalid_argument("e_sino must be 3-D");
+    int Ny       = (int)volume.shape(0);
+    int Nz       = (int)volume.shape(1);
+    int Nx       = (int)volume.shape(2);
+    int n_angles = (int)e_sino.shape(0);
+    int N_det    = (int)e_sino.shape(2);
+    if ((int)e_sino.shape(1) != Ny) throw std::invalid_argument("e_sino Ny mismatch");
+    if ((int)angles.size() != n_angles) throw std::invalid_argument("angles length mismatch");
+    if ((int)volume_snapshot.size() != Ny * Nz * Nx)
+        throw std::invalid_argument("volume_snapshot size mismatch");
+    if ((int)perm.size() != Ny * Nz * Nx)
+        throw std::invalid_argument("perm size must be Ny*Nz*Nx");
+
+    float *d_ptr = nullptr;
+    if (!d_offsets.is_none()) {
+        f32arr d = py::cast<f32arr>(d_offsets);
+        if ((int)d.size() != n_angles) throw std::invalid_argument("d_offsets length mismatch");
+        d_ptr = static_cast<float *>(d.request().ptr);
+    } else if (estimate_offset) {
+        throw std::invalid_argument("estimate_offset=True but d_offsets is None");
+    }
+
+    const float *lam_ptr = nullptr;
+    if (!lambdas.is_none()) {
+        f32arr l = py::cast<f32arr>(lambdas);
+        if ((int)l.size() != n_angles * Ny * N_det)
+            throw std::invalid_argument("lambdas size mismatch");
+        lam_ptr = static_cast<const float *>(l.request().ptr);
+    }
+
+    std::vector<float> cos_a, sin_a;
+    compute_trig(angles, cos_a, sin_a);
+
+    float sigma_out = sigma;
+    mbir_icd_sweep_cpu(
+        static_cast<float *>(volume.request().ptr),
+        static_cast<float *>(e_sino.request().ptr),
+        d_ptr,
+        estimate_variance ? &sigma_out : nullptr,
+        static_cast<const float *>(volume_snapshot.request().ptr),
+        static_cast<const int *>(perm.request().ptr),
+        cos_a.data(), sin_a.data(), lam_ptr,
+        Ny, Nz, Nx, n_angles, N_det,
+        qggmrf_p, qggmrf_q, qggmrf_c, sigma_f,
+        huber_T, huber_delta, sigma, sigma_min,
+        estimate_offset ? 1 : 0, estimate_variance ? 1 : 0,
+        num_threads
+    );
+    return sigma_out;
+}
+
 void register_cpu(py::module_ &m) {
     m.def("forward_project_cpu", &py_forward_project_cpu,
           "Parallel-beam forward projection (CPU). "
@@ -336,4 +434,27 @@ void register_cpu(py::module_ &m) {
           py::arg("fk_real"), py::arg("fk_imag"),
           py::arg("cos_a"),   py::arg("sin_a"),
           py::arg("cutoff_dist") = 0.5f);
+
+    m.def("mbir_forward_project_cpu", &py_mbir_forward_project_cpu,
+          "MBIR voxel-driven bilinear forward projection (CPU). Distinct "
+          "from `forward_project_cpu` — uses the column-A model that "
+          "matches `mbir_icd_sweep_cpu`. Returns [n_angles, Ny, N_det].",
+          py::arg("volume"), py::arg("angles"), py::arg("N_det") = -1,
+          py::arg("num_threads") = 1);
+
+    m.def("mbir_icd_sweep_cpu", &py_mbir_icd_sweep_cpu,
+          "One outer iteration of MBIR-AM-PE (CPU). Mutates volume / e_sino "
+          "/ d_offsets in place; returns the (possibly updated) sigma. "
+          "Pass estimate_offset=False and d_offsets=None to skip the offset "
+          "update; estimate_variance=False to keep sigma fixed.",
+          py::arg("volume"), py::arg("e_sino"), py::arg("d_offsets"),
+          py::arg("lambdas"), py::arg("volume_snapshot"), py::arg("perm"),
+          py::arg("angles"),
+          py::arg("qggmrf_p"), py::arg("qggmrf_q"),
+          py::arg("qggmrf_c"), py::arg("sigma_f"),
+          py::arg("huber_T"), py::arg("huber_delta"),
+          py::arg("sigma"),   py::arg("sigma_min"),
+          py::arg("estimate_offset") = true,
+          py::arg("estimate_variance") = true,
+          py::arg("num_threads") = 1);
 }
