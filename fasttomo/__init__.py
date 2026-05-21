@@ -79,6 +79,13 @@ from fasttomo.algorithms import (
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.regularizers import tilt_ssim_loss, s3im_loss, logsum_sparsity, tv_loss_xz
+from fasttomo.configs import (
+    AdReconConfig,
+    ConstraintConfig,
+    OptimConfig,
+    PoseRefinementConfig,
+    RegularizerConfig,
+)
 
 __all__ = [
     "forward_project",
@@ -112,4 +119,9 @@ __all__ = [
     "s3im_loss",
     "logsum_sparsity",
     "tv_loss_xz",
+    "AdReconConfig",
+    "ConstraintConfig",
+    "OptimConfig",
+    "PoseRefinementConfig",
+    "RegularizerConfig",
 ]

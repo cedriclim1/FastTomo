@@ -1331,13 +1331,8 @@ class TestRunAdRecon:
         vol = phantom_2d(N).unsqueeze(0)
         sino = ft.forward_project(vol, angles)
 
-        _, losses = ft.run_ad_recon(
-            sino, angles,
-            n_iter=200,
-            refine_pose=False,
-            lr_volume=0.05,
-            return_loss=True,
-        )
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=200, lr_volume=0.05))
+        _, losses = ft.run_ad_recon(sino, angles, config=cfg, return_loss=True)
         assert losses[-1].item() < losses[0].item(), (
             f"run_ad_recon (no pose) did not reduce loss: "
             f"{losses[0].item():.4f} -> {losses[-1].item():.4f}"
@@ -1376,13 +1371,14 @@ class TestRunAdRecon:
         perturbed_angles_cpu = perturbed_angles.cpu()
         error_before = perturbation.abs().max().item()
 
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=300, lr_volume=0.05),
+            pose=ft.PoseRefinementConfig(refine_pose=True, lr_angles=1e-2),
+            constraints=ft.ConstraintConfig(positivity=True),
+        )
         result = ft.run_ad_recon(
             sino, perturbed_angles_cpu,
-            n_iter=300,
-            refine_pose=True,
-            lr_volume=0.05,
-            lr_angles=1e-2,
-            positivity=True,
+            config=cfg,
             return_pose=True,
         )
         # result = (volume, euler_or_None, shifts_or_None)
@@ -1413,16 +1409,19 @@ class TestRunAdRecon:
         wrong_proj = ft.RotmatProjector(
             (1, N, N), n_angles=n_angles, device=DEVICE, N_det=N,
         )
+        cfg_no_pose = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
         with pytest.raises(ValueError, match="ParallelProjector"):
-            ft.run_ad_recon(sino, angles, refine_pose=False, projector=wrong_proj,
-                            n_iter=1)
+            ft.run_ad_recon(sino, angles, projector=wrong_proj, config=cfg_no_pose)
 
         parallel_proj = ft.ParallelProjector(
             (1, N, N), angles, device=DEVICE, N_det=N,
         )
+        cfg_pose = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=1),
+            pose=ft.PoseRefinementConfig(refine_pose=True),
+        )
         with pytest.raises(ValueError, match="RotmatProjector"):
-            ft.run_ad_recon(sino, angles, refine_pose=True, projector=parallel_proj,
-                            n_iter=1)
+            ft.run_ad_recon(sino, angles, projector=parallel_proj, config=cfg_pose)
 
     def test_return_loss_shape(self):
         """return_loss=True: loss history length equals n_iter."""
@@ -1432,7 +1431,8 @@ class TestRunAdRecon:
         sino = ft.forward_project(vol, angles)
 
         n_iter = 50
-        _, losses = ft.run_ad_recon(sino, angles, n_iter=n_iter, return_loss=True)
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=n_iter))
+        _, losses = ft.run_ad_recon(sino, angles, config=cfg, return_loss=True)
         assert losses.shape == (n_iter,), (
             f"Expected loss history of length {n_iter}, got {losses.shape}"
         )
