@@ -2260,17 +2260,37 @@ def run_mbir(
     volume : [Ny, Nz, Nx] float32 tensor.
     If `return_history=True`, also returns (d_offsets, sigma, history).
     """
+    if multires_levels < 1:
+        raise ValueError("multires_levels must be >= 1")
     if sinogram.dim() != 3:
         raise ValueError("sinogram must be [n_angles, Ny, N_det]")
+    if angles_deg.dim() != 1:
+        raise ValueError("angles_deg must be [n_angles]")
     if sinogram.dtype != torch.float32:
         sinogram = sinogram.float()
     if angles_deg.dtype != torch.float32:
         angles_deg = angles_deg.float()
 
     n_angles, Ny, N_det = sinogram.shape
+    if angles_deg.numel() != n_angles:
+        raise ValueError(
+            f"sinogram has {n_angles} projections but angles_deg has "
+            f"{angles_deg.numel()} entries"
+        )
     if Nz < 0:
         Nz = N_det
     Nx = N_det  # standard parallel-beam convention
+
+    if lambdas is not None:
+        if lambdas.dim() != 3 or tuple(lambdas.shape) != tuple(sinogram.shape):
+            raise ValueError(
+                "lambdas must match sinogram shape "
+                f"[n_angles, Ny, N_det], got {tuple(lambdas.shape)}"
+            )
+        if lambdas.dtype != torch.float32:
+            lambdas = lambdas.float()
+        if lambdas.device != sinogram.device:
+            lambdas = lambdas.to(sinogram.device)
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())
@@ -2281,6 +2301,17 @@ def run_mbir(
 
     # Multires schedule: factors = [2**(L-1), ..., 2, 1] for L levels.
     factors = [2 ** (multires_levels - 1 - lvl) for lvl in range(multires_levels)]
+    coarse_factor = factors[0]
+    if (
+        N_det % coarse_factor != 0
+        or Nx % coarse_factor != 0
+        or Nz % coarse_factor != 0
+    ):
+        raise ValueError(
+            "run_mbir multires_levels requires detector and reconstruction "
+            f"dims divisible by {coarse_factor}; got N_det={N_det}, "
+            f"Nx={Nx}, Nz={Nz}"
+        )
     if sigma_f_per_scale is None:
         sigma_f_per_scale = [sigma_f * float(f) for f in factors]
     elif len(sigma_f_per_scale) != multires_levels:

@@ -903,6 +903,26 @@ def test_mbir_cpu_runs():
     assert rel < 0.30, f"CPU MBIR rel error {rel:.4f} > 0.30"
 
 
+def test_mbir_multires_requires_divisible_dims():
+    """Coarse-to-fine MBIR downsamples by powers of two and then upsamples
+    between levels. Non-divisible detector/volume sizes would desync scale
+    shapes and can cause invalid kernel indexing, so the API must reject
+    them up front."""
+    n_angles, Ny, N_det = 8, 4, 17  # not divisible by 2
+    sino = torch.zeros(n_angles, Ny, N_det, dtype=torch.float32)
+    angles = make_angles(n_angles)
+    with pytest.raises(ValueError, match="multires_levels requires"):
+        ft.run_mbir(
+            sino,
+            angles,
+            multires_levels=2,
+            outer_iters=1,
+            estimate_offset=False,
+            estimate_variance=False,
+            sigma_init=1.0,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA GPU")
 def test_mbir_cpu_cuda_consistency():
     """CPU and CUDA paths use identical math and an identical (seeded)
