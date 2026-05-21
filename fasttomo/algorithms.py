@@ -1065,10 +1065,32 @@ def run_ad_recon(
     # ConstraintConfig.mask: bool True → build inside; Tensor → use as-is;
     # None/False → no mask.
     _cmask: torch.Tensor | None = None
+    _cmask_mul: torch.Tensor | None = None
     if isinstance(constraints_cfg.mask, torch.Tensor):
-        _cmask = constraints_cfg.mask
+        _cmask = constraints_cfg.mask.to(device=device, dtype=volume.dtype)
     elif constraints_cfg.mask is True:
         _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
+    if _cmask is not None:
+        if _cmask.ndim == 2:
+            if _cmask.shape != (Nz, Nx):
+                raise ValueError(
+                    "ConstraintConfig.mask must have shape (Nz, Nx) when 2-D; "
+                    f"got {_cmask.shape} for (Nz, Nx)=({Nz}, {Nx})."
+                )
+            _cmask_mul = _cmask.unsqueeze(0)
+        elif _cmask.ndim == 3:
+            if _cmask.shape[1:] != (Nz, Nx) or _cmask.shape[0] not in (1, Ny):
+                raise ValueError(
+                    "ConstraintConfig.mask must have shape (1, Nz, Nx) or "
+                    "(Ny, Nz, Nx) when 3-D; "
+                    f"got {_cmask.shape} for Ny={Ny}, Nz={Nz}, Nx={Nx}."
+                )
+            _cmask_mul = _cmask
+        else:
+            raise ValueError(
+                "ConstraintConfig.mask must be 2-D or 3-D when given as a tensor; "
+                f"got {_cmask.ndim}-D."
+            )
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
@@ -1139,8 +1161,8 @@ def run_ad_recon(
         with torch.no_grad():
             if constraints_cfg.positivity:
                 volume.clamp_(min=0.0)
-            if _cmask is not None:
-                volume.mul_(_cmask.unsqueeze(0))
+            if _cmask_mul is not None:
+                volume.mul_(_cmask_mul)
             tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
                 tilt_angle_opt[:, 1].clamp_(

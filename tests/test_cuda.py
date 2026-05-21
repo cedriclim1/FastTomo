@@ -1338,6 +1338,21 @@ class TestRunAdRecon:
             f"{losses[0].item():.4f} -> {losses[-1].item():.4f}"
         )
 
+    def test_tensor_mask_with_leading_dim_is_accepted(self):
+        """A [1, Nz, Nx] tensor mask must work in run_ad_recon."""
+        N = 16
+        angles = make_angles(10)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+        mask = ft.cylindrical_mask(N, N, device=DEVICE).unsqueeze(0)
+
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5, lr_volume=0.05),
+            constraints=ft.ConstraintConfig(mask=mask),
+        )
+        rec = ft.run_ad_recon(sino, angles, config=cfg)
+        assert rec.shape == (1, N, N)
+
     def test_with_pose_recovers_perturbed_euler(self):
         """With-pose AD: angles are updated from a perturbed starting point.
 
