@@ -858,5 +858,83 @@ class TestRunSart:
             ft.run_sart(sino, angles, n_iter=1, Nz=N, volume=warm)
 
 
+# ── MBIR CPU reference + CPU/CUDA cross-consistency ──────────────────────
+#
+# The CPU MBIR reference exists for two reasons:
+#   1. validation when no GPU is present
+#   2. a numerically-comparable target for the CUDA kernel
+#
+# `test_mbir_cpu_runs` exercises the C kernel and ensures the algorithm
+# converges on the CPU path. The cross-consistency test below requires
+# CUDA and is skipped otherwise.
+
+
+def _mbir_sino_cpu(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Tensor:
+    """CPU voxel-driven bilinear FP (the same model used inside CPU ICD)."""
+    import math
+    import fasttomo._core as _core
+    Ny, Nz, Nx = phantom.shape
+    N_det = Nx
+    angles_rad = (angles_deg.float() * (math.pi / 180.0)).numpy().copy()
+    sino_np = _core.mbir_forward_project_cpu(
+        phantom.contiguous().numpy(),
+        angles_rad,
+        N_det,
+        num_threads=1,
+    )
+    return torch.from_numpy(sino_np)
+
+
+def test_mbir_cpu_runs():
+    """CPU MBIR end-to-end on a tiny phantom; assert convergence."""
+    Ny = Nz = Nx = 16
+    n_angles = 24
+    phantom = torch.zeros(Ny, Nz, Nx)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    angles = make_angles(n_angles, max_deg=60.0)
+    sino = _mbir_sino_cpu(phantom, angles)
+    vol = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=30, multires_levels=1,
+    )
+    rel = (vol - phantom).norm().item() / phantom.norm().item()
+    assert rel < 0.30, f"CPU MBIR rel error {rel:.4f} > 0.30"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA GPU")
+def test_mbir_cpu_cuda_consistency():
+    """CPU and CUDA paths use identical math and an identical (seeded)
+    permutation. Differences come from float summation order across the
+    GPU's parallel reductions — bounded but non-zero. We assert max
+    absolute deviation < 1e-2 and mean < 1e-3 on a small problem after
+    a modest number of iterations. """
+    Ny = Nz = Nx = 12
+    n_angles = 16
+    phantom = torch.zeros(Ny, Nz, Nx)
+    phantom[3:9, 3:9, 3:9] = 1.0
+    angles = make_angles(n_angles, max_deg=60.0)
+    sino_cpu = _mbir_sino_cpu(phantom, angles)
+    sino_cuda = sino_cpu.cuda()
+
+    kw = dict(
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        sigma_init=0.1,
+        outer_iters=20, multires_levels=1, seed=7,
+    )
+    v_cpu = ft.run_mbir(sino_cpu, angles, **kw)
+    v_cu  = ft.run_mbir(sino_cuda, angles.cuda(), **kw).cpu()
+
+    diff = (v_cu - v_cpu).abs()
+    assert diff.max().item() < 1e-2, (
+        f"CPU/CUDA max diff {diff.max().item():.5f} > 1e-2"
+    )
+    assert diff.mean().item() < 1e-3, (
+        f"CPU/CUDA mean diff {diff.mean().item():.6f} > 1e-3"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

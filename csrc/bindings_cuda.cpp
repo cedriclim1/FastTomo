@@ -338,6 +338,52 @@ static void py_genfire_gridding_2d_cuda(
     );
 }
 
+/* ── MBIR (CUDA) bindings ─────────────────────────────────────────────── */
+
+static void py_mbir_forward_project_cuda(
+    long vol_ptr, long sino_ptr,
+    long cos_ptr, long sin_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    long stream_ptr
+) {
+    mbir_forward_project_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(sino_ptr),
+        reinterpret_cast<const float *>(cos_ptr),
+        reinterpret_cast<const float *>(sin_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_mbir_icd_sweep_cuda(
+    long vol_ptr, long e_sino_ptr,
+    long vol_snapshot_ptr,
+    long d_offsets_ptr,        /* 0 → nullptr */
+    long lambdas_ptr,          /* 0 → nullptr */
+    long perm_ptr,
+    long cos_ptr, long sin_ptr,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
+    float huber_T, float huber_delta, float sigma,
+    long stream_ptr
+) {
+    mbir_icd_sweep_cuda(
+        reinterpret_cast<float *>(vol_ptr),
+        reinterpret_cast<float *>(e_sino_ptr),
+        reinterpret_cast<const float *>(vol_snapshot_ptr),
+        reinterpret_cast<const float *>(d_offsets_ptr),
+        reinterpret_cast<const float *>(lambdas_ptr),
+        reinterpret_cast<const int *>(perm_ptr),
+        reinterpret_cast<const float *>(cos_ptr),
+        reinterpret_cast<const float *>(sin_ptr),
+        Ny, Nz, Nx, n_angles, N_det,
+        qggmrf_p, qggmrf_q, qggmrf_c, sigma_f,
+        huber_T, huber_delta, sigma,
+        to_stream(stream_ptr)
+    );
+}
+
 void register_cuda(py::module_ &m) {
     m.def("forward_project_cuda", &py_forward_project_cuda,
           "Forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
@@ -516,6 +562,35 @@ void register_cuda(py::module_ &m) {
           py::arg("grid_real_ptr"), py::arg("grid_imag_ptr"), py::arg("weight_ptr"),
           py::arg("bigN"), py::arg("Ny"), py::arg("n_angles"),
           py::arg("cutoff_dist") = 0.5f,
+          py::arg("stream_ptr") = 0L);
+
+    m.def("mbir_forward_project_cuda", &py_mbir_forward_project_cuda,
+          "MBIR voxel-driven bilinear scatter forward projection (CUDA). "
+          "Distinct from forward_project_cuda (ray-marching). sino_ptr is "
+          "zeroed by the wrapper before launch.",
+          py::arg("vol_ptr"), py::arg("sino_ptr"),
+          py::arg("cos_ptr"), py::arg("sin_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("mbir_icd_sweep_cuda", &py_mbir_icd_sweep_cuda,
+          "One outer iteration of MBIR-AM-PE (CUDA). In-place mutates "
+          "volume and e_sino. Pass d_offsets_ptr=0 / lambdas_ptr=0 to "
+          "disable those inputs (treated as nullptr). Per-tilt offset d_k "
+          "and noise variance σ are updated in PyTorch by the Python "
+          "wrapper using the post-call e_sino.",
+          py::arg("vol_ptr"), py::arg("e_sino_ptr"),
+          py::arg("vol_snapshot_ptr"),
+          py::arg("d_offsets_ptr") = 0L,
+          py::arg("lambdas_ptr") = 0L,
+          py::arg("perm_ptr"),
+          py::arg("cos_ptr"), py::arg("sin_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"),
+          py::arg("qggmrf_p"), py::arg("qggmrf_q"),
+          py::arg("qggmrf_c"), py::arg("sigma_f"),
+          py::arg("huber_T"), py::arg("huber_delta"), py::arg("sigma"),
           py::arg("stream_ptr") = 0L);
 
     m.attr("cuda_available") = true;
