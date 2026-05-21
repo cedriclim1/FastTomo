@@ -140,6 +140,58 @@ void genfire_gridding_2d_cpu(
     float cutoff_dist
 );
 
+/*
+ * MBIR voxel-driven bilinear forward projection (CPU).
+ *
+ * Distinct from `forward_project_cpu` — this uses the voxel-driven scatter
+ * model A_MBIR that matches the column-A used in `mbir_icd_sweep_cpu`.
+ * For voxel (ix, iz, iy) at angle θ_k the detector coord is
+ *   u = (ix - half_x)·cos θ_k - (iz - half_z)·sin θ_k + half_det,
+ * and the voxel scatters to detector pixels (floor u, floor u + 1) at iy
+ * with bilinear weights (1-wu, wu). Sinogram is overwritten, not
+ * accumulated. */
+void mbir_forward_project_cpu(
+    const float *volume,
+    float       *sinogram,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+/*
+ * One outer iteration of MBIR-AM-PE (CPU reference).
+ *
+ *   volume, e_sino, d_offsets, sigma_out : in-place outputs
+ *   volume_snapshot                      : read-only snapshot for qGGMRF
+ *   perm[Ny, Nz*Nx]                      : per-Y-slice voxel permutation
+ *   lambdas[n_angles, Ny, N_det]         : per-pixel Λ data weights; NULL → 1
+ *
+ * Y-slices are parallelized via OpenMP (cross-slice qGGMRF reads use
+ * the snapshot, so slices are independent — "Jacobi-loose" semantics
+ * matching the paper). Within a slice, the sweep is sequential
+ * Gauss-Seidel ICD via the incremental error sinogram.
+ *
+ * Set estimate_offset=0 / estimate_variance=0 (and pass NULL for
+ * d_offsets / sigma_out) to disable those updates. */
+int mbir_icd_sweep_cpu(
+    float       *volume,
+    float       *e_sino,
+    float       *d_offsets,
+    float       *sigma_out,
+    const float *volume_snapshot,
+    const int   *perm,
+    const float *cos_a,
+    const float *sin_a,
+    const float *lambdas,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
+    float huber_T, float huber_delta, float sigma, float sigma_min,
+    int estimate_offset, int estimate_variance,
+    int num_threads
+);
+
 #ifdef __cplusplus
 }
 #endif

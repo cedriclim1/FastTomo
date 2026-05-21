@@ -74,6 +74,7 @@ from fasttomo.algorithms import (
     run_fista_tv,
     run_grad_descent,
     run_ad_recon,
+    run_mbir,
     refine_angles,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
@@ -103,6 +104,7 @@ __all__ = [
     "run_fista_tv",
     "run_grad_descent",
     "run_ad_recon",
+    "run_mbir",
     "refine_angles",
     "ParallelProjector",
     "RotmatProjector",

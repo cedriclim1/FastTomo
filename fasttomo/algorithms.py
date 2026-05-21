@@ -2025,3 +2025,428 @@ def run_grad_descent(
 
     out = volume.detach()
     return _finish_iters(out, losses, return_loss)
+
+
+# ── MBIR ───────────────────────────────────────────────────────────────────
+# Classical Model-Based Iterative Reconstruction for single-axis parallel-beam
+# tomography. Reference: Venkatakrishnan et al. 2015 (IEEE TCI 1(1)). The
+# kernels are in csrc/{cuda,cpu}/mbir_icd.{cu,c}; see
+# fasttomo-wiki/wiki/algorithms/mbir.md for the surrogate-MM derivation.
+
+
+@dataclass
+class _MbirState:
+    """One MBIR optimization level's running state.
+
+    Maintained by `_run_mbir_single_scale` and passed across multires
+    levels so the per-tilt offset survives upsampling. (σ is re-initialized
+    per scale; see the docstring of `run_mbir` for why.)
+    """
+    volume: torch.Tensor          # [Ny, Nz, Nx] float32
+    d_offsets: torch.Tensor       # [n_angles] float32
+    sigma: float
+    e_sino: torch.Tensor          # [n_angles, Ny, N_det] float32 — residual
+
+
+def _huber_surr_weight(r_abs: torch.Tensor, T: float, delta: float) -> torch.Tensor:
+    """Per-element Huber surrogate weight matching `huber_surr_weight_dev` in
+    the CUDA kernel and `huber_surr_weight` in the CPU reference. When
+    T = +inf the weight collapses to ones (conventional MBIR, no anomaly
+    suppression)."""
+    if not math.isfinite(T):
+        return torch.ones_like(r_abs)
+    inside = r_abs < T
+    outside_w = delta * T / r_abs.clamp(min=1e-30)
+    return torch.where(inside, torch.ones_like(r_abs), outside_w)
+
+
+def _mbir_update_offset_variance(
+    e_sino: torch.Tensor,
+    d_offsets: torch.Tensor,
+    sigma: float,
+    sigma_min: float,
+    T: float,
+    delta: float,
+    lambdas: torch.Tensor | None,
+    estimate_offset: bool,
+    estimate_variance: bool,
+) -> tuple[torch.Tensor, float]:
+    """Closed-form updates for d_k and σ under the quadratic surrogate.
+
+    The host-side counterpart of the offset/variance updates that the CPU
+    kernel does internally. For the CUDA path the kernel only runs the ICD
+    sweep, so the Python wrapper computes d_k / σ here on the live e_sino.
+
+    Returns (d_offsets_new, sigma_new) and mutates e_sino in place to
+    maintain the invariant e = g - A·f - d.
+    """
+    n_angles, Ny, N_det = e_sino.shape
+    if lambdas is None:
+        r = e_sino / sigma
+    else:
+        r = e_sino * lambdas.sqrt() / sigma
+    r_abs = r.abs()
+    bw = _huber_surr_weight(r_abs, T, delta)
+    lam = lambdas if lambdas is not None else torch.ones_like(e_sino)
+
+    if estimate_offset:
+        num = (bw * lam * e_sino).sum(dim=(1, 2))
+        den = (bw * lam).sum(dim=(1, 2)).clamp(min=1e-30)
+        delta_d = num / den
+        d_offsets = d_offsets + delta_d
+        e_sino.sub_(delta_d.view(n_angles, 1, 1))
+        # recompute weights for the variance update on the updated residual
+        if estimate_variance:
+            if lambdas is None:
+                r = e_sino / sigma
+            else:
+                r = e_sino * lambdas.sqrt() / sigma
+            r_abs = r.abs()
+            bw = _huber_surr_weight(r_abs, T, delta)
+
+    sigma_new = sigma
+    if estimate_variance:
+        total = n_angles * Ny * N_det
+        s2 = (bw * lam * e_sino * e_sino).sum() / total
+        sigma_new = max(sigma_min, float(s2.clamp(min=0.0).sqrt().item()))
+
+    return d_offsets, sigma_new
+
+
+def _generate_permutation(Ny: int, Nvox: int, rng: np.random.Generator) -> np.ndarray:
+    """Per-Y-slice independent random permutation, returned as int32
+    [Ny, Nvox]. Distinct shuffles across slices match the paper's
+    randomized ICD ordering. Reproducible for a given seeded rng."""
+    perm = np.empty((Ny, Nvox), dtype=np.int32)
+    for iy in range(Ny):
+        perm[iy] = rng.permutation(Nvox).astype(np.int32, copy=False)
+    return perm
+
+
+def _mbir_initial_residual(
+    volume: torch.Tensor,
+    sinogram: torch.Tensor,
+    cos_a: torch.Tensor,
+    sin_a: torch.Tensor,
+    angles_rad: torch.Tensor,
+) -> torch.Tensor:
+    """e = g - A_MBIR · f at the start of an MBIR level. Uses the voxel-
+    driven scatter FP that matches the column-A model in the ICD kernel.
+    Falls back to `e = g` when `volume` is exactly zero (a common warm-start
+    case) to skip a kernel launch."""
+    if volume.abs().sum().item() == 0.0:
+        return sinogram.clone()
+    Ny, Nz, Nx = volume.shape
+    n_angles = sinogram.shape[0]
+    N_det = sinogram.shape[2]
+    Af = torch.empty_like(sinogram)
+    if volume.is_cuda:
+        stream_ptr = torch.cuda.current_stream(volume.device).cuda_stream
+        _core.mbir_forward_project_cuda(
+            volume.contiguous().data_ptr(),
+            Af.data_ptr(),
+            cos_a.data_ptr(), sin_a.data_ptr(),
+            Ny, Nz, Nx, n_angles, N_det,
+            stream_ptr,
+        )
+    else:
+        Af_np = _core.mbir_forward_project_cpu(
+            volume.contiguous().cpu().numpy(),
+            angles_rad.cpu().numpy(),
+            N_det,
+            num_threads=4,
+        )
+        Af = torch.from_numpy(Af_np).to(volume.device)
+    return sinogram - Af
+
+
+def _run_mbir_single_scale(
+    sinogram: torch.Tensor,       # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,     # [n_angles]
+    *,
+    sigma_f: float,
+    qggmrf_p: float,
+    qggmrf_q: float,
+    qggmrf_c: float,
+    huber_T: float,
+    huber_delta: float,
+    sigma: float,
+    sigma_min: float,
+    estimate_offset: bool,
+    estimate_variance: bool,
+    outer_iters: int,
+    convergence_tol: float,
+    seed: int,
+    Nz: int,
+    Nx: int,
+    init_state: _MbirState | None,
+    lambdas: torch.Tensor | None,
+    return_history: bool,
+) -> tuple[_MbirState, list[float]]:
+    """Inner loop for one resolution scale. The public `run_mbir` wraps
+    this in a coarse-to-fine multiresolution loop.
+
+    Convergence is measured by the relative L2 change in the volume
+    between successive outer iterations. The check uses every-N-th voxel
+    sampling to keep the comparison cheap relative to the kernel."""
+    device = sinogram.device
+    n_angles, Ny, N_det = sinogram.shape
+
+    angles_rad = (angles_deg.float().to(device) * (math.pi / 180.0)).contiguous()
+    cos_a = torch.cos(angles_rad).contiguous()
+    sin_a = torch.sin(angles_rad).contiguous()
+
+    if init_state is None:
+        volume = torch.zeros((Ny, Nz, Nx), device=device, dtype=torch.float32)
+        d_offsets = torch.zeros(n_angles, device=device, dtype=torch.float32)
+    else:
+        volume = init_state.volume.clone().contiguous()
+        d_offsets = init_state.d_offsets.clone().contiguous()
+
+    # Residual e = g - A·f - d. d is rolled into A·f via the offset
+    # term (we maintain e ≡ g - A·f - d, so initial e adjusts for both).
+    e_sino = _mbir_initial_residual(volume, sinogram, cos_a, sin_a, angles_rad).contiguous()
+    if d_offsets.abs().sum().item() > 0.0:
+        e_sino.sub_(d_offsets.view(n_angles, 1, 1))
+
+    rng = np.random.default_rng(seed)
+    Nvox = Nz * Nx
+    history: list[float] = []
+    sigma_cur = float(sigma)
+
+    for it in range(outer_iters):
+        vol_snap = volume.clone().contiguous()
+        perm = _generate_permutation(Ny, Nvox, rng)
+
+        if device.type == "cuda":
+            perm_dev = torch.from_numpy(perm).to(device).contiguous()
+            stream_ptr = torch.cuda.current_stream(device).cuda_stream
+            _core.mbir_icd_sweep_cuda(
+                vol_ptr=volume.data_ptr(),
+                e_sino_ptr=e_sino.data_ptr(),
+                vol_snapshot_ptr=vol_snap.data_ptr(),
+                d_offsets_ptr=d_offsets.data_ptr() if estimate_offset else 0,
+                lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
+                perm_ptr=perm_dev.data_ptr(),
+                cos_ptr=cos_a.data_ptr(),
+                sin_ptr=sin_a.data_ptr(),
+                Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
+                qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q,
+                qggmrf_c=qggmrf_c, sigma_f=sigma_f,
+                huber_T=huber_T, huber_delta=huber_delta,
+                sigma=sigma_cur,
+                stream_ptr=stream_ptr,
+            )
+            # Host-side closed-form updates for d_k and σ.
+            d_offsets, sigma_cur = _mbir_update_offset_variance(
+                e_sino, d_offsets, sigma_cur, sigma_min,
+                huber_T, huber_delta, lambdas,
+                estimate_offset, estimate_variance,
+            )
+        else:
+            # CPU path: single C call does ICD + (optional) offset + (optional) variance.
+            volume_np = volume.numpy()
+            e_np = e_sino.numpy()
+            d_np = d_offsets.numpy() if estimate_offset else None
+            vol_snap_np = vol_snap.numpy()
+            lam_np = lambdas.numpy() if lambdas is not None else None
+            sigma_cur = float(_core.mbir_icd_sweep_cpu(
+                volume_np, e_np, d_np, lam_np,
+                vol_snap_np, perm,
+                angles_rad.numpy(),
+                qggmrf_p, qggmrf_q, qggmrf_c, sigma_f,
+                huber_T, huber_delta,
+                sigma_cur, sigma_min,
+                estimate_offset, estimate_variance,
+                num_threads=4,
+            ))
+
+        # Convergence check: relative L2 change on a strided sample so it
+        # scales as O(Nvox / 8). Cheap vs the per-iter compute.
+        with torch.no_grad():
+            stride = 8
+            f_new = volume.flatten()[::stride]
+            f_old = vol_snap.flatten()[::stride]
+            denom = f_old.norm().clamp(min=1e-12)
+            rel_change = float((f_new - f_old).norm() / denom)
+        if return_history:
+            history.append(rel_change)
+        if rel_change < convergence_tol:
+            break
+
+    state = _MbirState(volume=volume, d_offsets=d_offsets, sigma=sigma_cur, e_sino=e_sino)
+    return state, history
+
+
+def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
+    """Avg-pool the sinogram in the detector axis only. Y (tilt-axis row)
+    is preserved because each Y-slice is an independent MBIR sub-problem
+    under single-axis parallel-beam geometry."""
+    if factor == 1:
+        return sino
+    K, Y, M = sino.shape
+    s = sino.reshape(K * Y, 1, M)
+    s = F.avg_pool1d(s, kernel_size=factor, stride=factor)
+    return s.reshape(K, Y, s.shape[-1])
+
+
+def _upsample_volume_zx(vol: torch.Tensor, factor: int) -> torch.Tensor:
+    """Trilinear-style interp upsample in (Z, X) only. Y is preserved."""
+    if factor == 1:
+        return vol
+    Ny, Nz, Nx = vol.shape
+    v = vol.unsqueeze(0).unsqueeze(0)              # [1,1,Ny,Nz,Nx]
+    v = F.interpolate(v, size=(Ny, Nz * factor, Nx * factor),
+                      mode="trilinear", align_corners=False)
+    return v.squeeze(0).squeeze(0).contiguous()
+
+
+def run_mbir(
+    sinogram: torch.Tensor,           # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,         # [n_angles] degrees
+    *,
+    Nz: int = -1,
+    sigma_f: float = 1.0,
+    qggmrf_p: float = 1.2,
+    qggmrf_q: float = 2.0,
+    qggmrf_c: float = 1e-3,
+    huber_T: float = float("inf"),
+    huber_delta: float = 0.5,
+    estimate_offset: bool = True,
+    estimate_variance: bool = True,
+    sigma_init: float | None = None,
+    sigma_min: float | None = None,
+    multires_levels: int = 1,
+    outer_iters: int = 100,
+    convergence_tol: float = 1e-4,
+    seed: int = 0,
+    lambdas: torch.Tensor | None = None,
+    sigma_f_per_scale: list[float] | None = None,
+    return_history: bool = False,
+) -> torch.Tensor | tuple:
+    """Classical MBIR (Model-Based Iterative Reconstruction) for single-axis
+    parallel-beam tomography.
+
+    Implements MBIR-AM-PE (Venkatakrishnan et al. 2015): joint MAP
+    reconstruction of the volume `f`, per-tilt offset `d_k`, and noise
+    variance `σ` under a generalized-Huber likelihood + qGGMRF prior.
+
+    Parameters
+    ----------
+    sinogram : [n_angles, Ny, N_det] float32 tensor
+    angles_deg : [n_angles] float32 tensor, degrees
+    Nz : reconstruction depth (default = N_det)
+    sigma_f, qggmrf_p, qggmrf_q, qggmrf_c : qGGMRF prior parameters.
+        Defaults `p=1.2, q=2.0, c=1e-3` follow the paper. σ_f sets the
+        prior strength.
+    huber_T : threshold for the generalized Huber likelihood. `inf`
+        (default) recovers conventional MBIR (no anomaly modeling).
+        `T=3` is the paper's recommendation for BF-TEM with Bragg scatter.
+    huber_delta : slope of the Huber tail. `δ=0.5` is the recommendation.
+    estimate_offset, estimate_variance : enable closed-form updates of
+        `d_k` and `σ` between outer iterations (MBIR-AM → MBIR-AM-PE).
+    sigma_init : initial noise std. Defaults to the std of the sinogram.
+    sigma_min : lower clamp on σ to prevent collapse (default
+        `sigma_init * 1e-3`).
+    multires_levels : coarse-to-fine levels. 1 = single-scale (default).
+    outer_iters : maximum outer iterations per scale.
+    convergence_tol : stop when the relative L2 change in the volume
+        between iterations falls below this.
+    seed : RNG seed for the per-Y-slice voxel permutation.
+    lambdas : optional [n_angles, Ny, N_det] per-pixel data weights (Λ).
+        `None` → uniform 1 (standard Poisson approximation).
+    sigma_f_per_scale : optional list of σ_f overrides per multires level,
+        coarse → fine. If None, `σ_f * 2**level` is used (prior weight
+        scales with voxel size).
+    return_history : if True, also returns the per-iteration convergence
+        history (relative L2 change).
+
+    Returns
+    -------
+    volume : [Ny, Nz, Nx] float32 tensor.
+    If `return_history=True`, also returns (d_offsets, sigma, history).
+    """
+    if sinogram.dim() != 3:
+        raise ValueError("sinogram must be [n_angles, Ny, N_det]")
+    if sinogram.dtype != torch.float32:
+        sinogram = sinogram.float()
+    if angles_deg.dtype != torch.float32:
+        angles_deg = angles_deg.float()
+
+    n_angles, Ny, N_det = sinogram.shape
+    if Nz < 0:
+        Nz = N_det
+    Nx = N_det  # standard parallel-beam convention
+
+    if sigma_init is None:
+        sigma_init = float(sinogram.std().item())
+        if sigma_init < 1e-6:
+            sigma_init = 1.0
+    if sigma_min is None:
+        sigma_min = sigma_init * 1e-3
+
+    # Multires schedule: factors = [2**(L-1), ..., 2, 1] for L levels.
+    factors = [2 ** (multires_levels - 1 - lvl) for lvl in range(multires_levels)]
+    if sigma_f_per_scale is None:
+        sigma_f_per_scale = [sigma_f * float(f) for f in factors]
+    elif len(sigma_f_per_scale) != multires_levels:
+        raise ValueError(
+            "sigma_f_per_scale must have length multires_levels"
+        )
+
+    history_all: list[list[float]] = []
+    state: _MbirState | None = None
+
+    for lvl, f in enumerate(factors):
+        sino_lvl = _downsample_sino_det(sinogram, f)
+        # Scale lambdas the same way if provided.
+        if lambdas is not None and f > 1:
+            lam_lvl = _downsample_sino_det(lambdas, f)
+        else:
+            lam_lvl = lambdas
+
+        Nz_lvl = max(Nz // f, 1)
+        Nx_lvl = max(Nx // f, 1)
+
+        # First iteration at the coarsest scale: force T=inf so the
+        # anomaly modelling is disabled until the next finer scale. This
+        # matches the paper's multires + AM-PE bootstrap.
+        if multires_levels > 1 and lvl == 0:
+            level_T = float("inf")
+        else:
+            level_T = huber_T
+
+        # Carry d_offsets across scales unchanged; re-initialize σ from
+        # the current sinogram's std (intensity statistics shift with
+        # the detector binning).
+        if state is None:
+            level_sigma = sigma_init
+        else:
+            level_sigma = max(sigma_min, float(sino_lvl.std().item()))
+            state.sigma = level_sigma
+
+        state, hist = _run_mbir_single_scale(
+            sino_lvl, angles_deg,
+            sigma_f=sigma_f_per_scale[lvl],
+            qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
+            huber_T=level_T, huber_delta=huber_delta,
+            sigma=level_sigma, sigma_min=sigma_min,
+            estimate_offset=estimate_offset,
+            estimate_variance=estimate_variance,
+            outer_iters=outer_iters,
+            convergence_tol=convergence_tol,
+            seed=seed + lvl,
+            Nz=Nz_lvl, Nx=Nx_lvl,
+            init_state=state,
+            lambdas=lam_lvl,
+            return_history=return_history,
+        )
+        history_all.append(hist)
+
+        # Upsample volume to the next finer scale (factor 2).
+        if lvl + 1 < len(factors):
+            state.volume = _upsample_volume_zx(state.volume, 2)
+
+    if return_history:
+        return state.volume, state.d_offsets, state.sigma, history_all
+    return state.volume

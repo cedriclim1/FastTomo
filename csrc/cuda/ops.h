@@ -239,4 +239,50 @@ void genfire_gridding_2d_cuda(
     cudaStream_t stream
 );
 
+/*
+ * MBIR voxel-driven bilinear scatter forward projection (CUDA). Distinct
+ * from forward_project_cuda's ray-marching FP — this matches the column-A
+ * model used by mbir_icd_sweep_cuda. Output sinogram is zeroed by the
+ * wrapper before the kernel launches (atomicAdd scatter).
+ */
+void mbir_forward_project_cuda(
+    const float *d_volume,
+    float       *d_sinogram,
+    const float *d_cos_a,
+    const float *d_sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    cudaStream_t stream
+);
+
+/*
+ * One outer iteration of MBIR-AM-PE (CUDA). In-place mutates d_volume and
+ * d_e_sino. Per-tilt offset d_k and noise variance σ are updated host-side
+ * in PyTorch by the Python wrapper — the kernel only does the ICD sweep.
+ *
+ *   d_volume_snapshot : start-of-outer-iter copy of volume, bound to a
+ *                       tex3D for the qGGMRF 26-neighbour reads. Caller
+ *                       guarantees this is a valid snapshot.
+ *   d_d_offsets       : [n_angles] read-only; passed through but the
+ *                       kernel relies on the host's e = g - Af - d
+ *                       invariant rather than re-reading d_k.
+ *   d_lambdas         : per-pixel data weights or nullptr → uniform 1.
+ *   d_perm            : [Ny, Nz*Nx] int32 host-generated permutation.
+ *   sigma             : current noise std for the Huber surrogate.
+ */
+void mbir_icd_sweep_cuda(
+    float       *d_volume,
+    float       *d_e_sino,
+    const float *d_volume_snapshot,
+    const float *d_d_offsets,
+    const float *d_lambdas,
+    const int   *d_perm,
+    const float *d_cos_a,
+    const float *d_sin_a,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
+    float huber_T, float huber_delta, float sigma,
+    cudaStream_t stream
+);
+
 #endif /* FASTTOMO_CUDA_OPS_H */

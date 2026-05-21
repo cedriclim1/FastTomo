@@ -171,6 +171,7 @@ set(CORE_SOURCES
     csrc/cpu/projection_2d.c
     csrc/cpu/projection_3d.c
     csrc/cpu/genfire.c
+    csrc/cpu/mbir_icd.c
 )
 
 if(FASTTOMO_CUDA)
@@ -182,6 +183,7 @@ if(FASTTOMO_CUDA)
         csrc/cuda/grad_angle.cu
         csrc/cuda/tv_loss.cu
         csrc/cuda/texture_cache.cu
+        csrc/cuda/mbir_icd.cu
     )
 endif()
 

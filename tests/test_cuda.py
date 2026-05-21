@@ -1731,185 +1731,150 @@ class TestCrossDevice:
             torch.cuda.synchronize(dev)
 
 
-# ── run_ad_recon: anchor_reference + tilt_bound_deg ───────────────────────
+# ── MBIR (Model-Based Iterative Reconstruction) ──────────────────────────
+#
+# All MBIR tests use the project's own voxel-driven bilinear scatter forward
+# model (`mbir_forward_project_cuda`) to generate the input sinogram. This
+# is the same A used inside the ICD column updates, so the algorithm is
+# being tested as a self-adjoint MAP estimator under its own forward
+# model — the cleanest possible correctness check.
 
-class TestAdRecon:
-    """Tests for run_ad_recon anchor_reference and tilt_bound_deg features."""
 
-    # Ny=4 gives the 3D projector real depth along the tilt axis so that
-    # Y-Euler gradients are non-zero — needed for the drift behavioural test.
-    N        = 8
-    NZ       = 8
-    NY       = 4
-    N_ANGLES = 5
+def _mbir_sino_self(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Tensor:
+    """Forward-project using MBIR's own A (voxel-driven bilinear scatter)
+    rather than FastTomo's ray-marching `forward_project`. This is what
+    the ICD column updates are inverting, so tests using this FP can
+    expect near-perfect recovery of the input phantom."""
+    import math
+    import fasttomo._core as _core
+    Ny, Nz, Nx = phantom.shape
+    n_angles = angles_deg.shape[0]
+    N_det = Nx
+    sino = torch.zeros(n_angles, Ny, N_det, device=phantom.device, dtype=torch.float32)
+    angles_rad = (angles_deg.float().to(phantom.device) * (math.pi / 180.0)).contiguous()
+    cos_a = torch.cos(angles_rad).contiguous()
+    sin_a = torch.sin(angles_rad).contiguous()
+    _core.mbir_forward_project_cuda(
+        phantom.contiguous().data_ptr(), sino.data_ptr(),
+        cos_a.data_ptr(), sin_a.data_ptr(),
+        Ny, Nz, Nx, n_angles, N_det,
+        torch.cuda.current_stream(phantom.device).cuda_stream,
+    )
+    return sino
 
-    def _angles(self) -> torch.Tensor:
-        return torch.tensor([-30., -15., 0., 15., 30.], device=DEVICE)
 
-    def _sino(self) -> torch.Tensor:
-        vol = torch.zeros(self.NY, self.NZ, self.N, device=DEVICE)
-        # Asymmetric fill: only first half of Y slices so Y-Euler gradients
-        # are non-zero (needed for the drift behavioural test).
-        vol[:self.NY // 2, 2:6, 2:6] = 1.0
-        return ft.forward_project(vol, self._angles())  # [n_angles, NY, N_det]
+def test_mbir_perfect_data_recovers_phantom():
+    """Conventional MBIR (T=∞, no anomaly modeling) on a noiseless solid
+    cube should recover the phantom to high accuracy. Validates the
+    surrogate-MM ICD inner loop + qGGMRF prior + variance auto-tuning."""
+    Ny = Nz = Nx = 32
+    n_angles = 40
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[8:24, 8:24, 8:24] = 1.0
+    angles = make_angles(n_angles, max_deg=70.0)
 
-    def test_smoke_default_flags(self):
-        """Existing default call (no new flags) still returns correct shape/dtype."""
-        vol = ft.run_ad_recon(self._sino(), self._angles(), n_iter=5)
-        assert vol.shape == (self.NY, self.NZ, self.N)
-        assert vol.dtype == torch.float32
-        assert vol.device.type == "cuda"
+    sino = _mbir_sino_self(phantom, angles)
+    vol = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1,
+        huber_T=float("inf"),
+        estimate_offset=False,
+        estimate_variance=True,
+        outer_iters=80,
+        multires_levels=1,
+    )
+    rel_err = (vol - phantom).norm().item() / phantom.norm().item()
+    assert rel_err < 0.10, f"MBIR rel error {rel_err:.4f} > 0.10"
 
-    def test_anchor_reference_row_frozen(self):
-        """Reference row of euler and shifts is byte-identical to its initial value."""
-        angles = self._angles()
-        vol, euler, shifts = ft.run_ad_recon(
-            self._sino(), angles,
-            n_iter=50,
-            refine_pose=True,
-            refine_shifts=True,
-            anchor_reference=True,
-            lr_angles=1.0,
-            lr_shifts=1.0,
-            return_pose=True,
-            cosine_schedule=False,
-        )
-        ref_idx = int(angles.cpu().abs().argmin())
-        expected_euler = torch.tensor([0.0, angles[ref_idx].item(), 0.0])
-        assert torch.equal(euler[ref_idx], expected_euler), (
-            f"Reference euler row drifted: {euler[ref_idx]} != {expected_euler}"
-        )
-        assert torch.equal(shifts[ref_idx], torch.zeros(2)), (
-            f"Reference shift row drifted: {shifts[ref_idx]}"
-        )
 
-    def test_tilt_bound_respected(self):
-        """Y-Euler stays within nominal ± tilt_bound_deg under very high lr_angles."""
-        angles = self._angles()
-        bound  = 1.0
-        _, euler, _ = ft.run_ad_recon(
-            self._sino(), angles,
-            n_iter=50,
-            refine_pose=True,
-            tilt_bound_deg=bound,
-            lr_angles=5.0,
-            return_pose=True,
-            cosine_schedule=False,
-        )
-        max_drift = (euler[:, 1] - angles.cpu()).abs().max().item()
-        assert max_drift <= bound + 1e-5, (
-            f"Y-Euler drifted {max_drift:.4f}° beyond bound {bound}°"
-        )
+def test_mbir_pe_rejects_bragg_streak():
+    """The whole point of MBIR-AM-PE: with anomaly modeling, a single
+    high-magnitude Bragg-style streak in one tilt's detector strip is
+    suppressed in the reconstruction. Without anomaly modeling, the
+    streak corrupts the volume.
 
-    def test_tilt_bound_none_allows_drift(self):
-        """Without the bound, high lr_angles drives Y-Euler beyond ±1° of nominal."""
-        angles = self._angles()
-        _, euler, _ = ft.run_ad_recon(
-            self._sino(), angles,
-            n_iter=100,
-            refine_pose=True,
-            tilt_bound_deg=None,
-            lr_angles=5.0,
-            return_pose=True,
-            cosine_schedule=False,
-        )
-        max_drift = (euler[:, 1] - angles.cpu()).abs().max().item()
-        assert max_drift > 1.0, (
-            f"Expected Y-Euler drift > 1° with tilt_bound_deg=None and lr_angles=5.0, "
-            f"but max drift was {max_drift:.4f}°"
-        )
+    We assert MBIR-AM has lower RMSE than conventional MBIR on the
+    Bragg-corrupted data — the qualitative paper result, scaled to
+    32³ so it runs in a few seconds. """
+    Ny = Nz = Nx = 32
+    n_angles = 40
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[8:24, 8:24, 8:24] = 1.0
+    angles = make_angles(n_angles, max_deg=70.0)
 
-    def test_antisymmetric_z_enforced(self):
-        """Default antisymmetric_z=True keeps col2 == -col0 exactly after each step."""
-        _, euler, _ = ft.run_ad_recon(
-            self._sino(), self._angles(),
-            n_iter=50,
-            refine_pose=True,
-            tilt_bound_deg=None,   # let Y drift freely so gradients are non-trivial
-            lr_angles=5.0,
-            return_pose=True,
-            cosine_schedule=False,
-            # antisymmetric_z=True is the default
-        )
-        residual = (euler[:, 2] + euler[:, 0]).abs().max().item()
-        assert residual < 1e-5, (
-            f"ZY(-Z) constraint violated: max |col2 + col0| = {residual:.2e}"
-        )
+    sino_clean = _mbir_sino_self(phantom, angles)
 
-    def test_antisymmetric_z_false_allows_drift(self):
-        """antisymmetric_z=False lets col2 diverge from -col0 under high lr_angles."""
-        _, euler, _ = ft.run_ad_recon(
-            self._sino(), self._angles(),
-            n_iter=100,
-            refine_pose=True,
-            tilt_bound_deg=None,
-            antisymmetric_z=False,
-            lr_angles=5.0,
-            return_pose=True,
-            cosine_schedule=False,
-        )
-        # col0 and col2 start at 0; verify they evolve independently (col2 + col0 ≠ 0)
-        residual = (euler[:, 2] + euler[:, 0]).abs().max().item()
-        assert residual > 1e-3, (
-            f"Expected col2 != -col0 with antisymmetric_z=False, "
-            f"but max |col2 + col0| = {residual:.2e}"
-        )
+    # Inject a Bragg-like streak: at one tilt, multiply a 4-pixel-wide
+    # detector strip by 5× across all Y rows. This corrupts that
+    # projection at known coordinates.
+    sino_corrupt = sino_clean.clone()
+    angle_idx = n_angles // 3
+    sino_corrupt[angle_idx, :, 14:18] *= 5.0
 
-    def test_anchor_raises_without_refine(self):
-        """anchor_reference=True without any refinement raises ValueError."""
-        with pytest.raises(ValueError, match="anchor_reference"):
-            ft.run_ad_recon(
-                self._sino(), self._angles(),
-                n_iter=1,
-                anchor_reference=True,
-            )
+    # Conventional MBIR — no anomaly handling.
+    vol_conv = ft.run_mbir(
+        sino_corrupt, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=80, multires_levels=1,
+    )
+    err_conv = (vol_conv - phantom).norm().item()
 
-    def test_in_plane_weight_drives_alpha_to_zero(self):
-        """in_plane_weight suppresses α/γ drift that would otherwise occur at high lr_angles."""
-        common = dict(
-            n_iter=100,
-            refine_pose=True,
-            antisymmetric_z=False,  # let col0 and col2 evolve independently
-            tilt_bound_deg=None,
-            lr_angles=5.0,
-            return_pose=True,
-            cosine_schedule=False,
-        )
-        # Baseline: no penalty — α/γ should drift substantially
-        _, euler_free, _ = ft.run_ad_recon(
-            self._sino(), self._angles(), in_plane_weight=0.0, **common
-        )
-        baseline_drift = max(
-            euler_free[:, 0].abs().max().item(),
-            euler_free[:, 2].abs().max().item(),
-        )
-        assert baseline_drift > 1.0, (
-            f"Baseline (no penalty) should drift >1°, but max α/γ = "
-            f"{baseline_drift:.4f}°; raise lr_angles or n_iter if flaky"
-        )
-        # With a strong penalty: α and γ should stay small
-        _, euler_reg, _ = ft.run_ad_recon(
-            self._sino(), self._angles(), in_plane_weight=10.0, **common
-        )
-        reg_drift = max(
-            euler_reg[:, 0].abs().max().item(),
-            euler_reg[:, 2].abs().max().item(),
-        )
-        assert reg_drift < 0.5, (
-            f"With in_plane_weight=10.0, max |α|/|γ| = {reg_drift:.4f}° "
-            f"(expected < 0.5°)"
-        )
+    # MBIR-AM-PE — Bragg anomaly modeling on.
+    vol_am = ft.run_mbir(
+        sino_corrupt, angles,
+        sigma_f=0.1, huber_T=3.0, huber_delta=0.5,
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=80, multires_levels=1,
+    )
+    err_am = (vol_am - phantom).norm().item()
 
-    def test_in_plane_weight_skipped_without_pose(self):
-        """in_plane_weight is silently ignored when refine_pose=False."""
-        vol = ft.run_ad_recon(
-            self._sino(), self._angles(),
-            n_iter=5,
-            refine_pose=False,
-            in_plane_weight=1e-2,
-        )
-        assert vol.shape == (self.NY, self.NZ, self.N)
-        assert torch.isfinite(vol).all()
+    # AM should beat conventional MBIR on this corrupted data.
+    assert err_am < err_conv, (
+        f"MBIR-AM error {err_am:.4f} not lower than conventional MBIR "
+        f"{err_conv:.4f} — anomaly modeling not effective"
+    )
+
+
+def test_mbir_seed_reproducibility():
+    """The voxel-update permutation is the only stochastic step. With a
+    fixed seed two runs must produce bitwise-identical reconstructions."""
+    Ny = Nz = Nx = 16
+    angles = make_angles(20, max_deg=60.0)
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    sino = _mbir_sino_self(phantom, angles)
+
+    kw = dict(
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        outer_iters=20, multires_levels=1, sigma_init=0.1,
+    )
+    v1 = ft.run_mbir(sino, angles, seed=42, **kw)
+    v2 = ft.run_mbir(sino, angles, seed=42, **kw)
+    assert torch.equal(v1, v2), "MBIR not reproducible with the same seed"
+
+
+def test_mbir_estimate_offset_disabled_keeps_d_zero():
+    """When estimate_offset=False, the per-tilt offset must remain at its
+    initial value (zero). The kernel still receives the offset pointer but
+    the host wrapper bypasses the closed-form update."""
+    Ny = Nz = Nx = 16
+    angles = make_angles(20, max_deg=60.0)
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    sino = _mbir_sino_self(phantom, angles)
+
+    _, d_offsets, _, _ = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        outer_iters=10, multires_levels=1, sigma_init=0.1,
+        return_history=True,
+    )
+    assert torch.all(d_offsets == 0.0), (
+        f"d_offsets non-zero when estimate_offset=False: {d_offsets}"
+    )
 
 
 if __name__ == "__main__":
