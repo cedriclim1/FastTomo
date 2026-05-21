@@ -30,6 +30,7 @@ from fasttomo.projection import (
     back_project_resire,
 )
 from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
+from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
 
 _log = logging.getLogger(__name__)
@@ -954,7 +955,11 @@ def run_ad_recon(
     lr_angles: float = 1e-2,
     lr_shifts: float = 1e-2,
     tv_weight: float = 0.0,
+    tv_xz_weight: float = 0.0,
     sparsity: float = 0.0,
+    in_plane_weight: float = 0.0,
+    s3im_weight: float = 0.0,
+    tilt_ssim_weight: float = 0.0,
     positivity: bool = False,
     mask: bool = False,
     loss_fn: str = "mse",
@@ -962,6 +967,9 @@ def run_ad_recon(
     return_loss: bool = False,
     return_pose: bool = False,
     projector: object | None = None,
+    anchor_reference: bool = False,
+    tilt_bound_deg: float | None = 1.0,
+    antisymmetric_z: bool = True,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -991,10 +999,45 @@ def run_ad_recon(
         lr_shifts:       Adam learning rate for shifts (default 1e-2).
         tv_weight:       3-D isotropic TV regularisation weight; added as
                          ``tv_weight * tv_loss_3d(volume)`` each iteration.
+                         Includes a Y-gradient term that can produce horizontal-
+                         band artefacts in axis-2 projections at long runs;
+                         prefer ``tv_xz_weight`` for single-axis tilt data.
                          0.0 disables it.
+        tv_xz_weight:    XZ-plane 2-D isotropic TV weight; added as
+                         ``tv_xz_weight * tv_loss_xz(volume)`` each iteration.
+                         Penalises only X and Z gradients — no Y-gradient term —
+                         so adjacent Y-slices are never coupled and horizontal-
+                         band artefacts cannot form. Physically appropriate for
+                         single-axis tilt where each Y-slice is an independent
+                         XZ cross-section. 0.0 disables it (default).
         sparsity:        Sparsity weight; adds ``sparsity * volume.mean()``
                          to the loss each iteration (L1-style, as used in the
                          notebook for atomic-resolution data). 0.0 disables it.
+        in_plane_weight: Soft L2 regularisation weight on the in-plane Euler
+                         columns α (col0) and γ (col2); adds
+                         ``in_plane_weight * (α² + γ²).mean()`` (deg²) to the
+                         loss each iteration. Only active when
+                         ``refine_pose=True`` and the weight is > 0. With
+                         ``antisymmetric_z=True`` (default), γ = −α so this is
+                         effectively ``2 · α².mean()``. With
+                         ``antisymmetric_z=False`` it applies independently to
+                         both columns. Off by default (0.0); typical values for
+                         single-tilt data are 1e-4 to 1e-2.
+        s3im_weight:     Stochastic Structural Similarity (S3IM) regularisation
+                         weight; adds ``s3im_weight * s3im_loss(pred, sinogram)``
+                         to the loss each iteration. S3IM captures non-local
+                         sinogram structure that MSE/L1 misses, and empirically
+                         suppresses missing-wedge streaks without the ring
+                         artefact that TV can introduce at high weights.
+                         0.0 disables it (default). Typical values: 1e-5–1e-3.
+        tilt_ssim_weight: Wang-2004 per-tilt SSIM regularisation weight; adds
+                         ``tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)``
+                         to the loss each iteration. Penalises local structural
+                         dissimilarity within each 2-D projection image.
+                         Deterministic (unlike S3IM); enforces smooth, locally
+                         coherent projections without the Y-slab banding that
+                         3-D TV can introduce. 0.0 disables it (default).
+                         Typical values: 1e-3–1e-1.
         positivity:      If True, clamps ``volume`` to ``[0, ∞)`` after each
                          step inside ``torch.no_grad()``.
         mask:            If True, builds ``cylindrical_mask(Nz, Nx)`` once and
@@ -1016,6 +1059,26 @@ def run_ad_recon(
                          whose class does not match the requested mode raises
                          ``ValueError``. If ``None``, a projector is built
                          internally and torn down on return.
+        anchor_reference: If True, the projection whose tilt angle is closest
+                         to 0° is used as a gauge anchor — its pose row is
+                         frozen at ``(0, θ_ref, 0)`` and its shift row at
+                         ``(0, 0)`` for the entire run by zeroing that row's
+                         gradient before every Adam step. Requires at least
+                         one of ``refine_pose`` or ``refine_shifts`` to be
+                         True (raises ``ValueError`` otherwise). Default False.
+        tilt_bound_deg:  If not None, clamps the Y-Euler column (tilt axis)
+                         to ``[angles_deg ± tilt_bound_deg]`` after each Adam
+                         step. Only active when ``refine_pose=True``. Pass
+                         ``None`` to disable and let Y optimise freely.
+                         Default 1.0.
+        antisymmetric_z: If True (default), enforces ``γ = −α`` (ZY(-Z) form)
+                         after every Adam step — the third ZYZ angle is always
+                         the negative of the first. This removes a degree of
+                         freedom per projection and prevents unrealistic
+                         in-plane rotation drift on single-tilt data. Only
+                         active when ``refine_pose=True``; silently ignored
+                         otherwise. Pass ``False`` to let α and γ optimise
+                         independently.
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
@@ -1030,6 +1093,12 @@ def run_ad_recon(
     """
     if loss_fn not in ("mse", "l1"):
         raise ValueError(f"loss_fn must be 'mse' or 'l1', got {loss_fn!r}")
+
+    if anchor_reference and not (refine_pose or refine_shifts):
+        raise ValueError(
+            "anchor_reference=True requires refine_pose=True or "
+            "refine_shifts=True; nothing to anchor otherwise."
+        )
 
     # Projector class/mode mismatch validation
     if projector is not None:
@@ -1054,6 +1123,10 @@ def run_ad_recon(
     )
     Nx = N_det
     angles_deg = angles_deg.float().to(device)
+
+    ref_idx: int | None = None
+    if anchor_reference:
+        ref_idx = int(angles_deg.abs().argmin())
 
     # ── initialise volume ──────────────────────────────────────────────────
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
@@ -1114,6 +1187,11 @@ def run_ad_recon(
     if mask:
         _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
 
+    # ── S3IM generator (seeded once; reused each iteration) ───────────────
+    _s3im_gen: torch.Generator | None = None
+    if s3im_weight > 0.0:
+        _s3im_gen = torch.Generator(device=device).manual_seed(42)
+
     # ── iteration ─────────────────────────────────────────────────────────
     losses: list[float] = []
 
@@ -1141,11 +1219,32 @@ def run_ad_recon(
         # regularisation
         if tv_weight > 0.0:
             loss = loss + tv_weight * tv_loss_3d(volume)
+        if tv_xz_weight > 0.0:
+            loss = loss + tv_xz_weight * tv_loss_xz(volume)
         if sparsity > 0.0:
             loss = loss + sparsity * volume.mean()
+        if in_plane_weight > 0.0 and tilt_angle_opt is not None:
+            loss = loss + in_plane_weight * (
+                tilt_angle_opt[:, 0].pow(2).mean()
+                + tilt_angle_opt[:, 2].pow(2).mean()
+            )
+        if s3im_weight > 0.0:
+            loss = loss + s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
+        if tilt_ssim_weight > 0.0:
+            loss = loss + tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
 
         losses.append(loss.item())
         loss.backward()
+
+        if ref_idx is not None:
+            if tilt_angle_opt is not None and tilt_angle_opt.grad is not None:
+                tilt_angle_opt.grad[ref_idx] = 0.0
+            if shifts is not None and shifts.grad is not None:
+                shifts.grad[ref_idx] = 0.0
+
+        if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
+            if tilt_angle_opt.grad is not None:
+                tilt_angle_opt.grad[:, 2] = 0.0
 
         for opt in optimisers:
             opt.step()
@@ -1158,6 +1257,13 @@ def run_ad_recon(
                 volume.clamp_(min=0.0)
             if _cmask is not None:
                 volume.mul_(_cmask.unsqueeze(0))
+            if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
+                tilt_angle_opt[:, 1].clamp_(
+                    min=angles_deg - tilt_bound_deg,
+                    max=angles_deg + tilt_bound_deg,
+                )
+            if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
+                tilt_angle_opt[:, 2] = -tilt_angle_opt[:, 0]
 
     out = volume.detach()
 

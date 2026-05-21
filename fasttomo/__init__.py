@@ -78,7 +78,7 @@ from fasttomo.algorithms import (
     refine_angles,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
-from fasttomo.regularizers import tilt_ssim_loss, s3im_loss
+from fasttomo.regularizers import tilt_ssim_loss, s3im_loss, logsum_sparsity, tv_loss_xz
 
 __all__ = [
     "forward_project",
@@ -110,4 +110,6 @@ __all__ = [
     "RotmatProjector",
     "tilt_ssim_loss",
     "s3im_loss",
+    "logsum_sparsity",
+    "tv_loss_xz",
 ]
