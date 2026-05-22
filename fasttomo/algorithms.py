@@ -10,6 +10,7 @@ Angles: 1-D tensor, degrees.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 import math
 from dataclasses import dataclass
@@ -98,6 +99,124 @@ def _finish_iters(
     if return_loss:
         return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+def _resolve_ad_recon_config(
+    config: AdReconConfig | None,
+    legacy_kwargs: dict[str, object],
+) -> AdReconConfig:
+    """Build an ``AdReconConfig`` while accepting legacy flat kwargs.
+
+    ``run_ad_recon`` historically exposed many top-level keyword arguments.
+    Keep that calling style working so external scripts do not crash with
+    ``TypeError`` after upgrading.
+    """
+    if not legacy_kwargs:
+        return AdReconConfig() if config is None else config
+
+    allowed = {
+        "n_iter",
+        "refine_pose",
+        "refine_shifts",
+        "lr_volume",
+        "lr_angles",
+        "lr_shifts",
+        "tv_weight",
+        "tv_xz_weight",
+        "sparsity",
+        "in_plane_weight",
+        "s3im_weight",
+        "tilt_ssim_weight",
+        "positivity",
+        "mask",
+        "loss_fn",
+        "cosine_schedule",
+        "anchor_reference",
+        "tilt_bound_deg",
+        "antisymmetric_z",
+    }
+    unknown = sorted(set(legacy_kwargs) - allowed)
+    if unknown:
+        if len(unknown) == 1:
+            raise TypeError(
+                f"run_ad_recon() got an unexpected keyword argument {unknown[0]!r}"
+            )
+        unknown_rendered = ", ".join(repr(name) for name in unknown)
+        raise TypeError(
+            f"run_ad_recon() got unexpected keyword arguments: {unknown_rendered}"
+        )
+
+    resolved = AdReconConfig() if config is None else deepcopy(config)
+
+    optim_cfg = resolved.optim
+    reg_cfg = resolved.reg
+    constraints_cfg = resolved.constraints
+
+    if "n_iter" in legacy_kwargs:
+        optim_cfg.n_iter = legacy_kwargs["n_iter"]  # type: ignore[assignment]
+    if "lr_volume" in legacy_kwargs:
+        optim_cfg.lr_volume = legacy_kwargs["lr_volume"]  # type: ignore[assignment]
+    if "loss_fn" in legacy_kwargs:
+        optim_cfg.loss_fn = legacy_kwargs["loss_fn"]  # type: ignore[assignment]
+    if "cosine_schedule" in legacy_kwargs:
+        optim_cfg.cosine_schedule = legacy_kwargs["cosine_schedule"]  # type: ignore[assignment]
+
+    if "tv_weight" in legacy_kwargs:
+        reg_cfg.tv_weight = legacy_kwargs["tv_weight"]  # type: ignore[assignment]
+    if "tv_xz_weight" in legacy_kwargs:
+        reg_cfg.tv_xz_weight = legacy_kwargs["tv_xz_weight"]  # type: ignore[assignment]
+    if "sparsity" in legacy_kwargs:
+        reg_cfg.sparsity = legacy_kwargs["sparsity"]  # type: ignore[assignment]
+    if "s3im_weight" in legacy_kwargs:
+        reg_cfg.s3im_weight = legacy_kwargs["s3im_weight"]  # type: ignore[assignment]
+    if "tilt_ssim_weight" in legacy_kwargs:
+        reg_cfg.tilt_ssim_weight = legacy_kwargs["tilt_ssim_weight"]  # type: ignore[assignment]
+
+    if "positivity" in legacy_kwargs:
+        constraints_cfg.positivity = legacy_kwargs["positivity"]  # type: ignore[assignment]
+    if "mask" in legacy_kwargs:
+        constraints_cfg.mask = legacy_kwargs["mask"]  # type: ignore[assignment]
+
+    pose_keys = {
+        "refine_pose",
+        "refine_shifts",
+        "lr_angles",
+        "lr_shifts",
+        "in_plane_weight",
+        "anchor_reference",
+        "tilt_bound_deg",
+        "antisymmetric_z",
+    }
+    if pose_keys.intersection(legacy_kwargs):
+        if resolved.pose is None:
+            resolved.pose = PoseRefinementConfig()
+        pose_cfg = resolved.pose
+        assert pose_cfg is not None
+
+        if "refine_pose" in legacy_kwargs:
+            pose_cfg.refine_pose = legacy_kwargs["refine_pose"]  # type: ignore[assignment]
+        if "refine_shifts" in legacy_kwargs:
+            pose_cfg.refine_shifts = legacy_kwargs["refine_shifts"]  # type: ignore[assignment]
+        if "lr_angles" in legacy_kwargs:
+            pose_cfg.lr_angles = legacy_kwargs["lr_angles"]  # type: ignore[assignment]
+        if "lr_shifts" in legacy_kwargs:
+            pose_cfg.lr_shifts = legacy_kwargs["lr_shifts"]  # type: ignore[assignment]
+        if "in_plane_weight" in legacy_kwargs:
+            pose_cfg.in_plane_weight = legacy_kwargs["in_plane_weight"]  # type: ignore[assignment]
+        if "anchor_reference" in legacy_kwargs:
+            pose_cfg.anchor_reference = legacy_kwargs["anchor_reference"]  # type: ignore[assignment]
+        if "tilt_bound_deg" in legacy_kwargs:
+            pose_cfg.tilt_bound_deg = legacy_kwargs["tilt_bound_deg"]  # type: ignore[assignment]
+        if "antisymmetric_z" in legacy_kwargs:
+            pose_cfg.antisymmetric_z = legacy_kwargs["antisymmetric_z"]  # type: ignore[assignment]
+
+        if pose_cfg.anchor_reference and not (pose_cfg.refine_pose or pose_cfg.refine_shifts):
+            raise ValueError(
+                "anchor_reference=True requires refine_pose=True or "
+                "refine_shifts=True; nothing to anchor otherwise."
+            )
+
+    return resolved
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -922,6 +1041,7 @@ def run_ad_recon(
     config: AdReconConfig | None = None,
     return_loss: bool = False,
     return_pose: bool = False,
+    **legacy_kwargs: object,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -946,6 +1066,8 @@ def run_ad_recon(
                          regulariser, constraint, and pose-refinement knobs.
                          ``None`` (default) constructs ``AdReconConfig()``
                          which runs vanilla AD volume-only refinement.
+                         Legacy flat kwargs (``n_iter``, ``lr_volume``, etc.)
+                         are still accepted for backward compatibility.
         return_loss:     If True, also return the per-iteration loss history.
         return_pose:     If True, also return ``(refined_euler, refined_shifts)``
                          where each is ``None`` if the corresponding refinement
@@ -962,8 +1084,7 @@ def run_ad_recon(
         CUDA-only; passing CPU tensors will raise a ``RuntimeError`` from
         the projector constructor.
     """
-    if config is None:
-        config = AdReconConfig()
+    config = _resolve_ad_recon_config(config, legacy_kwargs)
 
     optim_cfg = config.optim
     reg_cfg = config.reg

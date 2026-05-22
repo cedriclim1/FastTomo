@@ -997,5 +997,33 @@ def test_mbir_reconstruction_from_standard_fp_sinogram_cpu():
     )
 
 
+def test_run_ad_recon_accepts_legacy_flat_kwargs():
+    """Legacy kwargs should not crash at call-site with TypeError.
+
+    ``run_ad_recon`` is CUDA-only, so CPU environments may still raise
+    ``RuntimeError`` after argument parsing. This test only protects the
+    public API surface from regressions in keyword handling.
+    """
+    sino = torch.zeros(1, 1, 1, dtype=torch.float32)
+    angles = torch.zeros(1, dtype=torch.float32)
+
+    try:
+        out = ft.run_ad_recon(
+            sino,
+            angles,
+            n_iter=1,
+            lr_volume=0.01,
+            loss_fn="mse",
+            refine_pose=False,
+        )
+    except TypeError as exc:
+        pytest.fail(f"run_ad_recon rejected legacy kwargs: {exc}")
+    except RuntimeError:
+        # Expected on CPU-only machines.
+        return
+
+    assert isinstance(out, torch.Tensor)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
