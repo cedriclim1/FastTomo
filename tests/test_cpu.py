@@ -885,6 +885,68 @@ def _mbir_sino_cpu(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Ten
     return torch.from_numpy(sino_np)
 
 
+def test_mbir_multires_odd_detector_resizes_exactly(monkeypatch):
+    """Odd detector widths with multires must resize to the exact fine shape.
+
+    Regression for a bug where the carry-over volume always used x2 upsampling.
+    For odd widths (e.g. 65), schedule 65 -> 32 -> 65 was incorrectly routed as
+    65 -> 32 -> 64, which then mismatched the next-level geometry.
+    """
+    import fasttomo.algorithms as _alg
+
+    calls = []
+    original = _alg._run_mbir_single_scale
+
+    def _fake_single_scale(sino_lvl, angles_lvl, **kwargs):
+        del angles_lvl
+        init_state = kwargs["init_state"]
+        Nz = kwargs["Nz"]
+        Nx = kwargs["Nx"]
+        sigma = kwargs["sigma"]
+        calls.append(
+            {
+                "target": (Nz, Nx),
+                "init_shape": None if init_state is None else tuple(init_state.volume.shape),
+            }
+        )
+        return (
+            _alg._MbirState(
+                volume=torch.zeros(
+                    (sino_lvl.shape[1], Nz, Nx),
+                    dtype=torch.float32,
+                    device=sino_lvl.device,
+                ),
+                d_offsets=torch.zeros(
+                    sino_lvl.shape[0], dtype=torch.float32, device=sino_lvl.device
+                ),
+                sigma=float(sigma),
+                e_sino=torch.zeros_like(sino_lvl),
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(_alg, "_run_mbir_single_scale", _fake_single_scale)
+    try:
+        sino = torch.zeros(5, 2, 65, dtype=torch.float32)
+        angles = make_angles(5)
+        out = ft.run_mbir(
+            sino,
+            angles,
+            multires_levels=2,
+            outer_iters=1,
+            estimate_offset=False,
+            estimate_variance=False,
+        )
+    finally:
+        monkeypatch.setattr(_alg, "_run_mbir_single_scale", original)
+
+    assert out.shape == (2, 65, 65)
+    assert calls[0]["target"] == (32, 32)
+    assert calls[0]["init_shape"] is None
+    assert calls[1]["target"] == (65, 65)
+    assert calls[1]["init_shape"] == (2, 65, 65)
+
+
 def test_mbir_cpu_runs():
     """CPU MBIR end-to-end on a tiny phantom; assert convergence."""
     Ny = Nz = Nx = 16

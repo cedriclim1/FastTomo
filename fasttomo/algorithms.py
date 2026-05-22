@@ -2290,14 +2290,18 @@ def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
     return s.reshape(K, Y, s.shape[-1])
 
 
-def _upsample_volume_zx(vol: torch.Tensor, factor: int) -> torch.Tensor:
-    """Trilinear-style interp upsample in (Z, X) only. Y is preserved."""
-    if factor == 1:
-        return vol
+def _resize_volume_zx(vol: torch.Tensor, target_nz: int, target_nx: int) -> torch.Tensor:
+    """Trilinear-style resize in (Z, X) only. Y is preserved."""
     Ny, Nz, Nx = vol.shape
+    if Nz == target_nz and Nx == target_nx:
+        return vol
     v = vol.unsqueeze(0).unsqueeze(0)              # [1,1,Ny,Nz,Nx]
-    v = F.interpolate(v, size=(Ny, Nz * factor, Nx * factor),
-                      mode="trilinear", align_corners=False)
+    v = F.interpolate(
+        v,
+        size=(Ny, target_nz, target_nx),
+        mode="trilinear",
+        align_corners=False,
+    )
     return v.squeeze(0).squeeze(0).contiguous()
 
 
@@ -2443,9 +2447,14 @@ def run_mbir(
         )
         history_all.append(hist)
 
-        # Upsample volume to the next finer scale (factor 2).
+        # Carry the current solution to the next scale with an exact resize.
+        # Using fixed x2 upsampling breaks odd detector sizes (e.g. 65 -> 32 -> 64),
+        # causing shape mismatches or invalid native-kernel accesses at the next level.
         if lvl + 1 < len(factors):
-            state.volume = _upsample_volume_zx(state.volume, 2)
+            next_f = factors[lvl + 1]
+            next_nz = max(Nz // next_f, 1)
+            next_nx = max(Nx // next_f, 1)
+            state.volume = _resize_volume_zx(state.volume, next_nz, next_nx)
 
     if return_history:
         return state.volume, state.d_offsets, state.sigma, history_all
