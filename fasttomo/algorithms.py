@@ -32,6 +32,13 @@ from fasttomo.projection import (
 from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
+from fasttomo.configs import (
+    AdReconConfig,
+    ConstraintConfig,
+    OptimConfig,
+    PoseRefinementConfig,
+    RegularizerConfig,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -45,10 +52,6 @@ _GENFIRE_RES_EXTENSION_PIVOTS = (0.0, 0.5, 0.95, 0.5, 0.0)
 
 
 # ── private helpers shared across algorithms ───────────────────────────────
-
-def _apply_sparsity(vol: torch.Tensor, weight: float) -> torch.Tensor:
-    """L1 soft-threshold (proximal operator of weight·‖·‖₁)."""
-    return vol.sign() * (vol.abs() - weight).clamp_(min=0.0)
 
 
 def _maybe_cylindrical_mask(
@@ -84,39 +87,6 @@ def _assert_warm_start_shape(
             f"{op_name}: volume must have shape {expected_shape}, "
             f"got {tuple(volume.shape)}."
         )
-
-
-@dataclass
-class ConstraintSet:
-    """Reconstruction constraints applied once per iteration.
-
-    Construct once before the iteration loop so the mask tensor is precomputed.
-    ``apply`` is out-of-place (returns new tensor); ``apply_inplace_`` mutates
-    in place for leaf tensors and CUDA Graph paths.
-
-    Application order: mask → positivity → sparsity.
-    """
-    positivity: bool = False
-    mask: torch.Tensor | None = None   # precomputed [1, Nz, Nx] or None
-    sparsity: float = 0.0
-
-    def apply(self, volume: torch.Tensor) -> torch.Tensor:
-        if self.mask is not None:
-            volume = volume * self.mask
-        if self.positivity:
-            volume = volume.clamp(min=0.0)
-        if self.sparsity > 0.0:
-            volume = _apply_sparsity(volume, self.sparsity)
-        return volume
-
-    def apply_inplace_(self, volume: torch.Tensor) -> None:
-        """In-place variant for leaf tensors and CUDA Graph paths."""
-        if self.mask is not None:
-            volume.mul_(self.mask)
-        if self.positivity:
-            volume.clamp_(min=0.0)
-        if self.sparsity > 0.0:
-            volume.copy_(_apply_sparsity(volume, self.sparsity))
 
 
 def _finish_iters(
@@ -232,7 +202,7 @@ def run_fbp(
         mask,
         dtype=volume.dtype,
     )
-    return ConstraintSet(positivity=positivity, mask=_mask).apply(volume)
+    return ConstraintConfig(positivity=positivity, mask=_mask).apply(volume)
 
 
 def run_weighted_backprojection(
@@ -277,7 +247,7 @@ def run_weighted_backprojection(
         volume[iy] = torch.fft.irfft2(F_out, s=(Nz, Nx))
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
-    return ConstraintSet(positivity=positivity, mask=_mask).apply(volume)
+    return ConstraintConfig(positivity=positivity, mask=_mask).apply(volume)
 
 
 def run_sirt(
@@ -363,7 +333,7 @@ def run_sirt(
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
+    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     # --- CUDA Graph capture path ----------------------------------------
@@ -723,7 +693,7 @@ def run_fista(
     )
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    constraints = ConstraintSet(positivity=positivity, mask=_mask)
+    constraints = ConstraintConfig(positivity=positivity, mask=_mask)
 
     return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, constraints.apply, return_loss)
 
@@ -921,7 +891,7 @@ def run_sart(
         C_list.append(C_s)
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
+    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     # --- outer iteration loop ---
@@ -947,138 +917,39 @@ def run_ad_recon(
     sinogram: torch.Tensor,            # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,          # [n_angles] degrees
     *,
-    n_iter: int = 1000,
-    refine_pose: bool = False,
-    refine_shifts: bool = False,
     Nz: int = -1,
-    lr_volume: float = 0.05,
-    lr_angles: float = 1e-2,
-    lr_shifts: float = 1e-2,
-    tv_weight: float = 0.0,
-    tv_xz_weight: float = 0.0,
-    sparsity: float = 0.0,
-    in_plane_weight: float = 0.0,
-    s3im_weight: float = 0.0,
-    tilt_ssim_weight: float = 0.0,
-    positivity: bool = False,
-    mask: bool = False,
-    loss_fn: str = "mse",
-    cosine_schedule: bool = True,
+    projector: object | None = None,
+    config: AdReconConfig | None = None,
     return_loss: bool = False,
     return_pose: bool = False,
-    projector: object | None = None,
-    anchor_reference: bool = False,
-    tilt_bound_deg: float | None = 1.0,
-    antisymmetric_z: bool = True,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
 
-    ``run_ad_recon`` packages the autograd reconstruction loop demonstrated in
-    ``Notebooks/test.ipynb`` (cells 5d13fa07, acadca5a). It is the AD path's
-    library entry point; it is not a new algorithm.
-
-    The loop optimises a volume (and optionally ZYZ Euler angles and/or 2-D
-    per-tilt shifts) by minimising the sinogram data-fit loss with Adam.  A
-    persistent :class:`ParallelProjector` or :class:`RotmatProjector` is built
-    once before the loop so the underlying ``TextureCache`` is reused across all
-    iterations — exactly as in the notebook.
+    Library entry point for the AD reconstruction loop demonstrated in
+    ``Notebooks/test.ipynb``. Knobs live on :class:`AdReconConfig` and its
+    sub-configs (:class:`OptimConfig`, :class:`RegularizerConfig`,
+    :class:`ConstraintConfig`, :class:`PoseRefinementConfig`); see those
+    classes for per-field semantics.
 
     Args:
         sinogram:        [n_angles, Ny, N_det] float32 CUDA tensor.
         angles_deg:      [n_angles] tilt angles in degrees.
-        n_iter:          Number of Adam steps (default 1000).
-        refine_pose:     If True, also optimise ZYZ Euler angles (requires
-                         RotmatProjector internally). Default False.
-        refine_shifts:   If True, also optimise per-tilt 2-D shifts via
-                         ``apply_shifts_2d`` after each FP. Independent of
-                         ``refine_pose``; both may be True simultaneously.
-        Nz:              Reconstruction depth; defaults to N_det.
-        lr_volume:       Adam learning rate for the volume (default 0.05).
-        lr_angles:       Adam learning rate for Euler angles (default 1e-2).
-        lr_shifts:       Adam learning rate for shifts (default 1e-2).
-        tv_weight:       3-D isotropic TV regularisation weight; added as
-                         ``tv_weight * tv_loss_3d(volume)`` each iteration.
-                         Includes a Y-gradient term that can produce horizontal-
-                         band artefacts in axis-2 projections at long runs;
-                         prefer ``tv_xz_weight`` for single-axis tilt data.
-                         0.0 disables it.
-        tv_xz_weight:    XZ-plane 2-D isotropic TV weight; added as
-                         ``tv_xz_weight * tv_loss_xz(volume)`` each iteration.
-                         Penalises only X and Z gradients — no Y-gradient term —
-                         so adjacent Y-slices are never coupled and horizontal-
-                         band artefacts cannot form. Physically appropriate for
-                         single-axis tilt where each Y-slice is an independent
-                         XZ cross-section. 0.0 disables it (default).
-        sparsity:        Sparsity weight; adds ``sparsity * volume.mean()``
-                         to the loss each iteration (L1-style, as used in the
-                         notebook for atomic-resolution data). 0.0 disables it.
-        in_plane_weight: Soft L2 regularisation weight on the in-plane Euler
-                         columns α (col0) and γ (col2); adds
-                         ``in_plane_weight * (α² + γ²).mean()`` (deg²) to the
-                         loss each iteration. Only active when
-                         ``refine_pose=True`` and the weight is > 0. With
-                         ``antisymmetric_z=True`` (default), γ = −α so this is
-                         effectively ``2 · α².mean()``. With
-                         ``antisymmetric_z=False`` it applies independently to
-                         both columns. Off by default (0.0); typical values for
-                         single-tilt data are 1e-4 to 1e-2.
-        s3im_weight:     Stochastic Structural Similarity (S3IM) regularisation
-                         weight; adds ``s3im_weight * s3im_loss(pred, sinogram)``
-                         to the loss each iteration. S3IM captures non-local
-                         sinogram structure that MSE/L1 misses, and empirically
-                         suppresses missing-wedge streaks without the ring
-                         artefact that TV can introduce at high weights.
-                         0.0 disables it (default). Typical values: 1e-5–1e-3.
-        tilt_ssim_weight: Wang-2004 per-tilt SSIM regularisation weight; adds
-                         ``tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)``
-                         to the loss each iteration. Penalises local structural
-                         dissimilarity within each 2-D projection image.
-                         Deterministic (unlike S3IM); enforces smooth, locally
-                         coherent projections without the Y-slab banding that
-                         3-D TV can introduce. 0.0 disables it (default).
-                         Typical values: 1e-3–1e-1.
-        positivity:      If True, clamps ``volume`` to ``[0, ∞)`` after each
-                         step inside ``torch.no_grad()``.
-        mask:            If True, builds ``cylindrical_mask(Nz, Nx)`` once and
-                         multiplies ``volume`` by it inside ``torch.no_grad()``
-                         after each step.
-        loss_fn:         ``"mse"`` (default) or ``"l1"`` — data-fit loss
-                         between predicted and measured sinogram.
-        cosine_schedule: If True, attaches a
-                         :class:`~torch.optim.lr_scheduler.CosineAnnealingLR`
-                         to each Adam optimiser (mirrors notebook defaults).
-        return_loss:     If True, also return the per-iteration loss history
-                         as ``torch.tensor(losses)``.
-        return_pose:     If True, also return the refined pose parameters as
-                         ``(euler_zyz_deg, shifts)`` where each is ``None``
-                         if the corresponding refinement was disabled.
+        Nz:              Reconstruction depth; defaults to ``N_det``.
         projector:       Optional pre-built :class:`RotmatProjector` (when
-                         ``refine_pose=True``) or :class:`ParallelProjector`
-                         (when ``refine_pose=False``). Passing a projector
+                         ``config.pose.refine_pose=True``) or
+                         :class:`ParallelProjector` (otherwise). A projector
                          whose class does not match the requested mode raises
-                         ``ValueError``. If ``None``, a projector is built
-                         internally and torn down on return.
-        anchor_reference: If True, the projection whose tilt angle is closest
-                         to 0° is used as a gauge anchor — its pose row is
-                         frozen at ``(0, θ_ref, 0)`` and its shift row at
-                         ``(0, 0)`` for the entire run by zeroing that row's
-                         gradient before every Adam step. Requires at least
-                         one of ``refine_pose`` or ``refine_shifts`` to be
-                         True (raises ``ValueError`` otherwise). Default False.
-        tilt_bound_deg:  If not None, clamps the Y-Euler column (tilt axis)
-                         to ``[angles_deg ± tilt_bound_deg]`` after each Adam
-                         step. Only active when ``refine_pose=True``. Pass
-                         ``None`` to disable and let Y optimise freely.
-                         Default 1.0.
-        antisymmetric_z: If True (default), enforces ``γ = −α`` (ZY(-Z) form)
-                         after every Adam step — the third ZYZ angle is always
-                         the negative of the first. This removes a degree of
-                         freedom per projection and prevents unrealistic
-                         in-plane rotation drift on single-tilt data. Only
-                         active when ``refine_pose=True``; silently ignored
-                         otherwise. Pass ``False`` to let α and γ optimise
-                         independently.
+                         ``ValueError``. If ``None``, one is built internally
+                         and torn down on return.
+        config:          :class:`AdReconConfig` bundling optimiser,
+                         regulariser, constraint, and pose-refinement knobs.
+                         ``None`` (default) constructs ``AdReconConfig()``
+                         which runs vanilla AD volume-only refinement.
+        return_loss:     If True, also return the per-iteration loss history.
+        return_pose:     If True, also return ``(refined_euler, refined_shifts)``
+                         where each is ``None`` if the corresponding refinement
+                         was disabled.
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
@@ -1087,17 +958,25 @@ def run_ad_recon(
         * if both                  — ``(volume, loss_history, euler_or_None, shifts_or_None)``
 
     Note:
-        This function requires a CUDA device.  The underlying projectors are
-        CUDA-only; passing CPU tensors will raise a ``RuntimeError`` from the
-        projector constructor.
+        This function requires a CUDA device. The underlying projectors are
+        CUDA-only; passing CPU tensors will raise a ``RuntimeError`` from
+        the projector constructor.
     """
-    if loss_fn not in ("mse", "l1"):
-        raise ValueError(f"loss_fn must be 'mse' or 'l1', got {loss_fn!r}")
+    if config is None:
+        config = AdReconConfig()
 
-    if anchor_reference and not (refine_pose or refine_shifts):
+    optim_cfg = config.optim
+    reg_cfg = config.reg
+    constraints_cfg = config.constraints
+    pose_cfg = config.pose
+
+    refine_pose = pose_cfg is not None and pose_cfg.refine_pose
+    refine_shifts = pose_cfg is not None and pose_cfg.refine_shifts
+    anchor_reference = pose_cfg is not None and pose_cfg.anchor_reference
+
+    if optim_cfg.loss_fn not in ("mse", "l1"):
         raise ValueError(
-            "anchor_reference=True requires refine_pose=True or "
-            "refine_shifts=True; nothing to anchor otherwise."
+            f"OptimConfig.loss_fn must be 'mse' or 'l1', got {optim_cfg.loss_fn!r}"
         )
 
     # Projector class/mode mismatch validation
@@ -1161,41 +1040,45 @@ def run_ad_recon(
                              requires_grad=True)
 
     # ── build optimiser list ───────────────────────────────────────────────
-    opt_vol = torch.optim.Adam([volume], lr=lr_volume)
+    opt_vol = torch.optim.Adam([volume], lr=optim_cfg.lr_volume)
     optimisers = [opt_vol]
 
     opt_angles: torch.optim.Optimizer | None = None
     opt_shifts: torch.optim.Optimizer | None = None
 
-    if refine_pose and tilt_angle_opt is not None:
-        opt_angles = torch.optim.Adam([tilt_angle_opt], lr=lr_angles)
+    if refine_pose and tilt_angle_opt is not None and pose_cfg is not None:
+        opt_angles = torch.optim.Adam([tilt_angle_opt], lr=pose_cfg.lr_angles)
         optimisers.append(opt_angles)
-    if refine_shifts and shifts is not None:
-        opt_shifts = torch.optim.Adam([shifts], lr=lr_shifts)
+    if refine_shifts and shifts is not None and pose_cfg is not None:
+        opt_shifts = torch.optim.Adam([shifts], lr=pose_cfg.lr_shifts)
         optimisers.append(opt_shifts)
 
     # ── cosine LR schedulers ───────────────────────────────────────────────
     schedulers: list = []
-    if cosine_schedule:
+    if optim_cfg.cosine_schedule:
         schedulers = [
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_iter)
+            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=optim_cfg.n_iter)
             for opt in optimisers
         ]
 
-    # ── cylindrical mask (built once) ─────────────────────────────────────
+    # ── cylindrical mask (built once if requested) ────────────────────────
+    # ConstraintConfig.mask: bool True → build inside; Tensor → use as-is;
+    # None/False → no mask.
     _cmask: torch.Tensor | None = None
-    if mask:
+    if isinstance(constraints_cfg.mask, torch.Tensor):
+        _cmask = constraints_cfg.mask
+    elif constraints_cfg.mask is True:
         _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
-    if s3im_weight > 0.0:
+    if reg_cfg.s3im_weight > 0.0:
         _s3im_gen = torch.Generator(device=device).manual_seed(42)
 
     # ── iteration ─────────────────────────────────────────────────────────
     losses: list[float] = []
 
-    for _ in range(n_iter):
+    for _ in range(optim_cfg.n_iter):
         for opt in optimisers:
             opt.zero_grad()
 
@@ -1211,27 +1094,27 @@ def run_ad_recon(
             pred = apply_shifts_2d(pred, shifts)
 
         # data-fit loss
-        if loss_fn == "mse":
+        if optim_cfg.loss_fn == "mse":
             loss = F.mse_loss(pred, sinogram)
         else:
             loss = F.l1_loss(pred, sinogram)
 
         # regularisation
-        if tv_weight > 0.0:
-            loss = loss + tv_weight * tv_loss_3d(volume)
-        if tv_xz_weight > 0.0:
-            loss = loss + tv_xz_weight * tv_loss_xz(volume)
-        if sparsity > 0.0:
-            loss = loss + sparsity * volume.mean()
-        if in_plane_weight > 0.0 and tilt_angle_opt is not None:
-            loss = loss + in_plane_weight * (
+        if reg_cfg.tv_weight > 0.0:
+            loss = loss + reg_cfg.tv_weight * tv_loss_3d(volume)
+        if reg_cfg.tv_xz_weight > 0.0:
+            loss = loss + reg_cfg.tv_xz_weight * tv_loss_xz(volume)
+        if reg_cfg.sparsity > 0.0:
+            loss = loss + reg_cfg.sparsity * volume.mean()
+        if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt_angle_opt is not None:
+            loss = loss + pose_cfg.in_plane_weight * (
                 tilt_angle_opt[:, 0].pow(2).mean()
                 + tilt_angle_opt[:, 2].pow(2).mean()
             )
-        if s3im_weight > 0.0:
-            loss = loss + s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
-        if tilt_ssim_weight > 0.0:
-            loss = loss + tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
+        if reg_cfg.s3im_weight > 0.0:
+            loss = loss + reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
+        if reg_cfg.tilt_ssim_weight > 0.0:
+            loss = loss + reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
 
         losses.append(loss.item())
         loss.backward()
@@ -1242,6 +1125,7 @@ def run_ad_recon(
             if shifts is not None and shifts.grad is not None:
                 shifts.grad[ref_idx] = 0.0
 
+        antisymmetric_z = pose_cfg is not None and pose_cfg.antisymmetric_z
         if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
             if tilt_angle_opt.grad is not None:
                 tilt_angle_opt.grad[:, 2] = 0.0
@@ -1253,10 +1137,11 @@ def run_ad_recon(
 
         # constraints applied inside no_grad (leaf-tensor safe)
         with torch.no_grad():
-            if positivity:
+            if constraints_cfg.positivity:
                 volume.clamp_(min=0.0)
             if _cmask is not None:
                 volume.mul_(_cmask.unsqueeze(0))
+            tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
                 tilt_angle_opt[:, 1].clamp_(
                     min=angles_deg - tilt_bound_deg,
@@ -1300,7 +1185,7 @@ def _run_sirt_cuda_graph(
     R_sino: torch.Tensor,
     _fp,
     _bp,
-    constraints: ConstraintSet,
+    constraints: ConstraintConfig,
     projector,
     key: tuple,
 ) -> torch.Tensor | None:
@@ -1410,7 +1295,7 @@ def _sirt_iter_inplace(
     omega: float,
     _fp,
     _bp,
-    constraints: ConstraintSet,
+    constraints: ConstraintConfig,
 ) -> None:
     """
     One in-place SIRT iteration on ``vol_static``.
@@ -1601,7 +1486,7 @@ def run_genfire(
         res_ind_us = torch.fft.ifftshift(res_ind)               # unshifted
 
     # ── iteration ───────────────────────────────────────────────────────────
-    _inner_constraints = ConstraintSet(
+    _inner_constraints = ConstraintConfig(
         positivity=positivity, mask=support.unsqueeze(0), sparsity=sparsity,
     )
     current_F = measured_K.clone()
@@ -1645,7 +1530,7 @@ def run_genfire(
     vol = torch.fft.fftshift(
         torch.fft.ifftn(best_F, dim=(-2, -1)), dim=(-2, -1),
     ).real                                                      # [Ny, bigN, bigN]
-    vol = ConstraintSet(positivity=positivity).apply(vol)
+    vol = ConstraintConfig(positivity=positivity).apply(vol)
 
     # crop to [Ny, Nz, Nx]
     vol = vol[:, z0:z1, x0:x1]
@@ -1710,7 +1595,7 @@ def run_wsirt(
         return out
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
-    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
+    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -1892,7 +1777,7 @@ def run_resire(
         _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0)  # [1, Nz, Nx]
     else:
         _mask = None
-    constraints = ConstraintSet(positivity=positivity, mask=_mask, sparsity=sparsity)
+    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -1999,7 +1884,7 @@ def run_grad_descent(
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
-    constraints = ConstraintSet(positivity=positivity, mask=_mask)
+    constraints = ConstraintConfig(positivity=positivity, mask=_mask)
     losses: list[float] = []
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)

@@ -1331,13 +1331,8 @@ class TestRunAdRecon:
         vol = phantom_2d(N).unsqueeze(0)
         sino = ft.forward_project(vol, angles)
 
-        _, losses = ft.run_ad_recon(
-            sino, angles,
-            n_iter=200,
-            refine_pose=False,
-            lr_volume=0.05,
-            return_loss=True,
-        )
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=200, lr_volume=0.05))
+        _, losses = ft.run_ad_recon(sino, angles, config=cfg, return_loss=True)
         assert losses[-1].item() < losses[0].item(), (
             f"run_ad_recon (no pose) did not reduce loss: "
             f"{losses[0].item():.4f} -> {losses[-1].item():.4f}"
@@ -1376,13 +1371,14 @@ class TestRunAdRecon:
         perturbed_angles_cpu = perturbed_angles.cpu()
         error_before = perturbation.abs().max().item()
 
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=300, lr_volume=0.05),
+            pose=ft.PoseRefinementConfig(refine_pose=True, lr_angles=1e-2),
+            constraints=ft.ConstraintConfig(positivity=True),
+        )
         result = ft.run_ad_recon(
             sino, perturbed_angles_cpu,
-            n_iter=300,
-            refine_pose=True,
-            lr_volume=0.05,
-            lr_angles=1e-2,
-            positivity=True,
+            config=cfg,
             return_pose=True,
         )
         # result = (volume, euler_or_None, shifts_or_None)
@@ -1413,16 +1409,19 @@ class TestRunAdRecon:
         wrong_proj = ft.RotmatProjector(
             (1, N, N), n_angles=n_angles, device=DEVICE, N_det=N,
         )
+        cfg_no_pose = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
         with pytest.raises(ValueError, match="ParallelProjector"):
-            ft.run_ad_recon(sino, angles, refine_pose=False, projector=wrong_proj,
-                            n_iter=1)
+            ft.run_ad_recon(sino, angles, projector=wrong_proj, config=cfg_no_pose)
 
         parallel_proj = ft.ParallelProjector(
             (1, N, N), angles, device=DEVICE, N_det=N,
         )
+        cfg_pose = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=1),
+            pose=ft.PoseRefinementConfig(refine_pose=True),
+        )
         with pytest.raises(ValueError, match="RotmatProjector"):
-            ft.run_ad_recon(sino, angles, refine_pose=True, projector=parallel_proj,
-                            n_iter=1)
+            ft.run_ad_recon(sino, angles, projector=parallel_proj, config=cfg_pose)
 
     def test_return_loss_shape(self):
         """return_loss=True: loss history length equals n_iter."""
@@ -1432,7 +1431,8 @@ class TestRunAdRecon:
         sino = ft.forward_project(vol, angles)
 
         n_iter = 50
-        _, losses = ft.run_ad_recon(sino, angles, n_iter=n_iter, return_loss=True)
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=n_iter))
+        _, losses = ft.run_ad_recon(sino, angles, config=cfg, return_loss=True)
         assert losses.shape == (n_iter,), (
             f"Expected loss history of length {n_iter}, got {losses.shape}"
         )
@@ -1874,6 +1874,68 @@ def test_mbir_estimate_offset_disabled_keeps_d_zero():
     )
     assert torch.all(d_offsets == 0.0), (
         f"d_offsets non-zero when estimate_offset=False: {d_offsets}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA GPU")
+def test_mbir_fp_matches_standard_fp_off_axis_voxel_cuda():
+    """Cross-projector regression (CUDA): mbir_forward_project_cuda and the
+    standard ft.forward_project must agree on detector hit positions for a
+    single off-Z-centre voxel. Placing the voxel at iz=8 (well off the
+    iz=Nz//2 centre) makes a z-sign error visible as a shifted COM."""
+    import math
+    import numpy as np
+    import fasttomo._core as _core
+    Ny, Nz, Nx = 4, 32, 32
+    N_det = Nx
+    n_angles = 12
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[Ny // 2, 8, Nx // 2] = 1.0   # off-centre in Z, on-centre in X
+    angles_deg = make_angles(n_angles, max_deg=60.0)
+
+    # MBIR CUDA forward project
+    sino_mbir = _mbir_sino_self(phantom, angles_deg)
+
+    # Standard ft.forward_project
+    sino_std = ft.forward_project(phantom, angles_deg)
+
+    det_idx = np.arange(N_det, dtype=np.float64)
+    iy = Ny // 2
+    for ia in range(n_angles):
+        m = sino_mbir[ia, iy].cpu().numpy().astype(np.float64)
+        s = sino_std[ia, iy].cpu().numpy().astype(np.float64)
+        m_sum, s_sum = m.sum(), s.sum()
+        if m_sum < 1e-12 and s_sum < 1e-12:
+            continue
+        com_m = (m * det_idx).sum() / max(m_sum, 1e-12)
+        com_s = (s * det_idx).sum() / max(s_sum, 1e-12)
+        assert abs(com_m - com_s) < 0.75, (
+            f"angle {ia}: MBIR CUDA FP COM {com_m:.2f} vs standard FP COM "
+            f"{com_s:.2f} (diff {abs(com_m - com_s):.3f} > 0.75 px)"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA GPU")
+def test_mbir_reconstruction_from_standard_fp_sinogram():
+    """End-to-end regression on the real bug path: sinogram built with the
+    standard ft.forward_project (as user code and the notebook do) is given to
+    run_mbir. With the z-sign bug the flip makes rel_err >> 1; post-fix it
+    should be < 0.25."""
+    Ny, Nz, Nx = 16, 32, 32
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[:, 20:28, 8:16] = 1.0   # Z-asymmetric block
+    angles = make_angles(40, max_deg=70.0)
+    sino = ft.forward_project(phantom, angles)
+    vol = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=60, multires_levels=1,
+    )
+    rel_err = (vol - phantom).norm().item() / phantom.norm().item()
+    assert rel_err < 0.25, (
+        f"MBIR rel error vs phantom {rel_err:.4f} > 0.25 "
+        "(possible projector sign regression)"
     )
 
 

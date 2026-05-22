@@ -18,7 +18,7 @@
  *
  * Forward operator A used internally:
  *   For voxel (ix, iz, iy) at angle θ_k, the detector coordinate is
- *       u = (ix - half_x)·cos θ_k - (iz - half_z)·sin θ_k + half_det
+ *       u = (ix - half_x)·cos θ_k + (iz - half_z)·sin θ_k + half_det
  *   and the voxel scatters to the two nearest detector pixels at iy with
  *   bilinear weights (1-wu, wu) where wu = u - floor(u). This is the
  *   standard "linear-interp / strip-integral" MBIR forward model and is
@@ -144,7 +144,7 @@ void mbir_forward_project_cpu(
                     float v = vol_slice[(size_t)iz * Nx + ix];
                     if (v == 0.0f) continue;
                     float x = ix - g.half_x;
-                    float u = x * ca - z * sa + g.half_det;
+                    float u = x * ca + z * sa + g.half_det;
                     int u0 = (int)floorf(u);
                     int u1 = u0 + 1;
                     float wu = u - u0;
@@ -215,7 +215,7 @@ int mbir_icd_sweep_cpu(
             float theta1 = 0.0f, theta2 = 0.0f;
             for (int ia = 0; ia < n_angles; ia++) {
                 float ca = cos_a[ia], sa = sin_a[ia];
-                float u  = x * ca - z * sa + half_det;
+                float u  = x * ca + z * sa + half_det;
                 int u0 = (int)floorf(u);
                 int u1 = u0 + 1;
                 float wu = u - u0;
@@ -268,7 +268,7 @@ int mbir_icd_sweep_cpu(
             /* ── error sinogram incremental update: e -= df · A_*j ──── */
             for (int ia = 0; ia < n_angles; ia++) {
                 float ca = cos_a[ia], sa = sin_a[ia];
-                float u  = x * ca - z * sa + half_det;
+                float u  = x * ca + z * sa + half_det;
                 int u0 = (int)floorf(u);
                 int u1 = u0 + 1;
                 float wu = u - u0;
