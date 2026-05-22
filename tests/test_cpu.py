@@ -176,6 +176,38 @@ def test_sirt_warm_start_shape_mismatch_raises():
         ft.run_sirt(sino, angles, n_iter=1, Nz=N, volume=warm)
 
 
+def test_sirt_projector_shape_mismatch_raises():
+    """Projector outputs must match the active reconstruction geometry.
+
+    Regression guard for silent broadcasting: if a user reuses a projector
+    built for Ny=1 with a Ny>1 sinogram, SIRT used to broadcast normalisers
+    and updates across Y without raising."""
+
+    class MismatchedProjector:
+        def __init__(self, n_angles: int, N: int):
+            self.n_angles = n_angles
+            self.N = N
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(self.n_angles, 1, self.N, dtype=volume.dtype)
+
+        def back(self, sinogram: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(1, self.N, self.N, dtype=sinogram.dtype)
+
+    n_angles, Ny, N = 12, 4, 16
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = make_angles(n_angles)
+
+    with pytest.raises(ValueError, match="projector returned"):
+        ft.run_sirt(
+            sino,
+            angles,
+            n_iter=1,
+            Nz=N,
+            projector=MismatchedProjector(n_angles=n_angles, N=N),
+        )
+
+
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
 
 def test_fista_shape():
@@ -995,6 +1027,50 @@ def test_mbir_reconstruction_from_standard_fp_sinogram_cpu():
         f"MBIR rel error vs phantom {rel_err:.4f} > 0.35 "
         "(possible projector sign regression)"
     )
+
+
+def test_mbir_multires_levels_zero_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="multires_levels must be >= 1"):
+        ft.run_mbir(sino, angles, multires_levels=0)
+
+
+def test_mbir_angles_2d_raises():
+    sino = torch.zeros(5, 2, 16)
+    with pytest.raises(ValueError, match="1-D"):
+        ft.run_mbir(sino, torch.zeros(5, 1))
+
+
+def test_mbir_angles_count_mismatch_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 7)
+    with pytest.raises(ValueError, match="5 projections"):
+        ft.run_mbir(sino, angles)
+
+
+def test_mbir_lambdas_shape_mismatch_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = torch.ones(5, 2, 8)  # wrong N_det
+    with pytest.raises(ValueError, match="lambdas must match"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+def test_mbir_multires_not_divisible_raises():
+    # N_det=14 is not divisible by coarse_factor=4 (multires_levels=3).
+    sino14 = torch.zeros(5, 2, 14)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="divisible by"):
+        ft.run_mbir(sino14, angles, multires_levels=3)
+
+
+def test_mbir_multires_even_runs():
+    """Baseline: 2-level multires with power-of-2 detector width should run."""
+    sino = torch.randn(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    vol = ft.run_mbir(sino, angles, multires_levels=2, outer_iters=2)
+    assert vol.shape == (2, 16, 16)
 
 
 if __name__ == "__main__":

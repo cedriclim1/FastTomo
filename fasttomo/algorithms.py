@@ -89,6 +89,27 @@ def _assert_warm_start_shape(
         )
 
 
+def _assert_projector_output_shape(
+    tensor: torch.Tensor,
+    expected_shape: tuple[int, ...],
+    tensor_name: str,
+    op_name: str,
+) -> None:
+    """Validate projector outputs before downstream arithmetic can broadcast.
+
+    Cached projectors are user-supplied and may be built for a different
+    geometry. Without this guard, singleton dimensions (e.g. Ny=1) can
+    silently broadcast across the target tensor and corrupt reconstruction
+    updates with no explicit error.
+    """
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(
+            f"{op_name}: projector returned {tensor_name} with shape "
+            f"{tuple(tensor.shape)}, expected {expected_shape}. "
+            "Ensure projector geometry matches the current sinogram/volume."
+        )
+
+
 def _finish_iters(
     volume: torch.Tensor,
     losses: list[float],
@@ -326,10 +347,12 @@ def run_sirt(
     # --- normalisation matrices (computed once with the chosen projector) ---
     ones_sino = torch.ones_like(sinogram)
     C_vol     = _bp(ones_sino)
+    _assert_projector_output_shape(C_vol, (Ny, Nz, Nx), "back-projection", "run_sirt")
     C_vol     = torch.where(C_vol > 0, 1.0 / C_vol, torch.zeros_like(C_vol))
 
     ones_vol  = torch.ones_like(volume)
     R_sino    = _fp(ones_vol)
+    _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
@@ -1065,10 +1088,32 @@ def run_ad_recon(
     # ConstraintConfig.mask: bool True → build inside; Tensor → use as-is;
     # None/False → no mask.
     _cmask: torch.Tensor | None = None
+    _cmask_mul: torch.Tensor | None = None
     if isinstance(constraints_cfg.mask, torch.Tensor):
-        _cmask = constraints_cfg.mask
+        _cmask = constraints_cfg.mask.to(device=device, dtype=volume.dtype)
     elif constraints_cfg.mask is True:
         _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
+    if _cmask is not None:
+        if _cmask.ndim == 2:
+            if _cmask.shape != (Nz, Nx):
+                raise ValueError(
+                    "ConstraintConfig.mask must have shape (Nz, Nx) when 2-D; "
+                    f"got {tuple(_cmask.shape)} for (Nz, Nx)=({Nz}, {Nx})."
+                )
+            _cmask_mul = _cmask.unsqueeze(0)
+        elif _cmask.ndim == 3:
+            if _cmask.shape[1:] != (Nz, Nx) or _cmask.shape[0] not in (1, Ny):
+                raise ValueError(
+                    "ConstraintConfig.mask must have shape (1, Nz, Nx) or "
+                    "(Ny, Nz, Nx) when 3-D; "
+                    f"got {tuple(_cmask.shape)} for Ny={Ny}, Nz={Nz}, Nx={Nx}."
+                )
+            _cmask_mul = _cmask
+        else:
+            raise ValueError(
+                "ConstraintConfig.mask must be 2-D or 3-D when given as a tensor; "
+                f"got {_cmask.ndim}-D."
+            )
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
@@ -1078,7 +1123,7 @@ def run_ad_recon(
     # ── iteration ─────────────────────────────────────────────────────────
     losses: list[float] = []
 
-    for _ in range(optim_cfg.n_iter):
+    for _ in tqdm(range(optim_cfg.n_iter)):
         for opt in optimisers:
             opt.zero_grad()
 
@@ -1139,8 +1184,8 @@ def run_ad_recon(
         with torch.no_grad():
             if constraints_cfg.positivity:
                 volume.clamp_(min=0.0)
-            if _cmask is not None:
-                volume.mul_(_cmask.unsqueeze(0))
+            if _cmask_mul is not None:
+                volume.mul_(_cmask_mul)
             tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
                 tilt_angle_opt[:, 1].clamp_(
@@ -2175,14 +2220,18 @@ def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
     return s.reshape(K, Y, s.shape[-1])
 
 
-def _upsample_volume_zx(vol: torch.Tensor, factor: int) -> torch.Tensor:
-    """Trilinear-style interp upsample in (Z, X) only. Y is preserved."""
-    if factor == 1:
-        return vol
+def _resize_volume_zx(vol: torch.Tensor, target_nz: int, target_nx: int) -> torch.Tensor:
+    """Trilinear-style resize in (Z, X) only. Y is preserved."""
     Ny, Nz, Nx = vol.shape
+    if Nz == target_nz and Nx == target_nx:
+        return vol
     v = vol.unsqueeze(0).unsqueeze(0)              # [1,1,Ny,Nz,Nx]
-    v = F.interpolate(v, size=(Ny, Nz * factor, Nx * factor),
-                      mode="trilinear", align_corners=False)
+    v = F.interpolate(
+        v,
+        size=(Ny, target_nz, target_nx),
+        mode="trilinear",
+        align_corners=False,
+    )
     return v.squeeze(0).squeeze(0).contiguous()
 
 
@@ -2251,17 +2300,37 @@ def run_mbir(
     volume : [Ny, Nz, Nx] float32 tensor.
     If `return_history=True`, also returns (d_offsets, sigma, history).
     """
+    if multires_levels < 1:
+        raise ValueError("multires_levels must be >= 1")
     if sinogram.dim() != 3:
         raise ValueError("sinogram must be [n_angles, Ny, N_det]")
+    if angles_deg.dim() != 1:
+        raise ValueError("angles_deg must be a 1-D tensor")
     if sinogram.dtype != torch.float32:
         sinogram = sinogram.float()
     if angles_deg.dtype != torch.float32:
         angles_deg = angles_deg.float()
 
     n_angles, Ny, N_det = sinogram.shape
+    if angles_deg.numel() != n_angles:
+        raise ValueError(
+            f"sinogram has {n_angles} projections but angles_deg has "
+            f"{angles_deg.numel()} entries"
+        )
     if Nz < 0:
         Nz = N_det
     Nx = N_det  # standard parallel-beam convention
+
+    if lambdas is not None:
+        if lambdas.dim() != 3 or tuple(lambdas.shape) != (n_angles, Ny, N_det):
+            raise ValueError(
+                "lambdas must match sinogram shape "
+                f"[n_angles, Ny, N_det]={sinogram.shape}, got {tuple(lambdas.shape)}"
+            )
+        if lambdas.dtype != torch.float32:
+            lambdas = lambdas.float()
+        if lambdas.device != sinogram.device:
+            lambdas = lambdas.to(sinogram.device)
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())
@@ -2272,6 +2341,17 @@ def run_mbir(
 
     # Multires schedule: factors = [2**(L-1), ..., 2, 1] for L levels.
     factors = [2 ** (multires_levels - 1 - lvl) for lvl in range(multires_levels)]
+    coarse_factor = factors[0]
+    if coarse_factor > 1 and (
+        N_det % coarse_factor != 0
+        or Nx % coarse_factor != 0
+        or Nz % coarse_factor != 0
+    ):
+        raise ValueError(
+            "run_mbir multires_levels requires detector and reconstruction "
+            f"dims divisible by {coarse_factor}; got N_det={N_det}, "
+            f"Nx={Nx}, Nz={Nz}"
+        )
     if sigma_f_per_scale is None:
         sigma_f_per_scale = [sigma_f * float(f) for f in factors]
     elif len(sigma_f_per_scale) != multires_levels:
@@ -2328,9 +2408,14 @@ def run_mbir(
         )
         history_all.append(hist)
 
-        # Upsample volume to the next finer scale (factor 2).
+        # Carry the current solution to the next scale with an exact resize.
+        # Using a fixed ×2 upsample breaks odd detector sizes (e.g. 65 → 32 → 64),
+        # causing shape mismatches at the next level.
         if lvl + 1 < len(factors):
-            state.volume = _upsample_volume_zx(state.volume, 2)
+            next_f = factors[lvl + 1]
+            next_nz = max(Nz // next_f, 1)
+            next_nx = max(Nx // next_f, 1)
+            state.volume = _resize_volume_zx(state.volume, next_nz, next_nx)
 
     if return_history:
         return state.volume, state.d_offsets, state.sigma, history_all
