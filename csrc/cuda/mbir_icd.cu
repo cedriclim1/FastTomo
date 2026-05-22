@@ -140,7 +140,7 @@ __global__ static void mbir_forward_project_kernel(
 
     for (int ia = 0; ia < n_angles; ia++) {
         float ca = cos_a[ia], sa = sin_a[ia];
-        float u = x * ca - z * sa + half_det;
+        float u = x * ca + z * sa + half_det;
         int u0 = (int)floorf(u);
         int u1 = u0 + 1;
         float wu = u - u0;
@@ -209,7 +209,7 @@ __global__ static void mbir_icd_sweep_kernel(
         float t1 = 0.0f, t2 = 0.0f;
         for (int ia = tid; ia < n_angles; ia += blockDim.x) {
             float ca = cos_a[ia], sa = sin_a[ia];
-            float u  = x * ca - z * sa + mbir_H.half_det;
+            float u  = x * ca + z * sa + mbir_H.half_det;
             int u0 = (int)floorf(u);
             int u1 = u0 + 1;
             float wu = u - u0;
@@ -281,7 +281,7 @@ __global__ static void mbir_icd_sweep_kernel(
          * guarantees no thread collision on detector pixels. */
         for (int ia = tid; ia < n_angles; ia += blockDim.x) {
             float ca = cos_a[ia], sa = sin_a[ia];
-            float u  = x * ca - z * sa + mbir_H.half_det;
+            float u  = x * ca + z * sa + mbir_H.half_det;
             int u0 = (int)floorf(u);
             int u1 = u0 + 1;
             float wu = u - u0;

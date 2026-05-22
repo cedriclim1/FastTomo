@@ -936,5 +936,66 @@ def test_mbir_cpu_cuda_consistency():
     )
 
 
+def test_mbir_fp_matches_standard_fp_off_axis_voxel():
+    """Cross-projector regression: mbir_forward_project_cpu and the standard
+    ft.forward_project must agree on where a single off-Z-centre voxel lands
+    on the detector. A Z-symmetric phantom hides the sign bug; placing the
+    voxel at iz=8 (well off the iz=Nz//2 centre) makes the sign error visible
+    as a shifted detector hit."""
+    import math
+    import numpy as np
+    import fasttomo._core as _core
+    Ny, Nz, Nx = 4, 32, 32
+    N_det = Nx
+    n_angles = 12
+    phantom = torch.zeros(Ny, Nz, Nx)
+    phantom[Ny // 2, 8, Nx // 2] = 1.0   # off-centre in Z, on-centre in X
+    angles_deg = make_angles(n_angles, max_deg=60.0)
+    angles_rad = (angles_deg.float() * (math.pi / 180.0)).numpy().copy()
+
+    sino_mbir = _core.mbir_forward_project_cpu(
+        phantom.contiguous().numpy(), angles_rad, N_det, num_threads=1,
+    )
+    sino_std = ft.forward_project(phantom, angles_deg)
+
+    det_idx = np.arange(N_det, dtype=np.float32)
+    iy = Ny // 2
+    for ia in range(n_angles):
+        m = sino_mbir[ia, iy].astype(np.float64)
+        s = sino_std[ia, iy].numpy().astype(np.float64)
+        m_sum, s_sum = m.sum(), s.sum()
+        if m_sum < 1e-12 and s_sum < 1e-12:
+            continue
+        com_m = (m * det_idx).sum() / max(m_sum, 1e-12)
+        com_s = (s * det_idx).sum() / max(s_sum, 1e-12)
+        assert abs(com_m - com_s) < 0.75, (
+            f"angle {ia}: MBIR FP COM {com_m:.2f} vs standard FP COM "
+            f"{com_s:.2f} (diff {abs(com_m - com_s):.3f} > 0.75 px)"
+        )
+
+
+def test_mbir_reconstruction_from_standard_fp_sinogram_cpu():
+    """End-to-end regression on the real bug path: sinogram built with the
+    standard ft.forward_project (as user code and the notebook do) is given to
+    run_mbir. With the bug the Z-flip makes rel_err >> 1; post-fix it should be
+    < 0.35 (tolerates MBIR↔ray-marching model mismatch on CPU small phantom)."""
+    Ny, Nz, Nx = 4, 24, 24
+    phantom = torch.zeros(Ny, Nz, Nx)
+    phantom[:, 16:22, 4:10] = 1.0   # Z-asymmetric block
+    angles = make_angles(30, max_deg=70.0)
+    sino = ft.forward_project(phantom, angles)
+    vol = ft.run_mbir(
+        sino, angles,
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=True,
+        outer_iters=50, multires_levels=1,
+    )
+    rel_err = (vol - phantom).norm().item() / phantom.norm().item()
+    assert rel_err < 0.35, (
+        f"MBIR rel error vs phantom {rel_err:.4f} > 0.35 "
+        "(possible projector sign regression)"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
