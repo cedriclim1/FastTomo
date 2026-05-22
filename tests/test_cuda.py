@@ -1271,6 +1271,51 @@ def test_rotmat_cached_backward_stale_volume_falls_back_uncached():
     assert rel_b < 1e-5, f"latest branch gradient mismatch: rel_err={rel_b:.2e}"
 
 
+# ── Projector shape validation ────────────────────────────────────────────
+
+def test_parallel_projector_volume_shape_mismatch_raises():
+    """ParallelProjector.forward must raise if volume shape != projector geometry."""
+    N = 16
+    angles = make_angles(10)
+    proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+    wrong_vol = torch.zeros(2, N, N, device=DEVICE)  # Ny mismatch
+    with pytest.raises(ValueError, match="volume must have shape"):
+        proj.forward(wrong_vol)
+
+
+def test_parallel_projector_sinogram_shape_mismatch_raises():
+    """ParallelProjector.back must raise if sinogram shape != projector geometry."""
+    N = 16
+    n_angles = 10
+    angles = make_angles(n_angles)
+    proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
+    wrong_sino = torch.zeros(n_angles, 2, N, device=DEVICE)  # Ny mismatch
+    with pytest.raises(ValueError, match="sinogram must have shape"):
+        proj.back(wrong_sino)
+
+
+def test_rotmat_projector_volume_shape_mismatch_raises():
+    """RotmatProjector.forward must raise if volume shape != projector geometry."""
+    N = 16
+    n_angles = 10
+    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=DEVICE)
+    mats = torch.eye(3, device=DEVICE).unsqueeze(0).expand(n_angles, -1, -1).contiguous()
+    wrong_vol = torch.zeros(2, N, N, device=DEVICE)  # Ny mismatch
+    with pytest.raises(ValueError, match="volume must have shape"):
+        proj.forward(wrong_vol, mats)
+
+
+def test_rotmat_projector_mats_shape_mismatch_raises():
+    """RotmatProjector must raise on bad mats shape."""
+    N = 16
+    n_angles = 10
+    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=DEVICE)
+    vol = torch.zeros(1, N, N, device=DEVICE)
+    wrong_mats = torch.eye(3, device=DEVICE).unsqueeze(0).expand(5, -1, -1).contiguous()
+    with pytest.raises(ValueError, match="mats must have shape"):
+        proj.forward(vol, wrong_mats)
+
+
 # ── SART ──────────────────────────────────────────────────────────────────
 
 class TestRunSartCuda:
@@ -1437,6 +1482,46 @@ class TestRunAdRecon:
             f"Expected loss history of length {n_iter}, got {losses.shape}"
         )
         assert losses.dtype == torch.float32
+
+    def test_3d_mask_1_nz_nx_accepted(self):
+        """ConstraintConfig.mask with shape [1, Nz, Nx] should not crash."""
+        N = 16
+        angles = make_angles(20)
+        sino = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+        mask_3d = torch.ones(1, N, N, device=DEVICE)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5),
+            constraints=ft.ConstraintConfig(mask=mask_3d),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert vol.shape == (1, N, N)
+
+    def test_3d_mask_ny_nz_nx_accepted(self):
+        """ConstraintConfig.mask with shape [Ny, Nz, Nx] should not crash."""
+        N, Ny = 16, 4
+        angles = make_angles(20)
+        vol_gt = phantom_2d(N).unsqueeze(0).expand(Ny, -1, -1).contiguous()
+        sino = ft.forward_project(vol_gt, angles)
+        mask_3d = torch.ones(Ny, N, N, device=DEVICE)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5),
+            constraints=ft.ConstraintConfig(mask=mask_3d),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert vol.shape == (Ny, N, N)
+
+    def test_bad_3d_mask_shape_raises(self):
+        """Wrong 3-D mask shape should raise a ValueError with a clear message."""
+        N = 16
+        angles = make_angles(20)
+        sino = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+        bad_mask = torch.ones(3, N, N, device=DEVICE)  # Ny=3 but sino has Ny=1
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=1),
+            constraints=ft.ConstraintConfig(mask=bad_mask),
+        )
+        with pytest.raises(ValueError, match="3-D"):
+            ft.run_ad_recon(sino, angles, config=cfg)
 
 
 # ── CUDA Graph capture for run_sirt ──────────────────────────────────────────
