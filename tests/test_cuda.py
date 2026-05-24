@@ -1383,6 +1383,27 @@ class TestRunAdRecon:
             f"{losses[0].item():.4f} -> {losses[-1].item():.4f}"
         )
 
+    def test_sparsity_penalizes_magnitude_not_signed_mean(self):
+        """With zero data-fit signal, L1 sparsity must not drive volume negative.
+
+        Regression guard: if sparsity is implemented as `+lambda * mean(volume)`
+        (signed mean) instead of `+lambda * mean(abs(volume))`, Adam steps push
+        all voxels negative even when the optimum should stay at zero.
+        """
+        N = 16
+        n_angles = 10
+        sino = torch.zeros(n_angles, 1, N, device=DEVICE, dtype=torch.float32)
+        angles = make_angles(n_angles)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5, lr_volume=0.05, cosine_schedule=False),
+            reg=ft.RegularizerConfig(sparsity=1.0),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert float(vol.abs().max().item()) < 1e-6, (
+            "run_ad_recon sparsity term should keep zero-initialized volume at zero "
+            "for zero sinogram; got non-zero drift (possible signed-mean sparsity bug)"
+        )
+
     def test_with_pose_recovers_perturbed_euler(self):
         """With-pose AD: angles are updated from a perturbed starting point.
 
