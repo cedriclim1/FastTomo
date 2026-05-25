@@ -1057,6 +1057,37 @@ def test_mbir_lambdas_shape_mismatch_raises():
         ft.run_mbir(sino, angles, lambdas=bad_lambdas)
 
 
+def test_mbir_lambdas_negative_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = -torch.ones_like(sino)
+    with pytest.raises(ValueError, match="non-negative"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+def test_mbir_lambdas_nonfinite_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = torch.ones_like(sino)
+    bad_lambdas[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+def test_mbir_nonpositive_sigma_init_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="sigma_init"):
+        ft.run_mbir(sino, angles, sigma_init=0.0)
+
+
+def test_mbir_nonpositive_sigma_min_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="sigma_min"):
+        ft.run_mbir(sino, angles, sigma_min=0.0)
+
+
 def test_mbir_multires_not_divisible_raises():
     # N_det=14 is not divisible by coarse_factor=4 (multires_levels=3).
     sino14 = torch.zeros(5, 2, 14)

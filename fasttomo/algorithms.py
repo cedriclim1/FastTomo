@@ -2331,13 +2331,21 @@ def run_mbir(
             lambdas = lambdas.float()
         if lambdas.device != sinogram.device:
             lambdas = lambdas.to(sinogram.device)
+        if not torch.isfinite(lambdas).all():
+            raise ValueError("lambdas must contain only finite values")
+        if (lambdas < 0).any():
+            raise ValueError("lambdas must be non-negative")
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())
         if sigma_init < 1e-6:
             sigma_init = 1.0
+    if not math.isfinite(float(sigma_init)) or float(sigma_init) <= 0.0:
+        raise ValueError("sigma_init must be a finite positive scalar")
     if sigma_min is None:
         sigma_min = sigma_init * 1e-3
+    if not math.isfinite(float(sigma_min)) or float(sigma_min) <= 0.0:
+        raise ValueError("sigma_min must be a finite positive scalar")
 
     # Multires schedule: factors = [2**(L-1), ..., 2, 1] for L levels.
     factors = [2 ** (multires_levels - 1 - lvl) for lvl in range(multires_levels)]
