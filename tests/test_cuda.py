@@ -1483,6 +1483,29 @@ class TestRunAdRecon:
         )
         assert losses.dtype == torch.float32
 
+    def test_sparsity_regularizer_uses_l1_magnitude(self):
+        """Sparsity should be |f|-based, not signed mean(f).
+
+        Regression guard: with zero sinogram and no positivity clamp, the
+        sparse regulariser alone should not push an all-zero volume negative.
+        A signed-mean penalty introduces a constant negative gradient and
+        drifts volume below zero.
+        """
+        N = 16
+        n_angles = 10
+        angles = make_angles(n_angles)
+        sino = torch.zeros(n_angles, 1, N, device=DEVICE)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=3, lr_volume=0.1, cosine_schedule=False),
+            reg=ft.RegularizerConfig(sparsity=0.1),
+            constraints=ft.ConstraintConfig(positivity=False),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert float(vol.abs().max()) < 1e-7, (
+            "L1 sparsity on an all-zero input should keep the volume at zero; "
+            "detected drift away from zero."
+        )
+
     def test_3d_mask_1_nz_nx_accepted(self):
         """ConstraintConfig.mask with shape [1, Nz, Nx] should not crash."""
         N = 16
