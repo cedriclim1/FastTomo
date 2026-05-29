@@ -1468,6 +1468,21 @@ class TestRunAdRecon:
         with pytest.raises(ValueError, match="RotmatProjector"):
             ft.run_ad_recon(sino, angles, projector=parallel_proj, config=cfg_pose)
 
+    def test_projector_geometry_mismatch_raises(self):
+        """run_ad_recon must reject projector outputs that would broadcast."""
+        N = 16
+        angles = make_angles(20)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+
+        # Bad cached projector: same volume geometry, wrong n_angles=1.
+        # Without an explicit shape check, MSE would broadcast [1, 1, N]
+        # over [20, 1, N] and silently corrupt optimisation.
+        bad_proj = ft.ParallelProjector((1, N, N), make_angles(1), device=DEVICE, N_det=N)
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
+        with pytest.raises(ValueError, match="projector returned"):
+            ft.run_ad_recon(sino, angles, projector=bad_proj, config=cfg)
+
     def test_return_loss_shape(self):
         """return_loss=True: loss history length equals n_iter."""
         N = 16

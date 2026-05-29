@@ -1120,6 +1120,8 @@ def run_ad_recon(
     if reg_cfg.s3im_weight > 0.0:
         _s3im_gen = torch.Generator(device=device).manual_seed(42)
 
+    expected_pred_shape = (n_angles, Ny, N_det)
+
     # ── iteration ─────────────────────────────────────────────────────────
     losses: list[float] = []
 
@@ -1137,6 +1139,12 @@ def run_ad_recon(
         # optional shift correction
         if refine_shifts and shifts is not None:
             pred = apply_shifts_2d(pred, shifts)
+        _assert_projector_output_shape(
+            pred,
+            expected_pred_shape,
+            "forward-projection",
+            "run_ad_recon",
+        )
 
         # data-fit loss
         if optim_cfg.loss_fn == "mse":
