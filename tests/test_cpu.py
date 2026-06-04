@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import fasttomo as ft
+import fasttomo.algorithms as ft_algorithms
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -206,6 +207,25 @@ def test_sirt_projector_shape_mismatch_raises():
             Nz=N,
             projector=MismatchedProjector(n_angles=n_angles, N=N),
         )
+
+
+def test_ad_sparsity_loss_is_sign_symmetric_and_has_zero_gradient_at_zero():
+    """AD sparsity regularization must implement mean(abs(volume)).
+
+    Regression guard: a signed mean drives all voxels negative when sparsity
+    is enabled, corrupting AD reconstructions.
+    """
+    vol = torch.tensor([[[1.0, -2.0], [0.5, -0.25]]], dtype=torch.float32)
+    loss = ft_algorithms._ad_sparsity_loss(vol)
+    mirrored_loss = ft_algorithms._ad_sparsity_loss(-vol)
+    assert torch.allclose(loss, mirrored_loss), "L1 sparsity must be sign-symmetric"
+
+    vol_zero = torch.zeros(1, 2, 2, dtype=torch.float32, requires_grad=True)
+    zero_loss = ft_algorithms._ad_sparsity_loss(vol_zero)
+    zero_loss.backward()
+    assert torch.count_nonzero(vol_zero.grad).item() == 0, (
+        "L1 sparsity should not apply a signed push at zero; gradient must be zero"
+    )
 
 
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
