@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import fasttomo as ft
+from fasttomo.algorithms import _ad_sparsity_penalty
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -23,6 +24,14 @@ def phantom_2d(N: int) -> torch.Tensor:
     q   = N // 4
     vol[q:3*q, q:3*q] = 1.0
     return vol
+
+
+def test_ad_sparsity_penalty_uses_abs_mean():
+    """AD sparsity should penalize magnitude, not signed intensity."""
+    vol = torch.tensor([[[-3.0, 3.0]]], dtype=torch.float32)
+    penalty = _ad_sparsity_penalty(vol)
+    assert torch.isclose(penalty, vol.abs().mean())
+    assert penalty.item() == pytest.approx(3.0)
 
 
 # ── adjoint test ───────────────────────────────────────────────────────────
