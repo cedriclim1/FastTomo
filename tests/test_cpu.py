@@ -1073,5 +1073,51 @@ def test_mbir_multires_even_runs():
     assert vol.shape == (2, 16, 16)
 
 
+def test_ad_recon_sparsity_uses_l1_magnitude(monkeypatch):
+    """AD sparsity should penalize |volume|, not signed mean(volume).
+
+    Regression trigger:
+      - zero sinogram
+      - sparsity > 0
+      - positivity disabled
+    With a signed-mean penalty, gradients are constant and push the whole
+    volume negative from an all-zero start. With L1 magnitude, grad at zero
+    is zero and the volume remains unchanged.
+    """
+    import fasttomo.algorithms as algo
+
+    n_angles, Ny, N_det, Nz = 5, 1, 8, 8
+    sinogram = torch.zeros(n_angles, Ny, N_det, dtype=torch.float32)
+    angles = make_angles(n_angles)
+
+    class FakeParallelProjector:
+        def __init__(self, geom, angles_deg, device, N_det):
+            self.n_angles = len(angles_deg)
+            self.Ny, self.Nz, self.Nx = geom
+            self.N_det = N_det
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                self.n_angles, self.Ny, self.N_det, dtype=volume.dtype, device=volume.device
+            )
+
+    def fake_check_inputs(sino, angles_deg, nz, **_kwargs):
+        n_ang, ny, n_det = sino.shape
+        return n_ang, ny, n_det, (n_det if nz < 0 else nz), sino.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", FakeParallelProjector)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=1, lr_volume=1.0),
+        reg=ft.RegularizerConfig(sparsity=1.0),
+        constraints=ft.ConstraintConfig(positivity=False, mask=False, sparsity=0.0),
+    )
+    projector = FakeParallelProjector((Ny, Nz, N_det), angles, sinogram.device, N_det)
+
+    out = ft.run_ad_recon(sinogram, angles, Nz=Nz, projector=projector, config=cfg)
+    assert torch.allclose(out, torch.zeros_like(out), atol=1e-8)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
