@@ -2331,6 +2331,11 @@ def run_mbir(
             lambdas = lambdas.float()
         if lambdas.device != sinogram.device:
             lambdas = lambdas.to(sinogram.device)
+        # MBIR kernels consume lambdas via raw linear pointers; enforce dense
+        # row-major storage so strided views (e.g. expand/transpose) cannot
+        # corrupt indexing inside the C/CUDA sweeps.
+        if not lambdas.is_contiguous():
+            lambdas = lambdas.contiguous()
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())
@@ -2369,6 +2374,8 @@ def run_mbir(
             lam_lvl = _downsample_sino_det(lambdas, f)
         else:
             lam_lvl = lambdas
+        if lam_lvl is not None and not lam_lvl.is_contiguous():
+            lam_lvl = lam_lvl.contiguous()
 
         Nz_lvl = max(Nz // f, 1)
         Nx_lvl = max(Nx // f, 1)

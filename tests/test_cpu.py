@@ -1057,6 +1057,39 @@ def test_mbir_lambdas_shape_mismatch_raises():
         ft.run_mbir(sino, angles, lambdas=bad_lambdas)
 
 
+def test_mbir_noncontiguous_lambdas_matches_contiguous():
+    """Regression: strided lambda views must behave like dense tensors.
+
+    MBIR kernels consume lambdas through raw pointers; non-contiguous views
+    (e.g. from ``expand``) must be materialized first, otherwise indexing is
+    corrupted and reconstruction changes despite identical logical values.
+    """
+    torch.manual_seed(0)
+    Ny = Nz = Nx = 8
+    angles = make_angles(5, max_deg=40.0)
+    phantom = torch.rand(Ny, Nz, Nx)
+    sino = ft.forward_project(phantom, angles)
+
+    lam_contig = torch.ones_like(sino)
+    lam_expand = torch.ones(1, Ny, Nx).expand_as(sino)
+    assert not lam_expand.is_contiguous()
+
+    kw = dict(
+        Nz=Nz,
+        sigma_f=0.1,
+        huber_T=float("inf"),
+        estimate_offset=False,
+        estimate_variance=False,
+        outer_iters=4,
+        multires_levels=1,
+        seed=11,
+    )
+    vol_contig = ft.run_mbir(sino, angles, lambdas=lam_contig, **kw)
+    vol_expand = ft.run_mbir(sino, angles, lambdas=lam_expand, **kw)
+
+    assert torch.allclose(vol_contig, vol_expand, atol=1e-6, rtol=1e-6)
+
+
 def test_mbir_multires_not_divisible_raises():
     # N_det=14 is not divisible by coarse_factor=4 (multires_levels=3).
     sino14 = torch.zeros(5, 2, 14)
