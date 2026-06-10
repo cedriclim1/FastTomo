@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import fasttomo as ft
+import fasttomo.algorithms as ft_algorithms
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -206,6 +207,57 @@ def test_sirt_projector_shape_mismatch_raises():
             Nz=N,
             projector=MismatchedProjector(n_angles=n_angles, N=N),
         )
+
+
+def test_ad_recon_sparsity_penalty_uses_abs_l1(monkeypatch):
+    """AD sparsity must be sign-symmetric: zero volume should stay zero.
+
+    Regression for a critical sign bug where the loss used ``volume.mean()``
+    instead of ``abs(volume).mean()``. With zero sinogram this introduces a
+    constant positive gradient that drives the whole volume negative.
+    """
+
+    class DummyParallelProjector:
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            # Return a simple differentiable [n_angles=1, Ny=1, N_det=2] view.
+            return volume[:, 0, :].unsqueeze(0)
+
+    def fake_check_inputs(
+        sinogram: torch.Tensor,
+        angles_deg: torch.Tensor,
+        Nz: int,
+        allowed_dtypes: tuple[torch.dtype, ...],
+        op_name: str,
+        require_cuda: bool,
+    ) -> tuple[int, int, int, int, torch.device]:
+        del allowed_dtypes, op_name, require_cuda
+        n_angles, Ny, N_det = sinogram.shape
+        if Nz < 0:
+            Nz = N_det
+        return n_angles, Ny, N_det, Nz, torch.device("cpu")
+
+    monkeypatch.setattr(ft_algorithms, "_check_inputs", fake_check_inputs)
+    monkeypatch.setattr(ft_algorithms, "ParallelProjector", DummyParallelProjector)
+
+    sino = torch.zeros(1, 1, 2, dtype=torch.float32)
+    angles = torch.zeros(1, dtype=torch.float32)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=1, lr_volume=0.1, cosine_schedule=False),
+        reg=ft.RegularizerConfig(sparsity=1.0),
+        constraints=ft.ConstraintConfig(positivity=False),
+    )
+
+    vol = ft.run_ad_recon(
+        sino,
+        angles,
+        Nz=2,
+        projector=DummyParallelProjector(),
+        config=cfg,
+    )
+    assert torch.allclose(vol, torch.zeros_like(vol)), (
+        "L1 sparsity should not push an all-zero volume negative when data "
+        "residual is zero."
+    )
 
 
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────

@@ -1150,7 +1150,7 @@ def run_ad_recon(
         if reg_cfg.tv_xz_weight > 0.0:
             loss = loss + reg_cfg.tv_xz_weight * tv_loss_xz(volume)
         if reg_cfg.sparsity > 0.0:
-            loss = loss + reg_cfg.sparsity * volume.mean()
+            loss = loss + reg_cfg.sparsity * volume.abs().mean()
         if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt_angle_opt is not None:
             loss = loss + pose_cfg.in_plane_weight * (
                 tilt_angle_opt[:, 0].pow(2).mean()
