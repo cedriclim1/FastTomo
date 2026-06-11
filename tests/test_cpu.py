@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import fasttomo as ft
+from fasttomo.algorithms import _sparsity_loss_l1
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -206,6 +207,19 @@ def test_sirt_projector_shape_mismatch_raises():
             Nz=N,
             projector=MismatchedProjector(n_angles=n_angles, N=N),
         )
+
+
+def test_ad_sparsity_penalty_uses_l1_magnitude():
+    """AD sparsity must penalise magnitude, not signed mean."""
+    vol = torch.tensor(
+        [[[2.0, -1.0], [-3.0, 4.0]]],
+        dtype=torch.float32,
+    )
+    expected = torch.tensor((2.0 + 1.0 + 3.0 + 4.0) / 4.0, dtype=torch.float32)
+    penalty = _sparsity_loss_l1(vol)
+
+    assert torch.isclose(penalty, expected)
+    assert torch.isclose(_sparsity_loss_l1(vol), _sparsity_loss_l1(-vol))
 
 
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
