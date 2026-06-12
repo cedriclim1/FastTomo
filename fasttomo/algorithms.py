@@ -10,9 +10,11 @@ Angles: 1-D tensor, degrees.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import torch
@@ -156,6 +158,64 @@ def _finish_iters(
     if return_loss:
         return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+# ── loss-callback helpers (live loss streaming) ────────────────────────────
+#
+# Contract (app handoff, 2026-06-11): iterative algorithms accept an optional
+# ``loss_callback`` kwarg invoked as ``loss_callback(iter, loss)`` with
+# 0-based iteration index and a plain CPU float (NaN/Inf passed through).
+# Callbacks that declare a ``components`` keyword additionally receive
+# ``components={...}`` — per-term CPU floats whose sum ≈ the total loss.
+# The kwarg must be a named parameter (introspectable via inspect.signature),
+# the callback is display-only (``return_loss`` is unchanged), and a raising
+# callback must never abort the reconstruction.
+
+
+def _callback_accepts_components(loss_callback: Callable) -> bool:
+    """True if ``loss_callback`` can receive the ``components=`` kwarg.
+
+    Existing consumers pass plain 2-positional callables; probe the signature
+    once so those keep working without the components extension.
+    """
+    try:
+        sig = inspect.signature(loss_callback)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "components" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def _emit_loss(
+    loss_callback: Callable,
+    send_components: bool,
+    iteration: int,
+    loss: float,
+    components: dict[str, float] | None,
+) -> None:
+    """Invoke ``loss_callback``, swallowing (but logging) any exception.
+
+    One failed call must not stop subsequent invocations — the caller keeps
+    calling every iteration regardless.
+    """
+    try:
+        if send_components:
+            loss_callback(iteration, loss, components=components)
+        else:
+            loss_callback(iteration, loss)
+    except Exception:
+        _log.warning(
+            "loss_callback raised at iteration %d; continuing reconstruction",
+            iteration,
+            exc_info=True,
+        )
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -345,6 +405,7 @@ def run_sirt(
     projector: object | None = None,            # ParallelProjector / RotmatProjector for cached FP/BP
     volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
     support_mask: torch.Tensor | None = None,   # precomputed support, enforced each iteration
+    loss_callback: Callable | None = None,      # per-iteration loss streaming hook
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
@@ -389,6 +450,15 @@ def run_sirt(
     expected (soft [0, 1] values act as a smooth weighting); cast to the
     compute dtype/device internally. Mutually exclusive with ``mask=True``
     — one support per reconstruction.
+    loss_callback: optional hook invoked once per iteration as
+    ``loss_callback(i, loss)`` — 0-based index and the same plain CPU float
+    that lands in ``loss_history[i]`` (NaN/Inf passed through). Callbacks
+    whose signature accepts a ``components`` keyword also receive
+    ``components={"fidelity": loss}`` (SIRT's loss is pure data fidelity;
+    ``sparsity`` acts as a proximal constraint, not a loss term). Exceptions
+    raised by the callback are logged and swallowed. Independent of
+    ``return_loss``; supplying a callback forces the eager loop (no CUDA
+    Graph capture).
 
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
@@ -436,6 +506,10 @@ def run_sirt(
         _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
     constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
+    track_loss = return_loss or loss_callback is not None
+    send_components = (
+        loss_callback is not None and _callback_accepts_components(loss_callback)
+    )
 
     # --- CUDA Graph capture path ----------------------------------------
     # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
@@ -443,7 +517,7 @@ def run_sirt(
     # matrix tensor can vary, while cached graphs assume fixed captured inputs.
     # If capture fails, fall back to the eager loop below.
     _active_proj = projector if projector is not None else _internal_proj
-    if sinogram.is_cuda and not return_loss and n_iter > 1 and euler_zyz_deg is None:
+    if sinogram.is_cuda and not track_loss and n_iter > 1 and euler_zyz_deg is None:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
             sinogram=sinogram,
@@ -467,11 +541,18 @@ def run_sirt(
         if graph_result is not None:
             return graph_result
 
-    # --- eager iteration loop (fallback / CPU / return_loss path) --------
-    for _ in range(n_iter):
+    # --- eager iteration loop (fallback / CPU / loss-tracking path) ------
+    for it in range(n_iter):
         raw_res  = sinogram - _fp(volume)
-        if return_loss:
-            losses.append(raw_res.pow(2).mean().item())
+        if track_loss:
+            loss_val = raw_res.pow(2).mean().item()
+            if return_loss:
+                losses.append(loss_val)
+            if loss_callback is not None:
+                _emit_loss(
+                    loss_callback, send_components, it, loss_val,
+                    {"fidelity": loss_val} if send_components else None,
+                )
         residual = raw_res * R_sino
         volume   = volume + omega * C_vol * _bp(residual)
         volume   = constraints.apply(volume)
@@ -639,6 +720,7 @@ def _fista_loop(
     L: float,
     prox_fn,
     return_loss: bool,
+    loss_callback: Callable | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Shared Beck-Teboulle FISTA outer loop.
 
@@ -648,17 +730,30 @@ def _fista_loop(
 
     ``return_loss`` records ``||b − A·y_k||²`` (data-fit MSE at the momentum
     point, which is free) at each iteration — a tight surrogate for the loss
-    at ``x_k``.
+    at ``x_k``. ``loss_callback`` streams the same value per iteration
+    (components: ``{"fidelity": loss}`` — the recorded loss is the data-fit
+    term only, regardless of prox regularisation).
     """
     inv_L = 1.0 / L
     t = 1.0
     x_prev = volume.clone()
     y = volume.clone()
     losses: list[float] = []
-    for _ in range(n_iter):
+    track_loss = return_loss or loss_callback is not None
+    send_components = (
+        loss_callback is not None and _callback_accepts_components(loss_callback)
+    )
+    for it in range(n_iter):
         fp_y = _fp(y)
-        if return_loss:
-            losses.append((sinogram - fp_y).pow(2).mean().item())
+        if track_loss:
+            loss_val = (sinogram - fp_y).pow(2).mean().item()
+            if return_loss:
+                losses.append(loss_val)
+            if loss_callback is not None:
+                _emit_loss(
+                    loss_callback, send_components, it, loss_val,
+                    {"fidelity": loss_val} if send_components else None,
+                )
         grad = _bp(fp_y - sinogram)
         x_new = prox_fn(y - inv_L * grad)
         t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
@@ -732,6 +827,7 @@ def run_fista(
     num_threads: int | None = None,
     projector: object | None = None,
     volume: torch.Tensor | None = None,
+    loss_callback: Callable | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA (Beck & Teboulle 2009) on the smooth least-squares problem
@@ -765,6 +861,9 @@ def run_fista(
         projector:    optional cached :class:`ParallelProjector` /
                       :class:`RotmatProjector` (CUDA reuse).
         volume:       optional warm-start ``[Ny, Nz, Nx]``.
+        loss_callback: optional per-iteration hook ``loss_callback(i, loss)``
+                      streaming the same value recorded in ``loss_history``
+                      (see :func:`run_sirt` for the full contract).
 
     Returns the reconstructed volume (or ``(volume, loss_history)`` when
     ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
@@ -797,7 +896,10 @@ def run_fista(
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
     constraints = ConstraintConfig(positivity=positivity, mask=_mask)
 
-    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, constraints.apply, return_loss)
+    return _fista_loop(
+        volume, sinogram, _fp, _bp, n_iter, L_eff, constraints.apply,
+        return_loss, loss_callback,
+    )
 
 
 def run_fista_tv(
@@ -817,6 +919,7 @@ def run_fista_tv(
     num_threads: int | None = None,
     projector: object | None = None,
     volume: torch.Tensor | None = None,
+    loss_callback: Callable | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA-TV (Beck & Teboulle 2009 + 2009b) on the composite problem
@@ -831,7 +934,8 @@ def run_fista_tv(
 
     Args:
         sinogram, angles_deg, n_iter, Nz, positivity, mask, euler_zyz_deg,
-        return_loss, n_power_iter, L, num_threads, projector, volume:
+        return_loss, n_power_iter, L, num_threads, projector, volume,
+        loss_callback:
                       see :func:`run_fista`.
         tv_weight:    isotropic TV regularisation weight (required, > 0).
                       Pass ``tv_weight=0`` and use :func:`run_fista` directly.
@@ -876,7 +980,10 @@ def run_fista_tv(
     lam = tv_weight / L_eff
     prox = lambda u: _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
-    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, return_loss)
+    return _fista_loop(
+        volume, sinogram, _fp, _bp, n_iter, L_eff, prox,
+        return_loss, loss_callback,
+    )
 
 
 def run_sart(
@@ -1025,6 +1132,7 @@ def run_ad_recon(
     support_mask: torch.Tensor | None = None,
     return_loss: bool = False,
     return_pose: bool = False,
+    loss_callback: Callable | None = None,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -1060,6 +1168,17 @@ def run_ad_recon(
         return_pose:     If True, also return ``(refined_euler, refined_shifts)``
                          where each is ``None`` if the corresponding refinement
                          was disabled.
+        loss_callback:   Optional hook invoked once per iteration as
+                         ``loss_callback(i, loss)`` — 0-based index and the
+                         same plain CPU float that lands in ``loss_history[i]``
+                         (NaN/Inf passed through). Callbacks whose signature
+                         accepts a ``components`` keyword also receive
+                         ``components={...}``: per-term CPU floats keyed
+                         ``fidelity`` plus only the regularisers active this
+                         run (``tv``, ``tv_xz``, ``sparsity``, ``in_plane``,
+                         ``s3im``, ``tilt_ssim``), each already weighted so
+                         ``sum(components.values()) ≈ loss``. Exceptions
+                         raised by the callback are logged and swallowed.
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
@@ -1198,8 +1317,11 @@ def run_ad_recon(
 
     # ── iteration ─────────────────────────────────────────────────────────
     losses: list[float] = []
+    send_components = (
+        loss_callback is not None and _callback_accepts_components(loss_callback)
+    )
 
-    for _ in tqdm(range(optim_cfg.n_iter)):
+    for it in tqdm(range(optim_cfg.n_iter)):
         for opt in optimisers:
             opt.zero_grad()
 
@@ -1214,30 +1336,44 @@ def run_ad_recon(
         if refine_shifts and shifts is not None:
             pred = apply_shifts_2d(pred, shifts)
 
-        # data-fit loss
+        # data-fit + regularisation terms, keyed for the loss_callback
+        # components contract. Insertion order matches the historical
+        # summation order (float addition is non-associative), keeping the
+        # total bit-identical to the pre-callback behaviour.
+        terms: dict[str, torch.Tensor] = {}
         if optim_cfg.loss_fn == "mse":
-            loss = F.mse_loss(pred, sinogram)
+            terms["fidelity"] = F.mse_loss(pred, sinogram)
         else:
-            loss = F.l1_loss(pred, sinogram)
-
-        # regularisation
+            terms["fidelity"] = F.l1_loss(pred, sinogram)
         if reg_cfg.tv_weight > 0.0:
-            loss = loss + reg_cfg.tv_weight * tv_loss_3d(volume)
+            terms["tv"] = reg_cfg.tv_weight * tv_loss_3d(volume)
         if reg_cfg.tv_xz_weight > 0.0:
-            loss = loss + reg_cfg.tv_xz_weight * tv_loss_xz(volume)
+            terms["tv_xz"] = reg_cfg.tv_xz_weight * tv_loss_xz(volume)
         if reg_cfg.sparsity > 0.0:
-            loss = loss + reg_cfg.sparsity * volume.mean()
+            terms["sparsity"] = reg_cfg.sparsity * volume.mean()
         if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt_angle_opt is not None:
-            loss = loss + pose_cfg.in_plane_weight * (
+            terms["in_plane"] = pose_cfg.in_plane_weight * (
                 tilt_angle_opt[:, 0].pow(2).mean()
                 + tilt_angle_opt[:, 2].pow(2).mean()
             )
         if reg_cfg.s3im_weight > 0.0:
-            loss = loss + reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
+            terms["s3im"] = reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
         if reg_cfg.tilt_ssim_weight > 0.0:
-            loss = loss + reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
+            terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
 
-        losses.append(loss.item())
+        loss = terms["fidelity"]
+        for key, term in terms.items():
+            if key != "fidelity":
+                loss = loss + term
+
+        loss_val = loss.item()
+        losses.append(loss_val)
+        if loss_callback is not None:
+            _emit_loss(
+                loss_callback, send_components, it, loss_val,
+                {key: term.item() for key, term in terms.items()}
+                if send_components else None,
+            )
         loss.backward()
 
         if ref_idx is not None:
