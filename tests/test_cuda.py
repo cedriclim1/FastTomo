@@ -2024,5 +2024,138 @@ def test_mbir_reconstruction_from_standard_fp_sinogram():
     )
 
 
+# ── custom support masks (support_mask kwarg) ──────────────────────────────
+
+def _half_support(N: int, left: bool) -> torch.Tensor:
+    """Binary [1, N, N] support covering the left or right half in x."""
+    M = torch.zeros(1, N, N, device=DEVICE)
+    if left:
+        M[:, :, : N // 2] = 1.0
+    else:
+        M[:, :, N // 2:] = 1.0
+    return M
+
+
+def test_fbp_support_mask_cuda():
+    """support_mask on CUDA: equals post-multiply; bool tensors accepted."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M = _half_support(N, left=True)
+    rec_masked = ft.run_fbp(sino, angles, Nz=N, support_mask=M)
+    rec_plain  = ft.run_fbp(sino, angles, Nz=N)
+    assert torch.equal(rec_masked, rec_plain * M)
+
+    rec_bool = ft.run_fbp(sino, angles, Nz=N, support_mask=M.bool())
+    assert torch.equal(rec_bool, rec_masked)
+
+
+def test_fbp_support_mask_fp16_volume_fp32_mask_cuda():
+    """fp16 sinogram + fp32 mask: mask is cast, dtype preserved end-to-end."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles).half()
+
+    M   = _half_support(N, left=True)            # float32
+    rec = ft.run_fbp(sino, angles, Nz=N, support_mask=M)
+    assert rec.dtype == torch.float16
+    assert rec[M.expand_as(rec) == 0].abs().max().item() == 0.0
+
+
+def test_sirt_support_mask_cuda_zeros_outside_support():
+    """Support enforced each iteration on the CUDA (graph) path."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M   = _half_support(N, left=True)
+    rec = ft.run_sirt(sino, angles, n_iter=5, Nz=N, support_mask=M)
+    assert rec[M == 0].abs().max().item() == 0.0
+    assert rec[M == 1].abs().max().item() > 0.0
+
+
+def test_sirt_support_mask_cuda_graph_not_stale():
+    """Two same-geometry calls with different masks must not share a cached
+    graph's baked-in mask: the second call's output must follow the second
+    mask, not the first."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M_left  = _half_support(N, left=True)
+    M_right = _half_support(N, left=False)
+
+    rec_left  = ft.run_sirt(sino, angles, n_iter=5, Nz=N, support_mask=M_left)
+    rec_right = ft.run_sirt(sino, angles, n_iter=5, Nz=N, support_mask=M_right)
+
+    assert rec_left[M_left == 0].abs().max().item() == 0.0
+    assert rec_right[M_right == 0].abs().max().item() == 0.0, (
+        "second call replayed the first call's mask (stale CUDA Graph buffer)"
+    )
+    assert rec_right[M_right == 1].abs().max().item() > 0.0
+
+
+def test_sirt_support_mask_full_3d_cuda():
+    """A full [Ny, Nz, Nx] support that varies along the tilt axis is honored."""
+    N, Ny  = 32, 4
+    angles = make_angles(20)
+    vol    = phantom_2d(N).unsqueeze(0).expand(Ny, -1, -1).contiguous()
+    sino   = ft.forward_project(vol, angles)
+
+    M = torch.zeros(Ny, N, N, device=DEVICE)
+    M[: Ny // 2, : N // 2, :] = 1.0
+    M[Ny // 2:, N // 2:, :] = 1.0
+    rec = ft.run_sirt(sino, angles, n_iter=5, Nz=N, support_mask=M)
+    assert rec.shape == (Ny, N, N)
+    assert rec[M == 0].abs().max().item() == 0.0
+
+
+class TestAdReconSupportMask:
+    """support_mask kwarg on run_ad_recon (hard per-iteration constraint)."""
+
+    def test_zeros_outside_support(self):
+        N = 16
+        angles = make_angles(20)
+        sino = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+        M = torch.zeros(1, N, N, device=DEVICE)
+        q = N // 4
+        M[:, q:3*q, q:3*q] = 1.0
+
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=5))
+        vol = ft.run_ad_recon(sino, angles, config=cfg, support_mask=M)
+        assert vol[M == 0].abs().max().item() == 0.0
+        assert vol[M == 1].abs().max().item() > 0.0
+
+    def test_conflicts_with_config_mask(self):
+        N = 16
+        angles = make_angles(10)
+        sino = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+        M = torch.ones(1, N, N, device=DEVICE)
+
+        cfg_true = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=1),
+            constraints=ft.ConstraintConfig(mask=True),
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ft.run_ad_recon(sino, angles, config=cfg_true, support_mask=M)
+
+        cfg_tensor = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=1),
+            constraints=ft.ConstraintConfig(mask=M),
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ft.run_ad_recon(sino, angles, config=cfg_tensor, support_mask=M)
+
+    def test_bad_shape_raises(self):
+        N = 16
+        angles = make_angles(10)
+        sino = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+        bad = torch.ones(3, N, N, device=DEVICE)   # Ny=3 but sino has Ny=1
+        with pytest.raises(ValueError, match="support_mask"):
+            ft.run_ad_recon(sino, angles, support_mask=bad)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
