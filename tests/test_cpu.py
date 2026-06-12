@@ -1073,5 +1073,112 @@ def test_mbir_multires_even_runs():
     assert vol.shape == (2, 16, 16)
 
 
+# ── custom support masks (support_mask kwarg) ──────────────────────────────
+
+def _box_support(Ny: int, N: int) -> torch.Tensor:
+    """Binary [Ny, N, N] support: 1 inside the central half-box, 0 outside."""
+    M = torch.zeros(Ny, N, N)
+    q = N // 4
+    M[:, q:3*q, q:3*q] = 1.0
+    return M
+
+
+def test_fbp_support_mask_equals_post_multiply():
+    """FBP applies the support once at the end: == unmasked recon * mask."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M = _box_support(1, N)
+    rec_masked = ft.run_fbp(sino, angles, Nz=N, support_mask=M)
+    rec_plain  = ft.run_fbp(sino, angles, Nz=N)
+    assert torch.equal(rec_masked, rec_plain * M)
+
+
+def test_fbp_support_mask_reproduces_cylinder():
+    """Passing the cylinder as a support tensor reproduces mask=True exactly."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M = ft.cylindrical_mask(N, N).unsqueeze(0)
+    rec_support  = ft.run_fbp(sino, angles, Nz=N, support_mask=M)
+    rec_cylinder = ft.run_fbp(sino, angles, Nz=N, mask=True)
+    assert torch.equal(rec_support, rec_cylinder)
+
+
+def test_fbp_support_mask_with_mask_true_raises():
+    N      = 32
+    angles = make_angles(10)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ft.run_fbp(sino, angles, Nz=N, mask=True,
+                   support_mask=_box_support(1, N))
+
+
+def test_fbp_support_mask_bad_shape_raises():
+    N      = 32
+    angles = make_angles(10)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+    with pytest.raises(ValueError, match="support_mask"):
+        ft.run_fbp(sino, angles, Nz=N, support_mask=torch.ones(N + 1, N))
+    with pytest.raises(ValueError, match="support_mask"):
+        ft.run_fbp(sino, angles, Nz=N, support_mask=torch.ones(3, N, N))
+
+
+def test_sirt_support_mask_zeros_outside_support():
+    """Support is enforced every iteration: out-of-support voxels stay 0."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M   = _box_support(1, N)
+    rec = ft.run_sirt(sino, angles, n_iter=5, Nz=N, support_mask=M)
+    outside = rec[M == 0]
+    assert outside.abs().max().item() == 0.0, (
+        f"out-of-support voxels must be exactly 0, got "
+        f"{outside.abs().max():.2e}"
+    )
+    assert rec[M == 1].abs().max().item() > 0.0, (
+        "in-support voxels should be reconstructed (non-zero)"
+    )
+
+
+def test_sirt_support_mask_2d_broadcasts():
+    """A [Nz, Nx] support broadcasts along the tilt axis."""
+    N, Ny  = 32, 3
+    angles = make_angles(20)
+    vol    = phantom_2d(N).unsqueeze(0).expand(Ny, -1, -1).contiguous()
+    sino   = ft.forward_project(vol, angles)
+
+    M   = _box_support(1, N).squeeze(0)          # [Nz, Nx]
+    rec = ft.run_sirt(sino, angles, n_iter=3, Nz=N, support_mask=M)
+    assert rec.shape == (Ny, N, N)
+    outside = rec[:, M == 0]
+    assert outside.abs().max().item() == 0.0
+
+
+def test_sirt_support_mask_with_mask_true_raises():
+    N      = 32
+    angles = make_angles(10)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ft.run_sirt(sino, angles, n_iter=1, Nz=N, mask=True,
+                    support_mask=_box_support(1, N))
+
+
+def test_sirt_support_mask_bool_tensor_accepted():
+    """A bool support tensor is cast to the compute dtype internally."""
+    N      = 32
+    angles = make_angles(20)
+    sino   = ft.forward_project(phantom_2d(N).unsqueeze(0), angles)
+
+    M_bool  = _box_support(1, N).bool()
+    M_float = _box_support(1, N)
+    rec_b = ft.run_sirt(sino, angles, n_iter=3, Nz=N, support_mask=M_bool)
+    rec_f = ft.run_sirt(sino, angles, n_iter=3, Nz=N, support_mask=M_float)
+    assert torch.equal(rec_b, rec_f)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

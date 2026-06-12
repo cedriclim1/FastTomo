@@ -73,6 +73,43 @@ def _maybe_cylindrical_mask(
     return cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
 
 
+def _resolve_support_mask(
+    support_mask: torch.Tensor,
+    Ny: int,
+    Nz: int,
+    Nx: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    op_name: str,
+) -> torch.Tensor:
+    """Validate and normalise a user-supplied support mask.
+
+    Accepts ``[Nz, Nx]`` (broadcast along the tilt axis), ``[1, Nz, Nx]``,
+    or full ``[Ny, Nz, Nx]``. Returns a 3-D tensor on ``device`` cast to
+    ``dtype``, ready to multiply against the volume. Values are expected
+    binary {0, 1}; soft values in [0, 1] act as a smooth weighting.
+    """
+    if support_mask.ndim == 2:
+        if support_mask.shape != (Nz, Nx):
+            raise ValueError(
+                f"{op_name}: support_mask must have shape ({Nz}, {Nx}) "
+                f"when 2-D; got {tuple(support_mask.shape)}."
+            )
+        support_mask = support_mask.unsqueeze(0)
+    elif support_mask.ndim == 3:
+        if support_mask.shape[1:] != (Nz, Nx) or support_mask.shape[0] not in (1, Ny):
+            raise ValueError(
+                f"{op_name}: support_mask must have shape (1, {Nz}, {Nx}) or "
+                f"({Ny}, {Nz}, {Nx}) when 3-D; got {tuple(support_mask.shape)}."
+            )
+    else:
+        raise ValueError(
+            f"{op_name}: support_mask must be 2-D or 3-D; "
+            f"got {support_mask.ndim}-D."
+        )
+    return support_mask.to(device=device, dtype=dtype).contiguous()
+
+
 def _assert_warm_start_shape(
     volume: torch.Tensor,
     expected_shape: tuple[int, int, int],
@@ -234,6 +271,7 @@ def run_fbp(
     positivity: bool = False,
     mask: bool = False,
     projector: object | None = None,
+    support_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Filtered Back-Projection.
@@ -241,6 +279,13 @@ def run_fbp(
     Applies ramp filter to each sinogram row then back-projects.
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
+
+    support_mask: optional precomputed support tensor applied once to the
+    final volume (hard constraint: ``volume * support_mask``). Shape
+    ``[Nz, Nx]``, ``[1, Nz, Nx]``, or ``[Ny, Nz, Nx]``; binary {0, 1}
+    expected (soft [0, 1] values act as a smooth weighting); cast to the
+    volume dtype/device internally. Mutually exclusive with ``mask=True``
+    — one support per reconstruction.
 
     On CUDA a :class:`ParallelProjector` is built internally if ``projector``
     is None — the BP runs through a persistent cudaArray + texture handle that
@@ -258,6 +303,11 @@ def run_fbp(
     to fp32 on visualization-grade reconstructions but visibly noisier
     on edges — use fp32 for quantitative work. bf16 raises.
     """
+    if support_mask is not None and mask:
+        raise ValueError(
+            "run_fbp: mask=True and support_mask are mutually exclusive — "
+            "pass one support per reconstruction."
+        )
     n_angles, Ny, N_det, Nz, device = _check_inputs(
         sinogram, angles_deg, Nz,
         allowed_dtypes=(torch.float32, torch.float16),
@@ -276,13 +326,22 @@ def run_fbp(
         volume = back_project(filtered, angles_deg, Nz=Nz)
     # angular sampling normalisation: π / n_angles
     volume = volume * (math.pi / n_angles)
-    _mask = _maybe_cylindrical_mask(
-        volume.shape[1],
-        volume.shape[2],
-        volume.device,
-        mask,
-        dtype=volume.dtype,
-    )
+    if support_mask is not None:
+        # Validate against the actual output shape — a cached projector may
+        # reconstruct with Nz != N_det.
+        _mask = _resolve_support_mask(
+            support_mask,
+            volume.shape[0], volume.shape[1], volume.shape[2],
+            volume.device, volume.dtype, "run_fbp",
+        )
+    else:
+        _mask = _maybe_cylindrical_mask(
+            volume.shape[1],
+            volume.shape[2],
+            volume.device,
+            mask,
+            dtype=volume.dtype,
+        )
     return ConstraintConfig(positivity=positivity, mask=_mask).apply(volume)
 
 
@@ -345,6 +404,7 @@ def run_sirt(
     num_threads: int | None = None,             # CPU 3D path only
     projector: object | None = None,            # ParallelProjector / RotmatProjector for cached FP/BP
     volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
+    support_mask: torch.Tensor | None = None,   # precomputed support, enforced each iteration
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
@@ -383,6 +443,13 @@ def run_sirt(
     dtype so the projector locks consistently. Output preserves the compute
     dtype — fp16 in, fp16 out.
 
+    support_mask: optional precomputed support tensor enforced as a hard
+    constraint each iteration (``volume * support_mask`` after every
+    update, like ``mask=True`` but with an arbitrary support). Shape
+    ``[Nz, Nx]``, ``[1, Nz, Nx]``, or ``[Ny, Nz, Nx]``; binary {0, 1}
+    expected (soft [0, 1] values act as a smooth weighting); cast to the
+    compute dtype/device internally. Mutually exclusive with ``mask=True``
+    — one support per reconstruction.
     loss_callback: optional hook invoked once per iteration as
     ``loss_callback(i, loss)`` — 0-based index and the same plain CPU float
     that lands in ``loss_history[i]`` (NaN/Inf passed through). Callbacks
@@ -396,6 +463,11 @@ def run_sirt(
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
+    if support_mask is not None and mask:
+        raise ValueError(
+            "run_sirt: mask=True and support_mask are mutually exclusive — "
+            "pass one support per reconstruction."
+        )
     n_angles, Ny, N_det, Nz, device = _check_inputs(
         sinogram, angles_deg, Nz,
         allowed_dtypes=(torch.float32, torch.float16),
@@ -426,7 +498,12 @@ def run_sirt(
     _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
+    if support_mask is not None:
+        _mask = _resolve_support_mask(
+            support_mask, Ny, Nz, Nx, device, compute_dtype, "run_sirt",
+        )
+    else:
+        _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
     constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
     track_loss = return_loss or loss_callback is not None
@@ -457,7 +534,8 @@ def run_sirt(
                  float(omega),
                  constraints.positivity,
                  float(constraints.sparsity),
-                 constraints.mask is not None,
+                 tuple(constraints.mask.shape)
+                 if isinstance(constraints.mask, torch.Tensor) else None,
                  euler_zyz_deg is not None),
         )
         if graph_result is not None:
@@ -1051,6 +1129,7 @@ def run_ad_recon(
     Nz: int = -1,
     projector: object | None = None,
     config: AdReconConfig | None = None,
+    support_mask: torch.Tensor | None = None,
     return_loss: bool = False,
     return_pose: bool = False,
     loss_callback: Callable | None = None,
@@ -1078,6 +1157,13 @@ def run_ad_recon(
                          regulariser, constraint, and pose-refinement knobs.
                          ``None`` (default) constructs ``AdReconConfig()``
                          which runs vanilla AD volume-only refinement.
+        support_mask:    Optional precomputed support tensor enforced as a
+                         hard constraint each iteration (``volume *=
+                         support_mask`` after every optimiser step). Shape
+                         ``[Nz, Nx]``, ``[1, Nz, Nx]``, or ``[Ny, Nz, Nx]``;
+                         binary {0, 1} expected. Convenience alias for
+                         ``config.constraints.mask`` — passing both raises
+                         ``ValueError`` (one support per reconstruction).
         return_loss:     If True, also return the per-iteration loss history.
         return_pose:     If True, also return ``(refined_euler, refined_shifts)``
                          where each is ``None`` if the corresponding refinement
@@ -1204,36 +1290,25 @@ def run_ad_recon(
             for opt in optimisers
         ]
 
-    # ── cylindrical mask (built once if requested) ────────────────────────
-    # ConstraintConfig.mask: bool True → build inside; Tensor → use as-is;
-    # None/False → no mask.
-    _cmask: torch.Tensor | None = None
-    _cmask_mul: torch.Tensor | None = None
-    if isinstance(constraints_cfg.mask, torch.Tensor):
-        _cmask = constraints_cfg.mask.to(device=device, dtype=volume.dtype)
-    elif constraints_cfg.mask is True:
-        _cmask = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
-    if _cmask is not None:
-        if _cmask.ndim == 2:
-            if _cmask.shape != (Nz, Nx):
-                raise ValueError(
-                    "ConstraintConfig.mask must have shape (Nz, Nx) when 2-D; "
-                    f"got {tuple(_cmask.shape)} for (Nz, Nx)=({Nz}, {Nx})."
-                )
-            _cmask_mul = _cmask.unsqueeze(0)
-        elif _cmask.ndim == 3:
-            if _cmask.shape[1:] != (Nz, Nx) or _cmask.shape[0] not in (1, Ny):
-                raise ValueError(
-                    "ConstraintConfig.mask must have shape (1, Nz, Nx) or "
-                    "(Ny, Nz, Nx) when 3-D; "
-                    f"got {tuple(_cmask.shape)} for Ny={Ny}, Nz={Nz}, Nx={Nx}."
-                )
-            _cmask_mul = _cmask
-        else:
+    # ── support mask (built once if requested) ────────────────────────────
+    # ConstraintConfig.mask: bool True → build cylinder inside; Tensor →
+    # use as-is; None/False → no mask. The support_mask kwarg is an alias
+    # for the tensor case, mutually exclusive with a configured mask.
+    _mask_cfg: bool | torch.Tensor | None = constraints_cfg.mask
+    if support_mask is not None:
+        if isinstance(_mask_cfg, torch.Tensor) or _mask_cfg is True:
             raise ValueError(
-                "ConstraintConfig.mask must be 2-D or 3-D when given as a tensor; "
-                f"got {_cmask.ndim}-D."
+                "run_ad_recon: support_mask and ConstraintConfig.mask are "
+                "mutually exclusive — pass one support per reconstruction."
             )
+        _mask_cfg = support_mask
+    if _mask_cfg is True:
+        _mask_cfg = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
+    _cmask_mul: torch.Tensor | None = None
+    if isinstance(_mask_cfg, torch.Tensor):
+        _cmask_mul = _resolve_support_mask(
+            _mask_cfg, Ny, Nz, Nx, device, volume.dtype, "run_ad_recon",
+        )
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
@@ -1404,18 +1479,31 @@ def _run_sirt_cuda_graph(
     if key not in cache:
         # --- build a new graph for this key ---
         try:
-            # Allocate persistent static buffers.
+            # Allocate persistent static buffers. The constraint mask is a
+            # graph input too (captured by pointer inside apply_inplace_),
+            # so it gets its own static buffer refreshed on every replay —
+            # otherwise a later call with a different mask of the same shape
+            # would silently replay the first call's mask.
             vol_static = volume.clone()
             sino_static = sinogram.clone()
             C_static = C_vol.clone()
             R_static = R_sino.clone()
+            mask_static = (
+                constraints.mask.clone()
+                if isinstance(constraints.mask, torch.Tensor) else None
+            )
+            static_constraints = ConstraintConfig(
+                positivity=constraints.positivity,
+                mask=mask_static,
+                sparsity=constraints.sparsity,
+            )
 
             # Warmup: one eager iteration with the static buffer.
             # Populates cuFFT plans, allocator pool, projector texture caches.
             with torch.no_grad():
                 _sirt_iter_inplace(
                     vol_static, sino_static, C_static, R_static, omega,
-                    _fp, _bp, constraints,
+                    _fp, _bp, static_constraints,
                 )
 
             # Capture the iteration body on the correct device. Use an
@@ -1430,11 +1518,12 @@ def _run_sirt_cuda_graph(
                 with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
                     _sirt_iter_inplace(
                         vol_static, sino_static, C_static, R_static, omega,
-                        _fp, _bp, constraints,
+                        _fp, _bp, static_constraints,
                     )
                 torch.cuda.synchronize(target_device)
 
-            cache[key] = (g, vol_static, sino_static, C_static, R_static)
+            cache[key] = (g, vol_static, sino_static, C_static, R_static,
+                          mask_static)
 
         except Exception as exc:
             _log.warning(
@@ -1446,7 +1535,7 @@ def _run_sirt_cuda_graph(
             _sirt_graph_bad_keys.add(key)
             return None
 
-    g, vol_static, sino_static, C_static, R_static = cache[key]
+    g, vol_static, sino_static, C_static, R_static, mask_static = cache[key]
 
     # Reset the captured static buffer to the caller's starting volume so the
     # warmup iteration that ran inside the cache-build branch above does not
@@ -1460,6 +1549,8 @@ def _run_sirt_cuda_graph(
     sino_static.copy_(sinogram)
     C_static.copy_(C_vol)
     R_static.copy_(R_sino)
+    if mask_static is not None:
+        mask_static.copy_(constraints.mask)
 
     with torch.cuda.device(target_device):
         for _ in range(n_iter):
