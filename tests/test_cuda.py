@@ -1483,6 +1483,22 @@ class TestRunAdRecon:
         )
         assert losses.dtype == torch.float32
 
+    def test_sparsity_term_is_l1_magnitude(self):
+        """On zero data, L1 sparsity should keep the zero initialisation fixed.
+
+        Regression guard: using mean(volume) (missing abs) makes the loss
+        linear and drives the volume negative even when the data term is zero.
+        """
+        N = 16
+        angles = make_angles(10)
+        sino = torch.zeros(angles.numel(), 1, N, device=DEVICE, dtype=torch.float32)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=20, lr_volume=0.05),
+            reg=ft.RegularizerConfig(sparsity=1e-2),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert vol.abs().max().item() < 1e-6
+
     def test_3d_mask_1_nz_nx_accepted(self):
         """ConstraintConfig.mask with shape [1, Nz, Nx] should not crash."""
         N = 16
