@@ -1180,5 +1180,36 @@ def test_sirt_support_mask_bool_tensor_accepted():
     assert torch.equal(rec_b, rec_f)
 
 
+def test_ad_recon_sparsity_uses_l1_magnitude(monkeypatch):
+    """Signed-mean sparsity would push a zero-volume reconstruction negative."""
+    import fasttomo.algorithms as alg
+
+    class DummyParallelProjector:
+        def forward(self, volume):
+            # Minimal differentiable mapping to [n_angles=1, Ny=1, N_det].
+            return volume[:, 0, :].unsqueeze(0)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kwargs):
+        n_angles, Ny, N_det = sinogram.shape
+        if Nz == -1:
+            Nz = N_det
+        return n_angles, Ny, N_det, Nz, sinogram.device
+
+    monkeypatch.setattr(alg, "ParallelProjector", DummyParallelProjector)
+    monkeypatch.setattr(alg, "_check_inputs", fake_check_inputs)
+
+    sino = torch.zeros(1, 1, 8)
+    angles = torch.zeros(1)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=5, lr_volume=0.1),
+        reg=ft.RegularizerConfig(sparsity=1.0),
+        constraints=ft.ConstraintConfig(positivity=False, mask=False),
+    )
+    vol = alg.run_ad_recon(sino, angles, Nz=8, projector=DummyParallelProjector(), config=cfg)
+
+    # With true L1 (|x|) sparsity and zero data-fit gradient, x=0 is stationary.
+    assert vol.abs().max().item() == pytest.approx(0.0, abs=1e-8)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
