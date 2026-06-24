@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import fasttomo as ft
+from fasttomo.algorithms import _ad_sparsity_loss
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -1071,6 +1072,15 @@ def test_mbir_multires_even_runs():
     angles = torch.linspace(-70, 70, 5)
     vol = ft.run_mbir(sino, angles, multires_levels=2, outer_iters=2)
     assert vol.shape == (2, 16, 16)
+
+
+def test_ad_sparsity_loss_uses_l1_magnitude():
+    """AD sparsity term must penalise magnitude, not signed mean."""
+    vol = torch.tensor([[[1.0, -3.0], [2.0, -4.0]]], dtype=torch.float32)
+    # mean(|vol|) = (1 + 3 + 2 + 4) / 4 = 2.5
+    assert _ad_sparsity_loss(vol).item() == pytest.approx(2.5)
+    # Regression guard: signed mean would be negative here (-1.0).
+    assert _ad_sparsity_loss(vol).item() >= 0.0
 
 
 # ── custom support masks (support_mask kwarg) ──────────────────────────────
