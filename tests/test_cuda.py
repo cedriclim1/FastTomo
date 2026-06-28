@@ -1383,6 +1383,22 @@ class TestRunAdRecon:
             f"{losses[0].item():.4f} -> {losses[-1].item():.4f}"
         )
 
+    def test_sparsity_regularizer_uses_abs_value_penalty(self):
+        """With zero data, L1 sparsity should not push a zero volume negative."""
+        N = 16
+        n_angles = 10
+        angles = make_angles(n_angles)
+        sino = torch.zeros(n_angles, 1, N, device=DEVICE, dtype=torch.float32)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=1, lr_volume=0.05),
+            reg=ft.RegularizerConfig(sparsity=1.0),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert vol.abs().max().item() == 0.0, (
+            "L1 sparsity should keep an all-zero reconstruction at zero; "
+            "a signed mean penalty would drive it negative."
+        )
+
     def test_with_pose_recovers_perturbed_euler(self):
         """With-pose AD: angles are updated from a perturbed starting point.
 
