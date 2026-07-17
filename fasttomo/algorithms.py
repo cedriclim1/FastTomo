@@ -73,6 +73,48 @@ def _maybe_cylindrical_mask(
     return cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
 
 
+def _ad_recon_step_schedule(
+    iteration: int,
+    *,
+    pose_warmup_iters: int = 0,
+    alternating_period: int = 0,
+) -> tuple[bool, bool]:
+    """Return ``(step_volume, step_pose)`` for one AD iteration.
+
+    Defaults deliberately return the historical joint schedule. Warmup is
+    always volume-only. Alternation starts with a volume-only block, then a
+    pose-only block, and repeats.
+    """
+    if iteration < pose_warmup_iters:
+        return True, False
+    if alternating_period == 0:
+        return True, True
+    block = (iteration - pose_warmup_iters) // alternating_period
+    step_volume = block % 2 == 0
+    return step_volume, not step_volume
+
+
+def _prepare_ad_recon_pose_init(
+    value: object,
+    *,
+    expected_shape: tuple[int, int],
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Convert and validate one engine-native AD pose initialiser."""
+    try:
+        initial = torch.as_tensor(value, dtype=torch.float32, device=device)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"{name} must be a finite numeric array") from exc
+    if tuple(initial.shape) != expected_shape:
+        raise ValueError(
+            f"{name} must have shape {expected_shape}, got {tuple(initial.shape)}"
+        )
+    if not bool(torch.isfinite(initial).all()):
+        raise ValueError(f"{name} must contain only finite values")
+    return initial.detach().clone()
+
+
 def _resolve_support_mask(
     support_mask: torch.Tensor,
     Ny: int,
@@ -1260,13 +1302,34 @@ def run_ad_recon(
     shifts: torch.Tensor | None = None
 
     if refine_pose:
-        tilt_angle_opt = torch.zeros(n_angles, 3, dtype=torch.float32, device=device)
-        tilt_angle_opt[:, 1] = angles_deg
+        if pose_cfg is not None and pose_cfg.pose_init_euler_deg is not None:
+            tilt_angle_opt = _prepare_ad_recon_pose_init(
+                pose_cfg.pose_init_euler_deg,
+                expected_shape=(n_angles, 3),
+                device=device,
+                name="pose_init_euler_deg",
+            )
+        else:
+            tilt_angle_opt = torch.zeros(
+                n_angles, 3, dtype=torch.float32, device=device
+            )
+            tilt_angle_opt[:, 1] = angles_deg
         tilt_angle_opt.requires_grad_(True)
 
     if refine_shifts:
-        shifts = torch.zeros(n_angles, 2, dtype=torch.float32, device=device,
-                             requires_grad=True)
+        if pose_cfg is not None and pose_cfg.pose_init_shifts is not None:
+            shifts = _prepare_ad_recon_pose_init(
+                pose_cfg.pose_init_shifts,
+                expected_shape=(n_angles, 2),
+                device=device,
+                name="pose_init_shifts",
+            )
+            shifts.requires_grad_(True)
+        else:
+            shifts = torch.zeros(
+                n_angles, 2, dtype=torch.float32, device=device,
+                requires_grad=True,
+            )
 
     # ── build optimiser list ───────────────────────────────────────────────
     opt_vol = torch.optim.Adam([volume], lr=optim_cfg.lr_volume)
@@ -1320,6 +1383,9 @@ def run_ad_recon(
     send_components = (
         loss_callback is not None and _callback_accepts_components(loss_callback)
     )
+    pose_warmup_iters = pose_cfg.pose_warmup_iters if pose_cfg is not None else 0
+    alternating_period = pose_cfg.alternating_period if pose_cfg is not None else 0
+    default_step_schedule = pose_warmup_iters == 0 and alternating_period == 0
 
     for it in tqdm(range(optim_cfg.n_iter)):
         for opt in optimisers:
@@ -1387,10 +1453,26 @@ def run_ad_recon(
             if tilt_angle_opt.grad is not None:
                 tilt_angle_opt.grad[:, 2] = 0.0
 
-        for opt in optimisers:
-            opt.step()
-        for sched in schedulers:
-            sched.step()
+        if default_step_schedule:
+            # Keep the default path exactly identical to the historical loop.
+            for opt in optimisers:
+                opt.step()
+            for sched in schedulers:
+                sched.step()
+        else:
+            step_volume, step_pose = _ad_recon_step_schedule(
+                it,
+                pose_warmup_iters=pose_warmup_iters,
+                alternating_period=alternating_period,
+            )
+            step_flags = [step_volume] + [step_pose] * (len(optimisers) - 1)
+            for opt, should_step in zip(optimisers, step_flags):
+                if should_step:
+                    opt.step()
+            # An inactive optimiser's LR must not decay before its stage runs.
+            for sched, should_step in zip(schedulers, step_flags):
+                if should_step:
+                    sched.step()
 
         # constraints applied inside no_grad (leaf-tensor safe)
         with torch.no_grad():
