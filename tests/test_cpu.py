@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import fasttomo as ft
+import fasttomo.algorithms as _algorithms
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -23,6 +24,23 @@ def phantom_2d(N: int) -> torch.Tensor:
     q   = N // 4
     vol[q:3*q, q:3*q] = 1.0
     return vol
+
+
+def test_ad_sparsity_term_is_l1_with_signed_gradients():
+    """AD sparsity penalty must be λ·mean(|f|), not a signed mean bias."""
+    vol = torch.tensor(
+        [[[-2.0, -0.5], [0.0, 1.5]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    lam = 0.3
+
+    loss = _algorithms._ad_sparsity_term(vol, lam)
+    assert loss.item() == pytest.approx((lam * vol.detach().abs().mean()).item())
+
+    loss.backward()
+    expected_grad = lam * torch.sign(vol.detach()) / vol.numel()
+    assert torch.allclose(vol.grad, expected_grad)
 
 
 # ── adjoint test ───────────────────────────────────────────────────────────
