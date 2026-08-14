@@ -2156,6 +2156,21 @@ class TestAdReconSupportMask:
         with pytest.raises(ValueError, match="support_mask"):
             ft.run_ad_recon(sino, angles, support_mask=bad)
 
+    def test_sparsity_regularizer_uses_l1_magnitude(self):
+        """Regression: sparsity must not reward globally negative volumes."""
+        N = 16
+        angles = make_angles(10)
+        sino = torch.zeros(len(angles), 1, N, device=DEVICE)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5, lr_volume=0.1),
+            reg=ft.RegularizerConfig(sparsity=1e-1),
+            constraints=ft.ConstraintConfig(positivity=False),
+        )
+
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        # With true L1 (mean(abs(volume))), zero data and zero init stay at 0.
+        assert vol.abs().max().item() == pytest.approx(0.0, abs=1e-7)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
