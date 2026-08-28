@@ -1180,5 +1180,66 @@ def test_sirt_support_mask_bool_tensor_accepted():
     assert torch.equal(rec_b, rec_f)
 
 
+def test_ad_recon_sparsity_penalty_uses_l1_magnitude(monkeypatch):
+    """AD sparsity must be |volume|-based, not a signed mean.
+
+    run_ad_recon is CUDA-only in production. For this CPU regression harness,
+    monkeypatch input validation and the projector type-check target, then set
+    fidelity to zero so only the sparsity gradient can move the volume.
+
+    Correct L1 behaviour: zero is a stationary point and stays zero.
+    Buggy signed-mean behaviour: gradient is +const and Adam drifts negative.
+    """
+    import fasttomo.algorithms as algo
+
+    class DummyParallelProjector:
+        def __init__(self, n_angles: int, Ny: int, N_det: int):
+            self.n_angles = n_angles
+            self.Ny = Ny
+            self.N_det = N_det
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                self.n_angles, self.Ny, self.N_det,
+                dtype=volume.dtype, device=volume.device,
+            )
+
+    def fake_check_inputs(
+        sinogram: torch.Tensor,
+        angles_deg: torch.Tensor,
+        Nz: int,
+        allowed_dtypes=None,
+        op_name: str = "",
+        require_cuda: bool = False,
+    ):
+        del allowed_dtypes, op_name, require_cuda, angles_deg
+        n_angles, Ny, N_det = sinogram.shape
+        Nz_eff = N_det if Nz < 0 else Nz
+        return n_angles, Ny, N_det, Nz_eff, sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", DummyParallelProjector)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+
+    n_angles, Ny, N = 5, 1, 8
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = torch.linspace(-20.0, 20.0, n_angles)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=5, lr_volume=0.2, cosine_schedule=False),
+        reg=ft.RegularizerConfig(sparsity=1.0),
+        constraints=ft.ConstraintConfig(positivity=False),
+    )
+
+    rec = ft.run_ad_recon(
+        sino,
+        angles,
+        Nz=N,
+        projector=DummyParallelProjector(n_angles, Ny, N),
+        config=cfg,
+    )
+    assert rec.abs().max().item() == 0.0, (
+        "L1 sparsity should leave zero volume unchanged when fidelity loss is zero"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
