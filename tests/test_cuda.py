@@ -1483,6 +1483,26 @@ class TestRunAdRecon:
         )
         assert losses.dtype == torch.float32
 
+    def test_sparsity_regularizer_keeps_zero_volume_fixed_point(self):
+        """With zero data and L1 sparsity, zero should remain an optimizer fixed point.
+
+        Regression guard: using ``mean(volume)`` instead of ``mean(abs(volume))``
+        injects a constant negative drift and breaks this invariant.
+        """
+        N = 16
+        angles = make_angles(10)
+        sino = torch.zeros(len(angles), 1, N, device=DEVICE)
+
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=10, lr_volume=0.05, cosine_schedule=False),
+            reg=ft.RegularizerConfig(sparsity=1e-2),
+            constraints=ft.ConstraintConfig(positivity=False),
+        )
+        vol = ft.run_ad_recon(sino, angles, config=cfg)
+        assert vol.abs().max().item() == 0.0, (
+            "zero sinogram + L1 sparsity should keep volume at zero"
+        )
+
     def test_3d_mask_1_nz_nx_accepted(self):
         """ConstraintConfig.mask with shape [1, Nz, Nx] should not crash."""
         N = 16
