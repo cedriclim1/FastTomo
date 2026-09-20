@@ -452,12 +452,20 @@ class RotmatProjector(_ProjectorBase):
         return grad_mats
 
     def _normalize_and_validate_mats(self, mats: torch.Tensor) -> torch.Tensor:
+        # CUDA rotmat kernels always interpret matrix memory as float32.
+        # Accept any floating input dtype but normalize to fp32 here so we
+        # never reinterpret fp16/fp64 buffers as float pointers.
+        if not mats.is_floating_point():
+            raise TypeError(
+                f"{type(self).__name__}: mats must be a floating tensor, "
+                f"got {mats.dtype}."
+            )
         if mats.ndim == 3:
             self._check_shape(mats, "mats", (self.n_angles, 3, 3))
-            return mats.reshape(self.n_angles, 9)
+            return mats.reshape(self.n_angles, 9).to(dtype=torch.float32)
         if mats.ndim == 2:
             self._check_shape(mats, "mats", (self.n_angles, 9))
-            return mats
+            return mats.to(dtype=torch.float32)
         raise ValueError(
             f"{type(self).__name__}: mats must have shape "
             f"({self.n_angles}, 3, 3) or ({self.n_angles}, 9), "

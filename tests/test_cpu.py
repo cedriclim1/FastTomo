@@ -208,6 +208,36 @@ def test_sirt_projector_shape_mismatch_raises():
         )
 
 
+def test_rotmat_projector_normalize_casts_mats_to_fp32():
+    """RotmatProjector must normalize matrices to fp32 before CUDA calls.
+
+    The cached CUDA entry points reinterpret matrix memory as ``float*``.
+    Accepting fp64/fp16 tensors without normalization would silently corrupt
+    projection geometry (or crash for half-precision buffers).
+    """
+    n_angles = 5
+    proj = ft.RotmatProjector.__new__(ft.RotmatProjector)
+    proj.n_angles = n_angles
+    mats64 = (
+        torch.eye(3, dtype=torch.float64)
+        .unsqueeze(0)
+        .expand(n_angles, -1, -1)
+        .contiguous()
+    )
+    mats_flat = proj._normalize_and_validate_mats(mats64)
+    assert mats_flat.shape == (n_angles, 9)
+    assert mats_flat.dtype == torch.float32
+
+
+def test_rotmat_projector_normalize_rejects_non_floating_mats():
+    n_angles = 3
+    proj = ft.RotmatProjector.__new__(ft.RotmatProjector)
+    proj.n_angles = n_angles
+    mats_int = torch.zeros(n_angles, 3, 3, dtype=torch.int32)
+    with pytest.raises(TypeError, match="floating tensor"):
+        proj._normalize_and_validate_mats(mats_int)
+
+
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
 
 def test_fista_shape():
