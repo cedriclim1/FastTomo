@@ -26,10 +26,30 @@
 
 static constexpr uint64_t kScratchPoolKeepBytes = 64ull << 20;   /* 64 MiB */
 
+/* Relaxed stream-capture mode for this thread while in scope. The first use
+ * of the pool may happen inside a CUDA-graph capture (torch captures in the
+ * global mode, where cudaGetDeviceCount / cudaMemPoolCreate /
+ * cudaMemPoolSetAttribute would invalidate the capture); in relaxed mode
+ * these one-time, non-stream calls are allowed. The previous mode is
+ * restored on exit. */
+class RelaxedCaptureMode {
+public:
+    RelaxedCaptureMode() : mode_(cudaStreamCaptureModeRelaxed) {
+        cudaThreadExchangeStreamCaptureMode(&mode_);
+    }
+    ~RelaxedCaptureMode() { cudaThreadExchangeStreamCaptureMode(&mode_); }
+    RelaxedCaptureMode(const RelaxedCaptureMode &) = delete;
+    RelaxedCaptureMode &operator=(const RelaxedCaptureMode &) = delete;
+
+private:
+    cudaStreamCaptureMode mode_;
+};
+
 inline cudaMemPool_t fasttomo_scratch_pool(int device) {
     static std::mutex mu;
     static std::vector<cudaMemPool_t> pools;
     std::lock_guard<std::mutex> lock(mu);
+    RelaxedCaptureMode relaxed;   /* one-time setup may run during a capture */
     if (pools.empty()) {
         int n = 0;
         FASTTOMO_CUDA_CHECK(cudaGetDeviceCount(&n));

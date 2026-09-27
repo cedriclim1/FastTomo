@@ -396,6 +396,70 @@ def test_grad_angle_is_bit_reproducible():
     assert all(torch.equal(r, runs[0]) for r in runs[1:])
 
 
+# The partial-sum scratch comes from a process-wide pool created on first
+# use. That first use may happen inside a CUDA-graph capture (torch captures
+# in the global mode, where creating a memory pool would invalidate the
+# capture), so it runs in a fresh interpreter: the capture must succeed and
+# its replay equal the eager call bit for bit.
+_CAPTURE_FIRST_USE = r"""
+import sys, torch
+import fasttomo._core as C
+from fasttomo._backend import _TC_VOL_3D
+from fasttomo.autograd import _euler_zyz_to_rotmat
+kind = sys.argv[1]
+g = torch.Generator().manual_seed(3)
+Ny, Nz, Nx, Nd, n = 9, 20, 36, 40, 5
+vol = torch.rand(Ny, Nz, Nx, generator=g).cuda()
+gs = torch.randn(n, Ny, Nd, generator=g).cuda()
+s = torch.cuda.Stream()
+if kind == "grad_angle":
+    a = torch.linspace(-60, 60, n).cuda() * (3.141592653589793 / 180)
+    ca, sa = torch.cos(a), torch.sin(a)
+    out = torch.zeros(n, device="cuda")
+    def run():
+        C.grad_angle_cuda(vol.data_ptr(), gs.data_ptr(), ca.data_ptr(), sa.data_ptr(),
+                          out.data_ptr(), Ny, Nz, Nx, n, Nd,
+                          torch.cuda.current_stream().cuda_stream)
+else:
+    e = torch.stack([torch.linspace(-4, 4, n), torch.linspace(-60, 60, n),
+                     torch.linspace(3, -3, n)], 1)
+    mats = _euler_zyz_to_rotmat(e).reshape(n, 9).contiguous().cuda()
+    h = C.tc_create(_TC_VOL_3D, 0, 1, Ny, Nz, Nx, True)
+    sino = torch.empty(n, Ny, Nd, device="cuda")
+    C.forward_project_rotmat_cuda_cached(0, h, vol.data_ptr(), sino.data_ptr(), mats.data_ptr(),
+                                         Ny, Nz, Nx, n, Nd,
+                                         torch.cuda.current_stream().cuda_stream, True)
+    out = torch.zeros(n, 9, device="cuda")
+    def run():
+        C.grad_rotmat_cuda_cached(0, h, gs.data_ptr(), mats.data_ptr(), out.data_ptr(),
+                                  Ny, Nz, Nx, n, Nd, torch.cuda.current_stream().cuda_stream)
+torch.cuda.synchronize()
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph, stream=s):
+    run()                      # first use of the scratch pool in this process
+out.zero_()
+graph.replay()
+torch.cuda.synchronize()
+captured = out.clone()
+out.zero_()
+run()
+torch.cuda.synchronize()
+assert captured.abs().sum() > 0
+assert torch.equal(captured, out), (captured - out).abs().max()
+print("ok")
+"""
+
+
+@needs_cuda
+@pytest.mark.parametrize("kind", ["grad_angle", "grad_rotmat"])
+def test_gradient_scratch_first_use_inside_graph_capture(kind):
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, "-c", _CAPTURE_FIRST_USE, kind],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stderr[-2000:]
+
+
 @needs_cuda
 @pytest.mark.parametrize("shape,N_det", _MULTIBLOCK)
 def test_grad_rotmat_multiblock_matches_fp64_reference_and_cpu(shape, N_det):
