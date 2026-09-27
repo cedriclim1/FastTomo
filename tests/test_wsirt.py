@@ -2,11 +2,13 @@
 Weighted SIRT / exact weighted back-projection: CPU/CUDA parity and
 convergence.
 
-Root causes fixed (see run_wsirt):
-- the exact-filter deconvolution was a circular FFT on the unpadded
-  [Nz, Nx] grid, so the back-projected lines of the layergram wrapped
-  around; W-BP was then not close to an inverse of the projector and
-  wSIRT's data residual rose again after ~4 iterations at omega=1 (CUDA);
+Root causes fixed (see the "exact weighting filter" notes in algorithms.py):
+- the exact-filter deconvolution was a circular FFT on the bare [Nz, Nx]
+  grid, with the circular boundary on the volume edge; wSIRT diverged at
+  omega=1 on 32 of 45 geometries tested (CUDA), through a mode in the
+  outermost voxels and, with many views, one near the missing-wedge edge.
+  W-BP now works on a grid with a max(2, N // 16) voxel margin per side,
+  symmetric so the crop is exact for odd sizes too;
 - the CPU back-projection is ray-driven (the exact transpose of the CPU
   ray-marching forward projector), which is not shift-invariant: a constant
   sinogram back-projects to a +-34 % voxel pattern at 45 degrees. The
@@ -15,10 +17,14 @@ Root causes fixed (see run_wsirt):
   W-BP step now uses the voxel-driven (gather) back-projection on both
   backends, the model the CUDA kernel already implements.
 
-CPU/CUDA parity bound: 3e-4. That is the CUDA texture unit's 8-bit
-interpolation floor (measured ~2e-4 for the back-projection, ~1.3e-4 for
-the forward projector); the CPU path uses exact weights and is the
-reference, pinned separately against an fp64 NumPy back-projection.
+CPU/CUDA parity bound: 6e-4 for W-BP and wSIRT. The source is the CUDA
+texture unit's 8-bit interpolation weights (~2e-4 in the raw
+back-projection, ~1.3e-4 in the forward projector), amplified by the exact
+filter's high-frequency gain: measured up to 4.6e-4 over 18 geometries
+(3 tilt schemes x N in 40..65). The filter itself is built from the exact
+gather PSF on both backends, so its hard threshold cannot flip between
+them. The CPU path uses exact weights and is the reference, pinned
+separately against an fp64 NumPy back-projection.
 """
 
 from __future__ import annotations
@@ -71,30 +77,88 @@ def test_wsirt_residual_monotone_at_default_omega(backend, N, n, tilt):
 @needs_cuda
 @pytest.mark.parametrize("N,n,tilt", GEOMS)
 def test_wsirt_cpu_cuda_parity(N, n, tilt):
-    """Same input, 20 iterations: CPU and CUDA agree to 3e-4, the 8-bit
-    texture interpolation floor of the CUDA projectors (the forward
-    projector alone is 1.3e-4 apart). Before: 34 % apart; CPU 83 % error
-    after one iteration vs CUDA 30 %."""
+    """Same input, 20 iterations: CPU and CUDA agree to 6e-4, the CUDA
+    projectors' 8-bit texture interpolation floor as amplified by the
+    exact filter (see the module docstring). Before: 34 % apart; CPU 83 %
+    error after one iteration vs CUDA 30 %."""
     ang = torch.linspace(-tilt, tilt, n)
     sino = ft.forward_project(_phantom(N, "cpu"), ang)
     cpu = ft.run_wsirt(sino, ang, n_iter=20, Nz=N)
     gpu = ft.run_wsirt(sino.cuda(), ang.cuda(), n_iter=20, Nz=N)
-    assert _rel(gpu, cpu) < 3e-4
+    assert _rel(gpu, cpu) < 6e-4
 
 
 @needs_cuda
 @pytest.mark.parametrize("N,n,tilt", GEOMS)
 def test_weighted_backprojection_cpu_cuda_parity(N, n, tilt):
     """run_weighted_backprojection shares the W-BP operator: CPU and CUDA
-    agree to 3e-4 (8-bit texture interpolation floor of the CUDA
-    back-projection) and both recover the phantom to the one-step level."""
+    agree to 6e-4 (texture floor, see the module docstring) and both
+    recover the phantom to the one-step level."""
     ang = torch.linspace(-tilt, tilt, n)
     vol = _phantom(N, "cpu")
     sino = ft.forward_project(vol, ang)
     cpu = ft.run_weighted_backprojection(sino, ang, Nz=N)
     gpu = ft.run_weighted_backprojection(sino.cuda(), ang.cuda(), Nz=N)
-    assert _rel(gpu, cpu) < 3e-4
+    assert _rel(gpu, cpu) < 6e-4
     assert _rel(cpu, vol) < 0.45
+
+
+# ── geometry of the padded W-BP ────────────────────────────────────────────
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("N", [40, 41, 48, 49])
+def test_wbp_margin_crop_equals_direct_back_projection(backend, N):
+    """Back-projecting onto the padded grid and cropping the margin gives
+    exactly the direct back-projection, for odd and even N (a 2x pad of an
+    odd size shifted the crop by half a voxel)."""
+    from fasttomo.algorithms import _wbp_backproject, _wbp_margin
+    m = _wbp_margin(N)
+    ang = torch.linspace(-70, 70, 23, device=backend)
+    s = torch.rand(23, 2, N, generator=torch.Generator().manual_seed(N)).to(backend)
+    direct = _wbp_backproject(s, ang, N, N)
+    crop = _wbp_backproject(s, ang, N + 2 * m, N + 2 * m)[:, m:m + N, m:m + N]
+    assert _rel(crop, direct) < 1e-5
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("N", [40, 41, 48, 49])
+def test_wbp_keeps_a_centred_disk_centred(backend, N):
+    """One W-BP step of a disk at the rotation centre (symmetric tilts):
+    the centroid stays within 0.02 voxel of (N-1)/2 on both axes."""
+    c = (N - 1) / 2
+    zz, xx = torch.meshgrid(torch.arange(N) - c, torch.arange(N) - c, indexing="ij")
+    vol = ((zz ** 2 + xx ** 2) <= (N / 5) ** 2).float().unsqueeze(0)
+    ang = torch.linspace(-70, 70, 71)
+    sino = ft.forward_project(vol, ang).to(backend)
+    rec = ft.run_weighted_backprojection(sino, ang.to(backend), Nz=N)[0].cpu().clamp(min=0)
+    total = rec.sum()
+    cz = float((rec.sum(1) * torch.arange(N)).sum() / total)
+    cx = float((rec.sum(0) * torch.arange(N)).sum() / total)
+    assert abs(cz - c) < 0.02 and abs(cx - c) < 0.02, (cz, cx, c)
+
+
+# ── golden quality (41 views, +-70 deg) ────────────────────────────────────
+#
+# Pinned so a later change cannot lose accuracy silently: one-step W-BP and
+# 50-iteration wSIRT errors must stay within 2 % of these values (CPU and
+# CUDA agree to 1e-4 here). For reference, main before this fix gave
+# N=48: 0.295 / diverging (x2.4 residual) and N=49: 0.299 / 0.275 on CUDA,
+# 0.832 / 0.287 and 0.492 / 0.275 on CPU.
+
+GOLDEN = {48: (0.28923, 0.27236), 49: (0.28737, 0.26883)}
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("N", sorted(GOLDEN))
+def test_wsirt_golden_quality(backend, N):
+    e1_ref, e50_ref = GOLDEN[N]
+    ang = torch.linspace(-70, 70, 41, device=backend)
+    vol = _phantom(N, backend)
+    sino = ft.forward_project(vol, ang)
+    e1 = _rel(ft.run_weighted_backprojection(sino, ang, Nz=N), vol)
+    e50 = _rel(ft.run_wsirt(sino, ang, n_iter=50, Nz=N), vol)
+    assert abs(e1 - e1_ref) < 0.02 * e1_ref, e1
+    assert abs(e50 - e50_ref) < 0.02 * e50_ref, e50
 
 
 def _bp_voxel_ref(sino: np.ndarray, ang_deg: np.ndarray, Nz: int, Nx: int) -> np.ndarray:
