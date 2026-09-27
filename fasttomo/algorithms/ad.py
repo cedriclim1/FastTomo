@@ -171,8 +171,25 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
     for opt in run.optimisers:
         opt.zero_grad()
 
-    # forward project
     tilt, shifts = run.tilt_angle_opt, run.shifts
+    step_volume = step_pose = True
+    if not run.default_step_schedule:
+        step_volume, step_pose = _ad_recon_step_schedule(
+            it,
+            pose_warmup_iters=run.pose_warmup_iters,
+            alternating_period=run.alternating_period,
+        )
+        # Only the leaves stepped this iteration need a gradient: a
+        # volume-only iteration then skips grad_rotmat and the shift
+        # backward, a pose-only one the volume back-projection. The
+        # gradients that are computed do not depend on which other leaves
+        # require grad, so the result is bit-identical to computing all.
+        run.volume.requires_grad_(step_volume)
+        for leaf in (tilt, shifts):
+            if leaf is not None:
+                leaf.requires_grad_(step_pose)
+
+    # forward project
     if run.refine_pose and tilt is not None:
         mats = euler_zyz_to_rotmat(tilt)
         pred = run.fp(run.volume, mats)
@@ -213,7 +230,6 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         if tilt.grad is not None:
             tilt.grad[:, 2] = 0.0
 
-    step_volume = True
     if run.default_step_schedule:
         # Keep the default path exactly identical to the historical loop.
         for opt in run.optimisers:
@@ -221,11 +237,6 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         for sched in run.schedulers:
             sched.step()
     else:
-        step_volume, step_pose = _ad_recon_step_schedule(
-            it,
-            pose_warmup_iters=run.pose_warmup_iters,
-            alternating_period=run.alternating_period,
-        )
         step_flags = [step_volume] + [step_pose] * (len(run.optimisers) - 1)
         for opt, should_step in zip(run.optimisers, step_flags):
             if should_step:

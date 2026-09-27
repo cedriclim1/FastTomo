@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### AD reconstruction and regularisers: speed and accuracy (phase 1b, PR D)
+
+- `run_ad_recon` with a staged pose schedule (`pose_warmup_iters`,
+  `alternating_period`) now differentiates only the leaves stepped in each
+  iteration: a volume-only iteration skips `grad_rotmat` and the shift
+  backward, a pose-only one the volume back-projection. Bit-identical
+  output. At 256^3, 61 views, pose + shifts: a volume-only (warm-up)
+  iteration 5.4 -> 2.5 ms, `alternating_period=5` 6.3 -> 3.9 ms per
+  iteration.
+
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
 `ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes

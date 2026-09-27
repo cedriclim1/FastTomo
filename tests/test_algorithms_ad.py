@@ -901,11 +901,12 @@ class _RecordingRotmatProjector(ft.RotmatProjector):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.vols, self.mats = [], []
+        self.vols, self.mats, self.requires_grad = [], [], []
 
     def forward(self, volume, mats):
         self.vols.append(volume.detach().clone())
         self.mats.append(mats.detach().clone())
+        self.requires_grad.append((volume.requires_grad, mats.requires_grad))
         return super().forward(volume, mats)
 
 
@@ -925,8 +926,11 @@ def _staged_run(monkeypatch, n_iter, warmup, period):
     shift_log = []
     real_shift = algo.ad.apply_shifts_2d
 
+    shift_grad = []
+
     def recording_shift(pred, shifts):
         shift_log.append(shifts.detach().clone())
+        shift_grad.append(shifts.requires_grad)
         return real_shift(pred, shifts)
 
     monkeypatch.setattr(algo.ad, "apply_shifts_2d", recording_shift)
@@ -946,7 +950,8 @@ def _staged_run(monkeypatch, n_iter, warmup, period):
     vols = proj.vols + [rec]
     mats = proj.mats + [ft.euler_zyz_to_rotmat(euler.to(dev))]
     shift_log.append(shifts.to(dev))
-    return loss, vols, mats, shift_log
+    grad_flags = [(v, m, sh) for (v, m), sh in zip(proj.requires_grad, shift_grad)]
+    return loss, vols, mats, shift_log, grad_flags
 
 
 def _moved(seq, k):
@@ -959,7 +964,7 @@ def test_run_ad_recon_warmup_end_to_end(monkeypatch) -> None:
     not move during warm-up and moves on every later iteration; the volume
     moves on every iteration; the loss falls."""
     n_iter, warmup = 16, 6
-    loss, vols, mats, shifts = _staged_run(monkeypatch, n_iter, warmup, 0)
+    loss, vols, mats, shifts, _ = _staged_run(monkeypatch, n_iter, warmup, 0)
     for k in range(n_iter):
         assert _moved(vols, k), k
     for k in range(n_iter):
@@ -976,7 +981,7 @@ def test_run_ad_recon_alternating_end_to_end(monkeypatch) -> None:
     pose-only (5-7, 11-13) blocks. Each parameter moves exactly in its own
     blocks; the loss falls."""
     n_iter, warmup, period = 14, 2, 3
-    loss, vols, mats, shifts = _staged_run(monkeypatch, n_iter, warmup, period)
+    loss, vols, mats, shifts, _ = _staged_run(monkeypatch, n_iter, warmup, period)
     for k in range(n_iter):
         step_volume, step_pose = _ad_recon_step_schedule(
             k, pose_warmup_iters=warmup, alternating_period=period)
@@ -988,6 +993,23 @@ def test_run_ad_recon_alternating_end_to_end(monkeypatch) -> None:
     assert (loss[1:] <= loss[:-1]).all()
     assert loss[8] < loss[5]            # the pose-only block alone lowers the loss
     assert loss[-1] < 0.5 * loss[0]
+
+
+@needs_cuda
+def test_staged_iterations_differentiate_only_the_stepped_leaves(monkeypatch) -> None:
+    """A6-4: a volume-only iteration builds no graph for the pose and the
+    shifts (no grad_rotmat, no shift backward), a pose-only iteration none
+    for the volume (no back-projection). The default joint schedule keeps
+    every leaf differentiable."""
+    n_iter, warmup, period = 9, 2, 2
+    *_, flags = _staged_run(monkeypatch, n_iter, warmup, period)
+    assert len(flags) == n_iter
+    for k, (vol_rg, mats_rg, shift_rg) in enumerate(flags):
+        step_volume, step_pose = _ad_recon_step_schedule(
+            k, pose_warmup_iters=warmup, alternating_period=period)
+        assert (vol_rg, mats_rg, shift_rg) == (step_volume, step_pose, step_pose), k
+    *_, flags = _staged_run(monkeypatch, 3, 0, 0)
+    assert flags == [(True, True, True)] * 3
 
 
 def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:
