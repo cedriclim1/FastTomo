@@ -16,9 +16,9 @@
 /* ── ray clipping (FP) ────────────────────────────────────────────────────────
  * A ray (t, angle) samples fx(s) = (t*ca - s*sa) + half_x and
  * fz(s) = (t*sa + s*ca) + half_z at the integer steps s in [-ray_len,
- * ray_len]; only ~65 % of them pass the tight bounds test. clip_steps narrows
- * [lo, hi] to the steps at which the coordinate c(s) = a*s + b can lie in
- * [lo_v, hi_v] (the fp32 form of the CPU kernels' ft_clip_steps,
+ * ray_len]; only ~65 % of them pass the bounds test (-1, N) on both axes.
+ * clip_steps narrows [lo, hi] to the steps at which the coordinate
+ * c(s) = a*s + b can lie in [lo_v, hi_v] (the fp32 form of the CPU kernels' ft_clip_steps,
  * csrc/cpu/common.h; fp64 cost 1.6x at 128^3 on this consumer-rate part):
  *
  * - Rounding: the kernel computes c(s) with at most 3 fp32 roundings (FMA
@@ -51,15 +51,20 @@ __device__ __forceinline__ void clip_steps(float a, float b, float lo_v, float h
     if (h < (float)hi) hi = (int)h;
 }
 
-/* The step range [lo, hi] of one ray, clipped to the volume. */
+/* The step range [lo, hi] of one ray, clipped to the samples whose bilinear
+ * stencil can touch the volume: fx in [-1, Nx], fz in [-1, Nz] (the loop's
+ * test is the open (-1, N); the clip keeps the closed range and its slack).
+ * ray_len covers that box: a sample in it is at most
+ * 0.5 * sqrt((Nx+1)^2 + (Nz+1)^2) < ceil(0.5 * sqrt(Nx^2 + Nz^2)) + 1 steps
+ * from the ray's foot. */
 __device__ __forceinline__ void fp_step_range(float t, float ca, float sa, int Nx, int Nz,
                                               float half_x, float half_z, int ray_len,
                                               int &lo, int &hi) {
     lo = -ray_len;
     hi = ray_len;
     const float mag = fabsf(t) + (float)ray_len + fmaxf(half_x, half_z) + 1.0f;
-    clip_steps(-sa, t * ca + half_x, 0.0f, (float)(Nx - 1), mag, lo, hi);
-    clip_steps(ca, t * sa + half_z, 0.0f, (float)(Nz - 1), mag, lo, hi);
+    clip_steps(-sa, t * ca + half_x, -1.0f, (float)Nx, mag, lo, hi);
+    clip_steps(ca, t * sa + half_z, -1.0f, (float)Nz, mag, lo, hi);
 }
 
 /* Widen [lo, hi] to the union over the full warp (every lane must call it;
@@ -128,8 +133,8 @@ template <> struct PackedFetch<4> {
  * slices' samples, summed in the same order as the 1-channel kernel, so each
  * slice gets the same bits; only slices < Ny are stored). Marches along the
  * ray over the warp's clipped step range; tex2DLayered handles bilinear
- * interp and border. Every lane reaches the warp reduction (no early return
- * before it).
+ * interp and the zero border (sampling rule: loose, (-1, N), see the loop).
+ * Every lane reaches the warp reduction (no early return before it).
  */
 template <int C, typename T>
 __global__ static void forward_project_parallel_kernel(
@@ -166,16 +171,17 @@ __global__ static void forward_project_parallel_kernel(
         float s  = (float)step;
         float fx = (t * ca - s * sa) + half_x;
         float fz = (t * sa + s * ca) + half_z;
-        /* Match forward_project_cpu's tight bilinear-stencil bounds: only
-         * sample when both pixel neighbours along each axis are inside the
-         * volume (fx in [0, Nx-1), fz in [0, Nz-1)). Border-mode tex2DLayered
-         * would otherwise contribute a half-texel slab at each edge that the
-         * CPU kernel skips. Written as a negated conjunction so a NaN
-         * coordinate (NaN/Inf tilt angle) fails it and the sample is skipped
-         * (the NaN view projects to 0, like the CPU kernel) instead of
-         * reaching the texture unit, which returns finite garbage for it. */
-        if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
-              fz >= 0.0f && fz < (float)(Nz - 1)))
+        /* Sampling rule ("loose", the rotmat path's rule): the volume is a
+         * sum of bilinear tent functions, zero outside, so a sample
+         * contributes while any corner of its stencil is inside, fx in
+         * (-1, Nx) and fz in (-1, Nz), and corners outside read 0. The
+         * border-mode linear texture implements exactly that; this test
+         * only skips fetches that would return 0, and, written as a negated
+         * conjunction, rejects a NaN coordinate (NaN/Inf tilt angle) so the
+         * NaN view projects to 0 like the CPU kernel instead of reaching the
+         * texture unit, which returns finite garbage for it. */
+        if (!(fx > -1.0f && fx < (float)Nx &&
+              fz > -1.0f && fz < (float)Nz))
             continue;
         /* tex2DLayered: x→Nx axis, y→Nz axis, layer→iy_pack.
          * +0.5 maps integer pixel index to texel centre.
