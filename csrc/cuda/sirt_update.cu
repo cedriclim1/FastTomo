@@ -1,7 +1,7 @@
 /* ── fasttomo/csrc/cuda/sirt_update.cu ──────────────────────────────────────
  * Fused elementwise steps of one SIRT iteration (kernel audit F7).
- * Kernels: sirt_residual(_vec)_kernel, sirt_residual_tex(_packed_h4)_kernel,
- *          sirt_update(_vec)_kernel, sirt_update_packed_h4_kernel.
+ * Kernels: sirt_residual(_vec)_kernel, sirt_residual_tex(_packed)_kernel,
+ *          sirt_update(_vec)_kernel, sirt_update_packed_kernel.
  * Host wrappers: sirt_residual_cuda, sirt_residual_tex_cuda, sirt_update_cuda.
  *
  * The _tex variants and sirt_update_cuda with a vol_tc also write their
@@ -10,9 +10,10 @@
  * goes to the sinogram texture instead of global memory, and the updated
  * volume goes to both global memory and the volume texture, so the next
  * forward projection needs no tc_upload (cudaMemcpy3D D2D copy). The
- * texture ends up holding exactly what tc_upload would have copied (fp16
- * 4-channel caches: the same 4-Y-slice packing as write_half4_*_kernel),
- * so the projections read identical texels.
+ * texture ends up holding exactly what tc_upload would have copied (packed
+ * caches: the same Y-slice packing as write_packed_*_kernel, 2 fp32 or 4
+ * fp16 slices per texel, zeros past Ny), so the projections read identical
+ * texels.
  *
  * Each kernel replaces a chain of PyTorch elementwise ops and must give the
  * same bits: every intermediate is rounded to the I/O dtype where PyTorch
@@ -97,12 +98,18 @@ template <> __device__ __forceinline__ float surf_get<__half>(
     return __half2float(__ushort_as_half(u));
 }
 
-/* 4 fp16 values of consecutive Y-slices as one 4-channel texel, the layout
- * of write_half4_vol_kernel / write_half4_sino_kernel (texture_cache.cu). */
-union Half4 {
-    __half h[4];
+/* C values of consecutive Y-slices as one C-channel texel (2 fp32 or 4
+ * fp16: 8 bytes), the layout of write_packed_vol_kernel /
+ * write_packed_sino_kernel (texture_cache.cu). */
+template <typename T, int C> union Packed {
+    static_assert(sizeof(T) * C == sizeof(float2), "packed texels are 8 bytes");
+    T v[C];
     float2 f;
 };
+
+template <typename T> __device__ __forceinline__ T zero_t();
+template <> __device__ __forceinline__ float  zero_t<float>()  { return 0.0f; }
+template <> __device__ __forceinline__ __half zero_t<__half>() { return __ushort_as_half(0); }
 
 /* ── residual ─────────────────────────────────────────────────────────────
  *   raw = sino - fp           (rounded to T)
@@ -186,29 +193,36 @@ __global__ static void sirt_residual_tex_kernel(
     surf_put<T>(SurfTarget{surf, SURF_LAYERED}, __fmul_rn(rw, ld(R, i)), id, iy, ia);
 }
 
-/* fp16 residual into a 4-channel packed sinogram texture (Ny % 4 == 0):
- * one thread per (detector, Y-slice quad, angle). Grid (N_det / block,
- * Ny / 4, n_angles). */
-__global__ static void sirt_residual_tex_packed_h4_kernel(
-    const __half *__restrict__ sino,
-    const __half *__restrict__ fp,
-    const __half *__restrict__ R,
-    __half *__restrict__       raw_out,
-    cudaSurfaceObject_t        surf,
+/* Residual into a C-channel packed sinogram texture (C = 2 fp32, 4 fp16):
+ * one thread per (detector, group of C Y-slices, angle); the channels past
+ * Ny (last group when Ny % C != 0) are written as 0, like the pack kernel.
+ * Grid (N_det / block, ceil(Ny / C), n_angles). */
+template <typename T, int C>
+__global__ static void sirt_residual_tex_packed_kernel(
+    const T *__restrict__ sino,
+    const T *__restrict__ fp,
+    const T *__restrict__ R,
+    T *__restrict__       raw_out,
+    cudaSurfaceObject_t   surf,
     int Ny, int N_det
 ) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= N_det) return;
-    int iy4 = blockIdx.y, ia = blockIdx.z;
-    Half4 tmp;
+    int iyp = blockIdx.y, ia = blockIdx.z;
+    Packed<T, C> tmp;
     #pragma unroll
-    for (int k = 0; k < 4; k++) {
-        size_t i = ((size_t)ia * Ny + 4 * iy4 + k) * N_det + id;
-        float rw = rnd<__half>(__fsub_rn(ld(sino, i), ld(fp, i)));
-        if (raw_out) raw_out[i] = __float2half_rn(rw);
-        tmp.h[k] = __float2half_rn(__fmul_rn(rw, ld(R, i)));
+    for (int k = 0; k < C; k++) {
+        int iy = C * iyp + k;
+        if (iy >= Ny) {
+            tmp.v[k] = zero_t<T>();
+            continue;
+        }
+        size_t i = ((size_t)ia * Ny + iy) * N_det + id;
+        float rw = rnd<T>(__fsub_rn(ld(sino, i), ld(fp, i)));
+        if (raw_out) raw_out[i] = float_to_t<T>(rw);
+        tmp.v[k] = float_to_t<T>(__fmul_rn(rw, ld(R, i)));
     }
-    surf2DLayeredwrite<float2>(tmp.f, surf, id * (int)sizeof(float2), iy4, ia);
+    surf2DLayeredwrite<float2>(tmp.f, surf, id * (int)sizeof(float2), iyp, ia);
 }
 
 /* ── volume update + constraints ──────────────────────────────────────────
@@ -312,16 +326,16 @@ __global__ static void sirt_update_vec_kernel(
     }
 }
 
-/* fp16 update into a 4-channel packed layered volume texture (Ny % 4 == 0):
- * one thread per (Nz*Nx plane position, Y-slice quad). Grid (plane / block,
- * Ny / 4). */
-template <bool EAGER>
-__global__ static void sirt_update_packed_h4_kernel(
-    const __half *vol_in,
-    __half       *vol_out,
-    const __half *__restrict__ upd,
-    const __half *__restrict__ C,
-    const __half *__restrict__ mask,
+/* Update into a CH-channel packed layered volume texture (CH = 2 fp32, 4
+ * fp16): one thread per (Nz*Nx plane position, group of CH Y-slices); the
+ * channels past Ny stay 0. Grid (plane / block, ceil(Ny / CH)). */
+template <typename T, int CH, bool EAGER>
+__global__ static void sirt_update_packed_kernel(
+    const T *vol_in,
+    T       *vol_out,
+    const T *__restrict__ upd,
+    const T *__restrict__ C,
+    const T *__restrict__ mask,
     int mask_full,
     float omega,
     int positivity,
@@ -332,21 +346,27 @@ __global__ static void sirt_update_packed_h4_kernel(
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= plane) return;
     int x = p % Nx, z = p / Nx;
-    for (int y4 = blockIdx.y; y4 < Ny / 4; y4 += gridDim.y) {
-        Half4 tmp, cur;
+    int Nyp = (Ny + CH - 1) / CH;
+    for (int yp = blockIdx.y; yp < Nyp; yp += gridDim.y) {
+        Packed<T, CH> tmp, cur;
         if (!vol_in)    /* the volume lives in the texture */
-            surf2DLayeredread<float2>(&cur.f, surf, x * (int)sizeof(float2), z, y4);
+            surf2DLayeredread<float2>(&cur.f, surf, x * (int)sizeof(float2), z, yp);
         #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            size_t i = (size_t)(4 * y4 + k) * plane + p;
+        for (int k = 0; k < CH; k++) {
+            int y = CH * yp + k;
+            if (y >= Ny) {
+                tmp.v[k] = zero_t<T>();
+                continue;
+            }
+            size_t i = (size_t)y * plane + p;
             float m = mask ? ld(mask, mask_full ? i : (size_t)p) : 1.0f;
-            float v = sirt_update_one<__half, EAGER>(
-                vol_in ? ld(vol_in, i) : __half2float(cur.h[k]), ld(upd, i), ld(C, i),
+            float v = sirt_update_one<T, EAGER>(
+                vol_in ? ld(vol_in, i) : ld(cur.v, k), ld(upd, i), ld(C, i),
                 mask != nullptr, m, omega, positivity, soft_thr);
-            tmp.h[k] = __float2half_rn(v);
-            if (vol_out) vol_out[i] = tmp.h[k];
+            tmp.v[k] = float_to_t<T>(v);
+            if (vol_out) vol_out[i] = tmp.v[k];
         }
-        surf2DLayeredwrite<float2>(tmp.f, surf, x * (int)sizeof(float2), z, y4);
+        surf2DLayeredwrite<float2>(tmp.f, surf, x * (int)sizeof(float2), z, yp);
     }
 }
 
@@ -423,11 +443,19 @@ void sirt_residual_tex_cuda(
     if (Ny > 65535 || n_angles > 65535)
         throw std::invalid_argument("sirt_residual_tex_cuda: Ny or n_angles above 65535");
     const int block = 128;
-    if (res_tc->channels == 4) {
-        dim3 grid((unsigned)((N_det + block - 1) / block), (unsigned)(Ny / 4), (unsigned)n_angles);
-        sirt_residual_tex_packed_h4_kernel<<<grid, block, 0, stream>>>(
-            (const __half *)sino, (const __half *)fp, (const __half *)R,
-            (__half *)raw_out, res_tc->surf, Ny, N_det);
+    if (res_tc->channels > 1) {
+        dim3 grid((unsigned)((N_det + block - 1) / block),
+                  (unsigned)tc_packed_extent(Ny, res_tc->channels), (unsigned)n_angles);
+        if (io_dtype == 0 && res_tc->channels == 2)
+            sirt_residual_tex_packed_kernel<float, 2><<<grid, block, 0, stream>>>(
+                (const float *)sino, (const float *)fp, (const float *)R,
+                (float *)raw_out, res_tc->surf, Ny, N_det);
+        else if (io_dtype == 1 && res_tc->channels == 4)
+            sirt_residual_tex_packed_kernel<__half, 4><<<grid, block, 0, stream>>>(
+                (const __half *)sino, (const __half *)fp, (const __half *)R,
+                (__half *)raw_out, res_tc->surf, Ny, N_det);
+        else
+            throw std::invalid_argument("sirt_residual_tex_cuda: unsupported packed cache");
         CUDA_CHECK_KERNEL();
         return;
     }
@@ -470,19 +498,25 @@ void sirt_update_cuda(
         tc_validate(vol_tc, vol_tc->kind, io_dtype, Ny, Nz, Nx, "sirt_update_cuda");
         check_surface(vol_tc, "sirt_update_cuda");
         st = SurfTarget{vol_tc->surf, vol_tc->kind == TC_VOL_3D ? SURF_3D : SURF_LAYERED};
-        if (vol_tc->channels == 4) {        /* fp16 packed layered (Ny % 4 == 0) */
+        if (vol_tc->channels > 1) {         /* packed layered: 2 fp32 / 4 fp16 */
+            int Nyp = tc_packed_extent(Ny, vol_tc->channels);
             dim3 grid((unsigned)((plane + block - 1) / block),
-                      (unsigned)(Ny / 4 < 65535 ? Ny / 4 : 65535));
-            if (eager_order)
-                sirt_update_packed_h4_kernel<true><<<grid, block, 0, stream>>>(
-                    (const __half *)vol_in, (__half *)vol_out, (const __half *)upd,
-                    (const __half *)C, (const __half *)mask, mask_full, omega,
-                    positivity, soft_thr, Ny, plane, Nx, vol_tc->surf);
-            else
-                sirt_update_packed_h4_kernel<false><<<grid, block, 0, stream>>>(
-                    (const __half *)vol_in, (__half *)vol_out, (const __half *)upd,
-                    (const __half *)C, (const __half *)mask, mask_full, omega,
-                    positivity, soft_thr, Ny, plane, Nx, vol_tc->surf);
+                      (unsigned)(Nyp < 65535 ? Nyp : 65535));
+#define SIRT_UPDATE_PACKED(T, CH, E)                                             \
+    sirt_update_packed_kernel<T, CH, E><<<grid, block, 0, stream>>>(              \
+        (const T *)vol_in, (T *)vol_out, (const T *)upd, (const T *)C,            \
+        (const T *)mask, mask_full, omega, positivity, soft_thr, Ny, plane, Nx,  \
+        vol_tc->surf)
+            if (io_dtype == 0 && vol_tc->channels == 2) {
+                if (eager_order) SIRT_UPDATE_PACKED(float, 2, true);
+                else             SIRT_UPDATE_PACKED(float, 2, false);
+            } else if (io_dtype == 1 && vol_tc->channels == 4) {
+                if (eager_order) SIRT_UPDATE_PACKED(__half, 4, true);
+                else             SIRT_UPDATE_PACKED(__half, 4, false);
+            } else {
+                throw std::invalid_argument("sirt_update_cuda: unsupported packed cache");
+            }
+#undef SIRT_UPDATE_PACKED
             CUDA_CHECK_KERNEL();
             return;
         }

@@ -675,8 +675,10 @@ def test_tc_create_failure_does_not_leak(stage, kind, dtype, channels, dims):
 @needs_cuda
 def test_texture_limits_raise_clear_error_without_leak():
     """P4: more than 2048 layers is a clear ValueError, not a generic CUDA
-    'invalid argument', and it leaks nothing."""
-    vol = torch.zeros(2049, 8, 8, device="cuda")
+    'invalid argument', and it leaks nothing. An fp32 volume packs 2
+    Y-slices per float2 texel, so its limit is 4096 slices (2048 layers)."""
+    ft.forward_project(torch.zeros(2049, 8, 8, device="cuda"), torch.zeros(4, device="cuda"))
+    vol = torch.zeros(4097, 8, 8, device="cuda")
     with pytest.raises(ValueError, match="limit"):
         ft.forward_project(vol, torch.zeros(4, device="cuda"))
     sino = torch.zeros(2049, 1, 8, device="cuda")

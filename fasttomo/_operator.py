@@ -282,9 +282,10 @@ class CudaCachedOperator(ProjectionOperator):
     One volume ``TextureCache`` (layered for parallel, 3-D for rotmat) and
     one sinogram cache per view count, created on first use and released
     when the operator is collected (deferred while a CUDA graph is being
-    captured). The I/O dtype locks on first use; fp16 parallel caches pack
-    4 Y-slices per texel when ``Ny % 4 == 0``, exactly like the one-shot
-    wrappers, so cached and uncached results are identical.
+    captured). The I/O dtype locks on first use; parallel caches pack
+    Y-slices into one texel (2 per float2 texel for fp32, 4 for fp16; see
+    ``_channels``), exactly like the one-shot wrappers, so cached and
+    uncached results are identical.
 
     Gradients w.r.t. the geometry: parallel falls back to the uncached
     ``grad_angle`` kernel; rotmat samples the volume texture its forward
@@ -377,11 +378,13 @@ class CudaCachedOperator(ProjectionOperator):
             self._sin.copy_(sin_a)
 
     def _channels(self) -> int:
-        # 4-channel packed-Y mode for fp16 parallel caches when Ny % 4 == 0
-        # (TorchRadon's batch-channel-packing trick); rotmat needs continuous
-        # Y interpolation (tex3D) and stays single-channel.
-        if self.kind == "parallel" and self.dtype == torch.float16 and self.Ny % 4 == 0:
-            return 4
+        # Y-slice packing of the parallel textures (TorchRadon's
+        # batch-channel-packing trick), the layout the one-shot wrappers use:
+        # _core.parallel_channels (2 slices per float2 texel for fp32, 4 per
+        # fp16 texel; texture_cache.h). Rotmat needs continuous Y
+        # interpolation (tex3D) and stays single-channel.
+        if self.kind == "parallel":
+            return int(_core.parallel_channels(_dtype_to_tc_code(self.dtype), self.Ny))
         return 1
 
     def _vol_cache(self) -> int:

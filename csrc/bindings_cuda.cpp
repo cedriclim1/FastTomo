@@ -174,8 +174,8 @@ static long py_tc_create(int kind, int dtype, int channels,
         throw std::invalid_argument("tc_create: kind must be 0..2");
     if (dtype < 0 || dtype > 1)
         throw std::invalid_argument("tc_create: dtype must be 0 (fp32) or 1 (fp16)");
-    if (channels != 1 && channels != 4)
-        throw std::invalid_argument("tc_create: channels must be 1 or 4");
+    if (channels != 1 && channels != 2 && channels != 4)
+        throw std::invalid_argument("tc_create: channels must be 1, 2 or 4");
     TextureCache *tc = tc_create_ex(
         static_cast<tc_kind_t>(kind),
         static_cast<tc_dtype_t>(dtype),
@@ -585,9 +585,10 @@ void register_cuda(py::module_ &m) {
           "Allocate a persistent cudaArray + cudaTextureObject. "
           "kind: 0=TC_VOL_LAYERED (FP scalar), 1=TC_SINO_LAYERED (BP scalar/rotmat), "
           "2=TC_VOL_3D (FP rotmat). dtype: 0=fp32, 1=fp16. "
-          "channels: 1 (default) or 4. channels=4 enables TorchRadon-style "
-          "Y-axis packing (4 Y-slices per texel) — fp16 only, packing-axis "
-          "must be divisible by 4. dim_a/b/c match the source-tensor dims "
+          "channels: 1 (default), 2 or 4: TorchRadon-style Y-axis packing "
+          "(2 Y-slices per float2 texel for fp32, 4 per texel for fp16; any "
+          "Ny, the last texel is zero-padded; layered kinds only; see "
+          "parallel_channels). dim_a/b/c match the source-tensor dims "
           "in C order: vol is (Ny,Nz,Nx); sino is (n_angles,Ny,N_det). "
           "Returns an opaque integer handle — pass to tc_destroy when done. "
           "surface=True also creates a surface object on a 1-channel cache "
@@ -596,6 +597,12 @@ void register_cuda(py::module_ &m) {
           py::arg("kind"), py::arg("dtype"), py::arg("channels"),
           py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"),
           py::arg("surface") = false);
+
+    m.def("parallel_channels", &parallel_channels,
+          "Y slices per texel of the parallel FP/BP textures for io_dtype "
+          "(0 = fp32, 1 = fp16) and Ny: what the one-shot wrappers use, and "
+          "what a cached caller passes to tc_create so both share a layout.",
+          py::arg("io_dtype"), py::arg("Ny"));
 
     m.def("tc_has_surface", &py_tc_has_surface,
           "True if the TextureCache handle has a surface object (writable "
