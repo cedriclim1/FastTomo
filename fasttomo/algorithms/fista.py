@@ -19,6 +19,7 @@ from fasttomo.algorithms._common import (
     _deprecated_kwarg,
     _reject_unknown_kwargs,
     _prepare_recon,
+    _DeviceLossRecorder,
     _LossRecorder,
     _build_fp_bp,
 )
@@ -309,7 +310,7 @@ def run_fista(
         else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
     )
 
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista")
     return _fista_loop(
         volume, sinogram, _fp, _bp, n_iter, L_eff, setup.constraints.apply, rec,
     )
@@ -400,5 +401,5 @@ def run_fista_tv(
     def prox(u):
         return _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
     return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec)

@@ -30,7 +30,7 @@ from fasttomo.algorithms._common import (
     _reject_unknown_kwargs,
     _as_int,
     _prepare_recon,
-    _LossRecorder,
+    _DeviceLossRecorder,
     _build_fp_bp,
     _reciprocal_or_zero,
 )
@@ -121,12 +121,13 @@ def run_sirt(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
-    # Gate of the CUDA-graph path: CUDA input, no per-iteration loss (which
-    # calls .item()), n_iter > 1, parallel geometry. Rotmat mode
-    # (euler_zyz_deg) stays on the eager path because the per-call matrix
-    # tensor can vary, while cached graphs assume fixed captured inputs.
-    wants_loss = bool(return_loss) or loss_callback is not None
-    use_graph = sinogram.is_cuda and not wants_loss and n_iter > 1 and euler_zyz_deg is None
+    # Gate of the CUDA-graph path: CUDA input, n_iter > 1, parallel
+    # geometry. Rotmat mode (euler_zyz_deg) stays on the eager path because
+    # the per-call matrix tensor can vary, while cached graphs assume fixed
+    # captured inputs. A requested loss is computed inside the graph (the
+    # eager loop's rounding order, so the result does not change) and
+    # recorded on the device after each replay (solver audit P5).
+    use_graph = sinogram.is_cuda and n_iter > 1 and euler_zyz_deg is None
     graph_key = None
     cache_key = None
     if use_graph:
@@ -211,10 +212,12 @@ def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
     _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
     R_sino    = _reciprocal_or_zero(R_sino)
 
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
 
     # --- CUDA Graph capture path ----------------------------------------
-    # If capture fails, fall back to the eager loop below.
+    # If capture fails, fall back to the eager loop below. With a loss the
+    # graph is a different one (it also computes the loss, in the eager
+    # rounding order): the key says which, the kept operator may hold both.
     if use_graph:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
@@ -227,9 +230,10 @@ def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
             _bp=_bp,
             constraints=constraints,
             projector=op,
-            key=graph_key,
+            key=(*graph_key, rec.wants_loss),
             on_replay=rec.tick,
             tex_op=tex_op,
+            rec=rec if rec.wants_loss else None,
         )
         if graph_result is not None:
             return rec.finish(graph_result)
@@ -472,7 +476,7 @@ def run_sart(
         C_s = _reciprocal_or_zero(C_s)
         C_list.append(C_s)
 
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")
     full_geom = _subset_geom(None) if rec.wants_loss else None
 
     # --- outer iteration loop ---
@@ -552,7 +556,7 @@ def run_wsirt(
     op = _make_operator(Geometry("parallel", (setup.Ny, Nz, Nx), N_det, setup.n_angles,
                                  angles_deg), device, sinogram.dtype, num_threads=num_threads)
 
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_wsirt")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_wsirt")
 
     for it in rec.iterate(n_iter):
         proj     = op.project(volume)
@@ -718,9 +722,15 @@ def _run_sirt_cuda_graph(
     key: tuple,
     on_replay: Callable[[], None] | None = None,
     tex_op: CudaCachedOperator | None = None,
+    rec: _DeviceLossRecorder | None = None,
 ) -> torch.Tensor | None:
     """
     Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
+
+    With ``rec`` the graph also computes the data MSE before each update
+    (in a static 0-d buffer, rounded like the eager loop, whose update order
+    it uses too), recorded after every replay: a device copy without a sync
+    for ``return_loss``, one host transfer per iteration for a callback.
 
     Returns the reconstructed volume tensor, or ``None`` if capture was
     skipped / failed (caller should fall back to the eager loop).
@@ -794,10 +804,10 @@ def _run_sirt_cuda_graph(
                     capture_stream = torch.cuda.Stream(device=target_device)
                     g = torch.cuda.CUDAGraph()
                     with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
-                        _sirt_iter_inplace(
+                        loss_static = _sirt_iter_inplace(
                             vol_static, sino_static, C_static, R_static, omega,
                             _fp, _bp, static_constraints, tex_op=tex_op,
-                            texture_resident=resident,
+                            texture_resident=resident, with_loss=rec is not None,
                         )
                     torch.cuda.synchronize(target_device)
             finally:
@@ -810,7 +820,7 @@ def _run_sirt_cuda_graph(
                 raise RuntimeError("texture-resident SIRT capture is inconsistent")
 
             cache[key] = (g, vol_static, sino_static, C_static, R_static,
-                          mask_static, resident)
+                          mask_static, resident, loss_static)
             global _sirt_graph_captures
             _sirt_graph_captures += 1
 
@@ -826,7 +836,7 @@ def _run_sirt_cuda_graph(
             bad_keys.add(key)
             return None
 
-    g, vol_static, sino_static, C_static, R_static, mask_static, resident = cache[key]
+    g, vol_static, sino_static, C_static, R_static, mask_static, resident, loss_static = cache[key]
 
     # Load the caller's starting volume into the captured static buffer
     # (the capture itself does not execute, but a cache hit holds the
@@ -845,8 +855,10 @@ def _run_sirt_cuda_graph(
         tex_op._upload_vol(vol_static)
 
     with torch.cuda.device(target_device):
-        for _ in range(n_iter):
+        for it in range(n_iter):
             g.replay()
+            if rec is not None:
+                rec.record(it, loss_static)
             if on_replay is not None:
                 on_replay()
         if resident:
@@ -867,9 +879,14 @@ def _sirt_iter_inplace(
     constraints: ConstraintConfig,
     tex_op: CudaCachedOperator | None = None,
     texture_resident: bool = False,
-) -> None:
+    with_loss: bool = False,
+) -> torch.Tensor | None:
     """
-    One in-place SIRT iteration on ``vol_static``.
+    One in-place SIRT iteration on ``vol_static``. With ``with_loss`` it
+    returns the data MSE ``mean((b - A x)^2)`` before the update (0-d) and
+    rounds the update in the eager loop's order (``volume + omega * C *
+    update``), so a run with a loss equals `_run_sirt_body`'s eager loop bit
+    for bit; else None, in the CUDA-graph order.
 
     All writes go through in-place ops (``add_``, ``mul_``, ``clamp_``,
     ``copy_``) or the fused kernels writing into ``vol_static`` so that
@@ -880,22 +897,28 @@ def _sirt_iter_inplace(
     written there; ``vol_static`` is left stale, see `_fused_update`).
     """
     fp = _fp(vol_static)
-    fused = _fused_residual(sinogram, fp, R_sino, want_raw=False, tex_op=tex_op)
+    fused = _fused_residual(sinogram, fp, R_sino, want_raw=with_loss, tex_op=tex_op)
     if fused is None:
-        update = _bp((sinogram - fp) * R_sino)
-    elif fused[1] is None:
-        update = tex_op.bp_from_texture(None)
+        raw = sinogram - fp
+        update = _bp(raw * R_sino)
     else:
-        update = _bp(fused[1])
+        raw = fused[0]
+        update = tex_op.bp_from_texture(None) if fused[1] is None else _bp(fused[1])
+    loss = raw.pow(2).mean() if with_loss else None
     if vol_static.is_contiguous() and _fused_update(
             vol_static, update, C_vol, omega, constraints,
-            eager_order=False, out=vol_static, tex_op=tex_op,
+            eager_order=with_loss, out=vol_static, tex_op=tex_op,
             texture_resident=texture_resident) is not None:
-        return
+        return loss
     if texture_resident:
         raise RuntimeError("texture-resident SIRT update not possible")
-    # Avoid creating a temporary for `update * C_vol` to keep allocations
-    # inside the graph's memory pool.
-    update.mul_(C_vol)
-    vol_static.add_(update, alpha=omega)
+    if with_loss:
+        # the eager loop's `volume + omega * C_vol * update`, in place
+        vol_static.add_(omega * C_vol * update)
+    else:
+        # Avoid creating a temporary for `update * C_vol` to keep
+        # allocations inside the graph's memory pool.
+        update.mul_(C_vol)
+        vol_static.add_(update, alpha=omega)
     constraints.apply_inplace_(vol_static)
+    return loss

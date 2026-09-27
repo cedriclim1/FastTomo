@@ -381,6 +381,13 @@ def test_sirt_support_mask_full_3d_cuda():
 # ── SIRT CUDA graph ───────────────────────────────────────────────────────────
 
 
+def _force_eager_sirt(mp) -> None:
+    """Make run_sirt take its eager loop (as if the graph capture failed):
+    a requested loss no longer does that (solver audit P5)."""
+    from fasttomo.algorithms import algebraic
+    mp.setattr(algebraic, "_run_sirt_cuda_graph", lambda **kw: None)
+
+
 @needs_cuda
 class TestRunSirtCudaGraph:
     """Verify the CUDA-Graph-accelerated path in run_sirt.
@@ -395,14 +402,14 @@ class TestRunSirtCudaGraph:
         sino   = ft.forward_project(vol, angles)
         return sino, angles
 
-    def test_graph_matches_eager(self):
+    def test_graph_matches_eager(self, monkeypatch):
         """Graph path must produce volumes within 1e-5 RMSE of the eager path."""
         sino, angles = self._make_inputs(N=32, n_angles=20)
         n_iter = 20
 
-        # Eager path: return_loss=True forces the eager loop regardless.
-        rec_eager, _ = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
-                                   return_loss=True)
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            rec_eager = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32)
 
         # Graph path: default CUDA path with return_loss=False.
         rec_graph = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
@@ -430,7 +437,7 @@ class TestRunSirtCudaGraph:
             f"expected 1 cached graph, got {len(proj._sirt_graph_cache)}"
         )
 
-    def test_graph_cache_uses_latest_inputs(self):
+    def test_graph_cache_uses_latest_inputs(self, monkeypatch):
         """
         Cached graph replay must respect call-time sinogram and omega values.
 
@@ -454,10 +461,10 @@ class TestRunSirtCudaGraph:
         rec_graph_same_omega = ft.run_sirt(
             sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj
         )
-        rec_eager_same_omega, _ = ft.run_sirt(
-            sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj,
-            return_loss=True,
-        )
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            rec_eager_same_omega = ft.run_sirt(
+                sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj)
         rmse_same_omega = ((rec_graph_same_omega - rec_eager_same_omega) ** 2).mean().sqrt().item()
         assert rmse_same_omega < 1e-5, (
             f"cached graph ignored updated sinogram: RMSE={rmse_same_omega:.2e}"
@@ -467,10 +474,10 @@ class TestRunSirtCudaGraph:
         rec_graph_new_omega = ft.run_sirt(
             sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj
         )
-        rec_eager_new_omega, _ = ft.run_sirt(
-            sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj,
-            return_loss=True,
-        )
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            rec_eager_new_omega = ft.run_sirt(
+                sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj)
         rmse_new_omega = ((rec_graph_new_omega - rec_eager_new_omega) ** 2).mean().sqrt().item()
         assert rmse_new_omega < 1e-5, (
             f"cached graph ignored updated omega: RMSE={rmse_new_omega:.2e}"
@@ -889,7 +896,7 @@ def test_sirt_texture_writes_bit_identical(monkeypatch, caplog, dtype, Ny):
 
 
 @needs_cuda
-def test_sirt_texture_writes_skip_uploads():
+def test_sirt_texture_writes_skip_uploads(monkeypatch):
     """The debug counters: the eager loop uploads the volume once (plus the
     normalisation projections) and never the residual; the graph path
     uploads the volume once per call; afterwards the projector uploads
@@ -901,7 +908,9 @@ def test_sirt_texture_writes_skip_uploads():
     proj = ft.ParallelProjector((2, N, N), ang, device=DEVICE)
     counts = proj._op.upload_counts
 
-    ft.run_sirt(sino, ang, n_iter, projector=proj, return_loss=True)      # eager
+    with monkeypatch.context() as m:
+        _force_eager_sirt(m)
+        ft.run_sirt(sino, ang, n_iter, projector=proj)                    # eager
     # normalisations: one sinogram and one volume upload; then iteration 1
     # uploads the starting volume, every later volume and every residual
     # come from the fused kernels
@@ -1135,3 +1144,96 @@ def test_run_wsirt_rejects_fp16():
     sino     = ft.forward_project(phantom_2d(N, device=DEVICE).unsqueeze(0), angles).half()
     with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_wsirt(sino, angles, Nz=N, n_iter=2)
+
+
+# ── loss recording without per-iteration syncs (solver audit P5) ───────────
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype, Ny", [(torch.float32, 3), (torch.float16, 3),
+                                       (torch.float16, 4)])
+def test_sirt_loss_on_graph_path_bit_identical(monkeypatch, dtype, Ny):
+    """A requested loss (return_loss or a callback) keeps run_sirt on the
+    CUDA-graph path; volume and loss history equal the eager loop's bit for
+    bit, for every omega (the loss graph uses the eager rounding order)."""
+    from fasttomo.algorithms import algebraic
+
+    cases = [c for c in _sirt_cases(dtype, Ny) if "euler_zyz_deg" not in c]
+    for kw in cases:
+        kw = dict(kw, return_loss=True)
+        if "projector" in kw:
+            kw["projector"] = ft.ParallelProjector(tuple(kw["projector"]._op.vol_shape),
+                                                   kw["angles_deg"], device=DEVICE)
+        algebraic._SIRT_OPERATORS.clear()
+        captures = algebraic._sirt_graph_captures
+        calls = []
+        vol_g, hist_g = ft.run_sirt(**kw, loss_callback=lambda i, v: calls.append((i, v)))
+        assert algebraic._sirt_graph_captures == captures + 1      # the graph path
+        vol_r, hist_r = ft.run_sirt(**kw)                          # replayed
+        assert algebraic._sirt_graph_captures == captures + 1
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            vol_e, hist_e = ft.run_sirt(**kw)
+        for v, h in ((vol_g, hist_g), (vol_r, hist_r)):
+            assert torch.equal(v, vol_e) and torch.equal(h, hist_e), kw.keys()
+        assert [i for i, _ in calls] == list(range(kw["n_iter"]))
+        assert torch.equal(torch.tensor([v for _, v in calls], dtype=torch.float32), hist_e)
+    algebraic._SIRT_OPERATORS.clear()
+
+
+@needs_cuda
+def test_sirt_loss_and_plain_graphs_share_the_kept_operator():
+    """Calls with and without a loss alternate on one kept operator (two
+    graphs), without re-capturing."""
+    from fasttomo.algorithms import algebraic
+
+    algebraic._SIRT_OPERATORS.clear()
+    ang = make_angles(10, device=DEVICE)
+    sino = ft.forward_project(torch.rand(2, 24, 24, device=DEVICE), ang)
+    c0 = algebraic._sirt_graph_captures
+    for _ in range(2):
+        ft.run_sirt(sino, ang, 3)
+        ft.run_sirt(sino, ang, 3, return_loss=True)
+    assert algebraic._sirt_graph_captures == c0 + 2
+    assert len(algebraic._SIRT_OPERATORS) == 1
+    algebraic._SIRT_OPERATORS.clear()
+
+
+def _sync_count(fn) -> int:
+    """Synchronising CUDA operations torch reports while ``fn`` runs."""
+    import warnings
+    fn()                            # warm-up (graph capture, caches)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fn()
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    return sum("synchroniz" in str(x.message) for x in w)
+
+
+@needs_cuda
+@pytest.mark.parametrize("algo", ["sirt", "sirt_rotmat", "wsirt", "fista", "fista_tv"])
+def test_loss_recording_host_syncs(algo):
+    """return_loss alone costs no host sync per iteration (the losses stay
+    on the device until the end); a loss_callback one per iteration (the
+    frozen contract hands it a CPU float every iteration)."""
+    N, n = 24, 10
+    ang = make_angles(n, device=DEVICE)
+    vol = torch.rand(2, N, N, device=DEVICE)
+    sino = ft.forward_project(vol, ang)
+    eul = torch.stack([torch.zeros(n), ang.cpu(), torch.zeros(n)], 1).to(DEVICE)
+    sino3d = ft.forward_project_3d(vol, eul)
+    run = {
+        "sirt": lambda k, **kw: ft.run_sirt(sino, ang, k, **kw),
+        "sirt_rotmat": lambda k, **kw: ft.run_sirt(sino3d, ang, k, euler_zyz_deg=eul, **kw),
+        "wsirt": lambda k, **kw: ft.run_wsirt(sino, ang, k, **kw),
+        "fista": lambda k, **kw: ft.run_fista(sino, ang, k, L=100.0, **kw),
+        "fista_tv": lambda k, **kw: ft.run_fista_tv(sino, ang, k, L=100.0, tv_weight=0.1, **kw),
+    }[algo]
+    for kw, per_iter in ((dict(return_loss=True), 0), (dict(loss_callback=lambda i, v: None), 1)):
+        a = _sync_count(lambda: run(3, **kw))
+        b = _sync_count(lambda: run(9, **kw))
+        assert b - a == 6 * per_iter, (kw, a, b)
