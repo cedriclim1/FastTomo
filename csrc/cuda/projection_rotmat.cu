@@ -416,8 +416,16 @@ __global__ static void grad_rotmat_kernel(
         float gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
 
         if (gs != 0.0f) {
+            /* dL/dM[3r+c] = gs * sum_s d_c(s) * {u, v, s}[r] with d = grad of
+             * the trilinear sample: u, v and gs are per-ray constants, so the
+             * loop keeps S_c = sum d_c and T_c = sum d_c*s (6 accumulators)
+             * and they are applied once after it (phase1b audit R2). */
+            float Sx = 0.0f, Sy = 0.0f, Sz = 0.0f;
+            float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
             for (int step = -ray_len; step <= ray_len; step++) {
                 float s  = (float)step;
+                /* Same position arithmetic as before (and as grad_rotmat_cpu),
+                 * so samples fall on the same side of the trilinear kinks. */
                 float fx = ox + s * dxs + half_x;
                 float fy = oy + s * dys + half_y;
                 float fz = oz + s * dzs + half_z;
@@ -437,41 +445,51 @@ __global__ static void grad_rotmat_kernel(
                     fz <= -1.0f || fz >= (float)Nz)
                     continue;
 
-                int ix0 = (int)floorf(fx), iy0 = (int)floorf(fy), iz0 = (int)floorf(fz);
-                int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
-                float wx = fx - (float)ix0;
-                float wy = fy - (float)iy0;
-                float wz = fz - (float)iz0;
-                float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
+                /* Corner indices stay floats (exact: |x0| < 2^24), so the
+                 * texture coordinates need no float->int->float round trip. */
+                float x0 = floorf(fx), y0 = floorf(fy), z0 = floorf(fz);
+                float wx = fx - x0, wy = fy - y0, wz = fz - z0;
+                float cx0 = x0 + 0.5f, cx1 = x0 + 1.5f;
+                float cy0 = y0 + 0.5f, cy1 = y0 + 1.5f;
+                float cz0 = z0 + 0.5f, cz1 = z0 + 1.5f;
 
-                /* Point-filter tex3D reads: +0.5f offset maps integer index i
-                 * to the texel centre coordinate i+0.5, which with
-                 * cudaFilterModePoint rounds back to texel i.  The hardware
+                /* Point-filter tex3D reads: texel centre i+0.5 with
+                 * cudaFilterModePoint reads texel i exactly. The hardware
                  * promotes fp16 texels to fp32, so tex3D<float> is correct
                  * for both T=float and T=__half.
-                 * tex3D axis mapping: (x→Nx width, z→Nz height, y→Ny depth). */
-                float v000 = tex3D<float>(vol_tex, ix0+0.5f, iz0+0.5f, iy0+0.5f);
-                float v001 = tex3D<float>(vol_tex, ix1+0.5f, iz0+0.5f, iy0+0.5f);
-                float v010 = tex3D<float>(vol_tex, ix0+0.5f, iz1+0.5f, iy0+0.5f);
-                float v011 = tex3D<float>(vol_tex, ix1+0.5f, iz1+0.5f, iy0+0.5f);
-                float v100 = tex3D<float>(vol_tex, ix0+0.5f, iz0+0.5f, iy1+0.5f);
-                float v101 = tex3D<float>(vol_tex, ix1+0.5f, iz0+0.5f, iy1+0.5f);
-                float v110 = tex3D<float>(vol_tex, ix0+0.5f, iz1+0.5f, iy1+0.5f);
-                float v111 = tex3D<float>(vol_tex, ix1+0.5f, iz1+0.5f, iy1+0.5f);
+                 * tex3D axis mapping: (x→Nx width, z→Nz height, y→Ny depth).
+                 * Naming v<y><z><x>: v001 is the x+1 corner. */
+                float v000 = tex3D<float>(vol_tex, cx0, cz0, cy0);
+                float v001 = tex3D<float>(vol_tex, cx1, cz0, cy0);
+                float v010 = tex3D<float>(vol_tex, cx0, cz1, cy0);
+                float v011 = tex3D<float>(vol_tex, cx1, cz1, cy0);
+                float v100 = tex3D<float>(vol_tex, cx0, cz0, cy1);
+                float v101 = tex3D<float>(vol_tex, cx1, cz0, cy1);
+                float v110 = tex3D<float>(vol_tex, cx0, cz1, cy1);
+                float v111 = tex3D<float>(vol_tex, cx1, cz1, cy1);
 
-                /* analytic derivatives of trilinear interpolation */
-                float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
-                          + uy * wz * (v011 - v010) + wy * wz * (v111 - v110);
-                float dfy = ux * uz * (v100 - v000) + wx * uz * (v101 - v001)
-                          + ux * wz * (v110 - v010) + wx * wz * (v111 - v011);
-                float dfz = ux * uy * (v010 - v000) + wx * uy * (v011 - v001)
-                          + ux * wy * (v110 - v100) + wx * wy * (v111 - v101);
+                /* Analytic derivatives of the trilinear interpolant in lerp
+                 * form: d.. are the x-differences on the 4 (y,z) edges, e..
+                 * the x-lerped edge values. dfx = bilerp_yz(d);
+                 * dfy, dfz = d/dy, d/dz of bilerp_yz(e). */
+                float d00 = v001 - v000, d01 = v011 - v010;
+                float d10 = v101 - v100, d11 = v111 - v110;
+                float e00 = fmaf(wx, d00, v000), e01 = fmaf(wx, d01, v010);
+                float e10 = fmaf(wx, d10, v100), e11 = fmaf(wx, d11, v110);
+                float a0  = fmaf(wz, d01 - d00, d00), a1 = fmaf(wz, d11 - d10, d10);
+                float dfx = fmaf(wy, a1 - a0, a0);
+                float by0 = e10 - e00, by1 = e11 - e01;
+                float dfy = fmaf(wz, by1 - by0, by0);
+                float bz0 = e01 - e00, bz1 = e11 - e10;
+                float dfz = fmaf(wy, bz1 - bz0, bz0);
 
-                float gdfx = gs * dfx, gdfy = gs * dfy, gdfz = gs * dfz;
-                gM[0] += gdfx * u;  gM[1] += gdfy * u;  gM[2] += gdfz * u;
-                gM[3] += gdfx * v;  gM[4] += gdfy * v;  gM[5] += gdfz * v;
-                gM[6] += gdfx * s;  gM[7] += gdfy * s;  gM[8] += gdfz * s;
+                Sx += dfx;  Sy += dfy;  Sz += dfz;
+                Tx = fmaf(dfx, s, Tx);  Ty = fmaf(dfy, s, Ty);  Tz = fmaf(dfz, s, Tz);
             }
+            const float gu = gs * u, gv = gs * v;
+            gM[0] = gu * Sx;  gM[1] = gu * Sy;  gM[2] = gu * Sz;
+            gM[3] = gv * Sx;  gM[4] = gv * Sy;  gM[5] = gv * Sz;
+            gM[6] = gs * Tx;  gM[7] = gs * Ty;  gM[8] = gs * Tz;
         }
     }
 
