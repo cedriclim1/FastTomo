@@ -1057,6 +1057,49 @@ def test_mbir_lambdas_shape_mismatch_raises():
         ft.run_mbir(sino, angles, lambdas=bad_lambdas)
 
 
+def test_mbir_lambdas_negative_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = -torch.ones_like(sino)
+    with pytest.raises(ValueError, match="non-negative"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+def test_mbir_lambdas_nonfinite_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = torch.ones_like(sino)
+    bad_lambdas[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_mbir_invalid_sigma_init_raises(value):
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="sigma_init"):
+        ft.run_mbir(sino, angles, sigma_init=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -1e-3, float("nan")])
+def test_mbir_invalid_sigma_min_raises(value):
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="sigma_min"):
+        ft.run_mbir(sino, angles, sigma_min=value)
+
+
+def test_mbir_zero_lambdas_accepted():
+    """lambdas == 0 (fully masked pixels) is valid and must still run."""
+    sino = torch.randn(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    lam = torch.ones_like(sino)
+    lam[:, :, :4] = 0.0
+    vol = ft.run_mbir(sino, angles, lambdas=lam, outer_iters=2, multires_levels=1)
+    assert torch.isfinite(vol).all()
+
+
 def test_mbir_noncontiguous_lambdas_matches_contiguous():
     """Regression (#58): a strided lambdas view must behave like its dense copy.
 
