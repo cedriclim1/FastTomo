@@ -57,6 +57,11 @@ def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     falls back to the equivalent pure-PyTorch expression so the same
     public function works on either device.
 
+    A dimension of size 1 leaves no corners: the loss and its gradient are
+    0 on both backends. In particular a single-slice volume (``Ny = 1``)
+    gets no 3-D TV at all, not a 2-D one; use :func:`tv_loss_xz` for a
+    per-slice XZ TV.
+
     Args:
         volume: [Ny, Nz, Nx] float32 tensor.
         eps:    smoothing constant inside the sqrt (default 1e-8). Keeps
@@ -77,6 +82,11 @@ def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         return _TVLossIso3D.apply(volume, eps)
 
     # CPU fallback — pure PyTorch, autograd works automatically.
+    if min(volume.shape) < 2:
+        # no corners: 0 like the CUDA kernel (the mean of an empty tensor
+        # would be NaN); an empty sum stays attached to the graph (zero
+        # gradient) and is 0 whatever the volume holds
+        return volume.reshape(-1)[:0].sum()
     dy = volume[1:, :, :] - volume[:-1, :, :]
     dz = volume[:, 1:, :] - volume[:, :-1, :]
     dx = volume[:, :, 1:] - volume[:, :, :-1]
@@ -106,6 +116,11 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     Also available as ``tv_loss_zx`` (the same function; the volume axes
     are ``[Ny, Nz, Nx]``).
 
+    On CUDA, a fused kernel (the planar mode of the 3-D TV kernel: one pass
+    over the volume, deterministic fixed-order two-pass reduction with fp64
+    partials, voxel-driven gather backward); on CPU, the PyTorch
+    expression. ``Nz = 1`` or ``Nx = 1`` leaves no corners: 0 on both.
+
     Args:
         volume: [Ny, Nz, Nx] float32 tensor.
         eps:    smoothing constant inside the sqrt (default 1e-8).
@@ -117,6 +132,13 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         raise TypeError(f"tv_loss_xz is fp32-only (got {volume.dtype}).")
     if volume.ndim != 3:
         raise ValueError(f"tv_loss_xz expects [Ny, Nz, Nx], got {tuple(volume.shape)}")
+    if volume.is_cuda:
+        from fasttomo.autograd import _TVLossXZ
+        return _TVLossXZ.apply(volume, eps)
+
+    # CPU fallback — pure PyTorch, autograd works automatically.
+    if min(volume.shape[1:]) < 2:
+        return volume.reshape(-1)[:0].sum()    # no corners: 0, like CUDA
     dz = volume[:, 1:, :]  - volume[:, :-1, :]   # [Ny, Nz-1, Nx]
     dx = volume[:, :, 1:]  - volume[:, :, :-1]    # [Ny, Nz, Nx-1]
     return (dz[:, :, :-1].pow(2) + dx[:, :-1, :].pow(2) + eps).sqrt().mean()

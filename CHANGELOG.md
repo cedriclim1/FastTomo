@@ -50,6 +50,18 @@
   same centred, separable statistics as `tilt_ssim_loss`; `run_ad_recon`
   computes the constants once per run. `run_ad_recon` with `s3im_weight`
   at 256^3: 2.39 -> 2.24 ms per iteration, peak 408 -> 352 MiB.
+- `tv_loss_xz` on CUDA is a fused kernel (the planar mode of the 3-D TV
+  kernel, `csrc/cuda/tv_loss.cu`: deterministic two-pass reduction with
+  fp64 partials, gather backward). Forward + backward at 256^3 2.19 ->
+  0.16 ms; `run_ad_recon` with `tv_xz_weight` 4.05 -> 2.00 ms per
+  iteration, peak 608 -> 368 MiB. Values move by fp32 rounding only
+  (<= 2.7e-7 relative); the `ad_reg` golden was regenerated.
+- CPU `tv_loss_3d` returned NaN when a dimension is 1 (and `tv_loss_xz`
+  when `Nz` or `Nx` is 1); both now return 0 with a zero gradient, like
+  CUDA. A single-slice volume (`Ny = 1`) therefore has no 3-D TV (now
+  documented; `tv_loss_xz` is the per-slice TV). The fused TV backward
+  is `once_differentiable`: a double backward through it raises instead
+  of treating its output as a constant.
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 

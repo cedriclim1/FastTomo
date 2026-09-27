@@ -309,6 +309,36 @@ static void py_tv_loss_iso_3d_grad_cuda(
     );
 }
 
+static void py_tv_loss_xz_cuda(
+    long vol_ptr, long acc_ptr, long partials_ptr,
+    int Ny, int Nz, int Nx,
+    float eps,
+    long stream_ptr
+) {
+    tv_loss_xz_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(acc_ptr),
+        reinterpret_cast<double *>(partials_ptr),
+        Ny, Nz, Nx, eps,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_tv_loss_xz_grad_cuda(
+    long vol_ptr, long g_scaled_ptr, long grad_vol_ptr,
+    int Ny, int Nz, int Nx,
+    float eps,
+    long stream_ptr
+) {
+    tv_loss_xz_grad_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<const float *>(g_scaled_ptr),
+        reinterpret_cast<float *>(grad_vol_ptr),
+        Ny, Nz, Nx, eps,
+        to_stream(stream_ptr)
+    );
+}
+
 static void py_sirt_residual_cuda(
     int io_dtype,
     long sino_ptr, long fp_ptr, long R_ptr,
@@ -651,6 +681,35 @@ void register_cuda(py::module_ &m) {
           "output; the kernel writes every voxel exactly once when Ny, Nz and "
           "Nx are all >= 2. With a dimension < 2 there are no corners and "
           "nothing is launched, so the caller must zero the buffer then.",
+          py::arg("vol_ptr"), py::arg("g_scaled_ptr"), py::arg("grad_vol_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("eps"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("tv_loss_xz_cuda", &py_tv_loss_xz_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused planar (XZ) TV loss (CUDA): writes Σ sqrt(dz² + dx² + eps) "
+          "over the Ny·(Nz-1)·(Nx-1) corners to acc_ptr (single-element fp32 "
+          "buffer; zero it: left untouched when Nz or Nx is < 2), "
+          "deterministic. partials_ptr: fp64 scratch of "
+          "tv_loss_xz_workspace(Ny, Nz, Nx) elements. Caller post-divides "
+          "by N.",
+          py::arg("vol_ptr"), py::arg("acc_ptr"), py::arg("partials_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("eps"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("tv_loss_xz_workspace", &tv_loss_xz_workspace,
+          "fp64 elements of scratch tv_loss_xz_cuda needs for a "
+          "[Ny, Nz, Nx] volume (0 when Nz or Nx is < 2).",
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"));
+
+    m.def("tv_loss_xz_grad_cuda", &py_tv_loss_xz_grad_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Backward of tv_loss_xz_cuda. g_scaled_ptr: single-element fp32 "
+          "buffer holding grad_out · 1/N. Writes every voxel of grad_vol_ptr "
+          "once when Nz and Nx are >= 2; otherwise launches nothing (zero the "
+          "buffer).",
           py::arg("vol_ptr"), py::arg("g_scaled_ptr"), py::arg("grad_vol_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("eps"),

@@ -225,3 +225,166 @@ void tv_loss_iso_3d_grad_cuda(
     );
     CUDA_CHECK_KERNEL();
 }
+
+/* ── planar (XZ) mode: tv_loss_xz ─────────────────────────────────────────
+ *
+ *   loss(vol) = (1/N) · Σ_{i,j,k} sqrt( dz² + dx² + eps )
+ *
+ * with the dz, dx of the 3-D kernel and no dy: every Y-slice is an
+ * independent XZ image. Corner index set: i ∈ [0, Ny−1] (all slices),
+ * j ∈ [0, Nz−2], k ∈ [0, Nx−2]; N = Ny·(Nz−1)·(Nx−1). Same deterministic
+ * two-pass reduction as the 3-D forward (one corner row (i, j) per warp,
+ * per-lane fp32, fp64 above; the 3-D finalize kernel), and a voxel-driven
+ * gather backward over the (up to 3) corners that touch a voxel. Ny may be
+ * 1. With Nz or Nx < 2 there are no corners: nothing is launched.
+ */
+
+__global__ static void tv_loss_xz_kernel(
+    const float *__restrict__ vol,       /* [Ny, Nz, Nx] */
+    double      *__restrict__ partials,  /* [gridDim.x] */
+    int Ny, int Nz, int Nx,
+    float eps
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const long long rows = (long long)Ny * (Nz - 1);
+    const long long r = (long long)blockIdx.x * TV_FWD_WARPS + warp;
+
+    float local = 0.0f;
+    if (r < rows) {
+        const int i = (int)(r / (Nz - 1));
+        const int j = (int)(r - (long long)i * (Nz - 1));
+        const float *row = vol + ((size_t)i * Nz + j) * Nx;
+        for (int k = lane; k < Nx - 1; k += 32) {
+            float v000 = row[k];
+            float dz = row[k + Nx] - v000;        /* vol[i, j+1, k  ] */
+            float dx = row[k + 1]  - v000;        /* vol[i, j,   k+1] */
+            local += sqrtf(dx * dx + dz * dz + eps);
+        }
+    }
+
+    /* Warp: fixed xor-shuffle tree in fp64 (all 32 lanes active). */
+    double w = (double)local;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        w += __shfl_xor_sync(0xffffffffu, w, off);
+
+    /* Block: the warps' sums in warp order. */
+    __shared__ double s_warp[TV_FWD_WARPS];
+    if (lane == 0) s_warp[warp] = w;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double b = 0.0;
+        #pragma unroll
+        for (int q = 0; q < TV_FWD_WARPS; q++) b += s_warp[q];
+        partials[blockIdx.x] = b;
+    }
+}
+
+long long tv_loss_xz_workspace(int Ny, int Nz, int Nx) {
+    if (Ny < 1 || Nz < 2 || Nx < 2) return 0;
+    long long rows = (long long)Ny * (Nz - 1);
+    return (rows + TV_FWD_WARPS - 1) / TV_FWD_WARPS;
+}
+
+void tv_loss_xz_cuda(
+    const float *d_vol,
+    float       *d_acc,
+    double      *d_partials,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+) {
+    long long n_blocks = tv_loss_xz_workspace(Ny, Nz, Nx);
+    if (n_blocks == 0) {
+        /* No corners; caller's d_acc is already zero — leave it. */
+        return;
+    }
+    if (n_blocks > 0x7fffffffLL)
+        throw std::invalid_argument("tv_loss_xz_cuda: volume too large");
+
+    tv_loss_xz_kernel<<<(unsigned)n_blocks, 32 * TV_FWD_WARPS, 0, stream>>>(
+        d_vol, d_partials, Ny, Nz, Nx, eps
+    );
+    CUDA_CHECK_KERNEL();
+    tv_loss_iso_3d_finalize_kernel<<<1, TV_FIN_THREADS, 0, stream>>>(
+        d_partials, n_blocks, d_acc
+    );
+    CUDA_CHECK_KERNEL();
+}
+
+__device__ __forceinline__ float corner_xz_inv_s(
+    const float *__restrict__ vol,
+    int i, int j, int k,
+    int Nz, int Nx,
+    float eps,
+    float &dz, float &dx
+) {
+    size_t base = ((size_t)i * Nz + j) * Nx + k;
+    float v000 = vol[base];
+    dz = vol[base + (size_t)Nx] - v000;
+    dx = vol[base + 1]          - v000;
+    return rsqrtf(dx * dx + dz * dz + eps);
+}
+
+__global__ static void tv_loss_xz_grad_kernel(
+    const float *__restrict__ vol,         /* [Ny, Nz, Nx] */
+    const float *__restrict__ g_scaled,    /* [1] = grad_out · 1/N */
+    float       *__restrict__ grad_vol,    /* [Ny, Nz, Nx] */
+    int Ny, int Nz, int Nx,
+    float eps
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;   /* k axis (Nx) */
+    int b = blockIdx.y * blockDim.y + threadIdx.y;   /* j axis (Nz) */
+    int a = blockIdx.z * blockDim.z + threadIdx.z;   /* i axis (Ny) */
+    if (a >= Ny || b >= Nz || c >= Nx) return;
+
+    float g = __ldg(g_scaled);
+    float acc = 0.0f;
+    float dz, dx;
+
+    /* Corner anchored at (a, b, c): -(dx + dz) / s. */
+    if (b < Nz - 1 && c < Nx - 1) {
+        float inv_s = corner_xz_inv_s(vol, a, b, c, Nz, Nx, eps, dz, dx);
+        acc += -(dx + dz) * inv_s;
+    }
+    /* Corner anchored at (a, b-1, c) — vol[a,b,c] is the +z neighbor. */
+    if (b >= 1 && c < Nx - 1) {
+        float inv_s = corner_xz_inv_s(vol, a, b - 1, c, Nz, Nx, eps, dz, dx);
+        acc += dz * inv_s;
+    }
+    /* Corner anchored at (a, b, c-1) — vol[a,b,c] is the +x neighbor. */
+    if (b < Nz - 1 && c >= 1) {
+        float inv_s = corner_xz_inv_s(vol, a, b, c - 1, Nz, Nx, eps, dz, dx);
+        acc += dx * inv_s;
+    }
+
+    grad_vol[((size_t)a * Nz + b) * Nx + c] = g * acc;
+}
+
+void tv_loss_xz_grad_cuda(
+    const float *d_vol,
+    const float *d_g_scaled,
+    float       *d_grad_vol,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+) {
+    if (Ny < 1 || Nz < 2 || Nx < 2) {
+        /* No corners: the gradient is zero everywhere and nothing is
+         * launched, so the caller must pass a zeroed buffer (only here). */
+        return;
+    }
+    if ((Ny + 1) / 2 > 65535)
+        throw std::invalid_argument("tv_loss_xz_grad_cuda: Ny too large");
+
+    dim3 block(32, 4, 2);
+    dim3 grid((Nx + block.x - 1) / block.x,
+              (Nz + block.y - 1) / block.y,
+              (Ny + block.z - 1) / block.z);
+
+    tv_loss_xz_grad_kernel<<<grid, block, 0, stream>>>(
+        d_vol, d_g_scaled, d_grad_vol, Ny, Nz, Nx, eps
+    );
+    CUDA_CHECK_KERNEL();
+}

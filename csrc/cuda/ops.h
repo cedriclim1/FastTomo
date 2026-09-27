@@ -303,6 +303,35 @@ void tv_loss_iso_3d_grad_cuda(
     cudaStream_t stream
 );
 
+/*
+ * Planar (XZ) mode of the TV loss: loss = mean( sqrt( dz² + dx² + eps ) )
+ * over the Ny·(Nz-1)·(Nx-1) corners of every Y-slice (no dy term), for
+ * tv_loss_xz. Same conventions as tv_loss_iso_3d_*: d_acc zeroed by the
+ * caller and left untouched when Nz or Nx is < 2, fp64 scratch of
+ * tv_loss_xz_workspace elements, 1/N applied by the caller, and a backward
+ * that writes every voxel once when Nz, Nx >= 2 (else nothing: zero the
+ * buffer). Ny = 1 is valid.
+ */
+long long tv_loss_xz_workspace(int Ny, int Nz, int Nx);
+
+void tv_loss_xz_cuda(
+    const float *d_vol,
+    float       *d_acc,
+    double      *d_partials,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+);
+
+void tv_loss_xz_grad_cuda(
+    const float *d_vol,
+    const float *d_g_scaled,
+    float       *d_grad_vol,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+);
+
 void genfire_gridding_2d_cuda(
     const float *fk_real,
     const float *fk_imag,

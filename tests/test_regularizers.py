@@ -551,6 +551,105 @@ def test_tv_loss_xz_value_and_grad(backend, shape):
     assert val.item() == 0.0
 
 
+def _tv_xz_torch(vol: torch.Tensor, eps: float) -> torch.Tensor:
+    dz = vol[:, 1:, :-1] - vol[:, :-1, :-1]
+    dx = vol[:, :-1, 1:] - vol[:, :-1, :-1]
+    return (dz ** 2 + dx ** 2 + eps).sqrt().mean()
+
+
+_XZ_SHAPES = [(1, 5, 7), (3, 4, 6), (2, 2, 2), (5, 33, 65), (4, 2, 33), (7, 31, 2),
+              (17, 31, 65), (3, 300, 7), (1, 64, 64), (40, 70, 67)]
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape", _XZ_SHAPES)
+def test_tv_loss_xz_cuda_kernel_matches_fp64(shape):
+    """A6-5: the planar CUDA kernel against the fp64 formula (value and
+    autograd gradient) on shapes with partial warps (Nx - 1 not a multiple
+    of 32), one corner per row (Nx = 2), Nz = 2, Ny = 1 and several blocks;
+    piecewise-constant data (flat regions, where eps matters) and a 1e3
+    offset. The value is bit-identical run to run (fixed-order reduction)."""
+    g = torch.Generator().manual_seed(sum(shape))
+    for data in ("rand", "flat", "offset"):
+        v = torch.rand(*shape, generator=g) * 3.0
+        if data == "flat":
+            v = (v > 1.5).float()
+        elif data == "offset":
+            v = v + 1e3
+        for eps in (1e-8, 1e-3):
+            v64 = v.double().requires_grad_(True)
+            ref = _tv_xz_torch(v64, eps)
+            ref.backward()
+            vc = v.cuda().requires_grad_(True)
+            vals = [ft.tv_loss_xz(vc, eps=eps) for _ in range(3)]
+            assert all(torch.equal(x, vals[0]) for x in vals)
+            vals[0].backward()
+            assert abs(vals[0].item() - ref.item()) <= 1e-6 * abs(ref.item()) + 1e-7
+            gerr = (vc.grad.cpu().double() - v64.grad).abs().max()
+            # fp32 inputs quantise 1e3-offset differences to ~6e-5
+            tol = 1e-4 if data == "offset" else 1e-5
+            assert gerr <= tol * v64.grad.abs().max(), (data, eps, gerr.item())
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape", [(12, 14, 10), (2, 2, 2), (1, 6, 5), (6, 1, 5), (6, 5, 1)])
+def test_tv_loss_xz_backward_ignores_dirty_output_memory(shape):
+    """Like the 3-D kernel: the planar backward writes every voxel when
+    Nz, Nx >= 2 (its output is not zero-filled), and a degenerate volume
+    gets an exact zero gradient."""
+    from fasttomo.autograd import _tv_loss_grad_raw
+
+    torch.manual_seed(2)
+    vol = torch.randn(*shape, device=DEVICE)
+    g = torch.ones((), device=DEVICE)
+    grads = []
+    for fill in (float("nan"), 0.0):
+        junk = torch.full(shape, fill, device=DEVICE)
+        del junk
+        grads.append(_tv_loss_grad_raw(vol, g, 1e-7, "tv_loss_xz"))
+    assert torch.equal(grads[0], grads[1])
+    assert torch.isfinite(grads[0]).all()
+    if min(shape[1:]) < 2:
+        assert torch.equal(grads[0], torch.zeros_like(vol))
+
+
+@pytest.mark.parametrize("fn,shape", [
+    ("tv_loss_3d", (1, 8, 8)), ("tv_loss_3d", (8, 1, 8)), ("tv_loss_3d", (8, 8, 1)),
+    ("tv_loss_xz", (8, 1, 8)), ("tv_loss_xz", (8, 8, 1)), ("tv_loss_xz", (1, 1, 1))])
+def test_tv_losses_are_zero_without_corners(backend, fn, shape):
+    """A size-1 dimension leaves no difference sites: the loss is exactly 0
+    and the gradient zero on both backends (the CPU path returned NaN, the
+    mean of an empty tensor), even for non-finite volumes."""
+    v = torch.randn(*shape, device=backend)
+    v.view(-1)[0] = float("inf")
+    v.requires_grad_(True)
+    loss = getattr(ft, fn)(v)
+    assert loss.shape == () and loss.item() == 0.0
+    loss.backward()
+    assert torch.equal(v.grad, torch.zeros_like(v))
+
+
+def test_tv_loss_xz_single_slice_is_the_2d_tv(backend):
+    """Ny = 1: tv_loss_xz is the 2-D TV of that slice (tv_loss_3d is 0)."""
+    v = torch.rand(1, 9, 11, generator=torch.Generator().manual_seed(1))
+    got = ft.tv_loss_xz(v.to(backend), eps=1e-6).item()
+    assert got == pytest.approx(_tv_xz_torch(v.double(), 1e-6).item(), rel=1e-6)
+    assert ft.tv_loss_3d(v.to(backend)).item() == 0.0
+
+
+@needs_cuda
+@pytest.mark.parametrize("fn", ["tv_loss_3d", "tv_loss_xz"])
+def test_tv_loss_second_order_raises(fn):
+    """The fused TV backward is not differentiable (once_differentiable):
+    differentiating through it raises instead of treating its output as a
+    constant (here the gradient's dependence on the loss weight ``w``)."""
+    v = torch.rand(4, 5, 6, device=DEVICE, requires_grad=True)
+    w = torch.tensor(2.0, device=DEVICE, requires_grad=True)
+    (g,) = torch.autograd.grad(w * getattr(ft, fn)(v), v, create_graph=True)
+    with pytest.raises(RuntimeError, match="once_differentiable"):
+        g.sum().backward()
+
+
 def test_tv_loss_xz_rejects_bad_input():
     with pytest.raises(TypeError):
         ft.tv_loss_xz(torch.zeros(2, 3, 3, dtype=torch.float64))

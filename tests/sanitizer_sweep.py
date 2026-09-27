@@ -6,6 +6,8 @@ down by orders of magnitude and CI has no GPU. Run on a free GPU with
     compute-sanitizer --tool memcheck  --error-exitcode 1 python tests/sanitizer_sweep.py
     compute-sanitizer --tool racecheck --error-exitcode 1 python tests/sanitizer_sweep.py
 
+(append ``tv`` to run only the TV-loss kernels).
+
 Sizes 1, 15, 17, 33 and 37 cover single-element, partial-block (16x16 and
 8x8x4 blocks), multi-block and prime extents; Ny = 4 and 8 take the 4-channel
 packed fp16 path, the others the 1-channel path.
@@ -108,8 +110,19 @@ def clip_and_tv_variants(g) -> None:
             del rp
         torch.cuda.synchronize()
         print(f"ok clip shape={(Ny, Nz, Nx)} N_det={N_det}", flush=True)
-    for shape in ((40, 70, 67), (2, 2, 2), (5, 300, 7), (3, 17, 2)):
-        ft.tv_loss_3d(torch.rand(*shape, generator=g).to(dev).requires_grad_(True)).backward()
+    tv_variants(g)
+
+
+def tv_variants(g) -> None:
+    """The 3-D and planar (XZ) TV kernels, forward and backward: several
+    blocks with partial warps, one corner per row, a single row, Ny = 1,
+    and the degenerate shapes that launch nothing."""
+    dev = torch.device("cuda")
+    for shape in ((40, 70, 67), (2, 2, 2), (5, 300, 7), (3, 17, 2), (1, 33, 65), (7, 2, 33),
+                  (1, 1, 9), (4, 9, 1)):
+        vol = torch.rand(*shape, generator=g).to(dev)
+        ft.tv_loss_3d(vol.clone().requires_grad_(True)).backward()
+        ft.tv_loss_xz(vol.clone().requires_grad_(True)).backward()
         torch.cuda.synchronize()
         print(f"ok tv shape={shape}", flush=True)
 
@@ -132,4 +145,9 @@ def mbir_sweep_variants(g) -> None:
 
 
 if __name__ == "__main__":
-    sweep()
+    import sys
+
+    if sys.argv[1:] == ["tv"]:          # only the TV kernels (quick)
+        tv_variants(torch.Generator(device="cpu").manual_seed(0))
+    else:
+        sweep()
