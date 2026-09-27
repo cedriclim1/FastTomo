@@ -291,6 +291,15 @@ class CudaCachedOperator(ProjectionOperator):
 
     Also owns ``run_sirt``'s CUDA-graph cache (the graphs capture these
     textures, so they must die with them).
+
+    Streams: every call uploads into the same texture arrays, so a call on
+    one stream must not start before the calls already queued on another
+    stream have finished reading them (it overwrote the array under them:
+    two interleaved streams gave wrong projections in 16 of 20 trials). A
+    call from a different stream than the previous one therefore makes the
+    current stream wait for the previous stream (``wait_stream``, no host
+    sync, only on a stream switch). Nothing is done while a CUDA graph is
+    being captured (run_sirt synchronises the device around its capture).
     """
 
     def __init__(self, geometry: Geometry, device, dtype=None, name=None) -> None:
@@ -316,6 +325,22 @@ class CudaCachedOperator(ProjectionOperator):
         self._vol_cache_epoch = 0
         self._sirt_graph_cache = {}
         self._sirt_graph_bad_keys = set()
+        # the stream of the latest call that used the textures
+        self._last_stream: torch.cuda.Stream | None = None
+
+    def _order_after_other_streams(self) -> None:
+        """Make the current stream wait for the previous call's stream when
+        they differ, so this call's upload cannot overwrite a texture that a
+        kernel queued there is still reading (see the class docstring)."""
+        cur = torch.cuda.current_stream(self.device)
+        last = self._last_stream
+        if last is None or last == cur:
+            self._last_stream = cur
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        cur.wait_stream(last)
+        self._last_stream = cur
 
     def _channels(self) -> int:
         # 4-channel packed-Y mode for fp16 parallel caches when Ny % 4 == 0
@@ -364,6 +389,7 @@ class CudaCachedOperator(ProjectionOperator):
         io_dtype = self._lock_dtype(volume)
         self._check_input(volume, "volume", self.vol_shape)
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             h = self._vol_cache()
             vol = volume.contiguous()
             if self.kind == "parallel":
@@ -387,6 +413,7 @@ class CudaCachedOperator(ProjectionOperator):
     def bp(self, sinogram, geom=None):
         io_dtype = self._lock_dtype(sinogram)
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             sino = sinogram.contiguous()
             vol = torch.empty(self.Ny, self.Nz, self.Nx, dtype=self.dtype, device=self.device)
             if self.kind == "parallel":
@@ -433,6 +460,7 @@ class CudaCachedOperator(ProjectionOperator):
         # the gradient kernel accumulates in fp32
         gs = grad_sino.contiguous().float()
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             _core.grad_rotmat_cuda_cached(
                 io_dtype, self._vol_handle,
                 gs.data_ptr(), mats.data_ptr(), grad_mats.data_ptr(),
