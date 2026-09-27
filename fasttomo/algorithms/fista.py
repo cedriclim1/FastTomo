@@ -506,7 +506,19 @@ def run_fista_tv(
         fp32/fp16 sinogram, degrees, iterations (default 50).
     tv_weight : float
         Isotropic TV weight, required and > 0 (use :func:`run_fista` for 0).
-        Keyword-only (it used to be the third positional).
+        Keyword-only (it used to be the third positional). ``TV(x)`` is the
+        *sum* over all voxels of the isotropic gradient norm
+        ``sqrt(dy^2 + dz^2 + dx^2)`` from forward differences, zero across
+        the far boundary (for ``Ny = 1`` it is the 2-D TV of the slice), and
+        the data term the sum ``1/2 ||A x - b||^2``. The gradient-descent
+        solvers (:func:`run_grad_descent`, :func:`run_ad_recon`) scale both
+        differently: ``mean((A x - b)^2) + tv_weight * tv_loss_3d(x)``, with
+        :func:`fasttomo.tv_loss_3d` the *mean* over the ``Nc = (Ny-1)(Nz-1)
+        (Nx-1)`` inner voxels (with an ``eps`` in the root; 0 for ``Ny = 1``).
+        So the same ``tv_weight`` means different things; the same trade-off
+        (up to the boundary voxels) needs ``tv_weight_fista ~= tv_weight_ad *
+        M / (2 Nc)`` with ``M = n_angles * Ny * N_det`` the sinogram size
+        (61 views, 128^3: ``0.24 * tv_weight_ad``).
     tv_inner_iter : int
         Inner dual iterations of the TV prox per outer iteration (default 20,
         >= 0). The prox is solved inexactly, the more so the stronger the
