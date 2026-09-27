@@ -384,7 +384,7 @@ class RotmatProjector(_ProjectorBase):
         with torch.cuda.device(self.device):
             self._ensure_vol_cache()
             vol = volume.contiguous()
-            mats = mats_flat.detach().contiguous()
+            mats = mats_flat.detach().to(torch.float32).contiguous()
             sino = torch.empty(
                 self.n_angles, self.Ny, self.N_det,
                 dtype=self.dtype, device=self.device,
@@ -404,7 +404,7 @@ class RotmatProjector(_ProjectorBase):
         with torch.cuda.device(self.device):
             self._ensure_sino_cache()
             sino = sinogram.contiguous()
-            mats = mats_flat.detach().contiguous()
+            mats = mats_flat.detach().to(torch.float32).contiguous()
             vol = torch.empty(
                 self.Ny, self.Nz, self.Nx,
                 dtype=self.dtype, device=self.device,
@@ -441,23 +441,34 @@ class RotmatProjector(_ProjectorBase):
         # grad_sino comes from the BP path's autograd; force fp32 to match the kernel's
         # current accumulator. (Future fp16 grad_rotmat would template this.)
         gs = grad_sino.contiguous().float()
+        # The kernel reads mats as a dense float32 [n_angles, 9] buffer.
+        mats = mats_flat.detach().to(torch.float32).contiguous()
         with torch.cuda.device(self.device):
             _core.grad_rotmat_cuda_cached(
                 io_dtype,
                 self._vol_handle,
-                gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+                gs.data_ptr(), mats.data_ptr(), grad_mats.data_ptr(),
                 Ny, Nz, Nx, n_angles, N_det,
                 torch.cuda.current_stream(self.device).cuda_stream,
             )
         return grad_mats
 
     def _normalize_and_validate_mats(self, mats: torch.Tensor) -> torch.Tensor:
+        # The rotmat kernels read mats as a dense float32 buffer through a raw
+        # pointer, so fp16/fp64 or strided inputs would be misread. Cast and
+        # densify here (both are differentiable, so pose gradients still flow
+        # back to the caller's dtype).
+        if not mats.is_floating_point():
+            raise TypeError(
+                f"{type(self).__name__}: mats must be a floating tensor, "
+                f"got {mats.dtype}."
+            )
         if mats.ndim == 3:
             self._check_shape(mats, "mats", (self.n_angles, 3, 3))
-            return mats.reshape(self.n_angles, 9)
+            return mats.reshape(self.n_angles, 9).to(torch.float32).contiguous()
         if mats.ndim == 2:
             self._check_shape(mats, "mats", (self.n_angles, 9))
-            return mats
+            return mats.to(torch.float32).contiguous()
         raise ValueError(
             f"{type(self).__name__}: mats must have shape "
             f"({self.n_angles}, 3, 3) or ({self.n_angles}, 9), "

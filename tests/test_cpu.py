@@ -25,6 +25,101 @@ def phantom_2d(N: int) -> torch.Tensor:
     return vol
 
 
+# ── AD recon sparsity term (#71) ───────────────────────────────────────────
+
+def test_ad_sparsity_term_is_l1_with_signed_gradients():
+    """AD sparsity penalty must be λ·mean(|f|), not a signed mean bias."""
+    from fasttomo.algorithms import _ad_sparsity_term
+
+    vol = torch.tensor(
+        [[[-2.0, -0.5], [0.0, 1.5]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    lam = 0.3
+
+    loss = _ad_sparsity_term(vol, lam)
+    assert loss.item() == pytest.approx((lam * vol.detach().abs().mean()).item())
+
+    loss.backward()
+    expected_grad = lam * torch.sign(vol.detach()) / vol.numel()
+    assert torch.allclose(vol.grad, expected_grad)
+
+
+def test_ad_recon_sparsity_does_not_drift_without_positivity(monkeypatch):
+    """End-to-end (#73): with zero data and positivity=False, the L1 sparsity
+    term must leave a zero volume at zero.
+
+    run_ad_recon is CUDA-only in production, so the input check and the
+    projector are replaced by CPU stand-ins; the dummy projector always
+    returns zeros, so only the sparsity gradient can move the volume. The
+    old signed mean gave every voxel the same +λ/N gradient and Adam drove
+    the volume to about -n_iter * lr (≈ -1 here).
+    """
+    import fasttomo.algorithms as algo
+
+    class DummyParallelProjector:
+        def __init__(self, n_angles: int, Ny: int, N_det: int):
+            self.n_angles = n_angles
+            self.Ny = Ny
+            self.N_det = N_det
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                self.n_angles, self.Ny, self.N_det,
+                dtype=volume.dtype, device=volume.device,
+            )
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kwargs):
+        n_angles, Ny, N_det = sinogram.shape
+        return n_angles, Ny, N_det, (N_det if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", DummyParallelProjector)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+
+    n_angles, Ny, N = 5, 1, 8
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = torch.linspace(-20.0, 20.0, n_angles)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=5, lr_volume=0.2, cosine_schedule=False),
+        reg=ft.RegularizerConfig(sparsity=1.0),
+        constraints=ft.ConstraintConfig(positivity=False),
+    )
+
+    rec = ft.run_ad_recon(
+        sino, angles, Nz=N,
+        projector=DummyParallelProjector(n_angles, Ny, N),
+        config=cfg,
+    )
+    assert rec.abs().max().item() == 0.0, (
+        "L1 sparsity should leave a zero volume unchanged when fidelity is zero"
+    )
+
+
+def test_ad_recon_rejects_projector_with_wrong_output_shape(monkeypatch):
+    """Regression (#53): run_ad_recon must apply the same projector output
+    shape guard as run_sirt instead of letting the loss broadcast a
+    [1, Ny, N] prediction over the [n_angles, Ny, N] sinogram."""
+    import fasttomo.algorithms as algo
+
+    class WrongGeometryProjector:
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(1, volume.shape[0], volume.shape[2], dtype=volume.dtype)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kwargs):
+        n_angles, Ny, N_det = sinogram.shape
+        return n_angles, Ny, N_det, (N_det if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", WrongGeometryProjector)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+
+    sino = torch.zeros(5, 1, 8)
+    angles = torch.linspace(-20.0, 20.0, 5)
+    cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
+    with pytest.raises(ValueError, match="projector returned forward-projection"):
+        ft.run_ad_recon(sino, angles, projector=WrongGeometryProjector(), config=cfg)
+
+
 # ── adjoint test ───────────────────────────────────────────────────────────
 
 def test_adjoint_cpu():
@@ -206,6 +301,65 @@ def test_sirt_projector_shape_mismatch_raises():
             Nz=N,
             projector=MismatchedProjector(n_angles=n_angles, N=N),
         )
+
+
+# ── RotmatProjector mats normalisation (#75) ──────────────────────────────
+
+def _bare_rotmat_projector(n_angles: int):
+    """RotmatProjector without __init__ (which needs CUDA): enough to test
+    the pure-PyTorch mats normalisation on CPU."""
+    proj = ft.RotmatProjector.__new__(ft.RotmatProjector)
+    proj.n_angles = n_angles
+    return proj
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float16, torch.bfloat16])
+def test_rotmat_projector_normalize_casts_mats_to_fp32(dtype):
+    """The rotmat kernels read mats as float32; other float dtypes must be
+    cast, not reinterpreted."""
+    n_angles = 5
+    proj = _bare_rotmat_projector(n_angles)
+    mats = torch.eye(3, dtype=dtype).unsqueeze(0).expand(n_angles, -1, -1).contiguous()
+    mats_flat = proj._normalize_and_validate_mats(mats)
+    assert mats_flat.shape == (n_angles, 9)
+    assert mats_flat.dtype == torch.float32
+    assert mats_flat.is_contiguous()
+
+
+def test_rotmat_projector_normalize_makes_mats_contiguous():
+    """Strided mats (expand, transpose views) must come out dense with the
+    same logical values."""
+    n_angles = 4
+    proj = _bare_rotmat_projector(n_angles)
+    ref = torch.randn(n_angles, 9)
+
+    strided_2d = ref.t().contiguous().t()          # [n, 9], strides (1, n)
+    assert not strided_2d.is_contiguous()
+    out = proj._normalize_and_validate_mats(strided_2d)
+    assert out.is_contiguous() and torch.equal(out, ref)
+
+    expanded = torch.eye(3).unsqueeze(0).expand(n_angles, -1, -1)
+    assert not expanded.is_contiguous()
+    out = proj._normalize_and_validate_mats(expanded)
+    assert out.is_contiguous()
+    assert torch.equal(out, torch.eye(3).reshape(1, 9).expand(n_angles, 9))
+
+
+def test_rotmat_projector_normalize_keeps_grad_path():
+    """Casting and densifying must not cut the autograd graph to the pose."""
+    n_angles = 3
+    proj = _bare_rotmat_projector(n_angles)
+    mats = torch.randn(n_angles, 3, 3, dtype=torch.float64, requires_grad=True)
+    proj._normalize_and_validate_mats(mats).sum().backward()
+    assert mats.grad is not None and mats.grad.dtype == torch.float64
+
+
+def test_rotmat_projector_normalize_rejects_non_floating_mats():
+    n_angles = 3
+    proj = _bare_rotmat_projector(n_angles)
+    mats_int = torch.zeros(n_angles, 3, 3, dtype=torch.int32)
+    with pytest.raises(TypeError, match="floating tensor"):
+        proj._normalize_and_validate_mats(mats_int)
 
 
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
@@ -1055,6 +1209,118 @@ def test_mbir_lambdas_shape_mismatch_raises():
     bad_lambdas = torch.ones(5, 2, 8)  # wrong N_det
     with pytest.raises(ValueError, match="lambdas must match"):
         ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+def test_mbir_lambdas_negative_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = -torch.ones_like(sino)
+    with pytest.raises(ValueError, match="non-negative"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+def test_mbir_lambdas_nonfinite_raises():
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    bad_lambdas = torch.ones_like(sino)
+    bad_lambdas[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        ft.run_mbir(sino, angles, lambdas=bad_lambdas)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_mbir_invalid_sigma_init_raises(value):
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="sigma_init"):
+        ft.run_mbir(sino, angles, sigma_init=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -1e-3, float("nan")])
+def test_mbir_invalid_sigma_min_raises(value):
+    sino = torch.zeros(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    with pytest.raises(ValueError, match="sigma_min"):
+        ft.run_mbir(sino, angles, sigma_min=value)
+
+
+def test_mbir_zero_lambdas_accepted():
+    """lambdas == 0 (fully masked pixels) is valid and must still run."""
+    sino = torch.randn(5, 2, 16)
+    angles = torch.linspace(-70, 70, 5)
+    lam = torch.ones_like(sino)
+    lam[:, :, :4] = 0.0
+    vol = ft.run_mbir(sino, angles, lambdas=lam, outer_iters=2, multires_levels=1)
+    assert torch.isfinite(vol).all()
+
+
+def test_mbir_noncontiguous_lambdas_matches_contiguous():
+    """Regression (#58): a strided lambdas view must behave like its dense copy.
+
+    The MBIR sweeps read lambdas through a raw linear buffer, so an
+    ``expand``ed view used to be indexed as if it were dense (reading past
+    the real storage) and gave a different reconstruction.
+    """
+    torch.manual_seed(0)
+    Ny = Nz = Nx = 8
+    n_angles = 5
+    angles = make_angles(n_angles, max_deg=40.0)
+    phantom = torch.rand(Ny, Nz, Nx)
+    sino = ft.forward_project(phantom, angles)
+
+    lam_expand = (torch.rand(1, Ny, Nx) + 0.5).expand(n_angles, Ny, Nx)
+    assert not lam_expand.is_contiguous()
+    lam_contig = lam_expand.contiguous()
+
+    kw = dict(
+        Nz=Nz,
+        sigma_f=0.1,
+        huber_T=float("inf"),
+        estimate_offset=False,
+        estimate_variance=False,
+        outer_iters=4,
+        multires_levels=1,
+        seed=11,
+    )
+    vol_contig = ft.run_mbir(sino, angles, lambdas=lam_contig, **kw)
+    vol_expand = ft.run_mbir(sino, angles, lambdas=lam_expand, **kw)
+
+    assert torch.allclose(vol_contig, vol_expand, atol=1e-6, rtol=1e-6)
+
+
+def test_mbir_cpu_binding_rejects_noncontiguous_buffers():
+    """The CPU MBIR binding must not silently ignore numpy strides (#58)."""
+    import numpy as np
+    from fasttomo import _core
+
+    Ny, Nz, Nx, n_angles = 2, 4, 4, 3
+    N_det = Nx
+    angles = np.linspace(-0.5, 0.5, n_angles).astype(np.float32)
+    perm = np.tile(np.arange(Nz * Nx, dtype=np.int32), (Ny, 1))
+
+    def call(volume, e_sino, lambdas):
+        return _core.mbir_icd_sweep_cpu(
+            volume, e_sino, None, lambdas,
+            np.zeros((Ny, Nz, Nx), np.float32), perm, angles,
+            1.2, 2.0, 0.01, 1.0,
+            float("inf"), 1.0,
+            1.0, 1e-3,
+            False, False,
+            num_threads=1,
+        )
+
+    vol = np.zeros((Ny, Nz, Nx), np.float32)
+    e = np.ones((n_angles, Ny, N_det), np.float32)
+    lam = np.ones((n_angles, Ny, N_det), np.float32)
+    call(vol, e.copy(), lam)  # dense buffers are accepted
+
+    lam_strided = np.broadcast_to(np.ones((1, Ny, N_det), np.float32), (n_angles, Ny, N_det))
+    with pytest.raises(ValueError, match="lambdas must be C-contiguous"):
+        call(vol, e.copy(), lam_strided)
+
+    vol_strided = np.zeros((Ny, Nx, Nz), np.float32).transpose(0, 2, 1)
+    with pytest.raises(ValueError, match="volume must be C-contiguous"):
+        call(vol_strided, e.copy(), lam)
 
 
 def test_mbir_multires_not_divisible_raises():

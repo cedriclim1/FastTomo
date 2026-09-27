@@ -260,6 +260,17 @@ def _emit_loss(
         )
 
 
+def _ad_sparsity_term(volume: torch.Tensor, weight: float) -> torch.Tensor:
+    """L1 sparsity penalty for ``run_ad_recon``: ``weight * mean(|volume|)``.
+
+    Must use the magnitude, as documented on ``RegularizerConfig.sparsity``.
+    A signed ``mean(volume)`` is a linear term whose gradient is the same
+    constant for every voxel, so without positivity it drags the whole
+    volume negative instead of promoting sparsity.
+    """
+    return weight * volume.abs().mean()
+
+
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
 
 def _compute_exact_wf(
@@ -1401,6 +1412,11 @@ def run_ad_recon(
         # optional shift correction
         if refine_shifts and shifts is not None:
             pred = apply_shifts_2d(pred, shifts)
+        # A user-supplied projector built for another geometry would make
+        # the loss broadcast silently (e.g. [1, Ny, N] against the sinogram).
+        _assert_projector_output_shape(
+            pred, (n_angles, Ny, N_det), "forward-projection", "run_ad_recon",
+        )
 
         # data-fit + regularisation terms, keyed for the loss_callback
         # components contract. Insertion order matches the historical
@@ -1416,7 +1432,7 @@ def run_ad_recon(
         if reg_cfg.tv_xz_weight > 0.0:
             terms["tv_xz"] = reg_cfg.tv_xz_weight * tv_loss_xz(volume)
         if reg_cfg.sparsity > 0.0:
-            terms["sparsity"] = reg_cfg.sparsity * volume.mean()
+            terms["sparsity"] = _ad_sparsity_term(volume, reg_cfg.sparsity)
         if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt_angle_opt is not None:
             terms["in_plane"] = pose_cfg.in_plane_weight * (
                 tilt_angle_opt[:, 0].pow(2).mean()
@@ -2489,7 +2505,7 @@ def _run_mbir_single_scale(
             e_np = e_sino.numpy()
             d_np = d_offsets.numpy() if estimate_offset else None
             vol_snap_np = vol_snap.numpy()
-            lam_np = lambdas.numpy() if lambdas is not None else None
+            lam_np = lambdas.contiguous().numpy() if lambdas is not None else None
             sigma_cur = float(_core.mbir_icd_sweep_cpu(
                 volume_np, e_np, d_np, lam_np,
                 vol_snap_np, perm,
@@ -2641,13 +2657,28 @@ def run_mbir(
             lambdas = lambdas.float()
         if lambdas.device != sinogram.device:
             lambdas = lambdas.to(sinogram.device)
+        # The MBIR sweeps read lambdas through a raw linear pointer (CUDA) or
+        # a numpy buffer (CPU), so a strided view such as one produced by
+        # ``expand`` would be indexed as if it were dense. Materialise it.
+        lambdas = lambdas.contiguous()
+        # Negative weights make lambdas.sqrt() NaN inside the variance update;
+        # non-finite weights poison every voxel they touch.
+        if not torch.isfinite(lambdas).all():
+            raise ValueError("run_mbir: lambdas must contain only finite values")
+        if (lambdas < 0).any():
+            raise ValueError("run_mbir: lambdas must be non-negative")
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())
         if sigma_init < 1e-6:
             sigma_init = 1.0
+    # sigma divides the data term, so zero or negative values blow up.
+    if not math.isfinite(float(sigma_init)) or float(sigma_init) <= 0.0:
+        raise ValueError(f"run_mbir: sigma_init must be finite and > 0, got {sigma_init}")
     if sigma_min is None:
         sigma_min = sigma_init * 1e-3
+    if not math.isfinite(float(sigma_min)) or float(sigma_min) <= 0.0:
+        raise ValueError(f"run_mbir: sigma_min must be finite and > 0, got {sigma_min}")
 
     # Multires schedule: factors = [2**(L-1), ..., 2, 1] for L levels.
     factors = [2 ** (multires_levels - 1 - lvl) for lvl in range(multires_levels)]

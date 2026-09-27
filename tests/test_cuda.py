@@ -1271,6 +1271,82 @@ def test_rotmat_cached_backward_stale_volume_falls_back_uncached():
     assert rel_b < 1e-5, f"latest branch gradient mismatch: rel_err={rel_b:.2e}"
 
 
+# ── RotmatProjector mats dtype / layout (#75) ─────────────────────────────
+
+def _rotmat_setup(N: int = 16, n_angles: int = 8, seed: int = 7):
+    from fasttomo.autograd import _euler_zyz_to_rotmat
+
+    torch.manual_seed(seed)
+    volume = torch.randn(N, N, N, device=DEVICE, dtype=torch.float32)
+    grad_sino = torch.randn(n_angles, N, N, device=DEVICE, dtype=torch.float32)
+    euler = torch.zeros(n_angles, 3, device=DEVICE)
+    euler[:, 0] = torch.linspace(-10.0, 10.0, n_angles, device=DEVICE)
+    euler[:, 1] = torch.linspace(-50.0, 50.0, n_angles, device=DEVICE)
+    mats_flat = _euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous().float()
+    return volume, grad_sino, mats_flat
+
+
+def test_rotmat_projector_fp64_mats_match_fp32():
+    """fp64 mats must be cast, not reinterpreted as a float32 buffer."""
+    N, n_angles = 16, 8
+    volume, _, mats32 = _rotmat_setup(N, n_angles)
+    proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+    sino32 = proj.forward(volume, mats32)
+    sino64 = proj.forward(volume, mats32.double())
+    torch.testing.assert_close(sino64, sino32, rtol=1e-5, atol=1e-5)
+
+    sino = torch.randn_like(sino32)
+    torch.testing.assert_close(
+        proj.back(sino, mats32.double()), proj.back(sino, mats32), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_rotmat_projector_strided_mats_forward_and_pose_grad():
+    """A non-contiguous mats view must give the same projection and the same
+    pose gradient as its dense copy, through RotmatProjector.forward."""
+    N, n_angles = 16, 8
+    volume, grad_sino, mats32 = _rotmat_setup(N, n_angles)
+    proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+
+    dense = mats32.clone().requires_grad_(True)
+    base_t = mats32.t().contiguous().requires_grad_(True)   # [9, n_angles]
+    strided = base_t.t()                                     # [n_angles, 9] view
+    assert not strided.is_contiguous()
+
+    sino_d = proj.forward(volume, dense)
+    (sino_d * grad_sino).sum().backward()
+    sino_s = proj.forward(volume, strided)
+    (sino_s * grad_sino).sum().backward()
+
+    torch.testing.assert_close(sino_s, sino_d, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(base_t.grad.t(), dense.grad, rtol=1e-4, atol=1e-4)
+
+
+def test_rotmat_grad_paths_accept_strided_mats():
+    """Both backward gradient kernels (cached _grad_mats_raw and uncached
+    _grad_rotmat_raw) must densify mats themselves: _FP3DCached.backward
+    passes the saved mats straight through."""
+    from fasttomo.autograd import _grad_rotmat_raw
+
+    N, n_angles = 16, 8
+    volume, grad_sino, mats32 = _rotmat_setup(N, n_angles)
+    strided = mats32.t().contiguous().t()
+    assert not strided.is_contiguous()
+
+    ref = _grad_rotmat_raw(volume, grad_sino, mats32)
+    torch.testing.assert_close(
+        _grad_rotmat_raw(volume, grad_sino, strided), ref, rtol=1e-5, atol=1e-5
+    )
+
+    proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+    _ = proj.forward(volume, mats32)  # populates the cached volume texture
+    torch.testing.assert_close(
+        proj._grad_mats_raw(volume, grad_sino, strided),
+        proj._grad_mats_raw(volume, grad_sino, mats32),
+        rtol=1e-5, atol=1e-5,
+    )
+
+
 # ── Projector shape validation ────────────────────────────────────────────
 
 def test_parallel_projector_volume_shape_mismatch_raises():
@@ -1442,6 +1518,36 @@ class TestRunAdRecon:
             f"run_ad_recon pose refinement worsened angle accuracy: "
             f"error_before={error_before:.3f}°, error_after={error_after:.3f}°"
         )
+
+    def test_projector_geometry_mismatch_raises(self):
+        """Regression (#53): run_ad_recon must reject projector outputs that
+        would broadcast against the sinogram."""
+        N = 16
+        angles = make_angles(20)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+
+        # Same volume geometry but n_angles=1: without the shape check the
+        # MSE would broadcast [1, 1, N] over [20, 1, N].
+        bad_proj = ft.ParallelProjector((1, N, N), make_angles(1), device=DEVICE, N_det=N)
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
+        with pytest.raises(ValueError, match="projector returned"):
+            ft.run_ad_recon(sino, angles, projector=bad_proj, config=cfg)
+
+    def test_sparsity_does_not_drift_without_positivity(self):
+        """Regression (#71/#73): the sparsity term is λ·mean(|f|). With zero
+        data and positivity=False a zero volume must stay exactly zero; the
+        old signed mean drove every voxel to about -n_iter * lr."""
+        N = 16
+        angles = make_angles(10)
+        sino = torch.zeros(10, 1, N, device=DEVICE)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5, lr_volume=0.2, cosine_schedule=False),
+            reg=ft.RegularizerConfig(sparsity=1.0),
+            constraints=ft.ConstraintConfig(positivity=False),
+        )
+        rec = ft.run_ad_recon(sino, angles, config=cfg)
+        assert rec.abs().max().item() == 0.0
 
     def test_projector_mismatch_raises(self):
         """Passing a RotmatProjector with refine_pose=False raises ValueError."""
@@ -1938,6 +2044,31 @@ def test_mbir_seed_reproducibility():
     v1 = ft.run_mbir(sino, angles, seed=42, **kw)
     v2 = ft.run_mbir(sino, angles, seed=42, **kw)
     assert torch.equal(v1, v2), "MBIR not reproducible with the same seed"
+
+
+def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
+    """Regression (#58): the CUDA sweep reads lambdas through a raw pointer,
+    so an ``expand``ed view must give the same volume as its dense copy."""
+    Ny = Nz = Nx = 16
+    n_angles = 20
+    angles = make_angles(n_angles, max_deg=60.0)
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    sino = _mbir_sino_self(phantom, angles)
+
+    g = torch.Generator(device="cpu").manual_seed(0)
+    lam_expand = (torch.rand(1, Ny, Nx, generator=g) + 0.5).to(DEVICE).expand(n_angles, Ny, Nx)
+    assert not lam_expand.is_contiguous()
+    lam_contig = lam_expand.contiguous()
+
+    kw = dict(
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        outer_iters=10, multires_levels=1, sigma_init=0.1, seed=3,
+    )
+    v_contig = ft.run_mbir(sino, angles, lambdas=lam_contig, **kw)
+    v_expand = ft.run_mbir(sino, angles, lambdas=lam_expand, **kw)
+    assert torch.allclose(v_contig, v_expand, atol=1e-6, rtol=1e-6)
 
 
 def test_mbir_estimate_offset_disabled_keeps_d_zero():
