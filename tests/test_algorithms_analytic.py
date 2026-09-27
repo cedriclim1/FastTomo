@@ -48,14 +48,18 @@ def _cylinder_fbp_level(backend, radius, tilt, N=128):
 
 
 @pytest.mark.parametrize("radius", [20, 40])
-def test_fbp_angular_scale_is_right_for_limited_tilt(backend, radius):
+def test_fbp_angular_scale_keeps_mean_level_at_limited_tilt(backend, radius):
     """Scope report 2g [S]: FBP scales by pi / n_angles, which looks like
     it assumes 180 degrees of coverage, so +-70 degrees was suspected to be
-    off by 180/140. Not so: pi / n_angles is pi times the mean over the
-    measured views, and for a rotationally symmetric object every view
-    carries the same ray integral, so the absolute level at +-70 equals the
-    one at 180 degrees. Scaling by the actual spacing (140 degrees / n)
-    would make it 140/180 = 0.78 of that instead."""
+    off by 180/140. pi / n_angles is pi times the mean over the measured
+    views: it keeps the mean level correct, which is what this pins. For a
+    rotationally symmetric object every view carries the same ray integral,
+    so the level at +-70 equals the one at 180 degrees; scaling by the
+    actual spacing (140 degrees / n) would make it 0.78 of that and fail
+    here. This does not make +-70 unbiased: anisotropic objects still show
+    an orientation-dependent bias at limited tilt (the missing wedge; a 4:1
+    ellipse reads 1.20 or 0.50 depending on its orientation, #95 review),
+    which no angular scale removes."""
     full = _cylinder_fbp_level(backend, radius, 90)
     limited = _cylinder_fbp_level(backend, radius, 70)
     assert abs(limited / full - 1.0) < 5e-3, (limited, full)

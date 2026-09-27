@@ -92,11 +92,13 @@ def _resolve_num_threads(num_threads: int | None) -> int:
 # would come back as +-inf. Typical triggers: the back-projection of an
 # unnormalised sinogram (a unit-density object 1024 voxels wide has ray
 # sums ~800; summed over 180 views that is ~1.4e5), a forward projection of
-# a large volume with values of ~20 or more, FBP of such data, or FISTA's
+# a large volume with values of ~20 or more, or FISTA's
 # first gradient BP(-sinogram). Such a result raises OverflowError instead
 # of returning inf; scale the data into range (for example divide the
 # sinogram by its maximum, or by n_angles before a back-projection, and
-# undo it on the fp32 result) or use fp32.
+# undo it on the fp32 result) or use fp32. A NaN in a result whose input
+# was finite is reported separately (FloatingPointError, "NaN"): it is not
+# an overflow of the result, and scaling the data may not help.
 #
 # When: a projection op (functional API, projector classes, run_fbp,
 # refine_angles, autograd backward) checks its own fp16 result right away,
@@ -126,32 +128,67 @@ def _overflow_error(op_name: str, what: str) -> OverflowError:
     )
 
 
+def _nan_error(op_name: str, what: str) -> FloatingPointError:
+    return FloatingPointError(
+        f"{op_name}: {what} contains NaN although the input is finite (reported "
+        "separately from an fp16 overflow, which gives inf). Check the inputs and parameters for values that make the "
+        "computation undefined (for example inf - inf or 0 * inf in an "
+        "earlier step), or use float32."
+    )
+
+
+def _flag(out: torch.Tensor) -> torch.Tensor:
+    """0-d fp32 device-side flag of an fp16 result, one reduction kernel and
+    no sync: ``sum |x|`` is finite for a finite tensor, +inf when it holds
+    an inf and no NaN (no cancellation, unlike a plain sum, where inf - inf
+    reads as NaN), NaN when it holds a NaN (|sum| <= 65504 * numel)."""
+    return torch.linalg.vector_norm(out, 1, dtype=torch.float32)
+
+
 def _check_fp16_range(out: torch.Tensor, inp: torch.Tensor, op_name: str) -> None:
-    """Raise OverflowError when an fp16 projection overflowed: ``out`` holds
-    an inf although ``inp`` (the projected volume or sinogram) is finite.
-    No-op for other dtypes and during CUDA-graph capture; inside an fp16
-    algorithm only a device-side flag is recorded (see the comment above)."""
+    """Raise when an fp16 projection went non-finite although ``inp`` (the
+    projected volume or sinogram) is finite: OverflowError for an inf (the
+    result exceeded the fp16 range), else FloatingPointError for a NaN. No-op for other
+    dtypes and during CUDA-graph capture; inside an fp16 algorithm only a
+    device-side flag is recorded (see the comment above)."""
     if out.dtype != torch.float16:
         return
     if out.is_cuda and torch.cuda.is_current_stream_capturing():
         return
     flags = _fp16_overflow_flags.get()
     if flags is not None:
-        # One reduction kernel, no sync: the fp32 sum of an fp16 tensor is
-        # finite unless it holds an inf or NaN (|sum| <= 65504 * numel).
-        flags.append(out.sum(dtype=torch.float32))
+        flags.append(_flag(out))
         return
-    if not bool(torch.isinf(out).any()):
+    if bool(torch.isfinite(out).all()):
         return
     if not bool(torch.isfinite(inp).all()):
-        return          # the inf came in with the input
-    raise _overflow_error(op_name, "the fp16 projection result")
+        return          # the inf / NaN came in with the input
+    if bool(torch.isinf(out).any()):
+        raise _overflow_error(op_name, "the fp16 projection result")
+    raise _nan_error(op_name, "the fp16 projection result")
+
+
+def _raise_for_flags(flags: list, sinogram: torch.Tensor, name: str) -> None:
+    """After an fp16 algorithm whose ``sinogram`` is finite: raise for the
+    first projection whose flag is non-finite (an overflow is often
+    followed by NaNs downstream, so the first event names the cause)."""
+    f = torch.stack(flags)
+    bad = ~torch.isfinite(f)
+    if not bool(bad.any()) or not bool(torch.isfinite(sinogram).all()):
+        return
+    # (within one projection a NaN flag wins over an inf: sum |x| is NaN)
+    first = f[int(bad.nonzero()[0, 0])]
+    what = "a forward or back-projection of this fp16 run"
+    if bool(torch.isnan(first)):
+        raise _nan_error(name, what)
+    raise _overflow_error(name, what)
 
 
 def _fp16_overflow_checked(fn):
     """Decorator for the fp16-capable iterative algorithms: their
     projections record device-side overflow flags, read once on return; an
-    overflow (with a finite sinogram) raises OverflowError then."""
+    overflow (with a finite sinogram) raises OverflowError then, a NaN
+    FloatingPointError."""
     name = fn.__name__
 
     @functools.wraps(fn)
@@ -164,9 +201,8 @@ def _fp16_overflow_checked(fn):
             result = fn(sinogram, *args, **kwargs)
         finally:
             _fp16_overflow_flags.reset(token)
-        if (flags and not bool(torch.isfinite(torch.stack(flags)).all())
-                and bool(torch.isfinite(sinogram).all())):
-            raise _overflow_error(name, "a forward or back-projection of this fp16 run")
+        if flags:
+            _raise_for_flags(flags, sinogram, name)
         return result
 
     return wrapper

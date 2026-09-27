@@ -47,7 +47,8 @@ class _MbirState:
 
     Maintained by `_run_mbir_single_scale` and passed across multires
     levels so the per-tilt offset survives upsampling. (σ is re-initialized
-    per scale; see the docstring of `run_mbir` for why.)
+    per scale from that scale's sinogram std; carrying the coarse level's
+    σ over converged no better, see ``multires_levels`` in `run_mbir`.)
     """
     volume: torch.Tensor          # [Ny, Nz, Nx] float32
     d_offsets: torch.Tensor       # [n_angles] float32
@@ -621,7 +622,28 @@ def run_mbir(
         sinogram) and its floor (default ``sigma_init * 1e-3``).
     multires_levels : int
         Coarse-to-fine levels (1 = single scale). Nz and N_det must be
-        divisible by ``2**(levels - 1)``.
+        divisible by ``2**(levels - 1)``. Offsets carry over between levels
+        unchanged (sinogram units; the coarse sinogram is detector-averaged,
+        not summed), ``sigma`` restarts at each level's sinogram std, and the
+        volume is resized and rescaled to the level's voxel size.
+        With ``estimate_variance=False`` more levels reach the single-level
+        solution quickly (5e-4 relative at 60 iterations per level). With
+        ``estimate_variance=True`` they reach the same fixed point (same
+        ``sigma``), but slowly, and so does a single level: on noise-free
+        data ``sigma`` falls to the model-error floor (~0.1 against a
+        sinogram std of 18.8), which leaves the limited-tilt problem almost
+        unregularised, and ICD converges slowly on its missing-wedge
+        components. Measured 2-level vs 1-level volume difference (64^2
+        cylinder, +-70 degrees, 61 views, offsets off): 22 / 17 / 10 / 3.6 /
+        0.3 % at 30 / 150 / 600 / 2400 / 9600 iterations per level, while
+        the single-level result itself still moves 13 % from 600 to 2400
+        iterations. With ``estimate_offset=True`` too, the two also differ
+        by a common offset on every view (1.3-1.6 on this phantom, spread
+        0.015), a near-null direction of the joint volume/offset problem
+        that has not settled after 9600 iterations in either run. This is a
+        property of the joint estimate, not of the level hand-over
+        (restarting a level at the coarse ``sigma`` instead of the
+        sinogram std measured no better: 18 % instead of 17 % at 150).
     convergence_tol : float
         Per-level stop on the relative L2 volume change (default 1e-4).
     seed : int

@@ -744,22 +744,98 @@ def test_fp16_overflow_in_iterative_algorithms_raises_once_at_the_end():
     assert torch.isfinite(ft.run_sirt(big.half(), ang, 3, return_loss=True)[0]).all()
 
 
-@needs_cuda
-def test_fp16_fbp_overflow_raises():
+def test_fp16_fbp_scales_before_the_fp16_cast_when_it_would_overflow(backend):
     """FBP's back-projection sums n_angles filtered views before the pi /
-    n_angles scale: a density of 400 over 720 views is ~9.2e4 in fp16
-    before scaling (the sinogram itself, up to 2.6e4, fits)."""
-    ang = torch.linspace(-89.75, 89.75, 720, device=DEVICE)
-    vol = torch.zeros(2, 64, 64, device=DEVICE)
+    n_angles scale. When that unscaled sum exceeds fp16 (density 400 over
+    720 views: ~9.2e4), run_fbp scales the filtered sinogram in fp32 before
+    the fp16 cast instead, and returns ~400 rather than raising
+    OverflowError (#95 review)."""
+    ang = torch.linspace(-89.75, 89.75, 720, device=backend)
+    vol = torch.zeros(2, 64, 64, device=backend)
     vol[:, 16:48, 16:48] = 400.0
     sino = ft.forward_project(vol, ang)
     assert sino.max() < 65504
     ref = ft.run_fbp(sino, ang)
     assert torch.isfinite(ref).all()
+    # the unscaled back-projection of the filtered sinogram does not fit
+    unscaled = ft.back_project(ft.ramp_filter(sino), ang)
+    assert unscaled.abs().max() > 65504
+    out = ft.run_fbp(sino.half(), ang)
+    assert out.dtype == torch.float16 and torch.isfinite(out).all()
+    assert rel_err(out.float(), ref) < 1e-2
+    assert abs(out[:, 24:40, 24:40].float().mean().item() - 400.0) < 4.0
+
+
+@pytest.mark.parametrize("density", [1e-4, 1e-5])
+def test_fp16_fbp_keeps_low_amplitudes(backend, density):
+    """Pre-scaling by pi / n_angles only happens when the unscaled
+    back-projection would overflow: always pre-scaling pushes small
+    filtered values into the fp16 subnormal range (720 views: 8 % error at
+    a density of 1e-4, everything lost at 1e-5). Unscaled first, as before,
+    keeps them (0.08 % and 0.4 %)."""
+    ang = torch.linspace(-89.75, 89.75, 720, device=backend)
+    vol = torch.zeros(2, 64, 64, device=backend)
+    vol[:, 16:48, 16:48] = density
+    sino = ft.forward_project(vol, ang)
+    ref = ft.run_fbp(sino, ang)
+    out = ft.run_fbp(sino.half(), ang)
+    assert rel_err(out.float(), ref) < 1e-2
+
+
+def test_fp16_nan_is_reported_separately_from_overflow(backend):
+    """A non-finite fp16 projection result with a finite input: an inf is
+    an overflow (OverflowError, "fp16 range"), a NaN is not
+    (FloatingPointError, "NaN"), and an inf with NaNs is an overflow. Both
+    for a direct check and for the device-side flags of an fp16 algorithm,
+    which report the first non-finite projection (an overflow followed by
+    NaNs is an overflow)."""
+    from fasttomo._backend import _check_fp16_range, _fp16_overflow_checked
+
+    finite = torch.ones(3, device=backend)
+    inf_out = torch.tensor([1.0, float("inf"), 2.0], device=backend).half()
+    nan_out = torch.tensor([1.0, float("nan"), 2.0], device=backend).half()
+    both = torch.tensor([float("-inf"), 1.0, float("inf")], device=backend).half()
+    mixed = torch.tensor([float("inf"), float("nan"), 1.0], device=backend).half()
+    with pytest.raises(OverflowError, match="op: .*fp16 range"):
+        _check_fp16_range(inf_out, finite, "op")
+    with pytest.raises(FloatingPointError, match="op: .*NaN"):
+        _check_fp16_range(nan_out, finite, "op")
     with pytest.raises(OverflowError, match="fp16 range"):
-        ft.run_fbp(sino.half(), ang)
-    out = ft.run_fbp((sino / 400).half(), ang).float() * 400
-    assert rel_err(out, ref) < 1e-2
+        _check_fp16_range(both, finite, "op")
+    with pytest.raises(OverflowError, match="fp16 range"):
+        _check_fp16_range(mixed, finite, "op")      # an inf is an overflow
+    for out in (inf_out, nan_out):
+        _check_fp16_range(out, torch.full((3,), float("nan"), device=backend), "op")
+
+    def algo(outputs):
+        @_fp16_overflow_checked
+        def fake_algorithm(sinogram):
+            for o in outputs:
+                _check_fp16_range(o, finite, "fake")
+            return sinogram
+        return fake_algorithm
+
+    sino = torch.ones(2, 2, 2, device=backend).half()
+    ok = torch.ones(3, device=backend).half()
+    assert algo([ok, ok])(sino) is sino
+    with pytest.raises(OverflowError, match="fake_algorithm: .*fp16 range"):
+        algo([ok, inf_out, nan_out])(sino)
+    with pytest.raises(OverflowError, match="fake_algorithm: .*fp16 range"):
+        algo([ok, both])(sino)          # +inf and -inf: an overflow, not NaN
+    with pytest.raises(FloatingPointError, match="fake_algorithm: .*NaN"):
+        algo([ok, nan_out, inf_out])(sino)
+    algo([nan_out])(sino.clone().fill_(float("nan")))      # came with the input
+
+
+def test_fp16_nan_in_an_iterative_algorithm_is_not_called_overflow(backend):
+    """A NaN warm start with a finite sinogram: FISTA's projections go NaN,
+    which is reported as NaN (it used to read "exceeds the fp16 range")."""
+    ang = torch.linspace(-60, 60, 9, device=backend)
+    sino = torch.rand(9, 2, 16, device=backend).half()
+    warm = torch.zeros(2, 16, 16, device=backend).half()
+    warm[0, 3, 4] = float("nan")
+    with pytest.raises(FloatingPointError, match="run_fista: .*NaN"):
+        ft.run_fista(sino, ang, 2, warm_start=warm)
 
 
 @needs_cuda

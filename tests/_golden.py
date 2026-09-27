@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import sys
 import warnings
 
@@ -66,6 +67,40 @@ def _env_tag(device: str) -> str:
         return f"cpu:{torch.backends.cpu.get_cpu_capability()}:omp={omp}"
     major, minor = torch.cuda.get_device_capability()
     return f"cuda:sm_{major}{minor}:cuda{torch.version.cuda}"
+
+
+def cpu_model() -> str:
+    """The CPU's model name (``/proc/cpuinfo`` "model name", else
+    ``platform.processor()``), printed in ``GoldenNotExactWarning`` so a new
+    CI runner type can be identified from the log: runners with the same SIMD
+    dispatch label can still differ in the last bit of an FFT."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine() or "unknown"
+
+
+def peak_close(a: torch.Tensor, b: torch.Tensor, tol: float) -> tuple[bool, float, float]:
+    """Loose comparison for outputs that go through an FFT: ``|a - b| <= tol *
+    max(1, max|b|) + tol * |b|`` elementwise.
+
+    An FFT's round-off is set by the norm of the whole transform, not by each
+    bin's own size, so two CPU FFT code paths differ by about one ulp of the
+    tensor's largest value on every element, small bins included (CI run
+    36331234339: 3.8e-6 on a bin of ``cpu/_fft_rfft2`` whose peak is 66.7,
+    i.e. 5.7e-8 of the peak). The purely elementwise ``allclose(rtol=tol,
+    atol=tol)`` rejects that on the small bins. The ``max(1, ...)`` keeps the
+    bound at least as wide as the absolute one for tensors of peak below 1.
+    Returns ``(ok, max|a - b|, max|b|)``."""
+    a64, b64 = a.double(), b.double()
+    peak = b64.abs().max().item() if b.numel() else 0.0
+    diff = (a64 - b64).abs().max().item() if a.numel() else 0.0
+    ok = a.shape == b.shape and torch.allclose(a64, b64, rtol=tol, atol=tol * max(1.0, peak))
+    return ok, diff, peak
 
 
 def _probe(device: str) -> list[torch.Tensor]:
@@ -152,10 +187,14 @@ def exact_env(golden: dict, device: str, what: str = "") -> bool:
     known = golden.get(FINGERPRINT_KEY, {}).get(device, [])
     exact = fp in known
     if not exact:
+        host = f"CPU {cpu_model()!r}"
+        if device != "cpu":
+            host = f"GPU {torch.cuda.get_device_name()!r}, {host}"
         warnings.warn(GoldenNotExactWarning(
-            f"{what or 'golden'}: {device} arithmetic fingerprint {fp} ({_env_tag(device)}) "
-            f"is not one the golden was verified in {known}; exact (torch.equal) branch "
-            "NOT exercised, compared at the documented tolerance instead"), stacklevel=2)
+            f"{what or 'golden'}: {device} arithmetic fingerprint {fp[:8]} (full {fp}; "
+            f"{_env_tag(device)}; {host}) is not one the golden was verified in "
+            f"{[k[:8] for k in known]}; exact (torch.equal) branch NOT exercised, compared "
+            "at the documented tolerance instead"), stacklevel=2)
     return exact
 
 
@@ -198,5 +237,6 @@ if __name__ == "__main__":
         for p in sys.argv[2:]:
             print(p, stamp(p))
     else:
+        print("cpu model:", cpu_model())
         for d in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
             print(d, _env_tag(d), fingerprint(d))

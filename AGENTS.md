@@ -94,7 +94,7 @@ Layout, by topic:
 
 ### Golden files and the arithmetic fingerprint
 
-Exact (`torch.equal`) golden checks only run where the machine's arithmetic fingerprint (`tests/_golden.py`: a fixed probe through matmul, reductions, FFTs, transcendentals, fp16 rounding, interpolation, `grid_sample` and one backward pass, hashed with the CPU SIMD level and `OMP_NUM_THREADS`, or the GPU compute capability and CUDA version) is one stored in the golden under `_arith_fingerprint`. Elsewhere the test falls back to its documented tolerance and emits a `GoldenNotExactWarning` (see pytest's warnings summary). Atomics-based CUDA outputs are always compared at a tolerance.
+Exact (`torch.equal`) golden checks only run where the machine's arithmetic fingerprint (`tests/_golden.py`: a fixed probe through matmul, reductions, FFTs, transcendentals, fp16 rounding, interpolation, `grid_sample` and one backward pass, hashed with the CPU SIMD level and `OMP_NUM_THREADS`, or the GPU compute capability and CUDA version) is one stored in the golden under `_arith_fingerprint`. Elsewhere the test falls back to its documented tolerance and emits a `GoldenNotExactWarning` (see pytest's warnings summary; it names the fingerprint and the CPU model). Outputs that go through an FFT (ramp filter, FBP, W-BP, wSIRT, GENFIRE) are compared on that fallback relative to the tensor's largest value (`_golden.peak_close`), because FFT round-off follows the transform's norm rather than each bin's size. Atomics-based CUDA outputs are always compared at a tolerance.
 
 Re-stamp procedure (a torch upgrade, a new GPU or CPU, or a change to `_probe` changes the fingerprint):
 

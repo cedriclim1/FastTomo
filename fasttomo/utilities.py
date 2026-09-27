@@ -90,6 +90,13 @@ def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
     input dtype. Mirrors TorchRadon's `padded_sinogram.float() ... .to(dtype)`
     pattern — minor cost on the FFT itself, no cost on the BP that dominates.
     """
+    out = _ramp_filter_fp32(sinogram)
+    return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
+
+
+def _ramp_filter_fp32(sinogram: torch.Tensor) -> torch.Tensor:
+    """`ramp_filter` before the cast back to the input dtype: always fp32
+    (``run_fbp`` scales fp16 data in fp32 before that cast)."""
     if sinogram.dtype == torch.bfloat16:
         raise TypeError(
             "ramp_filter does not support torch.bfloat16; cast to "
@@ -99,8 +106,7 @@ def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
     sino_f = sinogram.float() if sinogram.dtype != torch.float32 else sinogram
     P, H   = _ramp_filter_coeffs(N_det, sino_f.device, torch.float32)
     f      = torch.fft.rfft(sino_f, n=P, dim=-1) * H
-    out    = torch.fft.irfft(f, n=P, dim=-1)[..., :N_det].contiguous()
-    return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
+    return torch.fft.irfft(f, n=P, dim=-1)[..., :N_det].contiguous()
 
 
 def estimate_shifts_xcorr(

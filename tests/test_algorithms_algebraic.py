@@ -505,9 +505,7 @@ class TestRunSirtCudaGraph:
         """Without ``projector=``, a repeated call replays the previous call's
         graph (kernel audit F8) and gives exactly what fresh calls give, with
         new sinogram data, new angles and a new support mask of the same
-        shapes each time; the replaying call is faster than the capturing one."""
-        import time
-
+        shapes each time."""
         from fasttomo.algorithms import algebraic
 
         N, n_angles = 32, 20
@@ -532,31 +530,57 @@ class TestRunSirtCudaGraph:
 
         algebraic._SIRT_OPERATORS.clear()
         captures0 = algebraic._sirt_graph_captures
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        reused = [ft.run_sirt(n_iter=7, Nz=N, positivity=True, **calls[0])]
-        torch.cuda.synchronize()
-        t_capture = time.perf_counter() - t0
-        reused += [ft.run_sirt(n_iter=7, Nz=N, positivity=True, **kw) for kw in calls[1:]]
+        reused = [ft.run_sirt(n_iter=7, Nz=N, positivity=True, **kw) for kw in calls]
         assert algebraic._sirt_graph_captures == captures0 + 1   # one capture, then replays
         assert len(algebraic._SIRT_OPERATORS) == 1
         for a, b in zip(fresh, reused):
             assert torch.equal(a, b)
-
-        t_replay = []
-        for _ in range(3):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            ft.run_sirt(n_iter=7, Nz=N, positivity=True, **calls[0])
-            torch.cuda.synchronize()
-            t_replay.append(time.perf_counter() - t0)
-        assert min(t_replay) < t_capture
 
         # another configuration evicts the kept one (one entry kept)
         ft.run_sirt(sino_a, angles_a, n_iter=7, Nz=N, omega=0.5)
         assert len(algebraic._SIRT_OPERATORS) == 1
         assert algebraic._sirt_graph_captures == captures0 + 2
         algebraic._SIRT_OPERATORS.clear()
+
+    def test_internal_graph_replay_faster_than_capture(self):
+        """A call that replays the kept graph is faster than one that
+        captures it. Medians of several calls of each kind, and a generous
+        margin (measured ratio ~0.3 on an idle RTX PRO 6000; asserted < 0.75);
+        skipped when another process shares the GPU, where wall-clock times
+        say nothing."""
+        import statistics
+        import time
+
+        from conftest import gpu_contention
+
+        from fasttomo.algorithms import algebraic
+
+        reason = gpu_contention()
+        if reason:
+            pytest.skip(f"timing not meaningful: {reason}")
+        sino, angles = self._make_inputs(N=32, n_angles=20)
+        kw = dict(n_iter=7, Nz=32, positivity=True)
+        ft.run_sirt(sino, angles, reuse_graph=False, **kw)       # load kernels once
+
+        def timed():
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            ft.run_sirt(sino, angles, **kw)
+            torch.cuda.synchronize()
+            return time.perf_counter() - t0
+
+        captures0 = algebraic._sirt_graph_captures
+        t_capture, t_replay = [], []
+        for _ in range(3):
+            ft.release_cached_projectors()
+            t_capture.append(timed())
+            t_replay += [timed() for _ in range(3)]
+        assert algebraic._sirt_graph_captures == captures0 + 3
+        ft.release_cached_projectors()
+        ratio = statistics.median(t_replay) / statistics.median(t_capture)
+        assert ratio < 0.75, (f"replay/capture = {ratio:.2f} (capture "
+                              f"{[f'{t * 1e3:.2f}' for t in t_capture]} ms, replay "
+                              f"{[f'{t * 1e3:.2f}' for t in t_replay]} ms)")
 
     def test_release_cached_projectors_returns_memory(self):
         """What run_sirt keeps between calls (projector textures, graph
@@ -600,6 +624,59 @@ class TestRunSirtCudaGraph:
         torch.cuda.empty_cache()
         # within 2 MiB (driver-side bookkeeping granularity)
         assert abs(torch.cuda.mem_get_info()[0] - free0) <= 2 << 20
+
+    def test_failed_capture_is_retried_after_release_or_new_configuration(self, monkeypatch):
+        """A failed graph capture runs the eager loop and marks the kept
+        projector; the mark does not pin that configuration to the eager
+        loop for the rest of the process: release_cached_projectors() and a
+        call with another configuration clear it, and the next call
+        captures again (failure injected by making CUDAGraph() raise)."""
+        from fasttomo.algorithms import algebraic
+
+        sino, angles = self._make_inputs(N=32, n_angles=20)
+        kw = dict(n_iter=5, Nz=32, positivity=True)
+        ft.release_cached_projectors()
+        ref = ft.run_sirt(sino, angles, reuse_graph=False, **kw)
+        ft.release_cached_projectors()
+
+        def failing_graph(*args, **kwargs):
+            raise RuntimeError("injected capture failure")
+
+        def fail_once():
+            captures0 = algebraic._sirt_graph_captures
+            with monkeypatch.context() as m:
+                m.setattr(torch.cuda, "CUDAGraph", failing_graph)
+                out = ft.run_sirt(sino, angles, **kw)
+            assert algebraic._sirt_graph_captures == captures0          # eager
+            torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+            (op,) = algebraic._SIRT_OPERATORS._ops.values()
+            assert len(op._sirt_graph_bad_keys) == 1
+            return op
+
+        def captures_again():
+            captures0 = algebraic._sirt_graph_captures
+            out = ft.run_sirt(sino, angles, **kw)
+            assert algebraic._sirt_graph_captures == captures0 + 1
+            assert torch.equal(out, ref)
+
+        # the same configuration right after a failure stays eager (no
+        # re-capture per call) ...
+        op = fail_once()
+        captures0 = algebraic._sirt_graph_captures
+        ft.run_sirt(sino, angles, **kw)
+        assert algebraic._sirt_graph_captures == captures0
+        # ... until release_cached_projectors()
+        assert ft.release_cached_projectors() == 1
+        assert not op._sirt_graph_bad_keys
+        captures_again()
+
+        # or until a call with another configuration (shape) replaces it
+        ft.release_cached_projectors()
+        op = fail_once()
+        ft.run_sirt(sino[:, :, :30].contiguous(), angles, n_iter=3)
+        assert not op._sirt_graph_bad_keys
+        captures_again()
+        ft.release_cached_projectors()
 
     def test_reuse_graph_false_keeps_nothing(self):
         """reuse_graph=False: same result, nothing kept, and a configuration

@@ -302,10 +302,12 @@ def test_resire_outputs_identical_to_main():
         if exact:
             assert torch.equal(now[k], golden[k]), k
         else:
-            torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)
+            torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5,
+                                       msg=lambda m, k=k: f"{k}: {m}")
     for k in RESIRE_NOISY:
         assert now[k].shape == golden[k].shape
-        torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)
+        torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5,
+                                   msg=lambda m, k=k: f"{k}: {m}")
 
 
 @needs_cuda

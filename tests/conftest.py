@@ -119,6 +119,37 @@ def phantom_3d(N: int, device="cpu") -> torch.Tensor:
     return vol
 
 
+def gpu_contention(device=None) -> str | None:
+    """Why wall-clock timings on ``device`` are not trustworthy right now, or
+    None: another process has a compute context on this GPU (the check the
+    workspace's GPU guard makes; the utilisation figure is not used, since
+    this process's own earlier work shows up in it). Uses ``nvidia-smi``;
+    without it (or on error) returns None."""
+    import os
+    import shutil
+    import subprocess
+    if not HAS_CUDA or shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        torch.cuda.synchronize(device)
+        uuid = str(torch.cuda.get_device_properties(device).uuid)
+        uuid = uuid if uuid.startswith("GPU-") else "GPU-" + uuid
+
+        def query(*args):
+            return subprocess.run(["nvidia-smi", *args, "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=10,
+                                  check=True).stdout.splitlines()
+        pids = [line.split(",")[1].strip() for line in query(
+                    "--query-compute-apps=gpu_uuid,pid")
+                if line.split(",")[0].strip() == uuid]
+        foreign = [p for p in pids if p != str(os.getpid())]
+        if foreign:
+            return f"GPU {uuid} is shared with other processes (pids {', '.join(foreign)})"
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError, RuntimeError):
+        return None
+    return None
+
+
 def rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
     """Max-abs error relative to the max-abs of ``expected``."""
     diff = (actual.float() - expected.float()).abs().max().item()
