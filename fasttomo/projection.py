@@ -40,6 +40,39 @@ __all__ = [
 # ── detector-plane shifts (used by forward_project_3d's ``shifts``) ─────────
 #
 # Moved from fasttomo.utilities (ARCH P8), which re-exports them.
+#
+# One contract for both functions (they differ only in the interpolation):
+#
+# * ``sinogram``: ``[n_angles, Ny, N_det]``; the result has the same shape,
+#   device and dtype (fp16 in, fp16 out; the arithmetic runs in fp32, or in
+#   fp64 for fp64 input).
+# * ``shifts``: ``[n_angles]`` (detector axis only) or ``[n_angles, 2]`` with
+#   columns ``(detector axis, tilt axis)``, i.e. ``(N_det, Ny)``, in pixels;
+#   it may live on another device than the sinogram.
+# * Sign: a positive shift moves the signal toward larger indices (right
+#   along the detector, down along the tilt axis):
+#   ``out[k, y, u] = sinogram[k, y - shifts[k, 1], u - shifts[k, 0]]``.
+# * ``apply_shifts``: Fourier phase shift, band-limited and circular (the
+#   signal wraps around). ``apply_shifts_2d``: bilinear ``grid_sample`` with
+#   zero fill (nothing wraps), differentiable w.r.t. sinogram and shifts,
+#   the pose model of ``forward_project_3d(shifts=)``. Both agree on integer
+#   shifts away from the edges.
+
+def _shift_table(sinogram: torch.Tensor, shifts: torch.Tensor, name: str) -> torch.Tensor:
+    """Validate the shared contract; return ``shifts`` on the sinogram's
+    device as ``[n_angles]`` or ``[n_angles, 2]`` in the compute dtype."""
+    if sinogram.ndim != 3:
+        raise ValueError(f"{name}: sinogram must be [n_angles, Ny, N_det], "
+                         f"got shape {tuple(sinogram.shape)}")
+    if not (shifts.ndim == 1 or (shifts.ndim == 2 and shifts.shape[-1] == 2)):
+        raise ValueError(f"{name}: shifts must have shape [n_angles] or "
+                         f"[n_angles, 2], got {tuple(shifts.shape)}")
+    n_a = sinogram.shape[0]
+    if shifts.shape[0] != n_a:
+        raise ValueError(f"{name}: shifts has {shifts.shape[0]} entries but "
+                         f"sinogram has {n_a} angles")
+    return shifts.to(device=sinogram.device, dtype=_shift_compute_dtype(sinogram))
+
 
 def _shift_compute_dtype(sinogram: torch.Tensor) -> torch.dtype:
     """fp32 arithmetic for fp16/fp32 sinograms, fp64 for fp64 ones."""
@@ -48,56 +81,63 @@ def _shift_compute_dtype(sinogram: torch.Tensor) -> torch.dtype:
 
 def apply_shifts(
     sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
-    shifts: torch.Tensor,     # [n_angles] detector-axis shifts in pixels
+    shifts: torch.Tensor,     # [n_angles] or [n_angles, 2] (det-axis, tilt-axis) pixels
 ) -> torch.Tensor:            # [n_angles, Ny, N_det], sinogram's device and dtype
     """
-    Sub-pixel shift each projection row along the detector axis via Fourier
-    phase multiplication.  Positive shift moves the signal to the right.
+    Sub-pixel shift of every projection by Fourier phase multiplication
+    (band-limited, circular: what leaves one edge re-enters at the other).
 
-    Returns the sinogram's dtype (fp16 in, fp16 out); the FFT runs in fp32
-    (fp64 for fp64 input). shifts may be on CPU even when sinogram is on CUDA.
+    ``shifts`` is ``[n_angles]`` (detector axis) or ``[n_angles, 2]``
+    (detector axis, tilt axis) in pixels; a positive shift moves the signal
+    toward larger indices. Same contract as :func:`apply_shifts_2d` (see the
+    comment above both); returns the sinogram's shape, device and dtype.
+    ``shifts`` may be on CPU even when ``sinogram`` is on CUDA.
     """
+    s = _shift_table(sinogram, shifts, "apply_shifts")
     dt = _shift_compute_dtype(sinogram)
+    s_det = s if s.ndim == 1 else s[:, 0]
     N_det = sinogram.shape[-1]
-    s = shifts.to(device=sinogram.device, dtype=dt)
-    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device, dtype=dt)  # [N_freq]
-    phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s.view(-1, 1, 1)
+    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device, dtype=dt)   # [N_freq]
+    phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s_det.view(-1, 1, 1)
     phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
     F = torch.fft.rfft(sinogram.to(dt), n=N_det, dim=-1)
-    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1).to(sinogram.dtype)
+    out = torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
+    if s.ndim == 2:
+        # tilt axis: complex FFT along Ny (rfft needs the last dim)
+        Ny = sinogram.shape[1]
+        fy = torch.fft.fftfreq(Ny, device=sinogram.device, dtype=dt)       # [Ny]
+        arg_y = -2.0 * math.pi * fy.view(1, -1, 1) * s[:, 1].view(-1, 1, 1)
+        Fy = torch.fft.fft(out, dim=1) * torch.polar(torch.ones_like(arg_y), arg_y)
+        out = torch.fft.ifft(Fy, dim=1).real
+    return out.to(sinogram.dtype)
 
 
 def apply_shifts_2d(
     sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
-    shifts: torch.Tensor,     # [n_angles, 2] — (det-axis, tilt-axis) pixel shifts
+    shifts: torch.Tensor,     # [n_angles, 2] (det-axis, tilt-axis) or [n_angles] pixels
 ) -> torch.Tensor:            # [n_angles, Ny, N_det], sinogram's device and dtype
     """
     Per-tilt sub-pixel translation of the sinogram in the detector plane via
-    bilinear ``grid_sample``.  Differentiable w.r.t. both ``sinogram`` and
-    ``shifts`` — autograd flows through ``grid_sample`` natively.
+    bilinear ``grid_sample`` with zero fill.  Differentiable w.r.t. both
+    ``sinogram`` and ``shifts`` — autograd flows through ``grid_sample``
+    natively.
 
     ``shifts[:, 0]`` shifts along the detector axis (last dim, ``N_det``);
-    ``shifts[:, 1]`` shifts along the tilt axis (``Ny``).  Sign convention
-    matches ``apply_shifts``: positive shift moves the signal toward larger
-    indices (right / down).
+    ``shifts[:, 1]`` shifts along the tilt axis (``Ny``); a 1-D ``[n_angles]``
+    tensor shifts along the detector axis only.  Positive shift moves the
+    signal toward larger indices (right / down).  Same contract as
+    :func:`apply_shifts` (see the comment above both); returns the
+    sinogram's shape, device and dtype.
 
     Intended for joint optimization with the volume and pose: drop in after
     ``forward_project_3d`` (or pass ``shifts=`` to it directly) so per-tilt
     translational alignment becomes a learnable parameter.
-
-    Returns the sinogram's dtype (fp16 in, fp16 out); the sampling runs in
-    fp32 (fp64 for fp64 input).
     """
-    if shifts.ndim != 2 or shifts.shape[-1] != 2:
-        raise ValueError(f"shifts must have shape [n_angles, 2], got {tuple(shifts.shape)}")
+    s = _shift_table(sinogram, shifts, "apply_shifts_2d")
+    if s.ndim == 1:
+        s = torch.stack((s, torch.zeros_like(s)), dim=-1)
     n_a, Ny, Nd = sinogram.shape
-    if shifts.shape[0] != n_a:
-        raise ValueError(
-            f"shifts has {shifts.shape[0]} entries but sinogram has {n_a} angles"
-        )
-
     dt = _shift_compute_dtype(sinogram)
-    s = shifts.to(device=sinogram.device, dtype=dt)
 
     ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=dt)
     xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=dt)

@@ -948,9 +948,57 @@ def test_apply_shifts_fp16_is_differentiable(backend):
     assert sino.grad.dtype == torch.float16 and sh.grad is not None
 
 
-def test_apply_shifts_2d_rejects_bad_shapes():
+@pytest.mark.parametrize("fn", ["apply_shifts", "apply_shifts_2d"])
+def test_shift_ops_reject_bad_shapes(fn):
+    """One shape contract for both shift ops."""
+    op = getattr(ft, fn)
     sino = torch.zeros(3, 4, 5)
-    with pytest.raises(ValueError, match=r"\[n_angles, 2\]"):
-        ft.apply_shifts_2d(sino, torch.zeros(3))
-    with pytest.raises(ValueError, match="3 angles"):
-        ft.apply_shifts_2d(sino, torch.zeros(2, 2))
+    for bad in (torch.zeros(3, 3), torch.zeros(3, 2, 1), torch.zeros(())):
+        with pytest.raises(ValueError, match=r"\[n_angles\] or \[n_angles, 2\]"):
+            op(sino, bad)
+    for bad in (torch.zeros(2), torch.zeros(2, 2)):
+        with pytest.raises(ValueError, match="3 angles"):
+            op(sino, bad)
+    with pytest.raises(ValueError, match=r"\[n_angles, Ny, N_det\]"):
+        op(torch.zeros(3, 5), torch.zeros(3))
+
+
+@pytest.mark.parametrize("fn", ["apply_shifts", "apply_shifts_2d"])
+def test_shift_ops_share_axis_order_and_sign(backend, fn):
+    """Same axis order (column 0 = detector, column 1 = tilt axis) and sign
+    (positive moves toward larger indices) for both ops: an integer shift of
+    a block with a zero margin is the same translation for the Fourier
+    (circular) and the bilinear (zero fill) op."""
+    sino = torch.zeros(2, 8, 12)
+    sino[0, 2:4, 3:6] = torch.arange(1.0, 7.0).reshape(2, 3)
+    sino[1, 3:6, 5:7] = 2.0
+    sh = torch.tensor([[2.0, 1.0], [-3.0, -2.0]])
+    exp = torch.zeros_like(sino)
+    exp[0, 3:5, 5:8] = sino[0, 2:4, 3:6]
+    exp[1, 1:4, 2:4] = 2.0
+    out = getattr(ft, fn)(sino.to(backend), sh)
+    torch.testing.assert_close(out.cpu(), exp, rtol=0, atol=1e-4)
+    # [n_angles] = detector axis only, the same as a zero tilt column
+    out1 = getattr(ft, fn)(sino.to(backend), sh[:, 0])
+    out2 = getattr(ft, fn)(sino.to(backend), torch.stack((sh[:, 0], torch.zeros(2)), 1))
+    torch.testing.assert_close(out1, out2, rtol=0, atol=1e-5)
+    exp1 = torch.zeros_like(sino)
+    exp1[0, 2:4, 5:8] = sino[0, 2:4, 3:6]
+    exp1[1, 3:6, 2:4] = 2.0
+    torch.testing.assert_close(out1.cpu(), exp1, rtol=0, atol=1e-4)
+
+
+def test_apply_shifts_tilt_axis_is_the_detector_shift_transposed(backend):
+    """The Fourier tilt-axis shift is the detector-axis shift of the
+    transposed sinogram (sub-pixel), so both axes follow one model."""
+    g = torch.Generator().manual_seed(9)
+    sino = torch.rand(3, 10, 7, generator=g).to(backend)
+    t = torch.tensor([0.35, -1.2, 2.6])
+    out = ft.apply_shifts(sino, torch.stack((torch.zeros(3), t), 1))
+    ref = ft.apply_shifts(sino.transpose(1, 2).contiguous(), t).transpose(1, 2)
+    torch.testing.assert_close(out, ref, rtol=0, atol=1e-5)
+    # and with both columns: detector then tilt axis
+    both = torch.stack((torch.tensor([0.5, -0.25, 1.5]), t), 1)
+    ref2 = ft.apply_shifts(ft.apply_shifts(sino, both[:, 0]).transpose(1, 2).contiguous(),
+                           t).transpose(1, 2)
+    torch.testing.assert_close(ft.apply_shifts(sino, both), ref2, rtol=0, atol=1e-5)
