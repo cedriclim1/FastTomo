@@ -1,7 +1,7 @@
 name: Build wheels
 
 # Two jobs:
-#   build_cpu  — manylinux_2_28 CPU wheels for cp310..cp313
+#   build_cpu  — manylinux_2_28 CPU wheels for cp310..cp314
 #   build_cuda — single-CUDA-toolkit wheels per Python ABI; libcudart is
 #                excluded from the wheel via auditwheel and resolved at import
 #                time against the libcudart that PyTorch loaded into the
@@ -33,11 +33,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: [cp310, cp311, cp312, cp313]
+        python: [cp310, cp311, cp312, cp313, cp314]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pypa/cibuildwheel@v2.21.3
+      # v3.1+ builds CPython 3.14 by default (v2.x has no cp314 identifiers).
+      # CIBW_BUILD names the GIL build only, so cp314t is not selected.
+      - uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
           CIBW_SKIP: "*-musllinux*"
@@ -65,11 +67,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: [cp310, cp311, cp312, cp313]
+        python: [cp310, cp311, cp312, cp313, cp314]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pypa/cibuildwheel@v2.21.3
+      - uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
           CIBW_SKIP: "*-musllinux*"

@@ -5,8 +5,18 @@
 import torch  # noqa: F401
 
 import warnings as _warnings
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _dist_version
 from packaging.version import Version as _Version
 from fasttomo import _core as _core_mod
+
+# The version has one source, ``[project] version`` in pyproject.toml; the
+# installed distribution's metadata carries it. The fallback covers a source
+# tree imported without being installed (PYTHONPATH=...).
+try:
+    __version__ = _dist_version("fasttomo")
+except _PackageNotFoundError:
+    __version__ = "0+unknown"
 
 # Hard requirement: torch >= 2.11 with its CUDA 13.0 (cu130) wheels, the
 # toolkit FastTomo's CUDA kernels are built with (verified with torch 2.12.1
@@ -46,7 +56,7 @@ if getattr(_core_mod, "cuda_available", False) and torch.version.cuda is not Non
         )
     del _parts, _cu_major, _cu_minor
 
-del _warnings, _Version, _torch_ver, _core_mod
+del _warnings, _Version, _torch_ver, _core_mod, _dist_version, _PackageNotFoundError
 
 from fasttomo.projection import (
     forward_project,

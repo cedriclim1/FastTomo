@@ -186,8 +186,8 @@ Tests are grouped by topic (`tests/test_projection.py`, `test_algorithms_*.py`, 
 
 Wheels are built by `.github/workflows/wheels.yml`:
 
-- **CPU manylinux_2_28 wheels** for cp310-cp313, x86_64, built without `-march=native`.
-- **CUDA wheels** for cp310-cp313, built with the CUDA 13.0 toolkit for architectures `75;80;86;89;90;100;120`, for use with the `cu130` torch wheels. `libcudart` is excluded from the wheel (`auditwheel --exclude`) and resolved at import time against the `libcudart` that PyTorch loaded; the test step loads the wheel under `torch+cu130`. `import fasttomo` raises `ImportError` for torch < 2.11 and emits a `RuntimeWarning` when a CUDA build meets a torch whose CUDA version is not 13.0, since mixed runtimes can crash at the first kernel launch. Volta (sm_70, V100) is not included because CUDA 13 dropped it; V100 users must build from source with a CUDA 12.x toolkit.
+- **CPU manylinux_2_28 wheels** for cp310-cp314, x86_64, built without `-march=native`.
+- **CUDA wheels** for cp310-cp314, built with the CUDA 13.0 toolkit for architectures `75;80;86;89;90;100;120`, for use with the `cu130` torch wheels. `libcudart` is excluded from the wheel (`auditwheel --exclude`) and resolved at import time against the `libcudart` that PyTorch loaded; the test step loads the wheel under `torch+cu130`. `import fasttomo` raises `ImportError` for torch < 2.11 and emits a `RuntimeWarning` when a CUDA build meets a torch whose CUDA version is not 13.0, since mixed runtimes can crash at the first kernel launch. Volta (sm_70, V100) is not included because CUDA 13 dropped it; V100 users must build from source with a CUDA 12.x toolkit.
 - **Sdist** for source builds when no wheel matches.
 
 ### One-time setup
