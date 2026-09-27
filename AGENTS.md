@@ -99,15 +99,15 @@ Exact (`torch.equal`) golden checks only run where the machine's arithmetic fing
 Re-stamp procedure (a torch upgrade, a new GPU or CPU, or a change to `_probe` changes the fingerprint):
 
 1. Run the golden tests (`test_algorithm_identity.py`, `test_frozen_identity.py`, `test_algorithms_genfire_resire.py`, the MBIR sweep golden in `test_algorithms_mbir.py`) with `OMP_NUM_THREADS` unset and confirm they pass at tolerance.
-2. `python tests/_golden.py stamp tests/data/<golden>.pt` (adds this environment's CPU and, if a GPU is visible, CUDA fingerprint; the tensors are checked byte-identical before the file is rewritten).
+2. `python tests/_golden.py stamp tests/data/<golden>.pt` (adds this environment's CPU and, if a GPU is visible, CUDA fingerprint; only the metadata changes, and after saving it re-loads the file and asserts the tensors are byte-identical to before).
 3. Re-run the same tests: they now take the exact branch. If any fails, this environment is not bit-identical: `git checkout tests/data/<golden>.pt` and leave it unstamped.
 4. Commit only the metadata change and say in the PR body which environment was added.
 
-Regenerating golden tensors (not just stamping) is a different operation: use the generator in `tests/data/*_gen.py` against the commit named in its docstring, and never for the frozen GENFIRE/RESIRE goldens to make a change pass.
+Regenerating golden tensors (not just stamping) is a different operation: use the generator in `tests/data/*_gen.py` (`algorithm_golden_main_gen.py`, `frozen_golden_main_gen.py`, `mbir_sweep_golden_gen.py`) against the commit named in its docstring; each calls `stamp()` after saving. `resire_golden_main.pt` has no generator script: it is `torch.save(_resire_cases())` from `tests/test_algorithms_genfire_resire.py`, run against the commit named in the comment above `RESIRE_GOLDEN`, then stamped. Never regenerate the frozen GENFIRE/RESIRE goldens to make a change pass.
 
 ## GPU etiquette (shared machine)
 
-The development box has 4 GPUs shared with other users. Use only a card that shows **0% utilization and no other user's processes** in both `nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv` and `nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv`; a card with foreign memory allocated counts as in use. Pin with `CUDA_VISIBLE_DEVICES=<idx>`, re-check before every GPU-heavy run (builds do not need a GPU), and stop and wait if another user appears on the chosen card.
+On a shared multi-GPU machine (the development box has 4 cards used by several people), use only a card that shows **0% utilization and no other user's processes** in both `nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv` and `nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv`; a card with foreign memory allocated counts as in use. Pin with `CUDA_VISIBLE_DEVICES=<idx>`, re-check before every GPU-heavy run (builds do not need a GPU), and stop and wait if another user appears on the chosen card.
 
 ## CI
 

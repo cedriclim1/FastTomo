@@ -2,7 +2,7 @@
 
 Ground-up fast tomography implementations in C and CUDA with direct workflows in PyTorch.
 
-Every public function takes and returns `torch.Tensor`. Projection and back-projection kernels run on the CPU (C/OpenMP) and on CUDA (texture memory). Volumes are `[Ny, Nz, Nx]`, sinograms `[n_angles, Ny, N_det]` and angles a 1-D tensor in degrees; `Ny` runs along the tilt axis. fp32 is supported everywhere; FBP, SIRT, SART, FISTA and FISTA-TV also accept fp16 (output in the input dtype). Other dtypes raise `TypeError`; nothing is cast silently.
+Every public function takes and returns `torch.Tensor`. Projection and back-projection kernels run on the CPU (C/OpenMP) and on CUDA (texture memory). Volumes are `[Ny, Nz, Nx]`, sinograms `[n_angles, Ny, N_det]` and angles a 1-D tensor in degrees; `Ny` runs along the tilt axis. fp32 is supported everywhere; the parallel and 3D projections (functional and the projector classes) and FBP, SIRT, SART, FISTA and FISTA-TV also accept fp16 (output in the input dtype). Other dtypes raise `TypeError`; nothing is cast silently.
 
 ## Algorithms
 
@@ -47,6 +47,13 @@ The sinogram, the angles and (for iterative methods) `n_iter` are positional; ev
 | `return_loss` | Return `(volume, loss_history)` instead of `volume`. |
 | `num_threads` | OpenMP threads for the CPU kernels: the keyword, else `OMP_NUM_THREADS`, else 1. Ignored on CUDA. |
 
+Exceptions, from the signatures:
+
+- `run_fbp` and `run_weighted_backprojection` are direct methods: no `n_iter`, `warm_start`, `loss_callback`, `progress` or `return_loss`.
+- `run_genfire` and `run_resire` have no `num_threads` (RESIRE is CUDA-only).
+- `run_ad_recon` has no `mask` (use `ConstraintConfig.cylinder` in its `config`) and no `num_threads` (CUDA-only).
+- `refine_angles` is not a reconstruction: `refine_angles(volume, sinogram, angles_deg, *, euler_zyz_deg, search_range_deg, n_steps, num_threads)`, with none of the other shared keywords.
+
 The full contract (constraint order, which loss each algorithm records, where the support is applied) is in the `fasttomo.algorithms` module docstring. Renamed keywords keep working for one release with a `DeprecationWarning`; see `CHANGELOG.md`.
 
 ```python
@@ -68,7 +75,7 @@ Move `sino` and `angles` to a CUDA device to run the same calls on the GPU.
 
 ### Frozen algorithms
 
-GENFIRE and RESIRE numerics are kept identical to the original implementations: their kernels, math, normalisation and edge handling are not changed, and their outputs are covered by bit-identity tests against stored goldens (`tests/test_frozen_identity.py`, the RESIRE golden in `tests/test_algorithms_genfire_resire.py`). Only additive keyword-only options (for example `loss_callback`, `warm_start`, `support_mask`) have been added, each with a test proving existing calls are unchanged.
+GENFIRE and RESIRE numerics are kept identical to the original implementations: their kernels, math, normalisation and edge handling are not changed, and their outputs are checked against stored goldens (`tests/test_frozen_identity.py`, the RESIRE golden in `tests/test_algorithms_genfire_resire.py`). GENFIRE on the CPU and the deterministic RESIRE paths (back-projection, exactly representable cases) are compared bit for bit (on machines whose arithmetic fingerprint matches the golden's, see Testing); GENFIRE on CUDA and RESIRE's forward projection and reconstruction outputs are compared at 1e-5, because their kernels accumulate with fp32 atomics and are not bit-reproducible run to run. Only additive keyword-only options (for example `loss_callback`, `warm_start`, `support_mask`) have been added, each with a test proving existing calls are unchanged.
 
 ## Requirements
 
@@ -94,6 +101,7 @@ GENFIRE and RESIRE numerics are kept identical to the original implementations: 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # skips ~2 GB of CUDA libraries
 pip install -e . -Ccmake.define.FASTTOMO_USE_CUDA=OFF
+pip install pytest          # to run the tests
 ```
 
 ### CUDA (from source)
@@ -107,7 +115,7 @@ conda install -c conda-forge gxx_linux-64 gcc_linux-64 cmake -y
 conda install -c nvidia 'cuda-nvcc=13.0' 'cuda-cudart-dev=13.0' -y
 
 pip install 'torch>=2.11' --index-url https://download.pytorch.org/whl/cu130
-pip install numpy tqdm packaging scikit-build-core pybind11
+pip install numpy tqdm packaging scikit-build-core pybind11 pytest
 pip install -e . --no-build-isolation -Ccmake.define.FASTTOMO_USE_CUDA=ON
 ```
 
@@ -179,7 +187,7 @@ Tests are grouped by topic (`tests/test_projection.py`, `test_algorithms_*.py`, 
 Wheels are built by `.github/workflows/wheels.yml`:
 
 - **CPU manylinux_2_28 wheels** for cp310-cp313, x86_64, built without `-march=native`.
-- **CUDA wheels** for cp310-cp313, built with the CUDA 13.0 toolkit for architectures `75;80;86;89;90;100;120`. `libcudart` is excluded from the wheel (`auditwheel --exclude`) and resolved at import time against the `libcudart` that PyTorch loaded, so one wheel works across PyTorch's CUDA versions; the toolkit only sets the minimum driver and the targeted architectures. The test step loads the wheel under `torch+cu130`. Volta (sm_70, V100) is not included because CUDA 13 dropped it; V100 users must build from source with a CUDA 12.x toolkit.
+- **CUDA wheels** for cp310-cp313, built with the CUDA 13.0 toolkit for architectures `75;80;86;89;90;100;120`, for use with the `cu130` torch wheels. `libcudart` is excluded from the wheel (`auditwheel --exclude`) and resolved at import time against the `libcudart` that PyTorch loaded; the test step loads the wheel under `torch+cu130`. `import fasttomo` raises `ImportError` for torch < 2.11 and emits a `RuntimeWarning` when a CUDA build meets a torch whose CUDA version is not 13.0, since mixed runtimes can crash at the first kernel launch. Volta (sm_70, V100) is not included because CUDA 13 dropped it; V100 users must build from source with a CUDA 12.x toolkit.
 - **Sdist** for source builds when no wheel matches.
 
 ### One-time setup
