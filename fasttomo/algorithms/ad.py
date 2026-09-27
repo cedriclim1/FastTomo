@@ -162,6 +162,14 @@ def _prepare_ad_recon_pose_init(
     return initial.detach().clone()
 
 
+def _adam(param: torch.Tensor, lr: float) -> torch.optim.Adam:
+    """Adam on one leaf: the fused CUDA implementation for a CUDA fp32
+    leaf (one kernel per step, no volume-sized temporary; A6-6), else the
+    default one. Fused and foreach Adam agree to ~1 ulp per step."""
+    fused = param.is_cuda and param.dtype == torch.float32
+    return torch.optim.Adam([param], lr=lr, fused=True if fused else None)
+
+
 def _ad_sparsity_term(volume: torch.Tensor, weight: float) -> torch.Tensor:
     """L1 sparsity penalty for ``run_ad_recon``: ``weight * mean(|volume|)``.
 
@@ -202,13 +210,35 @@ class _AdRun:
     pred_shape: tuple[int, int, int]      # (n_angles, Ny, N_det)
 
 
-def _ad_loss_terms(run: _AdRun, pred: torch.Tensor) -> dict[str, torch.Tensor]:
+def _ad_pose_euler(run: _AdRun) -> torch.Tensor | None:
+    """The ``[n, 3]`` ZYZ Euler angles of this iteration's forward
+    projection, built from the pose leaf inside the graph.
+
+    With ``antisymmetric_z``, ``psi = -phi`` is part of the graph, so the
+    gradient that reaches ``phi`` is the total derivative ``dL/dphi -
+    dL/dpsi`` on the constraint set (A6-3; stepping ``phi`` with the
+    partial ``dL/dphi`` and overwriting ``psi`` converged to the wrong pose).
+    ``psi`` is written as ``(psi_leaf + phi).detach() - phi``: exactly
+    ``-phi`` once the post-step constraint has set ``psi_leaf = -phi``, and
+    the initialiser's own ``psi`` in iteration 0 (the documented behaviour
+    of ``pose_init_euler_deg``). The leaf's ``psi`` column gets no gradient.
+    """
+    tilt = run.tilt_angle_opt
+    if tilt is None or not (run.pose_cfg is not None and run.pose_cfg.antisymmetric_z):
+        return tilt
+    phi = tilt[:, 0]
+    psi = (tilt[:, 2] + phi).detach() - phi
+    return torch.stack([phi, tilt[:, 1], psi], dim=1)
+
+
+def _ad_loss_terms(run: _AdRun, pred: torch.Tensor,
+                   euler: torch.Tensor | None) -> dict[str, torch.Tensor]:
     """Data-fit and regularisation terms, keyed for the loss_callback
     components contract (only the active ones). Insertion order is the
     summation order of the total loss (float addition is not associative),
-    kept identical to the historical loop."""
+    kept identical to the historical loop. ``euler``: `_ad_pose_euler`."""
     optim_cfg, reg_cfg, pose_cfg = run.optim_cfg, run.reg_cfg, run.pose_cfg
-    volume, sinogram, tilt = run.volume, run.sinogram, run.tilt_angle_opt
+    volume, sinogram, tilt = run.volume, run.sinogram, euler
     terms: dict[str, torch.Tensor] = {}
     if optim_cfg.loss_fn == "mse":
         terms["fidelity"] = F.mse_loss(pred, sinogram)
@@ -258,8 +288,9 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
                 leaf.requires_grad_(step_pose)
 
     # forward project
-    if run.refine_pose and tilt is not None:
-        mats = euler_zyz_to_rotmat(tilt)
+    euler = _ad_pose_euler(run)
+    if run.refine_pose and euler is not None:
+        mats = euler_zyz_to_rotmat(euler)
         pred = run.fp(run.volume, mats)
     else:
         pred = run.fp(run.volume)
@@ -276,7 +307,7 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
     if run.refine_shifts and shifts is not None:
         pred = apply_shifts_2d(pred, shifts)
 
-    terms = _ad_loss_terms(run, pred)
+    terms = _ad_loss_terms(run, pred, euler)
     loss = terms["fidelity"]
     for key, term in terms.items():
         if key != "fidelity":
@@ -289,11 +320,6 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
             tilt.grad[run.ref_idx] = 0.0
         if shifts is not None and shifts.grad is not None:
             shifts.grad[run.ref_idx] = 0.0
-
-    antisymmetric_z = run.pose_cfg is not None and run.pose_cfg.antisymmetric_z
-    if antisymmetric_z and run.refine_pose and tilt is not None:
-        if tilt.grad is not None:
-            tilt.grad[:, 2] = 0.0
 
     if run.default_step_schedule:
         # Keep the default path exactly identical to the historical loop.
@@ -523,17 +549,17 @@ def run_ad_recon(
             )
 
     # ── build optimiser list ───────────────────────────────────────────────
-    opt_vol = torch.optim.Adam([volume], lr=optim_cfg.lr_volume)
+    opt_vol = _adam(volume, optim_cfg.lr_volume)
     optimisers = [opt_vol]
 
     opt_angles: torch.optim.Optimizer | None = None
     opt_shifts: torch.optim.Optimizer | None = None
 
     if refine_pose and tilt_angle_opt is not None and pose_cfg is not None:
-        opt_angles = torch.optim.Adam([tilt_angle_opt], lr=pose_cfg.lr_angles)
+        opt_angles = _adam(tilt_angle_opt, pose_cfg.lr_angles)
         optimisers.append(opt_angles)
     if refine_shifts and shifts is not None and pose_cfg is not None:
-        opt_shifts = torch.optim.Adam([shifts], lr=pose_cfg.lr_shifts)
+        opt_shifts = _adam(shifts, pose_cfg.lr_shifts)
         optimisers.append(opt_shifts)
 
     pose_warmup_iters = pose_cfg.pose_warmup_iters if pose_cfg is not None else 0

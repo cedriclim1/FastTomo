@@ -62,6 +62,20 @@
   documented; `tv_loss_xz` is the per-slice TV). The fused TV backward
   is `once_differentiable`: a double backward through it raises instead
   of treating its output as a constant.
+- **`run_ad_recon` pose refinement with `antisymmetric_z=True` (the
+  default) changes (accuracy fix).** `phi` was stepped with the partial
+  derivative `dL/dphi` and `psi` then overwritten with `-phi`, whose
+  fixed points are not stationary points of the constrained problem.
+  `psi = -phi` is now built into the forward pass, so `phi` gets the
+  total derivative `dL/dphi - dL/dpsi`. On a 64^3, 31-view problem with
+  the volume fixed to the truth, the mean in-plane error goes from 0.275 to
+  0.051 deg (noise-free) and from 1.92 to 0.73 deg (5 % noise; start
+  0.87). The returned Euler angles still satisfy `psi = -phi` exactly, and
+  `pose_init_euler_deg` is still used unchanged in iteration 0.
+- `run_ad_recon` uses the fused CUDA Adam (`fused=True`) for the volume,
+  angles and shifts: L2 iteration 1.81 -> 1.72 ms at 256^3 (0.30 -> 0.25
+  ms at 128^3), peak 352 -> 304 MiB (no volume-sized temporary). Results move at the ulp level (all `ad_*` goldens were
+  regenerated). `run_grad_descent` keeps the caller's optimiser as given.
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 

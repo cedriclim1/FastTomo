@@ -729,6 +729,33 @@ class TestAdReconPoseConstraints:
         )
         assert euler[:, 0].abs().max().item() > 1e-3   # col0 actually moved
 
+    def test_antisymmetric_z_recovers_the_in_plane_rotation(self):
+        """A6-3: with psi = -phi built into the graph, phi is stepped with
+        the total derivative dL/dphi - dL/dpsi, so it converges to the true
+        in-plane rotation (volume fixed to the truth, noise-free). On this
+        problem the old scheme (partial dL/dphi, then psi := -phi) ended at
+        1.09 deg mean error, worse than the 0.88 deg start; now 0.03."""
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        N, n, q = 48, 25, 12
+        vol = torch.zeros(N, N, N, device="cuda")
+        vol[q:3 * q, q + 2:3 * q - 2, q - 2:3 * q - 4] = 1.0
+        vol[2 * q - 3:2 * q + 2, 2 * q - 3:2 * q, 2 * q - 1:3 * q + 1] = 2.0
+        vol = F.avg_pool3d(vol[None, None], 3, 1, 1)[0, 0].contiguous()
+        ang = torch.linspace(-60, 60, n, device="cuda")
+        phi_true = torch.randn(n, device="cuda")
+        sino = ft.forward_project_3d(vol, torch.stack([phi_true, ang, -phi_true], 1))
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=400, lr_volume=0.0, cosine_schedule=False),
+            pose=ft.PoseRefinementConfig(refine_pose=True, lr_angles=1e-2,
+                                         tilt_bound_deg=None))
+        _, euler, _ = ft.run_ad_recon(sino, ang, Nz=N, config=cfg, warm_start=vol,
+                                      return_pose=True)
+        err = (euler[:, 0] - phi_true.cpu()).abs().mean().item()
+        assert torch.equal(euler[:, 2], -euler[:, 0])
+        assert err < 0.1, err
+
     def test_antisymmetric_z_false_allows_drift(self):
         """antisymmetric_z=False lets col2 diverge from -col0 under high lr_angles."""
         _, euler, _ = ft.run_ad_recon(
@@ -1128,6 +1155,25 @@ def test_staged_iterations_differentiate_only_the_stepped_leaves(monkeypatch) ->
         assert (vol_rg, mats_rg, shift_rg) == (step_volume, step_pose, step_pose), k
     *_, flags = _staged_run(monkeypatch, 3, 0, 0)
     assert flags == [(True, True, True)] * 3
+
+
+@needs_cuda
+def test_ad_recon_uses_fused_adam_on_cuda(monkeypatch) -> None:
+    """A6-6: every run_ad_recon optimiser (volume, angles, shifts) is the
+    fused CUDA Adam; run_grad_descent keeps the caller's optimiser as is."""
+    made = []
+    real = torch.optim.Adam
+
+    def recording_adam(params, **kw):
+        made.append(kw.get("fused"))
+        return real(params, **kw)
+
+    monkeypatch.setattr(torch.optim, "Adam", recording_adam)
+    sino, angles = _small_cuda_problem()
+    cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=2),
+                           pose=ft.PoseRefinementConfig(refine_pose=True, refine_shifts=True))
+    ft.run_ad_recon(sino, angles, config=cfg)
+    assert made == [True, True, True]
 
 
 def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:

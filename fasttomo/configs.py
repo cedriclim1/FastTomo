@@ -158,7 +158,12 @@ class PoseRefinementConfig:
     Constraints applied after every iteration's optimiser step:
         * ``tilt_bound_deg`` clamps ``theta`` to ``angles_deg ± bound``
           around the *nominal* angles passed to ``run_ad_recon``;
-        * ``antisymmetric_z`` (default True) sets ``psi = -phi``;
+        * ``antisymmetric_z`` (default True) sets ``psi = -phi``. The
+          constraint is also part of the forward pass (``psi`` is built
+          as ``-phi`` in the graph), so ``phi`` is stepped with the total
+          derivative ``dL/dphi - dL/dpsi`` and the in-plane penalty acts
+          as ``2 * in_plane_weight * mean(phi²)``; the ``psi`` column
+          itself is never stepped;
         * ``anchor_reference`` zeroes the pose and shift gradients of the
           view closest to 0 degrees, so that row keeps its initial value.
         These also act on ``pose_init_euler_deg``: the initialiser is used
