@@ -41,6 +41,10 @@
  * creates its caches with it so both paths share one layout. */
 int parallel_channels(int io_dtype, int Ny);
 
+/* The four parallel FP/BP entry points take an optional `nonfinite` device
+ * int (null = off): an fp16 kernel ORs 1 into it when it stores an inf and 2
+ * when it stores a NaN, so the fp16 overflow check reads 4 bytes instead of
+ * scanning the output (fp32 outputs never set it). The caller zeroes it. */
 void forward_project_parallel_cuda(
     int io_dtype,
     const void  *vol,
@@ -49,7 +53,8 @@ void forward_project_parallel_cuda(
     const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite = nullptr
 );
 
 void back_project_parallel_cuda(
@@ -60,7 +65,8 @@ void back_project_parallel_cuda(
     const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite = nullptr
 );
 
 /*
@@ -103,7 +109,8 @@ void forward_project_parallel_cuda_cached(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream,
-    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int upload = 1,  /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int *nonfinite = nullptr
 );
 
 void back_project_parallel_cuda_cached(
@@ -116,7 +123,8 @@ void back_project_parallel_cuda_cached(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream,
-    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int upload = 1,  /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int *nonfinite = nullptr
 );
 
 void forward_project_rotmat_cuda_cached(

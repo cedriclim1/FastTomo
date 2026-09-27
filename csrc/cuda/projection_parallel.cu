@@ -84,6 +84,19 @@ __device__ __forceinline__ void warp_uniform_range(int &lo, int &hi) {
 #define FP_BLOCK_X 32
 #define FP_BLOCK_Y 8
 
+/* Store one result; for fp16, OR 1 (inf) or 2 (NaN) into *nonfinite when
+ * the rounded value is not finite (ops.h). Atomics fire only then. */
+template <typename T> __device__ __forceinline__ void store_out(T *p, float v, int *nonfinite);
+template <> __device__ __forceinline__ void store_out<float>(float *p, float v, int *) {
+    *p = v;
+}
+template <> __device__ __forceinline__ void store_out<__half>(__half *p, float v, int *nonfinite) {
+    __half h = __float2half_rn(v);
+    *p = h;
+    if (nonfinite && (__hisinf(h) || __hisnan(h)))
+        atomicOr(nonfinite, __hisnan(h) ? 2 : 1);
+}
+
 /* A C-channel texel fetch (C = 1, 2, 4) and its per-channel accumulation. */
 template <int C> struct PackedFetch;
 template <> struct PackedFetch<1> {
@@ -126,7 +139,8 @@ __global__ static void forward_project_parallel_kernel(
     const float *__restrict__ sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    float half_det, float half_x, float half_z, int ray_len
+    float half_det, float half_x, float half_z, int ray_len,
+    int *nonfinite
 ) {
     typedef typename PackedFetch<C>::type texel_t;
     int id      = blockIdx.x * blockDim.x + threadIdx.x;  /* detector pixel */
@@ -175,7 +189,7 @@ __global__ static void forward_project_parallel_kernel(
     #pragma unroll
     for (int b = 0; b < C; b++) {
         if (iy_base + b < Ny)
-            sino[((size_t)ia * Ny + (iy_base + b)) * N_det + id] = float_to_t<T>(sums[b]);
+            store_out<T>(&sino[((size_t)ia * Ny + (iy_base + b)) * N_det + id], sums[b], nonfinite);
     }
 }
 
@@ -242,7 +256,8 @@ __global__ static void back_project_parallel_kernel(
     const float *__restrict__ sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    float half_det, float half_x, float half_z
+    float half_det, float half_x, float half_z,
+    int *nonfinite
 ) {
     /* cos/sin tables stay fp32 in shared memory — small, precision-critical. */
     extern __shared__ float sh[];
@@ -272,7 +287,7 @@ __global__ static void back_project_parallel_kernel(
     #pragma unroll
     for (int b = 0; b < C; b++) {
         if (iy_base + b < Ny)
-            vol[((size_t)(iy_base + b) * Nz + iz) * Nx + ix] = float_to_t<T>(vals[b]);
+            store_out<T>(&vol[((size_t)(iy_base + b) * Nz + iz) * Nx + ix], vals[b], nonfinite);
     }
 }
 
@@ -307,7 +322,7 @@ static void forward_project_parallel_launch(
     const void *vol, void *sino,
     const float *cos_a, const float *sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    cudaStream_t stream, bool upload
+    cudaStream_t stream, bool upload, int *nonfinite
 ) {
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
     if (upload) tc_upload(vol_cache, vol, stream);
@@ -321,7 +336,7 @@ static void forward_project_parallel_launch(
     forward_project_parallel_kernel<CH, T><<<grid, block, 0, stream>>>(              \
         vol_cache->tex, (T *)sino, cos_a, sin_a,                                     \
         g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,                                       \
-        g.half_det, g.half_x, g.half_z, g.ray_len)
+        g.half_det, g.half_x, g.half_z, g.ray_len, nonfinite)
     if (C == 1 && io_dtype == 0)      FP_LAUNCH(1, float);
     else if (C == 1 && io_dtype == 1) FP_LAUNCH(1, __half);
     else if (C == 2 && io_dtype == 0) FP_LAUNCH(2, float);
@@ -338,7 +353,7 @@ static void back_project_parallel_launch(
     const void *sino, void *vol,
     const float *cos_a, const float *sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    cudaStream_t stream, bool upload
+    cudaStream_t stream, bool upload, int *nonfinite
 ) {
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
     if (upload) tc_upload(sino_cache, sino, stream);
@@ -351,7 +366,8 @@ static void back_project_parallel_launch(
     enable_extended_smem_if_needed((const void *)back_project_parallel_kernel<CH, T>, smem); \
     back_project_parallel_kernel<CH, T><<<grid, block, smem, stream>>>(               \
         sino_cache->tex, (T *)vol, cos_a, sin_a,                                     \
-        g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det, g.half_det, g.half_x, g.half_z);     \
+        g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det, g.half_det, g.half_x, g.half_z,      \
+        nonfinite);                                                                  \
 } while (0)
     if (C == 1 && io_dtype == 0)      BP_LAUNCH(1, float);
     else if (C == 1 && io_dtype == 1) BP_LAUNCH(1, __half);
@@ -370,13 +386,14 @@ void forward_project_parallel_cuda(
     const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite
 ) {
     check_io_dtype(io_dtype, "forward_project_parallel_cuda");
     ScopedTextureCache tc(TC_VOL_LAYERED, tc_dtype_of(io_dtype),
                           parallel_channels(io_dtype, Ny), Ny, Nz, Nx, stream);
     forward_project_parallel_launch(io_dtype, tc.get(), vol, sino,
-                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, true);
+                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, true, nonfinite);
     tc.finish();
 }
 
@@ -390,13 +407,15 @@ void forward_project_parallel_cuda_cached(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream,
-    int upload
+    int upload,
+    int *nonfinite
 ) {
     check_io_dtype(io_dtype, "forward_project_parallel_cuda_cached");
     tc_validate(vol_cache, TC_VOL_LAYERED, io_dtype, Ny, Nz, Nx,
                 "forward_project_parallel_cuda_cached");
     forward_project_parallel_launch(io_dtype, vol_cache, vol, sino,
-                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0);
+                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0,
+                           nonfinite);
 }
 
 void back_project_parallel_cuda(
@@ -407,13 +426,14 @@ void back_project_parallel_cuda(
     const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite
 ) {
     check_io_dtype(io_dtype, "back_project_parallel_cuda");
     ScopedTextureCache tc(TC_SINO_LAYERED, tc_dtype_of(io_dtype),
                           parallel_channels(io_dtype, Ny), n_angles, Ny, N_det, stream);
     back_project_parallel_launch(io_dtype, tc.get(), sino, vol,
-                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, true);
+                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, true, nonfinite);
     tc.finish();
 }
 
@@ -427,11 +447,13 @@ void back_project_parallel_cuda_cached(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream,
-    int upload
+    int upload,
+    int *nonfinite
 ) {
     check_io_dtype(io_dtype, "back_project_parallel_cuda_cached");
     tc_validate(sino_cache, TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det,
                 "back_project_parallel_cuda_cached");
     back_project_parallel_launch(io_dtype, sino_cache, sino, vol,
-                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0);
+                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0,
+                           nonfinite);
 }

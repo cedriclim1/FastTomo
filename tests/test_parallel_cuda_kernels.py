@@ -141,3 +141,58 @@ def test_tc_create_rejects_unsupported_packing(kind, dtype, channels):
 
     with pytest.raises((ValueError, RuntimeError)):
         core.tc_create(kind, dtype, channels, 8, 8, 8)
+
+
+# ── fp16 overflow check: the kernels report non-finite stores ──────────────
+
+@needs_cuda
+@pytest.mark.parametrize("Ny", [1, 3, 4])
+@pytest.mark.parametrize("cached", [False, True])
+def test_fp16_kernels_report_nonfinite_stores(Ny, cached):
+    """The fp16 parallel FP/BP OR 1 into the report word for an inf store
+    (overflow) and 2 for a NaN; a finite result leaves it 0; fp32 never
+    sets it."""
+    from fasttomo._operator import CudaCachedOperator, Geometry, UncachedOperator
+
+    n, N = 180, 32
+    ang = torch.linspace(-89.5, 89.5, n, device=DEV)
+    cls = CudaCachedOperator if cached else UncachedOperator
+
+    def word(kind, x, fill):
+        op = cls(Geometry("parallel", (Ny, N, N), N, n, ang), DEV)
+        w = torch.zeros(1, dtype=torch.int32, device=DEV)
+        (op.bp if kind == "bp" else op.fp)(torch.full_like(x, fill), nonfinite=w)
+        return int(w.item())
+
+    sino = torch.empty(n, Ny, N, device=DEV, dtype=torch.float16)
+    vol = torch.empty(Ny, N, N, device=DEV, dtype=torch.float16)
+    assert word("bp", sino, 1000.0) == 1          # 1.8e5 > 65504: inf
+    assert word("fp", vol, 3000.0) == 1           # ray sums ~9e4
+    assert word("bp", sino, 1.0) == 0
+    assert word("fp", vol, 1.0) == 0
+    assert word("bp", sino, float("nan")) & 2
+    assert word("bp", sino.float(), float("inf")) == 0   # fp32: never reported
+
+
+@needs_cuda
+def test_fp16_range_check_uses_the_kernel_word(monkeypatch):
+    """Public fp16 parallel calls on CUDA hand the kernel's report word to
+    the range check (no scan of the result); rotmat still scans."""
+    import fasttomo.autograd as ag
+
+    seen = []
+    real = ag._check_fp16_range
+
+    def spy(out, inp, name, nonfinite=None):
+        seen.append((name, nonfinite is not None))
+        return real(out, inp, name, nonfinite=nonfinite)
+
+    monkeypatch.setattr(ag, "_check_fp16_range", spy)
+    ang = _angles(5)
+    vol = torch.rand(3, 8, 8, device=DEV).half()
+    ft.forward_project(vol, ang)
+    ft.back_project(ft.forward_project(vol, ang), ang)
+    p = ft.ParallelProjector((3, 8, 8), ang, device=DEV)
+    p.back(p.forward(vol))
+    ft.forward_project_3d(vol, torch.zeros(5, 3, device=DEV))
+    assert [flag for _, flag in seen] == [True] * 5 + [False]

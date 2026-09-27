@@ -23,7 +23,7 @@ static void py_forward_project_parallel_cuda(
     long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, long nonfinite_ptr
 ) {
     forward_project_parallel_cuda(
         io_dtype,
@@ -32,7 +32,8 @@ static void py_forward_project_parallel_cuda(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr),
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -41,7 +42,7 @@ static void py_back_project_parallel_cuda(
     long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, long nonfinite_ptr
 ) {
     back_project_parallel_cuda(
         io_dtype,
@@ -50,7 +51,8 @@ static void py_back_project_parallel_cuda(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr),
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -209,7 +211,7 @@ static void py_forward_project_parallel_cuda_cached(
     long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr, bool upload
+    long stream_ptr, bool upload, long nonfinite_ptr
 ) {
     forward_project_parallel_cuda_cached(
         io_dtype,
@@ -219,7 +221,8 @@ static void py_forward_project_parallel_cuda_cached(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr), upload ? 1 : 0
+        to_stream(stream_ptr), upload ? 1 : 0,
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -229,7 +232,7 @@ static void py_back_project_parallel_cuda_cached(
     long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr, bool upload
+    long stream_ptr, bool upload, long nonfinite_ptr
 ) {
     back_project_parallel_cuda_cached(
         io_dtype,
@@ -239,7 +242,8 @@ static void py_back_project_parallel_cuda_cached(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr), upload ? 1 : 0
+        to_stream(stream_ptr), upload ? 1 : 0,
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -484,24 +488,26 @@ void register_cuda(py::module_ &m) {
           py::call_guard<py::gil_scoped_release>(),
           "Forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints. "
-          "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream).",
+          "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream). "
+          "nonfinite_ptr: optional device int32, fp16 stores OR in 1 (inf) / 2 (NaN).",
           py::arg("io_dtype"),
           py::arg("vol_ptr"), py::arg("sino_ptr"),
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("nonfinite_ptr") = 0L);
 
     m.def("back_project_parallel_cuda", &py_back_project_parallel_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "Back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
-          "All ptr args are device data_ptr() ints.",
+          "All ptr args are device data_ptr() ints. nonfinite_ptr: optional "
+          "device int32, fp16 stores OR in 1 (inf) / 2 (NaN).",
           py::arg("io_dtype"),
           py::arg("sino_ptr"), py::arg("vol_ptr"),
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("nonfinite_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda", &py_forward_project_rotmat_cuda,
           py::call_guard<py::gil_scoped_release>(),
@@ -628,7 +634,8 @@ void register_cuda(py::module_ &m) {
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true,
+          py::arg("nonfinite_ptr") = 0L);
 
     m.def("back_project_parallel_cuda_cached", &py_back_project_parallel_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
@@ -640,7 +647,8 @@ void register_cuda(py::module_ &m) {
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true,
+          py::arg("nonfinite_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda_cached", &py_forward_project_rotmat_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),

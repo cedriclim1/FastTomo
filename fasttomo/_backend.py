@@ -143,7 +143,8 @@ def _resolve_num_threads(num_threads: int | None) -> int:
 # When: a projection op (functional API, projector classes, run_fbp,
 # refine_angles, autograd backward) checks its own fp16 result right away,
 # which reads one flag back to the host (a stream sync per fp16 call on
-# CUDA). The fp16 iterative algorithms (run_sirt, run_sart, run_fista,
+# CUDA). The parallel CUDA kernels report non-finite stores themselves (a
+# 4-byte word, `nonfinite` below), so their check does not scan the output. The fp16 iterative algorithms (run_sirt, run_sart, run_fista,
 # run_fista_tv) instead OR a device-side flag per projection and read it
 # once when they return (`_fp16_overflow_checked`): a per-call sync cost
 # 1.7-1.8x on 64^3 fp16 FISTA/SIRT. Nothing is checked while a CUDA graph
@@ -185,20 +186,42 @@ def _flag(out: torch.Tensor) -> torch.Tensor:
     return torch.linalg.vector_norm(out, 1, dtype=torch.float32)
 
 
-def _check_fp16_range(out: torch.Tensor, inp: torch.Tensor, op_name: str) -> None:
+def _flag_from_bits(nonfinite: torch.Tensor) -> torch.Tensor:
+    """`_flag` of a kernel-reported word (the parallel CUDA kernels OR 1 into
+    it for an inf store, 2 for a NaN; csrc/cuda/ops.h), one tiny kernel and
+    no sync: log1p(-bits) is 0 for 0, -inf for 1 (an inf), NaN for 2 and 3
+    (a NaN wins, as in `_flag`)."""
+    return torch.log1p(-nonfinite.reshape(()).to(torch.float32))
+
+
+def _check_fp16_range(out: torch.Tensor, inp: torch.Tensor, op_name: str,
+                      nonfinite: torch.Tensor | None = None) -> None:
     """Raise when an fp16 projection went non-finite although ``inp`` (the
     projected volume or sinogram) is finite: OverflowError for an inf (the
     result exceeded the fp16 range), else FloatingPointError for a NaN. No-op for other
     dtypes and during CUDA-graph capture; inside an fp16 algorithm only a
-    device-side flag is recorded (see the comment above)."""
+    device-side flag is recorded (see the comment above).
+
+    ``nonfinite``: the int32 word the kernel that wrote ``out`` set (1 = it
+    stored an inf, 2 = a NaN; the parallel CUDA FP/BP). Then the check reads
+    those 4 bytes instead of scanning ``out`` (``isfinite(out).all()`` cost
+    1.3 ms of a 3.0 ms fp16 back-projection at 512^3); ``inp`` is only
+    scanned when a non-finite value was stored."""
     if out.dtype != torch.float16:
         return
     if out.is_cuda and torch.cuda.is_current_stream_capturing():
         return
     flags = _fp16_overflow_flags.get()
     if flags is not None:
-        flags.append(_flag(out))
+        flags.append(_flag(out) if nonfinite is None else _flag_from_bits(nonfinite))
         return
+    if nonfinite is not None:
+        bits = int(nonfinite.item())
+        if bits == 0 or not bool(torch.isfinite(inp).all()):
+            return
+        if bits & 1:
+            raise _overflow_error(op_name, "the fp16 projection result")
+        raise _nan_error(op_name, "the fp16 projection result")
     if bool(torch.isfinite(out).all()):
         return
     if not bool(torch.isfinite(inp).all()):

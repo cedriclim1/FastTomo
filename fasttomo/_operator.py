@@ -100,6 +100,11 @@ class Geometry:
     angles_deg: torch.Tensor | None = None
 
 
+def _word_ptr(word: torch.Tensor | None) -> int:
+    """Binding pointer of an optional non-finite report word (0 = none)."""
+    return 0 if word is None else word.data_ptr()
+
+
 class ProjectionOperator:
     """Forward/back projection for one geometry on one device.
 
@@ -174,6 +179,21 @@ class ProjectionOperator:
         cached rotmat adapter's volume-texture upload). ``None`` if the
         adapter keeps none."""
         return None
+
+    def _nonfinite_word(self, x: torch.Tensor) -> torch.Tensor | None:
+        """A zeroed int32 device word for ``fp(x, nonfinite=...)`` /
+        ``bp(x, nonfinite=...)`` when this adapter's kernels report the
+        non-finite values they store (the fp16 parallel CUDA kernels: 1 =
+        an inf, 2 = a NaN), else None. The fp16 range check then reads the
+        word instead of scanning the result (`_backend._check_fp16_range`).
+        None while a CUDA graph is being captured (nothing is checked)."""
+        return None
+
+    def _parallel_fp16_word(self, x: torch.Tensor) -> torch.Tensor | None:
+        if (self.kind != "parallel" or not x.is_cuda or x.dtype != torch.float16
+                or torch.cuda.is_current_stream_capturing()):
+            return None
+        return torch.zeros(1, dtype=torch.int32, device=x.device)
 
     # ── differentiable layer ─────────────────────────────────────────────
     def project(self, volume: torch.Tensor, geom: torch.Tensor | None = None) -> torch.Tensor:
@@ -256,19 +276,23 @@ class UncachedOperator(ProjectionOperator):
         # zero-size errors; otherwise they name the kernel
         self._label = name
 
-    def fp(self, volume, geom=None):
+    def fp(self, volume, geom=None, *, nonfinite=None):
         if self.kind == "parallel":
             return _forward_project_parallel_raw(volume, self._angles(geom), self.N_det,
-                                                 self.num_threads, label=self._label)
+                                                 self.num_threads, label=self._label,
+                                                 nonfinite=nonfinite)
         return _forward_project_rotmat_raw(volume, self._rotmat_geom(geom), self.N_det,
                                            self.num_threads, label=self._label)
 
-    def bp(self, sinogram, geom=None):
+    def bp(self, sinogram, geom=None, *, nonfinite=None):
         if self.kind == "parallel":
             return _back_project_parallel_raw(sinogram, self._angles(geom), self.Nz,
-                                              self.num_threads, Nx=self.Nx, label=self._label)
+                                              self.num_threads, Nx=self.Nx, label=self._label,
+                                              nonfinite=nonfinite)
         return _back_project_rotmat_raw(sinogram, self._rotmat_geom(geom), self.Nz,
                                         self.num_threads, Nx=self.Nx, label=self._label)
+
+    _nonfinite_word = ProjectionOperator._parallel_fp16_word
 
     def grad_geom(self, volume, grad_sino, geom=None, token=None):
         if self.kind == "parallel":
@@ -492,7 +516,9 @@ class CudaCachedOperator(ProjectionOperator):
         self._check_device(t, name)
         self._check_shape(t, name, shape)
 
-    def fp(self, volume, geom=None):
+    _nonfinite_word = ProjectionOperator._parallel_fp16_word
+
+    def fp(self, volume, geom=None, *, nonfinite=None):
         io_dtype = self._lock_dtype(volume)
         self._check_input(volume, "volume", self.vol_shape)
         with torch.cuda.device(self.device):
@@ -509,7 +535,7 @@ class CudaCachedOperator(ProjectionOperator):
                     io_dtype, h, vol.data_ptr(), sino.data_ptr(),
                     cos_a.data_ptr(), sin_a.data_ptr(),
                     self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
-                    upload=upload)
+                    upload=upload, nonfinite_ptr=_word_ptr(nonfinite))
             else:
                 mats = self._mats(geom)
                 n = mats.shape[0]
@@ -527,24 +553,26 @@ class CudaCachedOperator(ProjectionOperator):
             self.upload_counts["vol_skipped"] += 1
         return sino
 
-    def bp(self, sinogram, geom=None):
+    def bp(self, sinogram, geom=None, *, nonfinite=None):
         io_dtype = self._lock_dtype(sinogram)
-        return self._bp(io_dtype, sinogram.contiguous(), geom)
+        return self._bp(io_dtype, sinogram.contiguous(), geom, nonfinite)
 
     def bp_from_texture(self, geom=None) -> torch.Tensor:
         """Back-project the sinogram a kernel wrote into the texture for
         this view count (``_mark_sino_written``), without an upload."""
         if self.dtype is None:
             raise RuntimeError(f"{self._name}: bp_from_texture before any upload")
-        vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom)
+        probe = torch.empty(0, dtype=self.dtype, device=self.device)
+        word = self._nonfinite_word(probe)
+        vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom, word)
         # the fp16 overflow check `backproject` runs (inside an fp16
         # run_sirt: a device-side flag); the input sinogram is the texture,
         # so the output stands in for it (an inf is then never blamed on
         # the input, which the fused residual kernel produced finite)
-        _check_fp16_range(vol, vol.new_zeros(()), self._name)
+        _check_fp16_range(vol, vol.new_zeros(()), self._name, nonfinite=word)
         return vol
 
-    def _bp(self, io_dtype, sino, geom):
+    def _bp(self, io_dtype, sino, geom, nonfinite=None):
         """``bp`` of ``sino``, or (``sino`` None) of the texture's contents."""
         with torch.cuda.device(self.device):
             self._order_after_other_streams()
@@ -571,7 +599,7 @@ class CudaCachedOperator(ProjectionOperator):
                     io_dtype, self._sino_cache(n), sino_ptr, vol.data_ptr(),
                     cos_a.data_ptr(), sin_a.data_ptr(),
                     self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
-                    upload=upload)
+                    upload=upload, nonfinite_ptr=_word_ptr(nonfinite))
             else:
                 _core.back_project_rotmat_cuda_cached(
                     io_dtype, self._sino_cache(n), sino_ptr, vol.data_ptr(),
