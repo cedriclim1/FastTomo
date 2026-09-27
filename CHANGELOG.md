@@ -26,6 +26,22 @@
   `loss_callback(iter, loss)` contract is unchanged: plain floats, the
   true iteration index, the same values. `run_ad_recon` 128^3 L2 with
   `return_loss`: 0.42 -> 0.32 ms per iteration.
+- **`tilt_ssim_loss` values change (accuracy fix).** On CUDA, cuDNN ran
+  its dense 11 x 11 convolutions in TF32 at small batches, and the
+  `E[x^2] - mu^2` variance form turned that into a 1-6 % error in the loss
+  and its gradient at sinogram scale (mean ~100). The window is now
+  applied as two depthwise 1-D passes (no TF32 path) to data centred on
+  each target tilt's mean, with the SSIM formula rearranged so that no
+  step subtracts two `E[x^2]`-sized values. Against an fp64 reference the
+  error is now <= 1e-6 (loss) and 1.2e-7 (gradient), TF32 on or off, CPU
+  or CUDA. Same window, constants (`K1 = 0.01`, `K2 = 0.03`, `L = max -
+  min` of the target) and reflect padding. `run_ad_recon` caches the
+  measured sinogram's statistics. Faster: `tilt_ssim_loss` forward +
+  backward on 61 x 256^2 12.5 -> 2.2 ms; `run_ad_recon` with
+  `tilt_ssim_weight` 14.9 -> 3.7 ms per iteration at 256^3 (3.7 -> 1.0 ms
+  at 128^3).
+- The scikit-image SSIM cross-check test now runs without scikit-image
+  (an inline fp64 reference, anchored to a hard-coded scikit-image value).
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 

@@ -17,7 +17,7 @@ from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.projection import apply_shifts_2d
 from fasttomo.constraints import _soft_threshold_
-from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_3d, tv_loss_xz
+from fasttomo.regularizers import _TiltSSIMTarget, s3im_loss, tv_loss_3d, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.configs import (
     AdReconConfig,
@@ -194,6 +194,7 @@ class _AdRun:
     ref_idx: int | None                   # anchored view (anchor_reference)
     support: torch.Tensor | None          # resolved support, [1|Ny, Nz, Nx]
     s3im_gen: torch.Generator | None
+    ssim_target: _TiltSSIMTarget | None   # tilt_ssim_loss target statistics
     default_step_schedule: bool
     pose_warmup_iters: int
     alternating_period: int
@@ -226,7 +227,7 @@ def _ad_loss_terms(run: _AdRun, pred: torch.Tensor) -> dict[str, torch.Tensor]:
     if reg_cfg.s3im_weight > 0.0:
         terms["s3im"] = reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=run.s3im_gen)
     if reg_cfg.tilt_ssim_weight > 0.0:
-        terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
+        terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * run.ssim_target(pred)
     return terms
 
 
@@ -566,6 +567,9 @@ def run_ad_recon(
     if reg_cfg.s3im_weight > 0.0:
         _s3im_gen = torch.Generator(device=device).manual_seed(_S3IM_SEED)
 
+    # ── tilt SSIM: the sinogram's statistics, computed once ───────────────
+    ssim_target = _TiltSSIMTarget(sinogram) if reg_cfg.tilt_ssim_weight > 0.0 else None
+
     # ── iteration ─────────────────────────────────────────────────────────
     run = _AdRun(
         sinogram=sinogram, angles_deg=angles_deg, volume=volume, fp=op.project, op=op,
@@ -574,6 +578,7 @@ def run_ad_recon(
         optim_cfg=optim_cfg, reg_cfg=reg_cfg, constraints_cfg=constraints_cfg,
         pose_cfg=pose_cfg, refine_pose=refine_pose, refine_shifts=refine_shifts,
         ref_idx=ref_idx, support=setup.constraints.support_mask, s3im_gen=_s3im_gen,
+        ssim_target=ssim_target,
         default_step_schedule=default_step_schedule,
         pose_warmup_iters=pose_warmup_iters, alternating_period=alternating_period,
         pred_shape=(n_angles, Ny, N_det),

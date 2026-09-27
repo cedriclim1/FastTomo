@@ -72,6 +72,39 @@ def test_ssim_losses_do_not_sync_the_host():
     assert torch.isfinite(loss).item()
 
 
+def _ssim_map_fp64(x, y, *, win_size=11, sigma=1.5, data_range=None):
+    """Reference SSIM map (Wang et al. 2004), written out independently of
+    fasttomo: one dense 2-D Gaussian window (normalised to 1), torch
+    ``reflect`` padding (scipy's ``mirror``), population covariances,
+    ``C1 = (0.01 L)^2``, ``C2 = (0.03 L)^2`` with ``L = max(y) - min(y)``
+    unless given, and the textbook formula
+
+        SSIM = (2 mu_x mu_y + C1) (2 sigma_xy + C2)
+               / ((mu_x^2 + mu_y^2 + C1) (sigma_xx + sigma_yy + C2)).
+
+    ``x``, ``y``: ``[B, H, W]``; computed in float64 on the CPU."""
+    import torch.nn.functional as F
+
+    x, y = x.cpu().double(), y.cpu().double()
+    L = float(y.max() - y.min()) if data_range is None else data_range
+    C1, C2 = (0.01 * L) ** 2, (0.03 * L) ** 2
+    c = torch.arange(win_size, dtype=torch.float64) - (win_size - 1) / 2
+    g = torch.exp(-c ** 2 / (2 * sigma ** 2))
+    g = g / g.sum()
+    w = (g[:, None] * g[None, :])[None, None]
+    p = win_size // 2
+
+    def local_mean(v):
+        return F.conv2d(F.pad(v.unsqueeze(1), (p, p, p, p), mode="reflect"), w).squeeze(1)
+
+    mu_x, mu_y = local_mean(x), local_mean(y)
+    s_xx = local_mean(x * x) - mu_x ** 2
+    s_yy = local_mean(y * y) - mu_y ** 2
+    s_xy = local_mean(x * y) - mu_x * mu_y
+    return ((2 * mu_x * mu_y + C1) * (2 * s_xy + C2)
+            / ((mu_x ** 2 + mu_y ** 2 + C1) * (s_xx + s_yy + C2)))
+
+
 class TestTiltSSIM:
     def test_zero_for_identity(self):
         torch.manual_seed(0)
@@ -104,25 +137,75 @@ class TestTiltSSIM:
         assert x.grad.abs().sum().item() > 0.0
 
     def test_matches_skimage(self):
-        """Cross-check against skimage's structural_similarity.
-
-        Tolerance is loose (~1e-2) because skimage crops the SSIM map to the
-        valid region while we reflect-pad to full size — same SSIM math, just
-        different boundary handling.
-        """
-        skimage = pytest.importorskip("skimage.metrics")
+        """The fp64 reference below reproduces scikit-image's
+        ``structural_similarity`` on its valid region (value computed with
+        scikit-image 0.26 in fp64 on this input, hard-coded so the test does
+        not need scikit-image), and tilt_ssim_loss's full reflect-padded map
+        matches the same reference."""
         torch.manual_seed(42)
-        x_np = torch.rand(32, 32).numpy()
-        y_np = (torch.rand(32, 32) * 0.8 + 0.1).numpy()
-        sk = skimage.structural_similarity(
-            x_np, y_np, data_range=1.0, win_size=11,
-            gaussian_weights=True, sigma=1.5, use_sample_covariance=False,
-        )
-        loss = ft.tilt_ssim_loss(
-            torch.from_numpy(x_np)[None], torch.from_numpy(y_np)[None],
-            win_size=11, sigma=1.5, data_range=1.0,
-        ).item()
-        assert (1.0 - loss) == pytest.approx(sk, abs=1e-2)
+        x = torch.rand(32, 32)
+        y = torch.rand(32, 32) * 0.8 + 0.1
+        ssim_map = _ssim_map_fp64(x[None], y[None], data_range=1.0)
+        pad = 5
+        valid = ssim_map[:, pad:-pad, pad:-pad].mean().item()
+        assert valid == pytest.approx(0.019964165908094127, abs=1e-12)
+        loss = ft.tilt_ssim_loss(x[None], y[None], win_size=11, sigma=1.5,
+                                 data_range=1.0).item()
+        assert (1.0 - loss) == pytest.approx(ssim_map.mean().item(), abs=2e-7)
+
+    @pytest.mark.parametrize("device,tf32", [
+        ("cpu", False),
+        pytest.param("cuda", True, marks=needs_cuda),
+        pytest.param("cuda", False, marks=needs_cuda)])
+    @pytest.mark.parametrize("B,H", [(1, 128), (4, 128), (61, 64), (4, 256)])
+    def test_matches_fp64_reference_at_sinogram_scale(self, device, tf32, B, H):
+        """A6-1: loss and gradient against an fp64 evaluation of the
+        textbook formula, on sinogram-scale data (mean ~100, local std ~1-5)
+        where the old ``E[x^2] - mu^2`` form lost 1-6 % under cuDNN's
+        TF32 at small batches. cuDNN TF32 is set explicitly both ways."""
+        g = torch.Generator().manual_seed(B * 1000 + H)
+        base = 100.0 + 5.0 * torch.randn(B, H, H, generator=g)
+        target = base + torch.randn(B, H, H, generator=g)
+        pred = target * (1 + 0.02 * torch.randn(B, H, H, generator=g))
+
+        x64 = pred.double().requires_grad_(True)
+        ref = 1.0 - _ssim_map_fp64(x64, target.double()).mean()
+        ref.backward()
+
+        prev = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = tf32
+        try:
+            x = pred.to(device).requires_grad_(True)
+            loss = ft.tilt_ssim_loss(x, target.to(device))
+            loss.backward()
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev
+        assert abs(loss.item() - ref.item()) <= 1e-5 * abs(ref.item())
+        gerr = (x.grad.cpu().double() - x64.grad).norm() / x64.grad.norm()
+        assert gerr <= 1e-5
+
+    def test_cached_target_equals_public_function(self):
+        """run_ad_recon's cached target statistics give the public
+        function's value and gradient."""
+        from fasttomo.regularizers import _TiltSSIMTarget
+
+        g = torch.Generator().manual_seed(3)
+        y = 50 + torch.randn(5, 40, 36, generator=g)
+        x = (y + 0.3 * torch.randn(5, 40, 36, generator=g)).requires_grad_(True)
+        a = ft.tilt_ssim_loss(x, y)
+        (ga,) = torch.autograd.grad(a, x)
+        b = _TiltSSIMTarget(y)(x)
+        (gb,) = torch.autograd.grad(b, x)
+        assert torch.equal(a, b) and torch.equal(ga, gb)
+
+    def test_gradient_reaches_a_target_that_requires_grad(self):
+        g = torch.Generator().manual_seed(4)
+        y64 = (torch.rand(2, 24, 24, generator=g)).double().requires_grad_(True)
+        x = torch.rand(2, 24, 24, generator=g)
+        (1.0 - _ssim_map_fp64(x.double(), y64, data_range=1.0).mean()).backward()
+        y = y64.detach().float().requires_grad_(True)
+        ft.tilt_ssim_loss(x, y, data_range=1.0).backward()
+        torch.testing.assert_close(y.grad.double(), y64.grad, rtol=1e-4, atol=1e-7)
 
     def test_shape_mismatch_raises(self):
         x = torch.rand(4, 32, 32, dtype=torch.float32)
