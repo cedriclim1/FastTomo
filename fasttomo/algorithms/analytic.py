@@ -20,7 +20,7 @@ from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
 )
-from fasttomo.utilities import _ramp_filter_fp32
+from fasttomo.utilities import _ramp_filter_coeffs, _ramp_filter_fp32
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
     _WBP_MIN_THRESHOLD,
@@ -277,6 +277,47 @@ def _make_wbp(
     return wbp
 
 
+# ── FBP apodisation windows (solver audit H4) ─────────────────────────────
+#
+# The Ram-Lak ramp passes the highest frequencies at full gain, which is
+# what makes FBP noisy. A window W(f) multiplies the ramp's frequency
+# response on the zero-padded grid of `_ramp_filter_coeffs` (bin k of P,
+# f = k / P cycles per detector pixel, 0 <= f <= 1/2):
+#   "hann":    W = 0.5 + 0.5 cos(2 pi f)     (1 at DC, 0 at Nyquist)
+#   "hamming": W = 0.54 + 0.46 cos(2 pi f)   (1 at DC, 0.08 at Nyquist)
+# Built in fp64 (ramp times window) and cast once, cached per
+# (N_det, device, window) like the ramp itself. "none" is the bare ramp.
+_FBP_WINDOWS = ("none", "hann", "hamming")
+_WINDOWED_RAMP_CACHE: dict[tuple, tuple[int, torch.Tensor]] = {}
+
+
+def _windowed_ramp_coeffs(N_det: int, device: torch.device, window: str
+                          ) -> tuple[int, torch.Tensor]:
+    """``(P, H * W)``: the ramp's padded length and fp32 frequency response
+    times the window (see above)."""
+    key = (int(N_det), device, window)
+    hit = _WINDOWED_RAMP_CACHE.get(key)
+    if hit is None:
+        P, H = _ramp_filter_coeffs(N_det, torch.device("cpu"), torch.float64)
+        f = torch.arange(P // 2 + 1, dtype=torch.float64) / P
+        a = 0.5 if window == "hann" else 0.54
+        W = a + (1.0 - a) * torch.cos(2.0 * math.pi * f)
+        hit = (P, (H * W).to(device=device, dtype=torch.float32).contiguous())
+        _WINDOWED_RAMP_CACHE[key] = hit
+    return hit
+
+
+def _fbp_filter_fp32(sinogram: torch.Tensor, window: str) -> torch.Tensor:
+    """The ramp-filtered sinogram in fp32, apodised by ``window``."""
+    if window == "none":
+        return _ramp_filter_fp32(sinogram)
+    N_det = sinogram.shape[-1]
+    sino_f = sinogram.float() if sinogram.dtype != torch.float32 else sinogram
+    P, HW = _windowed_ramp_coeffs(N_det, sino_f.device, window)
+    f = torch.fft.rfft(sino_f, n=P, dim=-1) * HW
+    return torch.fft.irfft(f, n=P, dim=-1)[..., :N_det].contiguous()
+
+
 def run_fbp(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
@@ -287,6 +328,7 @@ def run_fbp(
     support_mask: torch.Tensor | None = None,
     projector: object | None = None,
     num_threads: int | None = None,
+    window: str = "none",
 ) -> torch.Tensor:
     """Filtered back-projection.
 
@@ -313,6 +355,12 @@ def run_fbp(
         Reuse its texture cache across calls (a tilt-series sweep on CUDA).
         Its angles and volume shape replace ``angles_deg`` and ``Nz`` for the
         back-projection. Numerics are identical to the call without it.
+    window : {"none", "hann", "hamming"}
+        Apodisation of the ramp filter (default ``"none"``: the bare Ram-Lak
+        ramp, as before). With f the frequency in cycles per detector pixel
+        (0 to 1/2), ``"hann"`` multiplies the ramp by ``0.5 + 0.5 cos(2 pi
+        f)`` and ``"hamming"`` by ``0.54 + 0.46 cos(2 pi f)``: less noise
+        and ringing, a little blur. The mean level (DC) is unchanged.
 
     Returns
     -------
@@ -329,6 +377,9 @@ def run_fbp(
             "run_fbp: mask=True and support_mask are mutually exclusive — "
             "pass one support per reconstruction."
         )
+    if window not in _FBP_WINDOWS:
+        raise ValueError(
+            f"run_fbp: window must be one of {_FBP_WINDOWS}, got {window!r}")
     # Validation only: the support is resolved below against the actual
     # output shape (a cached projector may reconstruct with Nz != N_det).
     setup = _prepare_recon(
@@ -340,7 +391,7 @@ def run_fbp(
     # angular sampling normalisation: π / n_angles (π times the mean over
     # the measured views; keeps the mean level right at limited tilt too)
     scale = math.pi / n_angles
-    filtered32 = _ramp_filter_fp32(sinogram)
+    filtered32 = _fbp_filter_fp32(sinogram, window)
     # one back-projection: the one-shot (scoped-texture) path on CUDA
     op = _make_operator(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),

@@ -390,3 +390,74 @@ def test_wbp_filter_cache_is_bit_identical(backend):
         an._cached_exact_wf(ang + i + 1.0, 8, 8, 8, sino.device, 1.0)
     assert len(an._WF_CACHE) == an._WF_CACHE_SIZE
     an._WF_CACHE.clear()
+
+
+# ── FBP apodisation window (solver audit H4) ─────────────────────────────────
+
+
+def _windowed_ramp_reference(sino: torch.Tensor, window: str) -> torch.Tensor:
+    """fp64 NumPy reference of the apodised ramp filter: the spatial
+    Ram-Lak kernel (h[0] = 1/4, h[odd n] = -1/(pi n)^2) zero-padded to the
+    next power of two P >= 2 N - 1, its spectrum times the window at
+    f = k / P, applied to each zero-padded row and cropped."""
+    import math
+
+    import numpy as np
+
+    N = sino.shape[-1]
+    P = 1 << max(1, (2 * N - 1).bit_length())
+    n = np.arange(P)
+    n = np.where(n < P // 2, n, n - P)
+    h = np.where(np.abs(n) % 2 == 1, -1.0 / (math.pi * np.where(n == 0, 1, n)) ** 2, 0.0)
+    h[0] = 0.25
+    f = np.arange(P // 2 + 1) / P
+    W = {"hann": 0.5 + 0.5 * np.cos(2 * math.pi * f),
+         "hamming": 0.54 + 0.46 * np.cos(2 * math.pi * f),
+         "none": np.ones_like(f)}[window]
+    H = np.fft.rfft(h).real * W
+    x = sino.double().cpu().numpy()
+    out = np.fft.irfft(np.fft.rfft(x, n=P, axis=-1) * H, n=P, axis=-1)[..., :N]
+    return torch.from_numpy(out)
+
+
+@pytest.mark.parametrize("window", ["none", "hann", "hamming"])
+def test_fbp_window_filter_matches_fp64_reference(backend, window):
+    """The apodised ramp filter run_fbp applies equals an independent fp64
+    reference to fp32 rounding, for odd and even detector widths."""
+    from fasttomo.algorithms.analytic import _fbp_filter_fp32
+
+    g = torch.Generator().manual_seed(5)
+    for N_det in (7, 16, 33, 128):
+        sino = torch.rand(3, 2, N_det, generator=g).to(backend)
+        got = _fbp_filter_fp32(sino, window).double().cpu()
+        ref = _windowed_ramp_reference(sino, window)
+        assert (got - ref).abs().max() <= 1e-6 * ref.abs().max(), (N_det, window)
+
+
+def test_fbp_window_keyword(backend):
+    """window="none" is the former run_fbp bit for bit; Hann and Hamming keep
+    the mean level of a unit cylinder, cut the noise of a noisy sinogram,
+    and run_fbp(window=w) is the back-projection of the apodised filter."""
+    import math
+
+    N, radius = 96, 30
+    z = torch.arange(N) - (N - 1) / 2
+    r2 = z[:, None] ** 2 + z[None, :] ** 2
+    vol = (r2 <= radius ** 2).float().expand(2, N, N).contiguous().to(backend)
+    ang = (torch.arange(180) * 1.0 - 90).to(backend)
+    sino = ft.forward_project(vol, ang)
+    g = torch.Generator().manual_seed(0)
+    noisy = sino + 0.5 * torch.randn(sino.shape, generator=g).to(backend)
+    inner = r2 <= (radius / 2) ** 2
+    assert torch.equal(ft.run_fbp(sino, ang), ft.run_fbp(sino, ang, window="none"))
+    std_none = ft.run_fbp(noisy, ang)[:, inner].std()
+    for w in ("hann", "hamming"):
+        rec = ft.run_fbp(sino, ang, window=w)
+        assert abs(rec[:, inner].mean().item() - 1.0) < 5e-3, w
+        assert ft.run_fbp(noisy, ang, window=w)[:, inner].std() < 0.8 * std_none, w
+    from fasttomo.algorithms.analytic import _fbp_filter_fp32
+    want = ft.back_project(_fbp_filter_fp32(sino, "hann"), ang) * (math.pi / 180)
+    torch.testing.assert_close(ft.run_fbp(sino, ang, window="hann"), want,
+                               rtol=1e-5, atol=1e-5)
+    with pytest.raises(ValueError, match="window"):
+        ft.run_fbp(sino, ang, window="shepp")
