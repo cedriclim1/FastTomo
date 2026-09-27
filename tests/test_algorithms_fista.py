@@ -337,3 +337,124 @@ def test_fista_fp16_large_lipschitz_runs():
     assert x16.dtype == torch.float16 and torch.isfinite(x16).all()
     err = (x16.float() - x32).norm() / x32.norm()
     assert err < 1e-2, err
+
+
+# ── fused FISTA update (solver audit P4) ─────────────────────────────────────
+
+
+def _edge(t: torch.Tensor) -> torch.Tensor:
+    """``t`` with NaN, +-inf, +-0, subnormals and fp16 extremes up front."""
+    vals = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0, 1e-40, -1e-40,
+            6e-8, -6e-8, 65504.0, -65504.0, 1e-8, -1e-8]
+    t.view(-1)[:len(vals)] = torch.tensor(vals, device=t.device).to(t.dtype)
+    return t
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.int16 if t.dtype == torch.float16 else torch.int32)
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("shape", [(3, 5, 7), (2, 33, 65), (4, 16, 24)])
+def test_fista_update_kernel_bit_identical(dtype, shape):
+    """The three modes of fista_update_cuda give the bits of the PyTorch
+    chains of _fista_loop, for every constraint combination, broadcast and
+    full support masks, several step sizes and momenta, and NaN / inf /
+    signed zero / subnormal inputs."""
+    from fasttomo.algorithms.fista import _fista_update
+    from fasttomo.configs import ConstraintConfig
+
+    g = torch.Generator().manual_seed(0)
+
+    def rand(*sz, scale=1.0, positive=False):
+        x = torch.rand(*sz, generator=g) if positive else torch.randn(*sz, generator=g)
+        return (x * scale).to("cuda", dtype)
+
+    Ny, Nz, Nx = shape
+    y = _edge(rand(*shape, scale=3.0))
+    grad = _edge(rand(*shape, scale=300.0))
+    xp = rand(*shape, scale=2.0)
+    xn = _edge(rand(*shape, scale=2.0))
+    for inv_L in (1.0 / 3.0, 0.0123, 1.7e-5):
+        u = torch.empty_like(y)
+        assert _fista_update(1, y, grad, None, u, None, inv_L, 0.0, None, None)
+        assert torch.equal(_bits(u), _bits(y - inv_L * grad))
+        for beta in (0.0, 0.3747, 0.97):
+            yo = torch.empty_like(y)
+            assert _fista_update(2, xn, None, xp, None, yo, inv_L, beta, None, None)
+            assert torch.equal(_bits(yo), _bits(xn + beta * (xn - xp)))
+            for mask_shape in (None, (1, Nz, Nx), (Ny, Nz, Nx)):
+                mask = None if mask_shape is None else rand(*mask_shape, positive=True)
+                for positivity in (False, True):
+                    cons = ConstraintConfig(positivity=positivity, support_mask=mask)
+                    x_want = cons.apply(y - inv_L * grad)
+                    y_want = x_want + beta * (x_want - xp)
+                    x_got, y_got = xp.clone(), y.clone()          # in place, as the loop
+                    assert _fista_update(0, y_got, grad, x_got, x_got, y_got, inv_L, beta,
+                                         cons, None)
+                    assert torch.equal(_bits(x_got), _bits(x_want)), (mask_shape, positivity)
+                    assert torch.equal(_bits(y_got), _bits(y_want)), (mask_shape, positivity)
+
+
+@needs_cuda
+def test_fista_update_declines_unfusable_inputs():
+    """CPU tensors, mixed dtypes, a soft threshold and odd mask shapes fall
+    back to the PyTorch chain (the helper returns False)."""
+    from fasttomo.algorithms.fista import _fista_update
+    from fasttomo.configs import ConstraintConfig
+
+    v = torch.ones(2, 4, 4, device="cuda")
+    assert not _fista_update(1, v.cpu(), v.cpu(), None, v.cpu(), None, 0.1, 0.0, None, None)
+    assert not _fista_update(1, v, v.half(), None, v.clone(), None, 0.1, 0.0, None, None)
+    cons = ConstraintConfig(soft_threshold=0.1)
+    assert not _fista_update(0, v, v, v.clone(), v.clone(), v.clone(), 0.1, 0.5, cons, None)
+    odd = ConstraintConfig(support_mask=torch.ones(4, 4, device="cuda"))
+    assert not _fista_update(0, v, v, v.clone(), v.clone(), v.clone(), 0.1, 0.5, odd, None)
+
+
+def _fista_cases(dtype, Ny):
+    N, n = 24, 10
+    ang = make_angles(n, device="cuda")
+    g = torch.Generator().manual_seed(1)
+    vol = torch.rand(Ny, N, N, generator=g).cuda()
+    sino = ft.forward_project(vol, ang).to(dtype)
+    eul = torch.stack([torch.zeros(n), ang.cpu(), torch.zeros(n)], 1).cuda()
+    sino3d = ft.forward_project_3d(vol, eul).to(dtype)
+    sm = torch.zeros(1, N, N, device="cuda", dtype=dtype)
+    sm[:, 3:-3, 2:-5] = 1
+    return [
+        (ft.run_fista, dict(sinogram=sino, angles_deg=ang, n_iter=5, L=300.0)),
+        (ft.run_fista, dict(sinogram=sino, angles_deg=ang, n_iter=5, L=300.0,
+                            positivity=True, support_mask=sm, return_loss=True)),
+        (ft.run_fista, dict(sinogram=sino, angles_deg=ang, n_iter=4, L=300.0, mask=True,
+                            projector=ft.ParallelProjector((Ny, N, N), ang, device="cuda"))),
+        (ft.run_fista, dict(sinogram=sino3d, angles_deg=ang, n_iter=4, L=300.0,
+                            euler_zyz_deg=eul, positivity=True)),
+        (ft.run_fista_tv, dict(sinogram=sino, angles_deg=ang, n_iter=4, L=300.0,
+                               tv_weight=0.05, positivity=True)),
+    ]
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype, Ny", [(torch.float32, 3), (torch.float16, 3),
+                                       (torch.float16, 4)])
+def test_fista_fused_path_bit_identical(monkeypatch, dtype, Ny):
+    """run_fista / run_fista_tv with the fused kernels and direct volume-
+    texture writes give exactly the PyTorch chain's bits (fp16 with
+    Ny % 4 == 0: packed textures; rotmat: 3-D texture), and the forward
+    projection of the new iterate skips its upload."""
+    from fasttomo.algorithms import fista
+
+    fused = []
+    for fn, kw in _fista_cases(dtype, Ny):
+        r = fn(**kw)
+        fused.append(r)
+    proj = _fista_cases(dtype, Ny)[2][1]["projector"]
+    ft.run_fista(**dict(_fista_cases(dtype, Ny)[2][1], projector=proj))
+    assert proj._op.upload_counts["vol_skipped"] >= 3
+    monkeypatch.setattr(fista, "_fista_update", lambda *a, **k: False)
+    for (fn, kw), a in zip(_fista_cases(dtype, Ny), fused):
+        b = fn(**kw)
+        for x, y in zip(a if isinstance(a, tuple) else (a,), b if isinstance(b, tuple) else (b,)):
+            assert torch.equal(x, y), (fn.__name__, kw.keys())

@@ -286,6 +286,32 @@ void sirt_residual_tex_cuda(
     cudaStream_t stream
 );
 
+/*
+ * Fused elementwise steps of one FISTA iteration (fista_update.cu), bit for
+ * bit the PyTorch op chains they replace. io_dtype 0 = fp32, 1 = fp16;
+ * every tensor contiguous [Ny, Nz, Nx]; step = 1/L and beta as floats.
+ *   mode 0 (FISTA):    x_out = constraints(a_in - step * grad),
+ *                      y_out = x + beta * (x - xp_in)
+ *   mode 1 (step):     x_out = a_in - step * grad
+ *   mode 2 (momentum): y_out = a_in + beta * (a_in - xp_in)
+ * a_in is y (modes 0, 1) or the prox output x (mode 2). constraints: the
+ * support mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter, or null)
+ * then clamp(min=0) if positivity. y_out may alias a_in, x_out may alias
+ * xp_in. A non-null vol_tc (volume TextureCache with a surface) also
+ * receives y_out in modes 0 and 2 when its layout allows (1 channel, or
+ * fp16 4-channel packed layered); returns 1 if it did, else 0.
+ */
+int fista_update_cuda(
+    int io_dtype, int mode,
+    const void *a_in, const void *grad, const void *xp_in,
+    const void *mask, int mask_full,
+    void *x_out, void *y_out,
+    float step, float beta, int positivity,
+    int Ny, int Nz, int Nx,
+    TextureCache *vol_tc,
+    cudaStream_t stream
+);
+
 long long tv_loss_iso_3d_workspace(int Ny, int Nz, int Nx);
 
 void tv_loss_iso_3d_cuda(

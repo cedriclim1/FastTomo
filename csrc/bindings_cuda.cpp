@@ -394,6 +394,28 @@ static void py_sirt_residual_tex_cuda(
         n_angles, Ny, N_det, to_stream(stream_ptr));
 }
 
+static int py_fista_update_cuda(
+    int io_dtype, int mode,
+    long a_ptr, long grad_ptr, long xp_ptr,
+    long mask_ptr, int mask_full,
+    long x_out_ptr, long y_out_ptr,
+    float step, float beta, int positivity,
+    int Ny, int Nz, int Nx,
+    long stream_ptr, long vol_cache_ptr
+) {
+    return fista_update_cuda(
+        io_dtype, mode,
+        reinterpret_cast<const void *>(a_ptr),
+        reinterpret_cast<const void *>(grad_ptr),
+        reinterpret_cast<const void *>(xp_ptr),
+        reinterpret_cast<const void *>(mask_ptr), mask_full,
+        reinterpret_cast<void *>(x_out_ptr),
+        reinterpret_cast<void *>(y_out_ptr),
+        step, beta, positivity, Ny, Nz, Nx,
+        reinterpret_cast<TextureCache *>(vol_cache_ptr),
+        to_stream(stream_ptr));
+}
+
 static void py_tc_upload(long handle, long src_ptr, long stream_ptr) {
     tc_upload(reinterpret_cast<TextureCache *>(handle),
               reinterpret_cast<const void *>(src_ptr), to_stream(stream_ptr));
@@ -751,6 +773,22 @@ void register_cuda(py::module_ &m) {
           py::arg("raw_out_ptr"), py::arg("cache_ptr"),
           py::arg("n_angles"), py::arg("Ny"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
+
+    m.def("fista_update_cuda", &py_fista_update_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused FISTA steps (io_dtype 0 = fp32, 1 = fp16). mode 0: x_out = "
+          "constraints(a - step * grad), y_out = x + beta * (x - xp); mode 1: "
+          "x_out = a - step * grad; mode 2: y_out = a + beta * (a - xp). "
+          "mask_ptr 0 = no support mask (mask_full = 1 for [Ny, Nz, Nx]). "
+          "vol_cache_ptr (0 = none): a volume texture cache with a surface "
+          "that also receives y_out (modes 0, 2); returns 1 if it did.",
+          py::arg("io_dtype"), py::arg("mode"),
+          py::arg("a_ptr"), py::arg("grad_ptr"), py::arg("xp_ptr"),
+          py::arg("mask_ptr"), py::arg("mask_full"),
+          py::arg("x_out_ptr"), py::arg("y_out_ptr"),
+          py::arg("step"), py::arg("beta"), py::arg("positivity"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L);
 
     m.def("tc_upload", &py_tc_upload,
           py::call_guard<py::gil_scoped_release>(),

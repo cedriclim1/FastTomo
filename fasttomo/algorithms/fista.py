@@ -11,7 +11,8 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
-from fasttomo._backend import _fp16_overflow_checked
+import fasttomo._core as _core
+from fasttomo._backend import _fp16_overflow_checked, _stream_ptr
 from fasttomo.algorithms._common import (
     _LIPSCHITZ_SAFETY,
     _NORM_EPS,
@@ -73,6 +74,15 @@ def _normalise(t: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
     t32 = t if t.dtype == torch.float32 else t.float()
     out = t32 * torch.reciprocal(den) if t.is_cuda else t32 / den
     return out if t.dtype == torch.float32 else out.to(t.dtype)
+
+
+def _fista_texture_operator(op, sinogram: torch.Tensor):
+    """The cached CUDA operator whose volume texture the fused FISTA update
+    may write (`algebraic._texture_operator`), or None."""
+    if not sinogram.is_cuda:
+        return None
+    from fasttomo.algorithms.algebraic import _texture_operator
+    return _texture_operator(op)
 
 
 def _tv_grad(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -206,6 +216,9 @@ def _fista_loop(
     L: float,
     prox_fn,
     rec: _LossRecorder,
+    *,
+    constraints=None,
+    tex_op=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Shared Beck-Teboulle FISTA outer loop.
 
@@ -217,23 +230,101 @@ def _fista_loop(
     point, which is free) at each iteration — a tight surrogate for the loss
     at ``x_k`` — and it is the data-fit term only (components
     ``{"fidelity": loss}``), regardless of prox regularisation.
+
+    On CUDA the elementwise steps run as the fused kernels of
+    ``fista_update.cu`` (solver audit P4), bit for bit the PyTorch chain:
+    with ``constraints`` (the caller's ``prox_fn`` is exactly
+    ``constraints.apply``) the step, the constraints and the momentum are one
+    kernel updating ``x_prev`` and ``y`` in place; otherwise the step and
+    the momentum around ``prox_fn`` are one kernel each. The new ``y`` also
+    goes into ``tex_op``'s volume texture when possible, so the next forward
+    projection skips its upload.
     """
     inv_L = 1.0 / L
     t = 1.0
     x_prev = volume.clone()
     y = volume.clone()
-    for it in rec.iterate(n_iter):
-        fp_y = _fp(y)
-        if rec.wants_loss:
-            rec.record(it, (sinogram - fp_y).pow(2).mean())
-        grad = _bp(fp_y - sinogram)
-        x_new = prox_fn(y - inv_L * grad)
-        t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
-        beta = (t - 1.0) / t_new
-        y = x_new + beta * (x_new - x_prev)
-        x_prev = x_new
-        t = t_new
+    try:
+        for it in rec.iterate(n_iter):
+            fp_y = _fp(y)
+            if rec.wants_loss:
+                rec.record(it, (sinogram - fp_y).pow(2).mean())
+            grad = _bp(fp_y - sinogram)
+            t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+            beta = (t - 1.0) / t_new
+            if constraints is not None and _fista_update(
+                    0, y, grad, x_prev, x_prev, y, inv_L, beta, constraints, tex_op):
+                pass                                    # x_prev <- x_new, y <- y_new
+            else:
+                u = _fista_step(y, grad, inv_L)
+                x_new = prox_fn(u)
+                if not _fista_update(2, x_new, None, x_prev, None, y, inv_L, beta,
+                                     None, tex_op):
+                    y = x_new + beta * (x_new - x_prev)
+                x_prev = x_new
+            t = t_new
+    finally:
+        if tex_op is not None:
+            tex_op._forget_texture_writes()
     return rec.finish(x_prev)
+
+
+def _fista_step(y: torch.Tensor, grad: torch.Tensor, inv_L: float) -> torch.Tensor:
+    """``y - inv_L * grad`` (fused on CUDA, same bits)."""
+    u = torch.empty_like(y, memory_format=torch.contiguous_format)
+    if _fista_update(1, y, grad, None, u, None, inv_L, 0.0, None, None):
+        return u
+    return y - inv_L * grad
+
+
+def _fista_update(mode: int, a, grad, xp, x_out, y_out, inv_L: float, beta: float,
+                  constraints, tex_op) -> bool:
+    """Run ``fista_update_cuda`` (modes of ``csrc/cuda/fista_update.cu``) and
+    return True, or return False when the tensors are not fusable (CPU, a
+    duck-typed projector's dtype, non-contiguous, a soft threshold, an
+    unexpected mask shape) so the caller runs the PyTorch chain. ``y_out``
+    (modes 0, 2) is also written into ``tex_op``'s volume texture when
+    possible."""
+    ts = [t for t in (a, grad, xp, x_out, y_out) if t is not None]
+    t0 = ts[0]
+    if not (t0.is_cuda and t0.dtype in (torch.float32, torch.float16) and t0.ndim == 3
+            and hasattr(_core, "fista_update_cuda")
+            and all(t.device == t0.device and t.dtype == t0.dtype and t.shape == t0.shape
+                    and t.is_contiguous() for t in ts)):
+        return False
+    Ny, Nz, Nx = t0.shape
+    mask = None
+    positivity = False
+    if constraints is not None:
+        if constraints.soft_threshold > 0.0:
+            return False
+        positivity = bool(constraints.positivity)
+        mask = constraints._support_for(t0)
+        if mask is not None:
+            if not (mask.is_cuda and mask.device == t0.device and mask.dtype == t0.dtype
+                    and mask.ndim == 3 and tuple(mask.shape[1:]) == (Nz, Nx)
+                    and mask.shape[0] in (1, Ny)):
+                return False
+            mask = mask.contiguous()
+    handle = None
+    if tex_op is not None and y_out is not None:
+        from fasttomo.algorithms.algebraic import _tex_target
+        handle = _tex_target(tex_op, y_out, "vol")
+
+    def ptr(t):
+        return 0 if t is None else t.data_ptr()
+
+    with torch.cuda.device(t0.device):
+        wrote = _core.fista_update_cuda(
+            0 if t0.dtype == torch.float32 else 1, mode,
+            ptr(a), ptr(grad), ptr(xp), ptr(mask),
+            int(mask is not None and mask.shape[0] == Ny and Ny > 1),
+            ptr(x_out), ptr(y_out), float(inv_L), float(beta), int(positivity),
+            Ny, Nz, Nx, _stream_ptr(t0.device),
+            vol_cache_ptr=0 if handle is None else handle)
+    if wrote:
+        tex_op._mark_vol_written(y_out)
+    return True
 
 
 @_fp16_overflow_checked
@@ -313,6 +404,7 @@ def run_fista(
     rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista")
     return _fista_loop(
         volume, sinogram, _fp, _bp, n_iter, L_eff, setup.constraints.apply, rec,
+        constraints=setup.constraints, tex_op=_fista_texture_operator(_op, sinogram),
     )
 
 
@@ -402,4 +494,5 @@ def run_fista_tv(
         return _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
     rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
-    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec)
+    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec,
+                       tex_op=_fista_texture_operator(_op, sinogram))
