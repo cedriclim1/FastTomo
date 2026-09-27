@@ -356,3 +356,37 @@ def test_fbp_support_mask_fp16_volume_fp32_mask_cuda():
     rec = ft.run_fbp(sino, angles, Nz=N, support_mask=M)
     assert rec.dtype == torch.float16
     assert rec[M.expand_as(rec) == 0].abs().max().item() == 0.0
+
+
+# ── W-BP weighting-filter cache (solver audit P3) ────────────────────────────
+
+
+def test_wbp_filter_cache_is_bit_identical(backend):
+    """The exact weighting filter is built once per geometry and reused:
+    a repeated run_wbp returns the same bits, the cached filter is the one a
+    fresh build gives, and angles / sizes / threshold are part of the key."""
+    from fasttomo.algorithms import analytic as an
+
+    an._WF_CACHE.clear()
+    N = 24
+    ang = make_angles(19, device=backend)
+    vol = phantom_2d(N, device=backend).unsqueeze(0).repeat(2, 1, 1)
+    sino = ft.forward_project(vol, ang)
+    a = ft.run_wbp(sino, ang)
+    assert len(an._WF_CACHE) == 1
+    b = ft.run_wbp(sino, ang)
+    assert len(an._WF_CACHE) == 1 and torch.equal(a, b)
+    wf = an._cached_exact_wf(ang, N, N, N, sino.device, 1.0)
+    fresh = an._compute_exact_wf(ang, N, N, N, sino.device, 1.0)
+    assert torch.equal(wf, fresh)
+    # angles on the other side of the host/device boundary hit the same entry
+    an._cached_exact_wf(ang.cpu(), N, N, N, sino.device, 1.0)
+    assert len(an._WF_CACHE) == 1
+    ft.run_wbp(sino, ang, threshold_scale=2.0)
+    ft.run_wbp(sino, ang + 0.5)
+    ft.run_wbp(sino, ang, Nz=20)
+    assert len(an._WF_CACHE) == 4
+    for i in range(an._WF_CACHE_SIZE + 2):          # bounded LRU
+        an._cached_exact_wf(ang + i + 1.0, 8, 8, 8, sino.device, 1.0)
+    assert len(an._WF_CACHE) == an._WF_CACHE_SIZE
+    an._WF_CACHE.clear()

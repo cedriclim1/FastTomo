@@ -6,6 +6,8 @@ Direct (non-iterative) reconstructions: FBP and weighted back-projection
 from __future__ import annotations
 
 import math
+import threading
+from collections import OrderedDict
 from typing import Callable
 
 import torch
@@ -198,6 +200,44 @@ def _compute_exact_wf(
     return torch.where(TF_amp > thresh, 1.0 / TF_amp, torch.zeros_like(TF_amp))
 
 
+# The weighting filters of recent geometries (solver audit P3): building one
+# is ~20 small device ops per view plus a host sync (5 ms, host-bound, at any
+# volume size), 4-11x the cost of applying it, and a W-BP sweep or repeated
+# wSIRT calls use the same geometry. The filter depends only on the key
+# below (the angles enter `_bp_gather` as fp32 values), so a hit returns the
+# identical tensor. At most _WF_CACHE_SIZE entries of [Pz, Px // 2 + 1] fp32.
+_WF_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_WF_CACHE_SIZE = 8
+_WF_CACHE_LOCK = threading.Lock()
+
+
+def _cached_exact_wf(
+    angles_deg: torch.Tensor,
+    Nz: int, Nx: int, N_det: int,
+    device: torch.device,
+    threshold_scale: float,
+) -> torch.Tensor:
+    """`_compute_exact_wf`, memoised per (fp32 angle values, sizes,
+    threshold, device). The key reads the angles on the host (one transfer
+    if they live on a GPU)."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    ang = tuple(angles_deg.detach().reshape(-1).to(device="cpu", dtype=torch.float32).tolist())
+    key = (ang, int(Nz), int(Nx), int(N_det), float(threshold_scale), dev)
+    with _WF_CACHE_LOCK:
+        wf = _WF_CACHE.get(key)
+        if wf is not None:
+            _WF_CACHE.move_to_end(key)
+            return wf
+    wf = _compute_exact_wf(angles_deg, Nz, Nx, N_det, dev, threshold_scale)
+    with _WF_CACHE_LOCK:
+        _WF_CACHE[key] = wf
+        while len(_WF_CACHE) > _WF_CACHE_SIZE:
+            _WF_CACHE.popitem(last=False)
+    return wf
+
+
 def _make_wbp(
     angles_deg: torch.Tensor,
     Nz: int, Nx: int, N_det: int,
@@ -207,9 +247,9 @@ def _make_wbp(
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return ``wbp(sinogram) -> [Ny, Nz, Nx]``: the exact weighted
     back-projection shared by `run_weighted_backprojection` and `run_wsirt`
-    (the filter is built once per geometry). ``num_threads`` drives the CPU
-    back-projection."""
-    WF = _compute_exact_wf(angles_deg, Nz, Nx, N_det, device, threshold_scale)
+    (the filter is built once per geometry and kept for later calls,
+    `_cached_exact_wf`). ``num_threads`` drives the CPU back-projection."""
+    WF = _cached_exact_wf(angles_deg, Nz, Nx, N_det, device, threshold_scale)
     oz, ox = _wbp_margin(Nz), _wbp_margin(Nx)
     Pz, Px = Nz + 2 * oz, Nx + 2 * ox       # symmetric margin: the crop is centred for odd N too
     angles_deg = angles_deg.to(device)
