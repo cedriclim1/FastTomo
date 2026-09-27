@@ -592,10 +592,12 @@ def _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev, vol_shape, N_d
     ny = tex_op._channels() if tex_op is not None else 1
     op_n = _make_operator(Geometry("parallel", (ny, Nz, Nx), N_det, n_angles, ang_dev),
                           device, dtype, num_threads=num_threads)
+    # every view's ray normaliser in one projection (each view's rays are
+    # computed on their own, so this is what the per-subset calls gave)
     ones_vol = torch.ones(ny, Nz, Nx, dtype=dtype, device=device)
-    R_all = torch.empty(n_angles, Ny, N_det, dtype=dtype, device=device)
+    R_all = _reciprocal_or_zero(op_n.project(ones_vol, ang_dev))[:, :1].expand(
+        n_angles, Ny, N_det).contiguous()
     for (s, e), geom in zip(bounds, geoms):
-        R_all[s:e] = _reciprocal_or_zero(op_n.project(ones_vol, geom))[:, :1]
         R_sub.append(R_all[s:e])
         ones_sino = torch.ones(e - s, ny, N_det, dtype=dtype, device=device)
         C_sub.append(_reciprocal_or_zero(op_n.backproject(ones_sino, geom))[:1].contiguous())
