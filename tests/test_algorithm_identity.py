@@ -276,16 +276,23 @@ def _compare(dev: str) -> None:
     want = {k for k in golden if k.startswith(dev + "/")}
     assert set(now) == want
     exact = _cuda_exact_env() if dev == "cuda" else _cpu_exact_env()
+    bad = []
     for k in sorted(want):
         a, b = now[k], golden[k]
         assert a.shape == b.shape and a.dtype == b.dtype, k
         base = k.split("#")[0]
+        diff = (a.double() - b.double()).abs().max().item() if a.numel() else 0.0
+        scale = b.double().abs().max().item() if b.numel() else 0.0
         if base in ATOMIC_KEYS:
-            torch.testing.assert_close(a, b, rtol=2e-6, atol=2e-6, msg=k)
+            ok = torch.allclose(a, b, rtol=2e-6, atol=2e-6)
         elif exact:
-            assert torch.equal(a, b), k
+            ok = torch.equal(a, b)
         else:
-            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5, msg=k)
+            ok = torch.allclose(a, b, rtol=1e-5, atol=1e-5)
+        if not ok:
+            bad.append(f"{k}: max|diff| {diff:.3e} (max|golden| {scale:.3e})")
+    assert not bad, (f"{len(bad)} of {len(want)} outputs differ from the golden "
+                     f"(exact={exact}, torch {torch.__version__}):\n" + "\n".join(bad))
 
 
 def test_cpu_outputs_identical_to_main():
