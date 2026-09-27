@@ -161,9 +161,9 @@ void mbir_forward_project_cpu(
 );
 
 /*
- * One outer iteration of MBIR-AM-PE (CPU reference).
+ * ICD sweep of one outer iteration of MBIR-AM-PE (CPU reference).
  *
- *   volume, e_sino, d_offsets, sigma_out : in-place outputs
+ *   volume, e_sino                       : in-place outputs
  *   volume_snapshot                      : read-only snapshot for qGGMRF
  *   perm[Ny, Nz*Nx]                      : per-Y-slice voxel permutation
  *   lambdas[n_angles, Ny, N_det]         : per-pixel Λ data weights; NULL → 1
@@ -173,13 +173,11 @@ void mbir_forward_project_cpu(
  * and the prior is Jacobi. Within a slice the data term is sequential
  * Gauss-Seidel ICD via the incremental error sinogram.
  *
- * Set estimate_offset=0 / estimate_variance=0 (and pass NULL for
- * d_offsets / sigma_out) to disable those updates. */
+ * The per-tilt offset and noise-variance updates are done by the caller in
+ * Python (`_mbir_update_offset_variance`), as on the CUDA path. */
 int mbir_icd_sweep_cpu(
     float       *volume,
     float       *e_sino,
-    float       *d_offsets,
-    float       *sigma_out,
     const float *volume_snapshot,
     const int   *perm,
     const float *cos_a,
@@ -187,8 +185,7 @@ int mbir_icd_sweep_cpu(
     const float *lambdas,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
-    float huber_T, float huber_delta, float sigma, float sigma_min,
-    int estimate_offset, int estimate_variance,
+    float huber_T, float huber_delta, float sigma,
     int num_threads
 );
 

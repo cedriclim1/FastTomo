@@ -191,8 +191,10 @@ def _assert_no_leak(fail_once, array_bytes, n_calls=200, attempts=3):
     """Call ``fail_once`` (which must raise) ``n_calls`` times and check the
     driver-level free memory does not drop by a leak-sized amount.
 
-    A leak of the one-shot cudaArray would cost ``n_calls * array_bytes``; the
-    bound is a quarter of that (at least 32 MiB). The GPU may be shared, so
+    The bound is a quarter of ``n_calls * array_bytes`` (at least 32 MiB).
+    On the pre-fix code the measured leak was half of ``n_calls *
+    array_bytes`` per attempt, so the bound catches it with a 2x margin
+    (not 4x). The GPU may be shared, so
     another process allocating during the loop could fake a drop: the loop
     is retried up to ``attempts`` times and passes if any attempt stays under
     the bound (a real leak shows up on every attempt)."""
@@ -366,12 +368,12 @@ def test_run_sirt_internal_projector_result_is_complete():
     assert torch.equal(a, b)
 
 
-@needs_cuda
-def test_projector_collected_during_graph_capture_is_freed_after_capture():
-    """A projector garbage-collected while a CUDA graph is being captured
-    cannot free its textures then (the device sync / cudaFreeArray would break
-    the capture). The release is deferred, and _drain_deferred_handles (called
-    by run_sirt right after its capture) frees them."""
+def _capture_release_attempt() -> tuple[list[int], int]:
+    """One run of the deferred-release scenario. Returns the three memory
+    readings (held before capture, still held after capture, freed by the
+    drain) and the texture bytes they should each exceed 75 % of. The
+    structural checks (two deferred handles, empty after drain, graph
+    replays) are asserted directly: they do not depend on other GPU users."""
     import gc
 
     from fasttomo import projector as projector_mod
@@ -386,8 +388,6 @@ def test_projector_collected_during_graph_capture_is_freed_after_capture():
     arrays = (N * N * N + 256 * N * N) * 4  # vol + sino cudaArrays: 24 MiB
     del sino
     held = free0 - _driver_free_bytes()
-    # Relative bounds: the card may be shared, so allow 25 % noise.
-    assert held > 0.75 * arrays
 
     x = torch.zeros(16, device="cuda")
     g = torch.cuda.CUDAGraph()
@@ -397,13 +397,35 @@ def test_projector_collected_during_graph_capture_is_freed_after_capture():
         gc.collect()
         assert len(projector_mod._deferred_handles) == 2
     still_held = free0 - _driver_free_bytes()
-    assert still_held > 0.75 * arrays               # not freed during capture
     projector_mod._drain_deferred_handles()
     assert not projector_mod._deferred_handles
-    assert still_held - (free0 - _driver_free_bytes()) > 0.75 * arrays   # freed now
+    freed = still_held - (free0 - _driver_free_bytes())
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(x, torch.ones_like(x))
+    return [held, still_held, freed], arrays
+
+
+@needs_cuda
+def test_projector_collected_during_graph_capture_is_freed_after_capture():
+    """A projector garbage-collected while a CUDA graph is being captured
+    cannot free its textures then (the device sync / cudaFreeArray would break
+    the capture). The release is deferred, and _drain_deferred_handles (called
+    by run_sirt right after its capture) frees them.
+
+    Memory is read at driver level and the card may be shared, so each
+    reading must exceed 75 % of the 24 MiB of textures (held before the
+    capture, still held after it, freed by the drain), and like the leak
+    tests the scenario is retried: it passes if any attempt meets all three
+    bounds; a real regression misses them on every attempt."""
+    seen = []
+    for _ in range(3):
+        readings, arrays = _capture_release_attempt()
+        seen.append([r // _MiB for r in readings])
+        if all(r > 0.75 * arrays for r in readings):
+            return
+    pytest.fail(f"deferred release bounds missed on every attempt: {seen} MiB "
+                f"(held, still held, freed; each must exceed {0.75 * arrays / _MiB:.0f} MiB)")
 
 
 # ── P3: strided inputs give the same result as contiguous ones ─────────────
@@ -613,15 +635,16 @@ def _sweep_args(Ny=2, Nz=4, Nx=4, n_angles=3):
     cos_a, sin_a = _trig_on_device(torch.linspace(-30, 30, n_angles), torch.device("cpu"))
     return dict(
         volume=torch.zeros(Ny, Nz, Nx), e_sino=torch.ones(n_angles, Ny, Nx),
-        d_offsets=torch.zeros(n_angles), lambdas=None,
+        lambdas=None,
         vol_snap=torch.zeros(Ny, Nz, Nx),
         perm=torch.arange(Nz * Nx, dtype=torch.int32).repeat(Ny, 1),
         cos_a=cos_a, sin_a=sin_a)
 
 
-@pytest.mark.parametrize("bad", ["e_sino_Ny", "angles", "d_offsets", "perm", "snapshot"])
+@pytest.mark.parametrize("bad", ["e_sino_Ny", "angles", "lambdas", "perm", "snapshot"])
 def test_mbir_cpu_sweep_rejects_mismatched_sizes(bad):
-    """The #58 size checks (e_sino Ny, angles, d_offsets) and the others."""
+    """The #58 size checks (e_sino Ny, angles) and the others. (d_offsets is
+    no longer passed to the C sweep: the offset update moved to Python, P12.)"""
     from fasttomo.algorithms import _mbir_icd_sweep_cpu
 
     kw = _sweep_args()
@@ -629,20 +652,19 @@ def test_mbir_cpu_sweep_rejects_mismatched_sizes(bad):
         kw["e_sino"] = torch.ones(3, 1, 4)
     elif bad == "angles":
         kw["cos_a"], kw["sin_a"] = kw["cos_a"][:2], kw["sin_a"][:2]
-    elif bad == "d_offsets":
-        kw["d_offsets"] = torch.zeros(2)
+    elif bad == "lambdas":
+        kw["lambdas"] = torch.ones(3, 2, 3)
     elif bad == "perm":
         kw["perm"] = kw["perm"][:, :5].contiguous()
     else:
         kw["vol_snap"] = torch.zeros(2, 4, 3)
     hyper = dict(qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=0.01, sigma_f=1.0,
-                 huber_T=float("inf"), huber_delta=1.0, sigma=1.0, sigma_min=1e-3,
-                 estimate_offset=True, estimate_variance=False, num_threads=1)
+                 huber_T=float("inf"), huber_delta=1.0, sigma=1.0, num_threads=1)
     with pytest.raises(ValueError):
-        _mbir_icd_sweep_cpu(kw["volume"], kw["e_sino"], kw["d_offsets"], kw["lambdas"],
+        _mbir_icd_sweep_cpu(kw["volume"], kw["e_sino"], kw["lambdas"],
                             kw["vol_snap"], kw["perm"], kw["cos_a"], kw["sin_a"], **hyper)
     _mbir_icd_sweep_cpu(*(_sweep_args()[k] for k in
-                          ("volume", "e_sino", "d_offsets", "lambdas", "vol_snap",
+                          ("volume", "e_sino", "lambdas", "vol_snap",
                            "perm", "cos_a", "sin_a")), **hyper)   # valid call runs
 
 

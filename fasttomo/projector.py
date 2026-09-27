@@ -102,6 +102,11 @@ class _ProjectorBase:
         device: torch.device,
         dtype: torch.dtype | None = None,
     ) -> None:
+        dims = dict(Ny=Ny, Nz=Nz, Nx=Nx, N_det=N_det, n_angles=n_angles)
+        if min(dims.values()) < 1:
+            raise ValueError(
+                f"{type(self).__name__}: every dimension must be at least 1, "
+                f"got {dims}")
         self.Ny       = Ny
         self.Nz       = Nz
         self.Nx       = Nx

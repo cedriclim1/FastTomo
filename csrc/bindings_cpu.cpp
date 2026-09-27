@@ -159,42 +159,33 @@ void register_cpu(py::module_ &m) {
 
     m.def("mbir_icd_sweep_cpu",
           [](std::intptr_t vol, std::intptr_t e_sino, std::intptr_t vol_snapshot,
-             std::intptr_t d_offsets, std::intptr_t lambdas, std::intptr_t perm,
+             std::intptr_t lambdas, std::intptr_t perm,
              std::intptr_t cos_a, std::intptr_t sin_a,
              int Ny, int Nz, int Nx, int n_angles, int N_det,
              float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
-             float huber_T, float huber_delta, float sigma, float sigma_min,
-             bool estimate_offset, bool estimate_variance, int num_threads) {
-              if (estimate_offset && d_offsets == 0)
-                  throw std::invalid_argument(
-                      "mbir_icd_sweep_cpu: estimate_offset=True needs d_offsets_ptr");
-              float sigma_out = sigma;
+             float huber_T, float huber_delta, float sigma, int num_threads) {
               mbir_icd_sweep_cpu(
-                  P<float>(vol), P<float>(e_sino), P<float>(d_offsets),
-                  estimate_variance ? &sigma_out : nullptr,
+                  P<float>(vol), P<float>(e_sino),
                   P<const float>(vol_snapshot), P<const int>(perm),
                   P<const float>(cos_a), P<const float>(sin_a),
                   P<const float>(lambdas),
                   Ny, Nz, Nx, n_angles, N_det,
                   qggmrf_p, qggmrf_q, qggmrf_c, sigma_f,
-                  huber_T, huber_delta, sigma, sigma_min,
-                  estimate_offset ? 1 : 0, estimate_variance ? 1 : 0,
+                  huber_T, huber_delta, sigma,
                   threads_or_one(num_threads));
-              return sigma_out;
           }, gil_release(),
-          "One outer iteration of MBIR-AM-PE (CPU). Mutates vol, e_sino and "
-          "d_offsets in place and returns the (possibly updated) sigma. "
-          "d_offsets_ptr / lambdas_ptr = 0 mean absent (lambdas -> uniform 1). "
-          "perm_ptr: [Ny, Nz*Nx] int32 per-slice voxel permutation.",
+          "ICD sweep of one MBIR-AM-PE outer iteration (CPU). Mutates vol and "
+          "e_sino in place; the offset and variance updates are done in Python "
+          "(_mbir_update_offset_variance), as for CUDA. lambdas_ptr = 0 means "
+          "uniform weights. perm_ptr: [Ny, Nz*Nx] int32 per-slice permutation.",
           py::arg("vol_ptr"), py::arg("e_sino_ptr"), py::arg("vol_snapshot_ptr"),
-          py::arg("d_offsets_ptr"), py::arg("lambdas_ptr"), py::arg("perm_ptr"),
+          py::arg("lambdas_ptr"), py::arg("perm_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("qggmrf_p"), py::arg("qggmrf_q"),
           py::arg("qggmrf_c"), py::arg("sigma_f"),
           py::arg("huber_T"), py::arg("huber_delta"),
-          py::arg("sigma"), py::arg("sigma_min"),
-          py::arg("estimate_offset"), py::arg("estimate_variance"),
+          py::arg("sigma"),
           py::arg("num_threads") = 1);
 }

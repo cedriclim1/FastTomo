@@ -12,9 +12,11 @@
  *       sampling) used inside MBIR. Distinct from the existing ray-marching
  *       `forward_project_parallel_cpu` so the column-A model used in the ICD updates
  *       below matches the FP used to compute the initial e = g - Af.
- *   mbir_icd_sweep_cpu - one full outer iteration: ICD sweep over all
- *       voxels (Y-parallel via OpenMP), optional offset update, optional
- *       variance update. Mutates volume, e_sino, d_offsets, sigma in place.
+ *   mbir_icd_sweep_cpu - the ICD sweep of one outer iteration over all
+ *       voxels (Y-parallel via OpenMP). Mutates volume and e_sino in place.
+ *       The per-tilt offset and noise-variance updates are not done here:
+ *       both backends call the one Python implementation,
+ *       `fasttomo.algorithms._mbir_update_offset_variance`.
  *
  * Forward operator A used internally:
  *   For voxel (ix, iz, iy) at angle θ_k, the detector coordinate is
@@ -157,27 +159,23 @@ void mbir_forward_project_cpu(
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * One outer iteration of MBIR-AM-PE.
- *
- *   1. ICD voxel sweep: for each Y-slice (OpenMP across slices), walk the
- *      slice's permutation; for each voxel compute the closed-form update
- *      from data term (Huber-surrogate weighted) + qGGMRF prior surrogate;
- *      apply with positivity; update error sinogram incrementally.
- *   2. (Optional) Update per-tilt offset d_k from the just-updated e.
- *   3. (Optional) Update noise variance σ from the just-updated e.
+ * ICD sweep of one outer iteration of MBIR-AM-PE: for each Y-slice (OpenMP
+ * across slices), walk the slice's permutation; for each voxel compute the
+ * closed-form update from the data term (Huber-surrogate weighted) and the
+ * qGGMRF prior surrogate; apply it with positivity; update the error
+ * sinogram incrementally. The per-tilt offset d_k and the noise variance σ
+ * are then updated by the caller (`_mbir_update_offset_variance`, shared
+ * with the CUDA path).
  *
  * The qGGMRF prior reads all 26 neighbours, in-slice ones included, from
  * `volume_snapshot` (start-of-outer-iter copy), not the live volume: the
  * prior is Jacobi within a slice as well as across Y-slices. The data term
  * uses the live (in-iteration) error sinogram, so it stays Gauss-Seidel ICD.
  *
- * In-place mutated outputs: volume, e_sino, d_offsets, sigma_out.
- * Returns 0 on success. */
+ * In-place mutated outputs: volume, e_sino. Returns 0 on success. */
 int mbir_icd_sweep_cpu(
     float       *volume,           /* [Ny, Nz, Nx] in-place */
     float       *e_sino,           /* [n_angles, Ny, N_det] in-place: e = g - Af - d */
-    float       *d_offsets,        /* [n_angles] in-place; NULL if estimate_offset = 0 */
-    float       *sigma_out,        /* single float; in-place; NULL if estimate_variance = 0 */
     const float *volume_snapshot,  /* [Ny, Nz, Nx] read-only snapshot for qGGMRF */
     const int   *perm,             /* [Ny, Nz*Nx] per-slice permutation */
     const float *cos_a,            /* [n_angles] */
@@ -185,8 +183,7 @@ int mbir_icd_sweep_cpu(
     const float *lambdas,          /* [n_angles, Ny, N_det] or NULL → uniform Λ = I */
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
-    float huber_T, float huber_delta, float sigma, float sigma_min,
-    int estimate_offset, int estimate_variance,
+    float huber_T, float huber_delta, float sigma,
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
@@ -283,56 +280,6 @@ int mbir_icd_sweep_cpu(
                 }
             }
         }
-    }
-
-    /* ── per-tilt offset update d_k ────────────────────────────────────────
-     * Closed form under quadratic surrogate around the current iterate:
-     *   Δd_k = Σ_i b_{k,i}·Λ_{k,i}·e_{k,i}  /  Σ_i b_{k,i}·Λ_{k,i}
-     * After d_k_new = d_k_old + Δd, subtract Δd from e[k, *, *] to maintain
-     * the invariant e = g - Af - d. */
-    if (estimate_offset && d_offsets) {
-        for (int ia = 0; ia < n_angles; ia++) {
-            double num = 0.0, den = 0.0;
-            const float *e_k = e_sino + (size_t)ia * Ny * N_det;
-            const float *l_k = lambdas ? (lambdas + (size_t)ia * Ny * N_det) : NULL;
-            for (size_t i = 0; i < (size_t)Ny * N_det; i++) {
-                float ek = e_k[i];
-                float lam = l_k ? l_k[i] : 1.0f;
-                float r = ek * sqrtf(lam) / sigma;
-                float bw = huber_surr_weight(r, huber_T, huber_delta);
-                num += (double)(bw * lam * ek);
-                den += (double)(bw * lam);
-            }
-            if (den < 1e-30) continue;
-            float dd = (float)(num / den);
-            d_offsets[ia] += dd;
-            /* propagate into error sinogram */
-            float *e_k_mut = e_sino + (size_t)ia * Ny * N_det;
-            for (size_t i = 0; i < (size_t)Ny * N_det; i++)
-                e_k_mut[i] -= dd;
-        }
-    }
-
-    /* ── noise-variance update σ ───────────────────────────────────────────
-     * Closed form for surrogate-weighted Gaussian MLE:
-     *   σ² = Σ b·Λ·e² / (M·K) — equivalent to Huber's reweighted ML estimate.
-     * Use double precision for the reduction to avoid catastrophic
-     * cancellation on large MK. */
-    if (estimate_variance && sigma_out) {
-        double s2 = 0.0;
-        double cnt = 0.0;
-        size_t total = (size_t)n_angles * Ny * N_det;
-        for (size_t i = 0; i < total; i++) {
-            float ek  = e_sino[i];
-            float lam = lambdas ? lambdas[i] : 1.0f;
-            float r   = ek * sqrtf(lam) / sigma;
-            float bw  = huber_surr_weight(r, huber_T, huber_delta);
-            s2  += (double)(bw * lam * ek * ek);
-            cnt += 1.0;
-        }
-        float sigma_new = (cnt > 0.0) ? (float)sqrt(s2 / cnt) : sigma;
-        if (sigma_new < sigma_min) sigma_new = sigma_min;
-        *sigma_out = sigma_new;
     }
 
     return 0;

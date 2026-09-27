@@ -282,12 +282,23 @@ def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = No
     ``io_dtype`` prepended (when given) and the current stream appended, and
     runs under the device guard; the CPU call gets the resolved
     ``num_threads`` appended. Returns ``out``.
+
+    Zero-size inputs or outputs (``n_angles``, ``Ny``, ``Nz``, ``Nx`` or
+    ``N_det`` of 0) raise ValueError on both backends. The CUDA kernels
+    cannot launch an empty grid or build an empty texture, and the CPU
+    kernels used to return empty tensors instead; one backend-independent
+    error is the chosen contract.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
     if len(shapes) != len(tensors):
         raise RuntimeError(f"fasttomo internal error: {op} declares "
                            f"{len(shapes)} shapes for {len(tensors)} tensors")
     _check_shapes(op, [(n, t, sh) for (n, sh), t in zip(shapes, tensors)])
+    for name, shape in shapes:
+        if 0 in tuple(shape):
+            raise ValueError(
+                f"{op}: {name} has a zero-size dimension {tuple(shape)}; every "
+                "dimension (n_angles, Ny, Nz, Nx, N_det) must be at least 1")
     names = iter(n for n, _ in shapes)
     ptrs = [_data_ptr(a, f"{op}: {next(names)}", out.device)
             if isinstance(a, torch.Tensor) else a
@@ -330,11 +341,15 @@ def _back_project_parallel_raw(
     angles_deg: torch.Tensor,
     Nz: int = -1,
     num_threads: int | None = None,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
-    """Single-axis BP. Output dtype = sinogram dtype (CPU computes in fp32)."""
+    """Single-axis BP. Output dtype = sinogram dtype (CPU computes in fp32).
+    ``Nx`` and ``Nz`` default to N_det; pass the volume's Nx when the
+    detector is wider or narrower than the volume (the kernels centre both)."""
     sino = _kernel_input(sinogram, "sinogram")
     n_angles, Ny, N_det = sino.shape
-    Nx = N_det
+    Nx = N_det if Nx < 0 else Nx
     Nz = N_det if Nz < 0 else Nz
     cos_a, sin_a = _trig_on_device(angles_deg, sino.device)
     vol = sino.new_empty(Ny, Nz, Nx)
@@ -361,9 +376,11 @@ def _back_project_euler_raw(
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
     num_threads: int | None = None,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     mats = _euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
-    return _back_project_rotmat_raw(sinogram, mats, Nz, num_threads)
+    return _back_project_rotmat_raw(sinogram, mats, Nz, num_threads, Nx=Nx)
 
 
 def _forward_project_rotmat_raw(
@@ -395,12 +412,15 @@ def _back_project_rotmat_raw(
     mats_flat: torch.Tensor,   # [n_angles, 9]
     Nz: int = -1,
     num_threads: int | None = None,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     """Adjoint partner of _forward_project_rotmat_raw (used inside
-    _FPRotmat.backward). Output dtype = sinogram dtype."""
+    _FPRotmat.backward). Output dtype = sinogram dtype. ``Nx`` and ``Nz``
+    default to N_det."""
     sino = _kernel_input(sinogram, "sinogram")
     n_angles, Ny, N_det = sino.shape
-    Nx = N_det
+    Nx = N_det if Nx < 0 else Nx
     Nz = N_det if Nz < 0 else Nz
     mats = _mats_input(mats_flat, sino.device)
     vol = sino.new_empty(Ny, Nz, Nx)
@@ -442,6 +462,32 @@ def _grad_rotmat_raw(
                    num_threads=num_threads)
 
 
+def _check_resire_shapes(op: str, data: torch.Tensor, data_name: str,
+                         euler_zyz_deg: torch.Tensor,
+                         n_views: int | None = None) -> None:
+    """Shape guard for the frozen RESIRE wrappers (validation only; the
+    kernel calls and their numerics are untouched).
+
+    ``data`` (volume or sinogram) must be 3-D with no zero-size dim, and
+    ``euler_zyz_deg`` must be ``[n_views, 3]``. For the back-projection
+    ``n_views`` is the sinogram's view count; the matrices are read per view,
+    so a count mismatch would otherwise surface as an opaque reshape error
+    (or, for a column count other than 3, silently use the wrong angles)."""
+    if data.ndim != 3:
+        raise ValueError(f"{op}: {data_name} must be 3-D, got shape {tuple(data.shape)}")
+    if data.numel() == 0:
+        raise ValueError(f"{op}: {data_name} has a zero-size dimension "
+                         f"{tuple(data.shape)}")
+    if euler_zyz_deg.ndim != 2 or euler_zyz_deg.shape[1] != 3:
+        raise ValueError(f"{op}: euler_zyz_deg must have shape [n_angles, 3], "
+                         f"got {tuple(euler_zyz_deg.shape)}")
+    if euler_zyz_deg.shape[0] == 0:
+        raise ValueError(f"{op}: euler_zyz_deg has no views")
+    if n_views is not None and euler_zyz_deg.shape[0] != n_views:
+        raise ValueError(f"{op}: sinogram has {n_views} views but euler_zyz_deg "
+                         f"has {euler_zyz_deg.shape[0]} rows")
+
+
 def _forward_project_resire_raw(
     volume: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
@@ -451,6 +497,9 @@ def _forward_project_resire_raw(
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
     _ensure_fp32(volume, "forward_project_resire")
+    _check_resire_shapes("forward_project_resire", volume, "volume", euler_zyz_deg)
+    if N_det == 0:
+        raise ValueError("forward_project_resire: N_det must be positive")
 
     Ny, Nz, Nx = volume.shape
     n_angles = euler_zyz_deg.shape[0]
@@ -476,14 +525,21 @@ def _back_project_resire_raw(
     sinogram: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     _assert_cuda(sinogram, "back_project_resire")
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
     _ensure_fp32(sinogram, "back_project_resire")
+    _check_resire_shapes("back_project_resire", sinogram, "sinogram", euler_zyz_deg,
+                         n_views=sinogram.shape[0] if sinogram.ndim == 3 else None)
+    if Nz == 0 or Nx == 0:
+        raise ValueError("back_project_resire: Nz and Nx must be positive")
 
     n_angles, Ny, N_det = sinogram.shape
-    Nx = N_det
+    if Nx < 0:
+        Nx = N_det
     if Nz < 0:
         Nz = N_det
 
@@ -543,6 +599,7 @@ class _FPParallel(torch.autograd.Function):
     def forward(ctx, volume, angles_deg, N_det, num_threads):
         ctx.save_for_backward(volume.detach(), angles_deg)
         ctx.Nz = volume.shape[-2]
+        ctx.Nx = volume.shape[-1]
         ctx.num_threads = num_threads
         return _forward_project_parallel_raw(volume, angles_deg, N_det, num_threads)
 
@@ -551,7 +608,7 @@ class _FPParallel(torch.autograd.Function):
         volume, angles_deg = ctx.saved_tensors
         grad_sino = grad_sino.contiguous()
         grad_vol = _back_project_parallel_raw(grad_sino, angles_deg, Nz=ctx.Nz,
-                                     num_threads=ctx.num_threads)
+                                              num_threads=ctx.num_threads, Nx=ctx.Nx)
         grad_angles = None
         if ctx.needs_input_grad[1]:
             grad_angles = _grad_angle_raw(volume, grad_sino, angles_deg,
@@ -561,11 +618,11 @@ class _FPParallel(torch.autograd.Function):
 
 class _BPParallel(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sinogram, angles_deg, Nz, num_threads):
+    def forward(ctx, sinogram, angles_deg, Nz, num_threads, Nx=-1):
         ctx.save_for_backward(angles_deg)
         ctx.N_det = sinogram.shape[-1]
         ctx.num_threads = num_threads
-        return _back_project_parallel_raw(sinogram, angles_deg, Nz, num_threads)
+        return _back_project_parallel_raw(sinogram, angles_deg, Nz, num_threads, Nx=Nx)
 
     @staticmethod
     def backward(ctx, grad_vol):
@@ -573,7 +630,7 @@ class _BPParallel(torch.autograd.Function):
         grad_sino = _forward_project_parallel_raw(grad_vol.contiguous(), angles_deg,
                                          N_det=ctx.N_det,
                                          num_threads=ctx.num_threads)
-        return grad_sino, None, None, None
+        return grad_sino, None, None, None, None
 
 
 class _FPRotmat(torch.autograd.Function):
@@ -595,6 +652,7 @@ class _FPRotmat(torch.autograd.Function):
         )
         ctx.save_for_backward(volume.detach(), mats_flat)
         ctx.Nz = volume.shape[-2]
+        ctx.Nx = volume.shape[-1]
         ctx.num_threads = num_threads
         return _forward_project_rotmat_raw(
             volume.detach(), mats_flat, N_det, num_threads
@@ -607,7 +665,8 @@ class _FPRotmat(torch.autograd.Function):
         grad_vol = None
         if ctx.needs_input_grad[0]:
             grad_vol = _back_project_rotmat_raw(
-                grad_sino, mats_flat, Nz=ctx.Nz, num_threads=ctx.num_threads
+                grad_sino, mats_flat, Nz=ctx.Nz, num_threads=ctx.num_threads,
+                Nx=ctx.Nx,
             )
         grad_mats = None
         if ctx.needs_input_grad[1]:
@@ -619,11 +678,11 @@ class _FPRotmat(torch.autograd.Function):
 
 class _BPRotmat(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sinogram, euler_zyz_deg, Nz, num_threads):
+    def forward(ctx, sinogram, euler_zyz_deg, Nz, num_threads, Nx=-1):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.N_det = sinogram.shape[-1]
         ctx.num_threads = num_threads
-        return _back_project_euler_raw(sinogram, euler_zyz_deg, Nz, num_threads)
+        return _back_project_euler_raw(sinogram, euler_zyz_deg, Nz, num_threads, Nx=Nx)
 
     @staticmethod
     def backward(ctx, grad_vol):
@@ -632,7 +691,7 @@ class _BPRotmat(torch.autograd.Function):
             grad_vol.contiguous(), euler_zyz_deg,
             N_det=ctx.N_det, num_threads=ctx.num_threads,
         )
-        return grad_sino, None, None, None
+        return grad_sino, None, None, None, None
 
 
 class _FPResire(torch.autograd.Function):
@@ -640,12 +699,14 @@ class _FPResire(torch.autograd.Function):
     def forward(ctx, volume, euler_zyz_deg, N_det):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.Nz = volume.shape[-2]
+        ctx.Nx = volume.shape[-1]
         return _forward_project_resire_raw(volume, euler_zyz_deg, N_det)
 
     @staticmethod
     def backward(ctx, grad_sino):
         (euler_zyz_deg,) = ctx.saved_tensors
-        grad_vol = _back_project_resire_raw(grad_sino.contiguous(), euler_zyz_deg, Nz=ctx.Nz)
+        grad_vol = _back_project_resire_raw(grad_sino.contiguous(), euler_zyz_deg,
+                                            Nz=ctx.Nz, Nx=ctx.Nx)
         return grad_vol, None, None
 
 
@@ -797,15 +858,15 @@ class _BPRotmatCached(torch.autograd.Function):
 
 class _BPResire(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sinogram, euler_zyz_deg, Nz):
+    def forward(ctx, sinogram, euler_zyz_deg, Nz, Nx=-1):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.N_det = sinogram.shape[-1]
-        return _back_project_resire_raw(sinogram, euler_zyz_deg, Nz)
+        return _back_project_resire_raw(sinogram, euler_zyz_deg, Nz, Nx=Nx)
 
     @staticmethod
     def backward(ctx, grad_vol):
         (euler_zyz_deg,) = ctx.saved_tensors
         grad_sino = _forward_project_resire_raw(grad_vol.contiguous(), euler_zyz_deg, N_det=ctx.N_det)
-        return grad_sino, None, None
+        return grad_sino, None, None, None
 
 

@@ -2048,7 +2048,16 @@ def test_mbir_seed_reproducibility():
 
 def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
     """Regression (#58): the CUDA sweep reads lambdas through a raw pointer,
-    so an ``expand``ed view must give the same volume as its dense copy."""
+    so an ``expand``ed view must give the same volume as its dense copy.
+
+    The view is expanded along Ny from a [n_angles, 1, N_det] base with
+    different values per angle, and a filler tensor is allocated right after
+    the base storage. Without the fix the kernel reads the base linearly:
+    past its first rows it lands in the filler (1e3), not in a copy of the
+    right values. (The first version of this test expanded along the angle
+    axis and allocated the dense copy right after the base, so the stray
+    reads found exactly the right values and the test passed on the unfixed
+    code.)"""
     Ny = Nz = Nx = 16
     n_angles = 20
     angles = make_angles(n_angles, max_deg=60.0)
@@ -2057,7 +2066,9 @@ def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
     sino = _mbir_sino_self(phantom, angles)
 
     g = torch.Generator(device="cpu").manual_seed(0)
-    lam_expand = (torch.rand(1, Ny, Nx, generator=g) + 0.5).to(DEVICE).expand(n_angles, Ny, Nx)
+    lam_base = (torch.rand(n_angles, 1, Nx, generator=g) + 0.5).to(DEVICE)
+    filler = torch.full((1 << 16,), 1e3, device=DEVICE)   # noqa: F841 — keeps the memory after lam_base
+    lam_expand = lam_base.expand(n_angles, Ny, Nx)
     assert not lam_expand.is_contiguous()
     lam_contig = lam_expand.contiguous()
 
@@ -2290,3 +2301,155 @@ class TestAdReconSupportMask:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── run_ad_recon pose constraints (restored from PR #39) ───────────────────
+#
+# PR #39 added anchor_reference, tilt_bound_deg, antisymmetric_z and
+# in_plane_weight with these tests; the merge c19ddee dropped the tests.
+# Restored here, adapted from the old flat kwargs to AdReconConfig.
+
+class TestAdReconPoseConstraints:
+    # Ny=4 gives the rotmat projector real depth along the tilt axis so that
+    # Y-Euler gradients are non-zero (needed for the drift tests).
+    N        = 8
+    NZ       = 8
+    NY       = 4
+    N_ANGLES = 5
+
+    def _angles(self) -> torch.Tensor:
+        return torch.tensor([-30., -15., 0., 15., 30.], device=DEVICE)
+
+    def _sino(self) -> torch.Tensor:
+        vol = torch.zeros(self.NY, self.NZ, self.N, device=DEVICE)
+        # Asymmetric fill: only the first half of the Y slices, so Y-Euler
+        # gradients are non-zero.
+        vol[:self.NY // 2, 2:6, 2:6] = 1.0
+        return ft.forward_project(vol, self._angles())  # [n_angles, NY, N_det]
+
+    @staticmethod
+    def _cfg(n_iter: int, **pose) -> ft.AdReconConfig:
+        return ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=n_iter, cosine_schedule=False),
+            pose=ft.PoseRefinementConfig(**pose) if pose else None,
+        )
+
+    def test_smoke_default_flags(self):
+        """Default call (no pose config) returns the right shape/dtype/device."""
+        vol = ft.run_ad_recon(self._sino(), self._angles(), config=self._cfg(5))
+        assert vol.shape == (self.NY, self.NZ, self.N)
+        assert vol.dtype == torch.float32
+        assert vol.device.type == "cuda"
+
+    def test_anchor_reference_row_frozen(self):
+        """Reference row of euler and shifts is byte-identical to its initial value."""
+        angles = self._angles()
+        _, euler, shifts = ft.run_ad_recon(
+            self._sino(), angles, return_pose=True,
+            config=self._cfg(50, refine_pose=True, refine_shifts=True,
+                             anchor_reference=True, lr_angles=1.0, lr_shifts=1.0),
+        )
+        ref_idx = int(angles.cpu().abs().argmin())
+        expected_euler = torch.tensor([0.0, angles[ref_idx].item(), 0.0])
+        assert torch.equal(euler[ref_idx], expected_euler), (
+            f"Reference euler row drifted: {euler[ref_idx]} != {expected_euler}"
+        )
+        assert torch.equal(shifts[ref_idx], torch.zeros(2)), (
+            f"Reference shift row drifted: {shifts[ref_idx]}"
+        )
+        # the other rows did move (the anchor is not a global freeze)
+        others = [i for i in range(self.N_ANGLES) if i != ref_idx]
+        assert (shifts[others].abs().amax() > 0).item()
+
+    def test_tilt_bound_respected(self):
+        """Y-Euler stays within nominal ± tilt_bound_deg under very high lr_angles."""
+        angles = self._angles()
+        bound = 1.0
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), angles, return_pose=True,
+            config=self._cfg(50, refine_pose=True, tilt_bound_deg=bound, lr_angles=5.0),
+        )
+        max_drift = (euler[:, 1] - angles.cpu()).abs().max().item()
+        assert max_drift <= bound + 1e-5, (
+            f"Y-Euler drifted {max_drift:.4f}° beyond bound {bound}°"
+        )
+
+    def test_tilt_bound_none_allows_drift(self):
+        """Without the bound, high lr_angles drives Y-Euler beyond ±1° of nominal."""
+        angles = self._angles()
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), angles, return_pose=True,
+            config=self._cfg(100, refine_pose=True, tilt_bound_deg=None, lr_angles=5.0),
+        )
+        max_drift = (euler[:, 1] - angles.cpu()).abs().max().item()
+        assert max_drift > 1.0, (
+            f"Expected Y-Euler drift > 1° with tilt_bound_deg=None and lr_angles=5.0, "
+            f"but max drift was {max_drift:.4f}°"
+        )
+
+    def test_anchor_raises_without_refine(self):
+        """anchor_reference=True without any refinement raises ValueError."""
+        with pytest.raises(ValueError, match="anchor_reference"):
+            ft.PoseRefinementConfig(anchor_reference=True)
+
+    def test_antisymmetric_z_enforced(self):
+        """Default antisymmetric_z=True keeps col2 == -col0 exactly after each step."""
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), self._angles(), return_pose=True,
+            # tilt_bound_deg=None lets Y drift freely so gradients are non-trivial
+            config=self._cfg(50, refine_pose=True, tilt_bound_deg=None, lr_angles=5.0),
+        )
+        residual = (euler[:, 2] + euler[:, 0]).abs().max().item()
+        assert residual < 1e-5, (
+            f"ZY(-Z) constraint violated: max |col2 + col0| = {residual:.2e}"
+        )
+        assert euler[:, 0].abs().max().item() > 1e-3   # col0 actually moved
+
+    def test_antisymmetric_z_false_allows_drift(self):
+        """antisymmetric_z=False lets col2 diverge from -col0 under high lr_angles."""
+        _, euler, _ = ft.run_ad_recon(
+            self._sino(), self._angles(), return_pose=True,
+            config=self._cfg(100, refine_pose=True, tilt_bound_deg=None,
+                             antisymmetric_z=False, lr_angles=5.0),
+        )
+        residual = (euler[:, 2] + euler[:, 0]).abs().max().item()
+        assert residual > 1e-3, (
+            f"Expected col2 != -col0 with antisymmetric_z=False, "
+            f"but max |col2 + col0| = {residual:.2e}"
+        )
+
+    def test_in_plane_weight_drives_alpha_to_zero(self):
+        """in_plane_weight suppresses α/γ drift that would otherwise occur at high lr_angles."""
+        common = dict(refine_pose=True, antisymmetric_z=False, tilt_bound_deg=None,
+                      lr_angles=5.0)
+        _, euler_free, _ = ft.run_ad_recon(
+            self._sino(), self._angles(), return_pose=True,
+            config=self._cfg(100, in_plane_weight=0.0, **common),
+        )
+        baseline_drift = max(euler_free[:, 0].abs().max().item(),
+                             euler_free[:, 2].abs().max().item())
+        assert baseline_drift > 1.0, (
+            f"Baseline (no penalty) should drift >1°, but max α/γ = "
+            f"{baseline_drift:.4f}°"
+        )
+        _, euler_reg, _ = ft.run_ad_recon(
+            self._sino(), self._angles(), return_pose=True,
+            config=self._cfg(100, in_plane_weight=10.0, **common),
+        )
+        reg_drift = max(euler_reg[:, 0].abs().max().item(),
+                        euler_reg[:, 2].abs().max().item())
+        assert reg_drift < 0.5, (
+            f"With in_plane_weight=10.0, max |α|/|γ| = {reg_drift:.4f}° (expected < 0.5°)"
+        )
+
+    def test_in_plane_weight_skipped_without_pose(self):
+        """in_plane_weight has no effect when refine_pose=False (no Euler
+        parameters exist): the result equals the no-pose run."""
+        cfg = self._cfg(5, refine_shifts=True, in_plane_weight=1e-2)
+        vol = ft.run_ad_recon(self._sino(), self._angles(), config=cfg)
+        assert vol.shape == (self.NY, self.NZ, self.N)
+        assert torch.isfinite(vol).all()
+        cfg0 = self._cfg(5, refine_shifts=True)
+        losses = ft.run_ad_recon(self._sino(), self._angles(), config=cfg, return_loss=True)[1]
+        losses0 = ft.run_ad_recon(self._sino(), self._angles(), config=cfg0, return_loss=True)[1]
+        torch.testing.assert_close(losses, losses0, rtol=1e-6, atol=1e-7)
