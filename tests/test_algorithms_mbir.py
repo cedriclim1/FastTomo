@@ -317,7 +317,7 @@ def _sweep_golden_cases(pre_restructure: bool = False) -> dict[str, torch.Tensor
 
 
 @needs_cuda
-def test_mbir_cuda_sweep_matches_pre_restructure_golden(record_property):
+def test_mbir_cuda_sweep_matches_pre_restructure_golden():
     """The one-warp-per-slice sweep (prepare kernel, register-resident e,
     fused warp reduction) reproduces the previous 64-thread kernel bit for
     bit on sm_120, for every variant: same order, same arithmetic, same
@@ -329,7 +329,7 @@ def test_mbir_cuda_sweep_matches_pre_restructure_golden(record_property):
     golden = tensors(raw)
     now = _sweep_golden_cases()
     assert set(now) == set(golden)
-    exact = exact_env(raw, "cuda", record_property, what=_SWEEP_GOLDEN.name)
+    exact = exact_env(raw, "cuda", what=_SWEEP_GOLDEN.name)
     bad = [k for k in sorted(now)
            if not (torch.equal(now[k], golden[k]) if exact
                    else torch.allclose(now[k], golden[k], rtol=1e-5, atol=1e-5))]

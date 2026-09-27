@@ -27,14 +27,14 @@ Comparison:
   only where the machine's arithmetic matches the one the golden was verified
   on: the golden stores the arithmetic fingerprints of those environments
   (``tests/_golden.py``: matmul, reductions, FFTs, transcendentals, fp16
-  rounding and interpolation run on the device, plus the CPU SIMD dispatch
+  rounding, interpolation, grid_sample and a backward pass run on the
+  device, plus the CPU SIMD dispatch
   level or the GPU compute capability), because the last bit depends on the
   CPU SIMD / BLAS / FFT paths and on the GPU's texture unit, not on the torch
   version (two CI runners with the same torch differ by a few ulp).
   Elsewhere they fall back to 1e-6 (CPU keys) or 1e-5 (CUDA keys), and fp16
   outputs to one fp16 ulp (2**-10 relative / absolute); the fallback is
-  reported as a ``GoldenNotExactWarning`` and the ``golden_exact`` test
-  property. The ``_fft_ramp`` / ``_fft_rfft2`` keys (the two torch.fft uses
+  reported as a ``GoldenNotExactWarning``. The ``_fft_ramp`` / ``_fft_rfft2`` keys (the two torch.fft uses
   on their own) are ordinary deterministic keys; the arithmetic fingerprint
   covers the FFT.
 """
@@ -279,13 +279,13 @@ def all_cases() -> dict[str, torch.Tensor]:
 # ── tests ─────────────────────────────────────────────────────────────────
 
 
-def _compare(dev: str, record_property) -> None:
+def _compare(dev: str) -> None:
     raw = torch.load(GOLDEN, weights_only=True)
     golden = tensors(raw)
     now = _cases(dev)
     want = {k for k in golden if k.startswith(dev + "/")}
     assert set(now) == want
-    exact = exact_env(raw, dev, record_property, what=GOLDEN.name)
+    exact = exact_env(raw, dev, what=GOLDEN.name)
     bad = []
     for k in sorted(want):
         a, b = now[k], golden[k]
@@ -307,10 +307,10 @@ def _compare(dev: str, record_property) -> None:
                      + "\n".join(bad))
 
 
-def test_cpu_outputs_identical_to_main(record_property):
-    _compare("cpu", record_property)
+def test_cpu_outputs_identical_to_main():
+    _compare("cpu")
 
 
 @pytest.mark.skipif(not HAS_CUDA, reason="no CUDA GPU available")
-def test_cuda_outputs_identical_to_main(record_property):
-    _compare("cuda", record_property)
+def test_cuda_outputs_identical_to_main():
+    _compare("cuda")
