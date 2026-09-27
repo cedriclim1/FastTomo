@@ -8,7 +8,9 @@ down by orders of magnitude and CI has no GPU. Run on a free GPU with
 
 (append ``tv`` to run only the TV-loss kernels, ``solvers`` for the SIRT,
 SART, FISTA-update and TV-prox kernels, ``parallel`` for the parallel-beam
-FP/BP, texture-pool and packed-texture variants).
+FP/BP, texture-pool and packed-texture variants, ``boundary`` for the
+loose-bounds forward and the kink branches of grad_angle / grad_rotmat on
+box-filling volumes).
 
 Sizes 1, 15, 17, 33 and 37 cover single-element, partial-block (16x16,
 32x8 and 8x8x4 blocks), multi-block and prime extents; Ny = 1 takes the
@@ -60,6 +62,53 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
     sirt_variants(g)
     solver_variants(g)
     parallel_variants(g)
+    boundary_variants(g)
+
+
+def boundary_variants(g) -> None:
+    """The loose sampling rule and the kink branches (phase 1b PR G) on
+    volumes non-zero on every face, where every stencil at the border reads
+    outside the slice: the parallel FP (1-channel, float2, fp16 packed) at
+    0 / +-90 / 180 deg with Nz = 1, Nx = 1, Ny = 1 and odd sizes; grad_angle
+    at the same views (every sample of a 0 deg view is on a grid line, and
+    with exact trig tables every sample of +-90 / 180 deg: the backward
+    loads at index -2 / N+1); grad_rotmat, uncached and cached, at the
+    identity, pure tilts (wy == 0 everywhere) and an exact 90 deg tilt."""
+    import math
+
+    import fasttomo._core as core
+    from fasttomo._backend import _stream_ptr
+    from fasttomo.autograd import _grad_angle_raw
+
+    dev = torch.device("cuda")
+    ang_deg = [0.0, 90.0, -90.0, 180.0, 45.0, -33.7]
+    r = [math.radians(a) for a in ang_deg]
+    exact_c = torch.tensor([0.0 if abs(math.cos(x)) < 1e-12 else math.cos(x) for x in r], device=dev)
+    exact_s = torch.tensor([0.0 if abs(math.sin(x)) < 1e-12 else math.sin(x) for x in r], device=dev)
+    angles = torch.tensor(ang_deg, device=dev)
+    tilts = torch.stack([torch.zeros(6, device=dev), angles, torch.zeros(6, device=dev)], 1)
+    mats = _euler_zyz_to_rotmat(tilts).reshape(6, 9)
+    mats = torch.where(mats.abs() < 1e-6, torch.zeros_like(mats), mats).contiguous()
+    for Ny, Nz, Nx, N_det in ((1, 17, 17, 17), (3, 33, 33, 35), (5, 1, 9, 9), (4, 9, 1, 7),
+                              (1, 1, 1, 3), (2, 16, 17, 15), (8, 33, 31, 33)):
+        vol = (torch.rand(Ny, Nz, Nx, generator=g) + 0.5).to(dev)
+        gs = torch.randn(6, Ny, N_det, generator=g).to(dev)
+        for dtype in (torch.float32, torch.float16):
+            ft.forward_project(vol.to(dtype), angles, N_det=N_det)
+            pp = ft.ParallelProjector((Ny, Nz, Nx), angles, N_det=N_det)
+            pp.forward(vol.to(dtype))
+            rp = ft.RotmatProjector((Ny, Nz, Nx), n_angles=6, device=dev, N_det=N_det)
+            m = mats.clone().requires_grad_(True)
+            (rp.forward(vol.to(dtype), m).float() * gs).sum().backward()
+            del pp, rp
+        _grad_angle_raw(vol, gs, angles)
+        out = torch.zeros(6, device=dev)
+        core.grad_angle_cuda(vol.data_ptr(), gs.data_ptr(), exact_c.data_ptr(), exact_s.data_ptr(),
+                             out.data_ptr(), Ny, Nz, Nx, 6, N_det, stream_ptr=_stream_ptr(dev))
+        _grad_rotmat_raw(vol, gs, mats)
+        _grad_rotmat_raw(vol, gs, torch.eye(3, device=dev).reshape(1, 9).repeat(6, 1).contiguous())
+        torch.cuda.synchronize()
+        print(f"ok boundary Ny={Ny} Nz={Nz} Nx={Nx} N_det={N_det}", flush=True)
 
 
 def parallel_variants(g) -> None:
@@ -273,5 +322,7 @@ if __name__ == "__main__":
         solver_variants(g)
     elif sys.argv[1:] == ["parallel"]:  # only the parallel-beam kernels
         parallel_variants(torch.Generator(device="cpu").manual_seed(0))
+    elif sys.argv[1:] == ["boundary"]:  # loose bounds and kink branches (PR G)
+        boundary_variants(torch.Generator(device="cpu").manual_seed(0))
     else:
         sweep()
