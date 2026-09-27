@@ -11,10 +11,12 @@ keyword names). Here the same calls use the new names and pass every new
 option at its no-op value, and must reproduce the golden:
 
 * GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal,
-  but only in the environment the golden was made on, because the result
-  depends on the torch FFT / reduction backends: GENFIRE-CPU on Linux x86_64
-  with torch 2.12 (elsewhere 1e-6), AD on sm_120 with torch 2.12 (elsewhere
-  1e-5), like the RESIRE golden in test_algorithms_genfire_resire.py.
+  but only in the environments the golden was verified in, because the
+  result depends on the torch FFT / reduction backends: GENFIRE-CPU on
+  Linux x86_64 with torch 2.12 or 2.14 (elsewhere 1e-6), AD on sm_120 with
+  torch 2.12 or 2.14 (elsewhere 1e-5), like the RESIRE golden in
+  test_algorithms_genfire_resire.py. (Made with torch 2.12.1; torch.equal
+  re-verified on 2.14.0+cu130.)
 * GENFIRE on CUDA (gridding atomics) and RESIRE (forward-projection
   atomics) are not bit-reproducible even main-vs-main: 1e-5 tolerance.
 """
@@ -73,15 +75,21 @@ def _check(now, golden, exact: bool, key: str, tol: float = 1e-5):
             torch.testing.assert_close(x, y, rtol=tol, atol=tol, msg=key)
 
 
+# torch versions the golden's torch.equal keys were verified on (made with
+# 2.12.1, re-verified on 2.14.0+cu130).
+EXACT_TORCH = ("2.12.", "2.14.")
+
+
 def _exact_env() -> bool:
-    return torch.cuda.get_device_capability() == (12, 0) and torch.__version__.startswith("2.12.")
+    return (torch.cuda.get_device_capability() == (12, 0)
+            and torch.__version__.startswith(EXACT_TORCH))
 
 
 def _genfire_cpu_exact_env() -> bool:
-    """The environment frozen_golden_main.pt's GENFIRE-CPU keys were made in
-    (torch 2.12 CPU FFT on Linux x86_64). Elsewhere the comparison falls back
-    to 1e-6 (#85 review N7)."""
-    return (torch.__version__.startswith("2.12.") and platform.system() == "Linux"
+    """The environments frozen_golden_main.pt's GENFIRE-CPU keys hold bit
+    for bit in (torch 2.12 or 2.14 CPU FFT on Linux x86_64). Elsewhere the
+    comparison falls back to 1e-6 (#85 review N7)."""
+    return (torch.__version__.startswith(EXACT_TORCH) and platform.system() == "Linux"
             and platform.machine() == "x86_64")
 
 

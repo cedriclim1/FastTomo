@@ -28,6 +28,10 @@ before starting Python. CUDA runs are not affected.
   and `tv_loss_3d` in `fasttomo.regularizers`; `fasttomo.utilities` and
   `fasttomo` re-export all three. This removes the import cycle between
   `fasttomo.utilities` and `fasttomo.projection`.
+- Existing editable installs (`pip install -e .`) made before this split must
+  be reinstalled: scikit-build-core's editable finder records module paths at
+  install time and still points `fasttomo.algorithms` at the deleted
+  `algorithms.py`, so `import fasttomo` fails until you re-run the install.
 - Tests are grouped by topic (`tests/test_projection.py`,
   `test_algorithms_*.py`, `test_contracts.py`, ...) with shared fixtures in
   `tests/conftest.py`; `gpu` and `multi_gpu` markers are registered, so

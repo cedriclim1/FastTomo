@@ -33,6 +33,7 @@ CUDACXX=$C/bin/nvcc uv pip install --python .venv/bin/python -e . \
 - C sources are compiled with `-O3` and no `-march=native`, so binaries are portable. For a local build tuned to this CPU, add `-Ccmake.define.FASTTOMO_MARCH_NATIVE=ON`.
 - CPU benchmarks must record whether the build used `FASTTOMO_MARCH_NATIVE=ON`. The flag changes CPU kernel speed (AVX2/FMA auto-vectorization). Builds before PR #76 always compiled C sources with `-march=native`, so older CPU results in `benchmarks/results/` are not comparable with a default build.
 - After modifying C/C++/CUDA source in `csrc/`, re-run the install command to recompile.
+- Existing editable installs made before the package split (PR #86: `fasttomo/algorithms.py` became the package `fasttomo/algorithms/`) must be reinstalled with the same command: scikit-build-core's editable finder records module paths at install time, so an old install still maps `fasttomo.algorithms` to the deleted file and `import fasttomo` fails. The same applies whenever a module becomes a package or is renamed.
 
 ## Testing
 
