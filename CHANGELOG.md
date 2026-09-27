@@ -18,8 +18,11 @@ projected to 0, and the result was not symmetric under an x-flip or a half
 turn. This reverses phase-1 decision 3 (tight bounds; its finite-difference
 argument holds for every rule).
 
-- `forward_project(v, a)` now equals `forward_project_3d(v, (0, a, 0))`
-  (bit for bit on CUDA, to 1e-7 on CPU). Volumes that are zero on the outer
+- `forward_project(v, a)` now equals `forward_project_3d(v, (0, a, 0))`:
+  on CUDA bit for bit at 0 / +-90 / 180 degrees and at most other views
+  (at some generic views about 0.3 % of the outputs differ by up to 3.4e-4
+  relative, where the two kernels round a texture coordinate to a different
+  8-bit filter weight), on CPU to 3e-7. Volumes that are zero on the outer
   voxel ring project to the same bits as before; the CPU back projection
   (still the exact transpose, bit for bit) changes only on that ring; the
   CUDA back projection (texture gather) is unchanged.
@@ -45,7 +48,9 @@ argument holds for every rule).
   180 degrees, the identity pose and pure tilts `(0, theta, 0)` (every
   sample on a y plane: the pose-refinement start), 1e-8 to 1.2e-6 against an
   fp64 central FD on both backends (was off by 20 % to several times there).
-  Off those views the gradients are unchanged. The design study measured
+  Elsewhere the gradients change only where a sample happens to fall
+  exactly on a grid line (at generic poses up to ~1e-3 relative for
+  `grad_rotmat` at 128^3). The design study measured
   no convergence change from the kink rule (pose-only Adam and
   `run_ad_recon` pose stages agree to 3-4 digits): it is a correctness and
   testability fix. Note: torch's fp32 cos(90 deg) is -4.4e-8, so a +-90 / 180
@@ -72,8 +77,9 @@ Goldens: the golden tests' input sinograms are now stored in the golden
 files (`_input/<device>/sino`, `tests/data/freeze_golden_inputs.py`), so
 GENFIRE / RESIRE (and FBP, W-BP, MBIR) keys stay byte-identical; the parallel
 projection keys, every parallel-derived algorithm key, the rotmat
-pose-gradient keys at the identity pose and the five `run_ad_recon` keys were
-regenerated (`tests/data/regen_boundary_goldens.py`).
+pose-gradient keys at the identity pose and four `run_ad_recon` keys (`ad`,
+`ad_reg`, `ad_pose`, `ad_staged`; `ad_support` is unchanged: its support
+mask zeroes the outer voxel ring) were regenerated (`tests/data/regen_boundary_goldens.py`).
 `tests/data/regenerate_golden_keys.py` now checks that every key it does not
 replace is still reproduced.
 

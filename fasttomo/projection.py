@@ -211,7 +211,10 @@ def forward_project(
     ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x at each ray step (CPU + CUDA); at a
     sample exactly on a grid line (every sample of a 0 degree view) the
     average of the two one-sided differences, so it is the central
-    derivative of the forward there.
+    derivative of the forward there. (On CUDA, FMA contraction of the sample
+    position can move a sample 1e-8 off a grid line the CPU puts it on, e.g.
+    Nz = 1 slices with odd Nx at 45 degrees; there the CUDA gradient is the
+    one-sided one.)
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)

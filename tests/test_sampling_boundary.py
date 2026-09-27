@@ -260,7 +260,13 @@ def test_grad_angle_matches_fd_at_grid_aligned_views(device, shape, N_det):
     torch's fp32 table a +-90 / 180 deg view is 2.5e-6 / 5e-6 deg past the
     alignment, and a sample whose offset survives fp32 rounding is off the
     grid line, where the one-sided derivative of that view is the exact one.
-    0 and 45 deg are exact in fp32 (checked at the API level below)."""
+    0 and 45 deg are exact in fp32 (checked at the API level below).
+    CUDA caveat, not covered here: nvcc contracts the sample position into
+    FMAs (the C kernels build with -ffp-contract=off), so where the
+    centring offset is 0 (half_z = 0 for Nz = 1) a sample can land 1e-8 off
+    a grid line that the CPU and fp64 place on it, and the CUDA gradient
+    takes the one-sided derivative there (seen on Nz = 1 slices with odd Nx
+    at 45 / 135 deg: 0.75 relative off the FD; the shapes here avoid it)."""
     ang = np.array([0.0, 90.0, -90.0, 45.0, 180.0, -47.3, 8.1])
     g = torch.Generator().manual_seed(7)
     for kind, vol in _volumes(shape, 3).items():

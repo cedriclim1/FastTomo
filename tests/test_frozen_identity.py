@@ -188,7 +188,7 @@ def ad_cases() -> dict:
 
 @needs_cuda
 def test_ad_recon_identical_to_main():
-    """The five AD keys were regenerated for deliberate changes (phase 1b:
+    """The AD keys were regenerated for deliberate changes (phase 1b:
     deterministic grad_rotmat for ad_pose; fused Adam for all five and the
     antisymmetric_z total derivative for ad_pose; PR G's sampling boundary
     and kink rule for all but ad_support) with

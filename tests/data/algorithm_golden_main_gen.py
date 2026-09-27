@@ -25,8 +25,9 @@ only), so generator and test cannot drift apart.
 
 The input sinograms (``_input/<device>/sino``) were added later by
 ``tests/data/freeze_golden_inputs.py`` (main 7fdaac2's forward projection):
-the test reads them instead of projecting, so the file now depends on
-them as well.
+the test reads them instead of projecting, so ``carry_inputs`` copies them
+from the repository's golden into the generated file (and stops with a
+message if there are none).
 
 ``_golden.stamp`` then records this environment's arithmetic fingerprints
 (tests/_golden.py) under ``_arith_fingerprint``: the exact comparisons are
@@ -42,7 +43,25 @@ import fasttomo  # noqa: E402
 from _golden import stamp  # noqa: E402
 from test_algorithm_identity import all_cases  # noqa: E402
 
+def carry_inputs(path: str) -> None:
+    """Copy the stored input sinograms (``_input/<device>/sino``, written by
+    tests/data/freeze_golden_inputs.py and read by the test) from the
+    repository's golden into the freshly generated file at ``path``, so the
+    regenerated golden does not fail the test with a KeyError. Fails with a
+    clear message if the repository golden has none."""
+    src = Path(__file__).resolve().parent / 'algorithm_golden_main.pt'
+    old = torch.load(src, weights_only=False)
+    keys = [k for k in old if k.startswith("_input/")]
+    if not keys:
+        raise SystemExit(f"{src.name} holds no _input/* keys: run "
+                         "tests/data/freeze_golden_inputs.py with a build of main 7fdaac2 first")
+    new = torch.load(path, weights_only=False)
+    new.update({k: old[k] for k in keys})
+    torch.save(new, path)
+
+
 if __name__ == "__main__":
     print("fasttomo from", fasttomo.__file__, "torch", torch.__version__, file=sys.stderr)
     torch.save(all_cases(), sys.argv[1])
+    carry_inputs(sys.argv[1])
     stamp(sys.argv[1])
