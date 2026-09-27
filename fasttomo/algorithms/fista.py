@@ -422,6 +422,22 @@ def run_fista(
     the momentum point ``y_k`` (free, a tight surrogate for ``x_k``). No
     CUDA graph (``t_k`` changes every iteration).
 
+    Long runs on CUDA: the CUDA back-projection (voxel-driven texture
+    gather) is not the exact adjoint of the CUDA forward projection
+    (ray-marching): ``||B - A^T||_F / ||A||_F = 0.24`` (the CPU pair is
+    exact), so ``B A`` has eigenvalues with small negative real parts and
+    FISTA's momentum eventually amplifies them (solver audit A2). Relative
+    error to the phantom, 64^2 slice, 61 views over +-60 degrees, after
+    20 / 200 / 1000 / 3000 iterations: CUDA noise-free 0.24 / 0.185 / 0.21
+    / 14.1, CPU 0.23 / 0.176 / 0.149 / 0.131; with 1 % noise CUDA 0.25 /
+    0.31 / 2.2 / 384 (CPU 0.24 / 0.34 / 1.3 / 3.0, the noise amplification
+    of unregularised least squares). ``positivity=True`` delays it (CUDA
+    noise-free 0.051 at 1000, 0.35 at 3000) but does not prevent it. SIRT
+    is not affected at these lengths. On CUDA keep ``n_iter`` at about 200
+    to 300 (with noise the error is lowest well before that anyway), or
+    regularise (:func:`run_fista_tv`) and watch the loss for longer runs.
+    The same holds for :func:`run_fista_tv`.
+
     Parameters
     ----------
     sinogram, angles_deg, n_iter

@@ -527,3 +527,34 @@ def test_fista_tv_inner_iter_keyword():
         ft.run_fista_tv(sino, angles, tv_inner_iter=-1, **kw)
     with pytest.raises(TypeError, match="tv_inner_iter"):
         ft.run_fista_tv(sino, angles, tv_inner_iter=2.5, **kw)
+
+
+# ── long-run behaviour with the unmatched CUDA projector pair (audit A2) ─────
+
+
+def _sphere_slice(N: int, Ny: int = 2) -> torch.Tensor:
+    """The phantom of the solver audit's long-run tables (see run_fista)."""
+    y = torch.linspace(-1, 1, N)[:, None, None]
+    z = torch.linspace(-1, 1, N)[None, :, None]
+    x = torch.linspace(-1, 1, N)[None, None, :]
+    v = ((x ** 2 + z ** 2 + (y * 0.9) ** 2) < 0.36).float()
+    v += 0.5 * (((x - 0.2) ** 2 + (z + 0.1) ** 2 + y ** 2) < 0.04).float()
+    return v[N // 2:N // 2 + 1].repeat(Ny, 1, 1).contiguous()
+
+
+@pytest.mark.parametrize("dev, bound", [("cpu", 0.19), pytest.param("cuda", 0.20, marks=needs_cuda)])
+def test_fista_200_iterations_pinned(dev, bound):
+    """run_fista after 200 noise-free iterations is where the run_fista
+    docstring says (0.176 CPU, 0.185 CUDA relative error, no blow-up). On
+    CUDA the unmatched FP/BP pair makes much longer runs diverge (14.1 after
+    3000 iterations); a change of that (a matched adjoint) is an owner
+    decision and should update the docstring and this test."""
+    N = 64
+    ang = torch.linspace(-60, 60, 61)
+    xt = _sphere_slice(N)
+    b = ft.forward_project(xt, ang).to(dev)
+    torch.manual_seed(0)
+    x = ft.run_fista(b, ang.to(dev), 200).cpu()
+    err = ((x - xt).norm() / xt.norm()).item()
+    assert 0.15 < err < bound, err
+    assert x.abs().max() < 1.25 * xt.max()              # no blow-up
