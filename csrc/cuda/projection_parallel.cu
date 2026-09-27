@@ -44,9 +44,12 @@ __global__ static void forward_project_parallel_kernel(
          * sample when both pixel neighbours along each axis are inside the
          * volume (fx in [0, Nx-1), fz in [0, Nz-1)). Border-mode tex2DLayered
          * would otherwise contribute a half-texel slab at each edge that the
-         * CPU kernel skips. */
-        if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-            fz < 0.0f || fz >= (float)(Nz - 1))
+         * CPU kernel skips. Written as a negated conjunction so a NaN
+         * coordinate (NaN/Inf tilt angle) fails it and the sample is skipped
+         * (the NaN view projects to 0, like the CPU kernel) instead of
+         * reaching the texture unit, which returns finite garbage for it. */
+        if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+              fz >= 0.0f && fz < (float)(Nz - 1)))
             continue;
         /* tex2DLayered: x→Nx axis, y→Nz axis, layer→iy.
          * +0.5 maps integer pixel index to texel centre.
@@ -84,8 +87,8 @@ __global__ static void forward_project_parallel_packed_h4_kernel(
         float s  = (float)step;
         float fx = (t * ca - s * sa) + half_x;
         float fz = (t * sa + s * ca) + half_z;
-        if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-            fz < 0.0f || fz >= (float)(Nz - 1))
+        if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+              fz >= 0.0f && fz < (float)(Nz - 1)))      /* NaN-safe, see above */
             continue;
         float4 v = tex2DLayered<float4>(vol_tex, fx + 0.5f, fz + 0.5f, iy_pack);
         sums[0] += v.x;
@@ -138,6 +141,14 @@ __global__ static void back_project_parallel_kernel(
 
     for (int ia = 0; ia < n_angles; ia++) {
         float ft = x * sh_cos[ia] + z * sh_sin[ia] + half_det;
+        /* Outside (-1, N_det) both texels of the linear filter are border
+         * zeros, so skipping those samples changes no bit (val never is -0:
+         * it starts at +0). The negated form also skips a NaN ft (NaN/Inf
+         * tilt angle): the view contributes nothing, like in the CPU
+         * kernels, instead of the finite garbage the texture unit returns
+         * for a NaN coordinate. */
+        if (!(ft > -1.0f && ft < (float)N_det))
+            continue;
         /* tex2DLayered: x→N_det axis, y→Ny axis, layer→ia.
          * Hardware linear filter interpolates along detector (ft fractional).
          * iy_tc is always at a texel centre so no interpolation in Y.
@@ -178,6 +189,8 @@ __global__ static void back_project_parallel_packed_h4_kernel(
 
     for (int ia = 0; ia < n_angles; ia++) {
         float ft = x * sh_cos[ia] + z * sh_sin[ia] + half_det;
+        if (!(ft > -1.0f && ft < (float)N_det))    /* NaN-safe, see above */
+            continue;
         float4 sample = tex2DLayered<float4>(sino_tex, ft + 0.5f, iy_tc, ia);
         vals[0] += sample.x;
         vals[1] += sample.y;
