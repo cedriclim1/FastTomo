@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from _golden import exact_env, tensors
 from conftest import (
     make_angles,
     needs_cuda,
@@ -316,16 +317,19 @@ def _sweep_golden_cases(pre_restructure: bool = False) -> dict[str, torch.Tensor
 
 
 @needs_cuda
-def test_mbir_cuda_sweep_matches_pre_restructure_golden():
+def test_mbir_cuda_sweep_matches_pre_restructure_golden(record_property):
     """The one-warp-per-slice sweep (prepare kernel, register-resident e,
     fused warp reduction) reproduces the previous 64-thread kernel bit for
     bit on sm_120, for every variant: same order, same arithmetic, same
-    summation order. On other GPUs the compiler may contract differently,
-    so the comparison falls back to 1e-5."""
-    golden = torch.load(_SWEEP_GOLDEN, weights_only=True)
+    summation order. On other GPUs the compiler may contract differently, so
+    where the CUDA arithmetic fingerprint (tests/_golden.py) is not one the
+    golden stores the comparison falls back to 1e-5 (with a
+    GoldenNotExactWarning)."""
+    raw = torch.load(_SWEEP_GOLDEN, weights_only=True)
+    golden = tensors(raw)
     now = _sweep_golden_cases()
     assert set(now) == set(golden)
-    exact = torch.cuda.get_device_capability() == (12, 0)
+    exact = exact_env(raw, "cuda", record_property, what=_SWEEP_GOLDEN.name)
     bad = [k for k in sorted(now)
            if not (torch.equal(now[k], golden[k]) if exact
                    else torch.allclose(now[k], golden[k], rtol=1e-5, atol=1e-5))]

@@ -11,21 +11,23 @@ keyword names). Here the same calls use the new names and pass every new
 option at its no-op value, and must reproduce the golden:
 
 * GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal,
-  but only in the environments the golden was verified in, because the
-  result depends on the torch FFT / reduction backends: GENFIRE-CPU on
-  Linux x86_64 with torch 2.12 or 2.14 (elsewhere 1e-6), AD on sm_120 with
-  torch 2.12 or 2.14 (elsewhere 1e-5), like the RESIRE golden in
-  test_algorithms_genfire_resire.py. (Made with torch 2.12.1; torch.equal
-  re-verified on 2.14.0+cu130.)
+  but only where the machine's arithmetic fingerprint (``tests/_golden.py``)
+  is one the golden stores, because the last bit depends on the CPU's SIMD /
+  FFT paths and the GPU, not on the torch version: GENFIRE-CPU against the
+  CPU fingerprint (elsewhere 1e-6), AD against the CUDA fingerprint
+  (elsewhere 1e-5), like the RESIRE golden in
+  test_algorithms_genfire_resire.py. A fallback is reported as a
+  ``GoldenNotExactWarning``. (Made with torch 2.12.1; torch.equal
+  re-verified on 2.14.0+cu130, where the fingerprints were recorded.)
 * GENFIRE on CUDA (gridding atomics) and RESIRE (forward-projection
   atomics) are not bit-reproducible even main-vs-main: 1e-5 tolerance.
 """
 
-import platform
 from pathlib import Path
 
 import pytest
 import torch
+from _golden import exact_env
 
 import fasttomo as ft
 
@@ -75,31 +77,13 @@ def _check(now, golden, exact: bool, key: str, tol: float = 1e-5):
             torch.testing.assert_close(x, y, rtol=tol, atol=tol, msg=key)
 
 
-# torch versions the golden's torch.equal keys were verified on (made with
-# 2.12.1, re-verified on 2.14.0+cu130).
-EXACT_TORCH = ("2.12.", "2.14.")
-
-
-def _exact_env() -> bool:
-    return (torch.cuda.get_device_capability() == (12, 0)
-            and torch.__version__.startswith(EXACT_TORCH))
-
-
-def _genfire_cpu_exact_env() -> bool:
-    """The environments frozen_golden_main.pt's GENFIRE-CPU keys hold bit
-    for bit in (torch 2.12 or 2.14 CPU FFT on Linux x86_64). Elsewhere the
-    comparison falls back to 1e-6 (#85 review N7)."""
-    return (torch.__version__.startswith(EXACT_TORCH) and platform.system() == "Linux"
-            and platform.machine() == "x86_64")
-
-
 def _golden():
     return torch.load(GOLDEN, weights_only=False)
 
 
-def test_genfire_cpu_identical_to_main():
+def test_genfire_cpu_identical_to_main(record_property):
     golden = _golden()
-    exact = _genfire_cpu_exact_env()
+    exact = exact_env(golden, "cpu", record_property, what=GOLDEN.name)
     sino, ang, _, _, N = _inputs("cpu")
     cb = _Calls()
     out = ft.run_genfire(sino, ang, n_iter=12, Nz=N, return_loss=True, loss_callback=cb,
@@ -144,9 +128,9 @@ def test_resire_matches_main():
 
 
 @needs_cuda
-def test_ad_recon_identical_to_main():
+def test_ad_recon_identical_to_main(record_property):
     golden = _golden()
-    exact = _exact_env()
+    exact = exact_env(golden, "cuda", record_property, what=GOLDEN.name)
     sino, ang, _, sm, N = _inputs("cuda")
     C, Opt, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
                      ft.ConstraintConfig, ft.PoseRefinementConfig)

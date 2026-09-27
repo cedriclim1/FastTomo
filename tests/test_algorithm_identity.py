@@ -24,39 +24,38 @@ Comparison:
   bit-reproducible even main-vs-main; they are compared at 2e-6 relative /
   absolute (the observed main-vs-main spread is below 1e-6).
 * Every other key is deterministic and compared with ``torch.equal``, but
-  only in the environment the golden was made in (torch 2.14 on Linux
-  x86_64 for CPU keys; plus an sm_120 GPU for CUDA keys), because the result
-  depends on torch's FFT / reduction kernels and on the GPU's texture unit.
-  Elsewhere the deterministic keys fall back to 1e-5.
-* Keys in ``FFT_KEYS`` also go through torch.fft (FBP's ramp filter, the
-  W-BP deconvolution), whose last bit depends on the CPU the FFT library
-  runs on (CI's runner gives FBP 1 ulp apart). The golden stores an FFT
-  fingerprint (``_fft_ramp``, ``_fft_rfft2``); where the local FFT reproduces
-  it bit for bit those keys are compared exactly, otherwise at 1e-6.
+  only where the machine's arithmetic matches the one the golden was verified
+  on: the golden stores the arithmetic fingerprints of those environments
+  (``tests/_golden.py``: matmul, reductions, FFTs, transcendentals, fp16
+  rounding and interpolation run on the device, plus the CPU SIMD dispatch
+  level or the GPU compute capability), because the last bit depends on the
+  CPU SIMD / BLAS / FFT paths and on the GPU's texture unit, not on the torch
+  version (two CI runners with the same torch differ by a few ulp).
+  Elsewhere they fall back to 1e-6 (CPU keys) or 1e-5 (CUDA keys), and fp16
+  outputs to one fp16 ulp (2**-10 relative / absolute); the fallback is
+  reported as a ``GoldenNotExactWarning`` and the ``golden_exact`` test
+  property. The ``_fft_ramp`` / ``_fft_rfft2`` keys (the two torch.fft uses
+  on their own) are ordinary deterministic keys; the arithmetic fingerprint
+  covers the FFT.
 """
 
 from __future__ import annotations
 
-import platform
 from pathlib import Path
 
 import pytest
 import torch
+from _golden import exact_env, tensors
 
 import fasttomo as ft
 
 GOLDEN = Path(__file__).parent / "data" / "algorithm_golden_main.pt"
 HAS_CUDA = torch.cuda.is_available()
 
-# The golden was generated with torch 2.14.0+cu130 on an RTX PRO 6000
-# Blackwell (sm_120), Linux x86_64.
-EXACT_TORCH = ("2.14.",)
-EXACT_CAPABILITY = (12, 0)
-
-# Outputs that pass through torch.fft (see the module docstring).
-FFT_KEYS = {f"{d}/{k}" for d in ("cpu", "cuda")
-            for k in ("fbp", "fbp_mask", "fbp_h", "fbp_proj", "wbp", "wsirt", "wsirt_cons")}
-FFT_FINGERPRINT = ("_fft_ramp", "_fft_rfft2")
+# Tolerances where the arithmetic fingerprint does not match (see the module
+# docstring).
+LOOSE_TOL = {"cpu": 1e-6, "cuda": 1e-5}
+FP16_TOL = 2.0 ** -10
 
 # Outputs of fp32-atomics kernels (not reproducible run to run).
 ATOMIC_KEYS = {
@@ -71,15 +70,6 @@ ATOMIC_KEYS = {
     "cuda/gd_resire_loss",
     "cuda/mbir",
 }
-
-
-def _cpu_exact_env() -> bool:
-    return (torch.__version__.startswith(EXACT_TORCH) and platform.system() == "Linux"
-            and platform.machine() == "x86_64")
-
-
-def _cuda_exact_env() -> bool:
-    return _cpu_exact_env() and torch.cuda.get_device_capability() == EXACT_CAPABILITY
 
 
 # ── inputs ────────────────────────────────────────────────────────────────
@@ -289,14 +279,13 @@ def all_cases() -> dict[str, torch.Tensor]:
 # ── tests ─────────────────────────────────────────────────────────────────
 
 
-def _compare(dev: str) -> None:
-    golden = torch.load(GOLDEN, weights_only=True)
+def _compare(dev: str, record_property) -> None:
+    raw = torch.load(GOLDEN, weights_only=True)
+    golden = tensors(raw)
     now = _cases(dev)
     want = {k for k in golden if k.startswith(dev + "/")}
     assert set(now) == want
-    exact = _cuda_exact_env() if dev == "cuda" else _cpu_exact_env()
-    fft_exact = exact and all(torch.equal(now[f"{dev}/{k}"], golden[f"{dev}/{k}"])
-                              for k in FFT_FINGERPRINT)
+    exact = exact_env(raw, dev, record_property, what=GOLDEN.name)
     bad = []
     for k in sorted(want):
         a, b = now[k], golden[k]
@@ -306,23 +295,22 @@ def _compare(dev: str) -> None:
         scale = b.double().abs().max().item() if b.numel() else 0.0
         if base in ATOMIC_KEYS:
             ok = torch.allclose(a, b, rtol=2e-6, atol=2e-6)
-        elif base in FFT_KEYS or base.split("/")[1] in FFT_FINGERPRINT:
-            ok = torch.equal(a, b) if fft_exact else torch.allclose(a, b, rtol=1e-6, atol=1e-6)
         elif exact:
             ok = torch.equal(a, b)
         else:
-            ok = torch.allclose(a, b, rtol=1e-5, atol=1e-5)
+            tol = FP16_TOL if b.dtype == torch.float16 else LOOSE_TOL[dev]
+            ok = torch.allclose(a, b, rtol=tol, atol=tol)
         if not ok:
             bad.append(f"{k}: max|diff| {diff:.3e} (max|golden| {scale:.3e})")
     assert not bad, (f"{len(bad)} of {len(want)} outputs differ from the golden "
-                     f"(exact={exact}, fft_exact={fft_exact}, torch {torch.__version__}):\n"
+                     f"(exact={exact}, torch {torch.__version__}):\n"
                      + "\n".join(bad))
 
 
-def test_cpu_outputs_identical_to_main():
-    _compare("cpu")
+def test_cpu_outputs_identical_to_main(record_property):
+    _compare("cpu", record_property)
 
 
 @pytest.mark.skipif(not HAS_CUDA, reason="no CUDA GPU available")
-def test_cuda_outputs_identical_to_main():
-    _compare("cuda")
+def test_cuda_outputs_identical_to_main(record_property):
+    _compare("cuda", record_property)
