@@ -121,12 +121,13 @@ class ProjectionOperator:
             raise ValueError(f"unknown projection geometry {geometry.kind!r}")
         self._name = name or type(self).__name__
         self.kind = geometry.kind
-        self.Ny, self.Nz, self.Nx = (int(v) for v in geometry.vol_shape)
-        self.N_det = int(geometry.N_det)
-        self.n_angles = int(geometry.n_angles)
+        # any negative size means "from the input" (the functional API's
+        # N_det=-1 / Nz=-1 convention accepts every negative value)
+        self.Ny, self.Nz, self.Nx, self.N_det, self.n_angles = (
+            max(int(v), -1) for v in (*geometry.vol_shape, geometry.N_det, geometry.n_angles))
         dims = dict(Ny=self.Ny, Nz=self.Nz, Nx=self.Nx, N_det=self.N_det,
                     n_angles=self.n_angles)
-        if 0 in dims.values() or min(dims.values()) < -1:
+        if 0 in dims.values():
             raise ValueError(
                 f"{self._name}: every dimension must be at least 1; got a "
                 f"zero-size dimension in {dims}")

@@ -79,6 +79,12 @@ class _ProjectorBase:
 
     def __init__(self, geometry: Geometry, device: torch.device | str,
                  num_threads: int | None) -> None:
+        Ny, Nz, Nx = geometry.vol_shape
+        dims = dict(Ny=Ny, Nz=Nz, Nx=Nx, N_det=geometry.N_det, n_angles=geometry.n_angles)
+        if min(dims.values()) < 1:
+            raise ValueError(
+                f"{type(self).__name__}: every dimension must be at least 1, "
+                f"got {dims}")
         self._op = _make_operator(geometry, device, num_threads=num_threads,
                                   name=type(self).__name__)
         op = self._op

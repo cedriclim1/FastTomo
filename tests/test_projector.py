@@ -206,6 +206,26 @@ def test_rotmat_projector_mats_shape_mismatch_raises(backend):
         proj.forward(vol, wrong_mats)
 
 
+@pytest.mark.parametrize("make", [
+    lambda: ft.ParallelProjector((2, 6, -1), torch.zeros(5), device="cpu"),
+    lambda: ft.RotmatProjector((2, 6, 6), n_angles=5, device="cpu", N_det=-4),
+    lambda: ft.ParallelProjector((2, 0, 6), torch.zeros(5), device="cpu"),
+])
+def test_cpu_projectors_reject_non_positive_geometry(make):
+    with pytest.raises(ValueError, match="at least 1"):
+        make()
+
+
+def test_functional_negative_sizes_mean_default():
+    """N_det / Nz / Nx < 0 select the defaults (any negative value, as
+    before the operator seam)."""
+    v = torch.rand(2, 8, 8)
+    a = torch.linspace(-30, 30, 5)
+    assert torch.equal(ft.forward_project(v, a, N_det=-7), ft.forward_project(v, a))
+    s = ft.forward_project(v, a)
+    assert torch.equal(ft.back_project(s, a, Nz=-3, Nx=-9), ft.back_project(s, a))
+
+
 @needs_cuda
 @pytest.mark.parametrize("make", [
     lambda: ft.ParallelProjector((2, 0, 6), torch.zeros(5, device="cuda")),
