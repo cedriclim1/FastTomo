@@ -23,7 +23,7 @@ from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that im
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _assert_dtype_match, _check_inputs, _data_ptr, _euler_zyz_to_rotmat, _launch,
+    _assert_dtype_match, _check_inputs, _check_shapes, _data_ptr, _euler_zyz_to_rotmat, _launch,
 )
 from fasttomo.projection import (
     forward_project,
@@ -2410,6 +2410,8 @@ def _mbir_initial_residual(
     vol = volume.detach().float().contiguous()
     _launch("mbir_forward_project", Af,
             vol, Af, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
+            shapes=[("volume", (Ny, Nz, Nx)), ("Af", (n_angles, Ny, N_det)),
+                    ("cos", (n_angles,)), ("sin", (n_angles,))],
             num_threads=4)
     return sinogram - Af
 
@@ -2432,6 +2434,8 @@ def _mbir_icd_sweep_cpu(
     volume / e_sino / d_offsets through raw pointers, so every buffer must be
     a dense CPU tensor of the right dtype: a silent copy would drop the
     in-place writes, so strided buffers raise instead (#58)."""
+    if volume.ndim != 3 or e_sino.ndim != 3:
+        raise ValueError("_mbir_icd_sweep_cpu: volume and e_sino must be 3-D")
     n_angles, Ny, N_det = e_sino.shape
     _, Nz, Nx = volume.shape
     for name, t, dt in (("volume", volume, torch.float32),
@@ -2442,10 +2446,17 @@ def _mbir_icd_sweep_cpu(
                         ("lambdas", lambdas, torch.float32)):
         if t is not None and (t.dtype != dt or t.device.type != "cpu"):
             raise TypeError(f"_mbir_icd_sweep_cpu: {name} must be a CPU {dt} tensor")
-    if perm.numel() != Ny * Nz * Nx or vol_snap.shape != volume.shape:
-        raise ValueError("_mbir_icd_sweep_cpu: perm / volume_snapshot size mismatch")
-    if lambdas is not None and lambdas.shape != e_sino.shape:
-        raise ValueError("_mbir_icd_sweep_cpu: lambdas shape mismatch")
+    # One place for every size the C sweep trusts (#58 checks included).
+    _check_shapes("_mbir_icd_sweep_cpu", [
+        ("volume", volume, (Ny, Nz, Nx)),            # e_sino Ny must match volume
+        ("e_sino", e_sino, (n_angles, Ny, N_det)),
+        ("volume_snapshot", vol_snap, (Ny, Nz, Nx)),
+        ("perm", perm, (Ny, Nz * Nx)),
+        ("d_offsets", d_offsets, (n_angles,)),
+        ("lambdas", lambdas, (n_angles, Ny, N_det)),
+        ("cos_a (angles)", cos_a, (n_angles,)),
+        ("sin_a (angles)", sin_a, (n_angles,)),
+    ])
     return float(_core.mbir_icd_sweep_cpu(
         vol_ptr=_data_ptr(volume, "volume"),
         e_sino_ptr=_data_ptr(e_sino, "e_sino"),

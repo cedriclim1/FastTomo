@@ -1066,6 +1066,8 @@ def _mbir_sino_cpu(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Ten
     sino = torch.empty(n_angles, Ny, N_det)
     return _launch("mbir_forward_project", sino,
                    vol, sino, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
+                   shapes=[("volume", (Ny, Nz, Nx)), ("sino", (n_angles, Ny, N_det)),
+                           ("cos", (n_angles,)), ("sin", (n_angles,))],
                    num_threads=1)
 
 
