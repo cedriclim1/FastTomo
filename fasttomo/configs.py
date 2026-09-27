@@ -22,6 +22,8 @@ serve the same modelling goal in two different optimisation regimes.
 from __future__ import annotations
 
 import math
+import numbers
+import operator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -42,18 +44,37 @@ def _apply_sparsity(vol: torch.Tensor, weight: float) -> torch.Tensor:
     return vol.sign() * (vol.abs() - weight).clamp_(min=0.0)
 
 
+def _real_or_none(value: object) -> float | None:
+    """``value`` as a float if it is a real number: Python and numpy
+    scalars (``numbers.Real``) and one-element real tensors count, bools do
+    not. None otherwise."""
+    if (isinstance(value, torch.Tensor) and value.numel() == 1
+            and value.dtype != torch.bool and not value.is_complex()):
+        value = value.item()
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    return float(value)
+
+
 def _check_weight(owner: str, name: str, value: object, *, positive: bool = False) -> None:
     """Raise ValueError unless ``value`` is a finite real number that is
-    >= 0 (or > 0 when ``positive``)."""
-    ok = (isinstance(value, (int, float)) and not isinstance(value, bool)
-          and math.isfinite(value) and (value > 0 if positive else value >= 0))
+    >= 0 (or > 0 when ``positive``). numpy and one-element tensor scalars
+    are accepted (parameter sweeps built with ``np.linspace``)."""
+    v = _real_or_none(value)
+    ok = v is not None and math.isfinite(v) and (v > 0 if positive else v >= 0)
     if not ok:
         bound = "> 0" if positive else ">= 0"
         raise ValueError(f"{owner}.{name} must be a finite number {bound}, got {value!r}")
 
 
 def _check_count(owner: str, name: str, value: object) -> None:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+    """Raise ValueError unless ``value`` is a non-negative integer (Python
+    or numpy integer, or an integer 0-d tensor; bools rejected)."""
+    try:
+        ok = not isinstance(value, bool) and operator.index(value) >= 0
+    except TypeError:
+        ok = False
+    if not ok:
         raise ValueError(f"{owner}.{name} must be a non-negative integer, got {value!r}")
 
 
@@ -171,11 +192,7 @@ class PoseRefinementConfig:
                 "refine_shifts=True; nothing to anchor otherwise."
             )
         for name in ("pose_warmup_iters", "alternating_period"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(
-                    f"{name} must be a non-negative integer, got {value!r}"
-                )
+            _check_count("PoseRefinementConfig", name, getattr(self, name))
         if self.alternating_period > 0 and not refine:
             raise ValueError(
                 "alternating_period > 0 requires refine_pose=True or "

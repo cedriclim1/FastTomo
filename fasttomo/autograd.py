@@ -67,61 +67,6 @@ def _assert_dtype_match(a: torch.Tensor, b: torch.Tensor,
         )
 
 
-def _check_inputs(
-    sinogram: torch.Tensor,
-    angles_deg: torch.Tensor | None,
-    Nz: int,
-    *,
-    allowed_dtypes: tuple[torch.dtype, ...],
-    op_name: str,
-    require_cuda: bool = False,
-) -> tuple[int, int, int, int, torch.device]:
-    """Validate and resolve sinogram/angles inputs for reconstruction algorithms.
-
-    Returns (n_angles, Ny, N_det, Nz_resolved, device). Never coerces.
-
-    Raises:
-        RuntimeError  if require_cuda and sinogram is not on CUDA.
-        TypeError     if sinogram.dtype not in allowed_dtypes.
-        ValueError    if sinogram is not 3-D, angles_deg is not 1-D,
-                      or sinogram.shape[0] != len(angles_deg).
-    """
-    if require_cuda and not sinogram.is_cuda:
-        raise RuntimeError(
-            f"{op_name} requires a CUDA tensor; got {sinogram.device}"
-        )
-
-    if sinogram.dtype not in allowed_dtypes:
-        names = " or ".join(str(d) for d in allowed_dtypes)
-        raise TypeError(
-            f"{op_name} requires {names} sinogram (got {sinogram.dtype}). "
-            "Cast with .float() or .half() first."
-        )
-
-    if sinogram.ndim != 3:
-        raise ValueError(
-            f"{op_name}: sinogram must be 3-D [n_angles, Ny, N_det], "
-            f"got shape {tuple(sinogram.shape)}"
-        )
-
-    n_angles, Ny, N_det = sinogram.shape
-
-    if angles_deg is not None:
-        if angles_deg.ndim != 1:
-            raise ValueError(
-                f"{op_name}: angles_deg must be 1-D [n_angles], "
-                f"got shape {tuple(angles_deg.shape)}"
-            )
-        if len(angles_deg) != n_angles:
-            raise ValueError(
-                f"{op_name}: sinogram has {n_angles} projections but "
-                f"angles_deg has {len(angles_deg)} entries."
-            )
-
-    Nz_resolved = N_det if Nz < 0 else Nz
-    return n_angles, Ny, N_det, Nz_resolved, sinogram.device
-
-
 # ── thread-count resolution ──────────────────────────────────────────────────
 #
 # Resolution order for the CPU 3D rotmat kernels:

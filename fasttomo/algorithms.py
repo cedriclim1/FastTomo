@@ -13,6 +13,8 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import numbers
+import operator
 import warnings
 from dataclasses import dataclass
 from typing import Callable
@@ -24,7 +26,7 @@ from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that im
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _assert_dtype_match, _check_inputs, _check_shapes, _data_ptr, _euler_zyz_to_rotmat, _launch,
+    _assert_dtype_match, _check_shapes, _data_ptr, _euler_zyz_to_rotmat, _launch,
 )
 from fasttomo.projection import (
     forward_project,
@@ -189,7 +191,7 @@ def _assert_warm_start_shape(
     reconstruction with no warning."""
     if tuple(volume.shape) != expected_shape:
         raise ValueError(
-            f"{op_name}: volume must have shape {expected_shape}, "
+            f"{op_name}: warm-start volume must have shape {expected_shape}, "
             f"got {tuple(volume.shape)}."
         )
 
@@ -224,6 +226,204 @@ def _finish_iters(
     if return_loss:
         return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+# ── shared reconstruction setup (ARCH P5) ──────────────────────────────────
+#
+# Every ``run_*`` starts with the same prologue: validate the sinogram and
+# angles, resolve ``Nz``/``Nx``, validate and clone a warm start, resolve the
+# support (cylinder flag or ``support_mask`` tensor, mutually exclusive) and
+# build the per-iteration ``ConstraintConfig``. `_prepare_recon` is that
+# prologue, written once. It depends only on torch and the constraint
+# helpers, so it can move to a private module unchanged.
+
+
+def _check_inputs(
+    sinogram: torch.Tensor,
+    angles_deg: torch.Tensor | None,
+    Nz: int,
+    *,
+    allowed_dtypes: tuple[torch.dtype, ...],
+    op_name: str,
+    require_cuda: bool = False,
+) -> tuple[int, int, int, int, torch.device]:
+    """Validate and resolve sinogram/angles inputs for reconstruction algorithms.
+
+    Returns (n_angles, Ny, N_det, Nz_resolved, device). Never coerces.
+
+    Raises:
+        RuntimeError  if require_cuda and sinogram is not on CUDA.
+        TypeError     if sinogram is not a tensor or its dtype is not in
+                      allowed_dtypes.
+        ValueError    if sinogram is not 3-D, angles_deg is not 1-D,
+                      or sinogram.shape[0] != len(angles_deg).
+    """
+    if not isinstance(sinogram, torch.Tensor):
+        raise TypeError(
+            f"{op_name}: sinogram must be a torch.Tensor, got {type(sinogram).__name__}"
+        )
+    if require_cuda and not sinogram.is_cuda:
+        raise RuntimeError(
+            f"{op_name} requires a CUDA tensor; got {sinogram.device}"
+        )
+
+    if sinogram.dtype not in allowed_dtypes:
+        names = " or ".join(str(d) for d in allowed_dtypes)
+        raise TypeError(
+            f"{op_name} requires {names} sinogram (got {sinogram.dtype}). "
+            "Cast with .float() or .half() first."
+        )
+
+    if sinogram.ndim != 3:
+        raise ValueError(
+            f"{op_name}: sinogram must be 3-D [n_angles, Ny, N_det], "
+            f"got shape {tuple(sinogram.shape)}"
+        )
+
+    n_angles, Ny, N_det = sinogram.shape
+
+    if angles_deg is not None:
+        if not isinstance(angles_deg, torch.Tensor):
+            raise TypeError(
+                f"{op_name}: angles_deg must be a torch.Tensor, "
+                f"got {type(angles_deg).__name__}"
+            )
+        if angles_deg.ndim != 1:
+            raise ValueError(
+                f"{op_name}: angles_deg must be 1-D [n_angles], "
+                f"got shape {tuple(angles_deg.shape)}"
+            )
+        if len(angles_deg) != n_angles:
+            raise ValueError(
+                f"{op_name}: sinogram has {n_angles} projections but "
+                f"angles_deg has {len(angles_deg)} entries."
+            )
+
+    Nz_resolved = N_det if Nz < 0 else Nz
+    return n_angles, Ny, N_det, Nz_resolved, sinogram.device
+
+
+def _as_int(value: object, name: str, op_name: str, *, minimum: int | None = 0) -> int:
+    """``value`` as a Python int. Accepts ints, numpy integers and integer
+    0-d tensors (anything with ``__index__``); rejects bools, floats and
+    values below ``minimum`` (TypeError / ValueError)."""
+    if isinstance(value, bool):
+        raise TypeError(f"{op_name}: {name} must be an integer, got {value!r}")
+    try:
+        out = operator.index(value)
+    except TypeError:
+        raise TypeError(
+            f"{op_name}: {name} must be an integer, got {type(value).__name__} {value!r}"
+        ) from None
+    if minimum is not None and out < minimum:
+        raise ValueError(f"{op_name}: {name} must be >= {minimum}, got {out}")
+    return out
+
+
+def _as_float(value: object, name: str, op_name: str, *, minimum: float | None = None) -> float:
+    """``value`` as a finite Python float. Accepts Python and numpy reals and
+    one-element real tensors; rejects bools, non-finite values and values
+    below ``minimum``."""
+    if isinstance(value, torch.Tensor) and value.numel() == 1 and not value.is_complex():
+        value = value.item()
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"{op_name}: {name} must be a real number, got {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{op_name}: {name} must be finite, got {value!r}")
+    if minimum is not None and out < minimum:
+        raise ValueError(f"{op_name}: {name} must be >= {minimum}, got {value!r}")
+    return out
+
+
+@dataclass
+class _ReconSetup:
+    """What `_prepare_recon` resolved for one reconstruction call."""
+    n_angles: int
+    Ny: int
+    N_det: int
+    Nz: int
+    Nx: int
+    device: torch.device
+    compute_dtype: torch.dtype
+    volume0: torch.Tensor | None    # [Ny, Nz, Nx]: cloned warm start, zeros, or None
+    constraints: ConstraintConfig   # support resolved to a tensor (or None)
+    n_iter: int | None
+
+
+def _prepare_recon(
+    op_name: str,
+    sinogram: torch.Tensor,
+    angles_deg: torch.Tensor | None,
+    *,
+    Nz: int = -1,
+    n_iter: int | None = None,
+    allowed_dtypes: tuple[torch.dtype, ...] = (torch.float32,),
+    require_cuda: bool = False,
+    warm_start: torch.Tensor | None = None,
+    init_volume: bool = True,
+    positivity: bool = False,
+    mask: bool = False,
+    support_mask: torch.Tensor | None = None,
+    sparsity: float = 0.0,
+) -> _ReconSetup:
+    """Validate the inputs of a reconstruction and resolve its setup.
+
+    * sinogram / angles: `_check_inputs` (dtype in ``allowed_dtypes``, 3-D
+      sinogram, 1-D angles of matching length, CUDA if ``require_cuda``).
+    * ``n_iter`` and ``Nz``: integers (numpy and 0-d tensor integers
+      accepted), ``n_iter >= 0``; ``Nz < 0`` means ``N_det``. ``Nx = N_det``.
+    * ``warm_start``: a tensor of shape ``[Ny, Nz, Nx]`` and the sinogram's
+      dtype, moved to the sinogram's device and cloned, so the caller's
+      tensor is never modified. Without it ``volume0`` is zeros in the
+      sinogram dtype (or None when ``init_volume=False``).
+    * support: ``mask=True`` (inscribed cylinder) and ``support_mask`` are
+      mutually exclusive (ValueError). ``support_mask`` is validated and
+      broadcast by `_resolve_support_mask`; either becomes a tensor in the
+      compute dtype on the compute device.
+    * ``ConstraintConfig(positivity, mask=<resolved support>, sparsity)``.
+    """
+    if support_mask is not None and mask:
+        raise ValueError(
+            f"{op_name}: mask=True and support_mask are mutually exclusive — "
+            "pass one support per reconstruction."
+        )
+    Nz = _as_int(Nz, "Nz", op_name, minimum=None)
+    if n_iter is not None:
+        n_iter = _as_int(n_iter, "n_iter", op_name)
+    sparsity = _as_float(sparsity, "sparsity", op_name, minimum=0.0)
+    n_angles, Ny, N_det, Nz, device = _check_inputs(
+        sinogram, angles_deg, Nz,
+        allowed_dtypes=allowed_dtypes, op_name=op_name, require_cuda=require_cuda,
+    )
+    Nx = N_det
+    compute_dtype = sinogram.dtype
+
+    volume0: torch.Tensor | None = None
+    if warm_start is not None:
+        if not isinstance(warm_start, torch.Tensor):
+            raise TypeError(
+                f"{op_name}: warm_start must be a torch.Tensor, "
+                f"got {type(warm_start).__name__}"
+            )
+        _assert_warm_start_shape(warm_start, (Ny, Nz, Nx), op_name)
+        _assert_dtype_match(sinogram, warm_start, "sinogram", "warm_start", op_name)
+        volume0 = warm_start.detach().to(device=device).contiguous().clone()
+    elif init_volume:
+        volume0 = torch.zeros(Ny, Nz, Nx, dtype=compute_dtype, device=device)
+
+    if support_mask is not None:
+        support = _resolve_support_mask(
+            support_mask, Ny, Nz, Nx, device, compute_dtype, op_name,
+        )
+    else:
+        support = _maybe_cylindrical_mask(Nz, Nx, device, bool(mask), dtype=compute_dtype)
+    constraints = ConstraintConfig(positivity=positivity, mask=support, sparsity=sparsity)
+    return _ReconSetup(
+        n_angles=n_angles, Ny=Ny, N_det=N_det, Nz=Nz, Nx=Nx, device=device,
+        compute_dtype=compute_dtype, volume0=volume0, constraints=constraints,
+        n_iter=n_iter,
+    )
 
 
 # ── loss-callback helpers (live loss streaming) ────────────────────────────
@@ -385,11 +585,14 @@ def run_fbp(
             "run_fbp: mask=True and support_mask are mutually exclusive — "
             "pass one support per reconstruction."
         )
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32, torch.float16),
-        op_name="run_fbp",
+    # Validation only: the support is resolved below against the actual
+    # output shape (a cached projector may reconstruct with Nz != N_det).
+    setup = _prepare_recon(
+        "run_fbp", sinogram, angles_deg, Nz=Nz,
+        allowed_dtypes=(torch.float32, torch.float16), init_volume=False,
     )
+    n_angles, Ny, N_det, Nz, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.device)
     filtered = ramp_filter(sinogram)
     if projector is not None:
         volume = projector.back(filtered)
@@ -439,12 +642,12 @@ def run_weighted_backprojection(
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32,),
-        op_name="run_weighted_backprojection",
+    setup = _prepare_recon(
+        "run_weighted_backprojection", sinogram, angles_deg, Nz=Nz,
+        init_volume=False, positivity=positivity, mask=mask,
     )
-    Nx = N_det
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
 
     # compute WF once for this tilt geometry [Nz, Nx//2+1] (amplitudes)
     WF_amp = _compute_exact_wf(
@@ -463,8 +666,7 @@ def run_weighted_backprojection(
         F_out   = phase * (F_slice.abs() * WF_amp)
         volume[iy] = torch.fft.irfft2(F_out, s=(Nz, Nx))
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
-    return ConstraintConfig(positivity=positivity, mask=_mask).apply(volume)
+    return setup.constraints.apply(volume)
 
 
 def run_sirt(
@@ -540,24 +742,14 @@ def run_sirt(
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
-    if support_mask is not None and mask:
-        raise ValueError(
-            "run_sirt: mask=True and support_mask are mutually exclusive — "
-            "pass one support per reconstruction."
-        )
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32, torch.float16),
-        op_name="run_sirt",
+    setup = _prepare_recon(
+        "run_sirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
+        positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
     )
-    Nx = N_det
-    if volume is None:
-        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
-    else:
-        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_sirt")
-        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_sirt")
-        volume = volume.to(device=device).contiguous().clone()
-    compute_dtype = volume.dtype
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
     _fp, _bp, _internal_proj = _build_fp_bp(
         sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
@@ -575,13 +767,6 @@ def run_sirt(
     _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
-    if support_mask is not None:
-        _mask = _resolve_support_mask(
-            support_mask, Ny, Nz, Nx, device, compute_dtype, "run_sirt",
-        )
-    else:
-        _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
     track_loss = return_loss or loss_callback is not None
     send_components = (
@@ -946,19 +1131,14 @@ def run_fista(
     ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
     ``t_k`` changes every iteration.
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32, torch.float16),
-        op_name="run_fista",
+    setup = _prepare_recon(
+        "run_fista", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
+        positivity=positivity, mask=mask,
     )
-    Nx = N_det
-    if volume is None:
-        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
-    else:
-        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_fista")
-        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_fista")
-        volume = volume.to(device=device).contiguous().clone()
-    compute_dtype = volume.dtype
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
 
     _fp, _bp, _internal_proj = _build_fp_bp(
         sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
@@ -970,11 +1150,8 @@ def run_fista(
         else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
     )
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    constraints = ConstraintConfig(positivity=positivity, mask=_mask)
-
     return _fista_loop(
-        volume, sinogram, _fp, _bp, n_iter, L_eff, constraints.apply,
+        volume, sinogram, _fp, _bp, n_iter, L_eff, setup.constraints.apply,
         return_loss, loss_callback,
     )
 
@@ -1029,19 +1206,14 @@ def run_fista_tv(
             "Use run_fista for the unregularised problem."
         )
 
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32, torch.float16),
-        op_name="run_fista_tv",
+    setup = _prepare_recon(
+        "run_fista_tv", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
+        positivity=positivity, mask=mask,
     )
-    Nx = N_det
-    if volume is None:
-        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
-    else:
-        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_fista_tv")
-        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_fista_tv")
-        volume = volume.to(device=device).contiguous().clone()
-    compute_dtype = volume.dtype
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
 
     _fp, _bp, _internal_proj = _build_fp_bp(
         sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
@@ -1053,7 +1225,7 @@ def run_fista_tv(
         else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
     )
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
+    _mask = setup.constraints.mask
     lam = tv_weight / L_eff
     prox = lambda u: _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
@@ -1121,19 +1293,15 @@ def run_sart(
 
     Returns volume [Ny, Nz, Nx].
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32, torch.float16),
-        op_name="run_sart",
+    setup = _prepare_recon(
+        "run_sart", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
+        positivity=positivity, mask=mask, sparsity=sparsity,
     )
-    Nx = N_det
-    if volume is None:
-        volume = torch.zeros(Ny, Nz, Nx, dtype=sinogram.dtype, device=device)
-    else:
-        _assert_warm_start_shape(volume, (Ny, Nz, Nx), "run_sart")
-        _assert_dtype_match(sinogram, volume, "sinogram", "volume", "run_sart")
-        volume = volume.to(device=device).contiguous().clone()
-    compute_dtype = volume.dtype
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
+    constraints = setup.constraints
 
     # Build functional closures that accept an index list so we can slice
     # both the angles tensor and the sinogram for each subset.
@@ -1176,8 +1344,6 @@ def run_sart(
         C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
         C_list.append(C_s)
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask, dtype=compute_dtype)
-    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     # --- outer iteration loop ---
@@ -1323,13 +1489,25 @@ def run_ad_recon(
                 f"or set refine_pose=True."
             )
 
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32,),
-        op_name="run_ad_recon",
-        require_cuda=True,
+    # ── support: ConstraintConfig.mask (bool True → cylinder; tensor → that
+    # support) or the support_mask kwarg, one support per reconstruction ──
+    _mask_cfg: bool | torch.Tensor | None = constraints_cfg.mask
+    if support_mask is not None:
+        if isinstance(_mask_cfg, torch.Tensor) or _mask_cfg is True:
+            raise ValueError(
+                "run_ad_recon: support_mask and ConstraintConfig.mask are "
+                "mutually exclusive — pass one support per reconstruction."
+            )
+    elif isinstance(_mask_cfg, torch.Tensor):
+        support_mask = _mask_cfg
+
+    setup = _prepare_recon(
+        "run_ad_recon", sinogram, angles_deg, Nz=Nz, n_iter=optim_cfg.n_iter,
+        require_cuda=True, mask=_mask_cfg is True, support_mask=support_mask,
     )
-    Nx = N_det
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    n_iter = setup.n_iter
     angles_deg = angles_deg.float().to(device)
 
     ref_idx: int | None = None
@@ -1337,8 +1515,7 @@ def run_ad_recon(
         ref_idx = int(angles_deg.abs().argmin())
 
     # ── initialise volume ──────────────────────────────────────────────────
-    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
-                         requires_grad=True)
+    volume = setup.volume0.requires_grad_(True)
 
     # ── build projector ────────────────────────────────────────────────────
     _internal_proj: object | None = None
@@ -1406,10 +1583,10 @@ def run_ad_recon(
     pose_warmup_iters = pose_cfg.pose_warmup_iters if pose_cfg is not None else 0
     alternating_period = pose_cfg.alternating_period if pose_cfg is not None else 0
     default_step_schedule = pose_warmup_iters == 0 and alternating_period == 0
-    if (refine_pose or refine_shifts) and pose_warmup_iters >= optim_cfg.n_iter > 0:
+    if (refine_pose or refine_shifts) and pose_warmup_iters >= n_iter > 0:
         warnings.warn(
             f"run_ad_recon: pose_warmup_iters={pose_warmup_iters} >= "
-            f"n_iter={optim_cfg.n_iter}, so the pose/shift parameters never step.",
+            f"n_iter={n_iter}, so the pose/shift parameters never step.",
             stacklevel=2,
         )
 
@@ -1420,7 +1597,7 @@ def run_ad_recon(
     schedulers: list = []
     if optim_cfg.cosine_schedule:
         vol_steps, pose_steps = _ad_recon_active_steps(
-            optim_cfg.n_iter,
+            n_iter,
             pose_warmup_iters=pose_warmup_iters,
             alternating_period=alternating_period,
         )
@@ -1430,25 +1607,8 @@ def run_ad_recon(
             for opt in optimisers
         ]
 
-    # ── support mask (built once if requested) ────────────────────────────
-    # ConstraintConfig.mask: bool True → build cylinder inside; Tensor →
-    # use as-is; None/False → no mask. The support_mask kwarg is an alias
-    # for the tensor case, mutually exclusive with a configured mask.
-    _mask_cfg: bool | torch.Tensor | None = constraints_cfg.mask
-    if support_mask is not None:
-        if isinstance(_mask_cfg, torch.Tensor) or _mask_cfg is True:
-            raise ValueError(
-                "run_ad_recon: support_mask and ConstraintConfig.mask are "
-                "mutually exclusive — pass one support per reconstruction."
-            )
-        _mask_cfg = support_mask
-    if _mask_cfg is True:
-        _mask_cfg = cylindrical_mask(Nz, Nx, device=device)  # [Nz, Nx]
-    _cmask_mul: torch.Tensor | None = None
-    if isinstance(_mask_cfg, torch.Tensor):
-        _cmask_mul = _resolve_support_mask(
-            _mask_cfg, Ny, Nz, Nx, device, volume.dtype, "run_ad_recon",
-        )
+    # support mask resolved once by _prepare_recon ([1|Ny, Nz, Nx] or None)
+    _cmask_mul: torch.Tensor | None = setup.constraints.mask
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
@@ -1461,7 +1621,7 @@ def run_ad_recon(
         loss_callback is not None and _callback_accepts_components(loss_callback)
     )
 
-    for it in tqdm(range(optim_cfg.n_iter)):
+    for it in tqdm(range(n_iter)):
         for opt in optimisers:
             opt.zero_grad()
 
@@ -1832,12 +1992,15 @@ def run_genfire(
     fp32 only — the GENFIRE gridding kernel (`csrc/cuda/genfire.cu`) has no
     half-precision path. Cast your sinogram to ``torch.float32`` first.
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32,),
-        op_name="run_genfire",
+    # Validation only (frozen algorithm): GENFIRE builds its support and
+    # constraints on the oversampled grid below.
+    setup = _prepare_recon(
+        "run_genfire", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        init_volume=False, sparsity=sparsity,
     )
-    Nx = N_det
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    n_iter = setup.n_iter
 
     # oversampled grid size (must be even)
     bigN = int(round(N_det * oversampling_ratio))
@@ -2027,13 +2190,13 @@ def run_wsirt(
     which builds the PSF in fp32 and applies a 2-D rfft, both fp32-pinned.
     Cast your sinogram to ``torch.float32`` first.
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32,),
-        op_name="run_wsirt",
+    setup = _prepare_recon(
+        "run_wsirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        positivity=positivity, mask=mask, sparsity=sparsity,
     )
-    Nx = N_det
-    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
     # pre-compute exact WF (once per tilt geometry)
     WF_amp = _compute_exact_wf(
@@ -2050,8 +2213,6 @@ def run_wsirt(
             out[iy] = torch.fft.irfft2(ph * (F.abs() * WF_amp), s=(Nz, Nx))
         return out
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
-    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -2207,14 +2368,13 @@ def run_resire(
 
     Returns volume [Ny, Nz, Nx].
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32,),
-        op_name="run_resire",
-        require_cuda=True,
+    setup = _prepare_recon(
+        "run_resire", sinogram, angles_deg, Nz=Nz, n_iter=n_iter, require_cuda=True,
+        positivity=positivity, mask=mask, support_mask=support, sparsity=sparsity,
     )
-    Nx = N_det
-    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
+    n_angles, Ny, N_det, Nz, Nx = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
+    volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
     # step size: matches RESIRE's dt = step_size / Num_pjs / dimz
     alpha = step_size / (n_angles * Nz)
@@ -2234,13 +2394,6 @@ def run_resire(
     _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
     _bp = lambda s: back_project_resire(s, euler_zyz_deg, Nz=Nz)
 
-    if support is not None:
-        _mask = support.to(device=device, dtype=torch.float32)
-    elif mask:
-        _mask = cylindrical_mask(Nz, Nx, device=device).unsqueeze(0)  # [1, Nz, Nx]
-    else:
-        _mask = None
-    constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
     for _ in range(n_iter):
@@ -2327,15 +2480,15 @@ def run_grad_descent(
             "euler_zyz_deg (3D ZYZ), not both or neither."
         )
 
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
-        sinogram, angles_deg, Nz,
-        allowed_dtypes=(torch.float32,),
-        op_name="run_grad_descent",
+    setup = _prepare_recon(
+        "run_grad_descent", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        positivity=positivity, mask=mask,
     )
-    Nx = N_det
+    n_angles, Ny, N_det, Nz, Nx = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
+    constraints, n_iter = setup.constraints, setup.n_iter
 
-    volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device,
-                         requires_grad=True)
+    volume = setup.volume0.requires_grad_(True)
     opt = optimizer_cls([volume], lr=lr)
 
     if euler_zyz_deg is not None:
@@ -2346,8 +2499,6 @@ def run_grad_descent(
     else:
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
 
-    _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
-    constraints = ConstraintConfig(positivity=positivity, mask=_mask)
     losses: list[float] = []
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
@@ -2763,24 +2914,16 @@ def run_mbir(
     """
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
-    if sinogram.dim() != 3:
-        raise ValueError("sinogram must be [n_angles, Ny, N_det]")
-    if angles_deg.dim() != 1:
-        raise ValueError("angles_deg must be a 1-D tensor")
-    if sinogram.dtype != torch.float32:
-        sinogram = sinogram.float()
-    if angles_deg.dtype != torch.float32:
-        angles_deg = angles_deg.float()
-
-    n_angles, Ny, N_det = sinogram.shape
-    if angles_deg.numel() != n_angles:
-        raise ValueError(
-            f"sinogram has {n_angles} projections but angles_deg has "
-            f"{angles_deg.numel()} entries"
-        )
-    if Nz < 0:
-        Nz = N_det
-    Nx = N_det  # standard parallel-beam convention
+    # fp32 only, like every other fp32 algorithm: other dtypes raise instead
+    # of being cast silently. The ICD kernels are fp32-only.
+    setup = _prepare_recon(
+        "run_mbir", sinogram, angles_deg, Nz=Nz, n_iter=outer_iters, init_volume=False,
+    )
+    n_angles, Ny, N_det, Nz, Nx = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
+    outer_iters = setup.n_iter
+    multires_levels = _as_int(multires_levels, "multires_levels", "run_mbir", minimum=1)
+    angles_deg = angles_deg.float()
     # A NaN/inf pixel would otherwise surface as "sigma_init must be finite"
     # (sinogram.std() is NaN) even though the caller never passed sigma_init,
     # or poison every voxel if sigma_init is given.
@@ -2793,8 +2936,7 @@ def run_mbir(
                 "lambdas must match sinogram shape "
                 f"[n_angles, Ny, N_det]={sinogram.shape}, got {tuple(lambdas.shape)}"
             )
-        if lambdas.dtype != torch.float32:
-            lambdas = lambdas.float()
+        _assert_dtype_match(sinogram, lambdas, "sinogram", "lambdas", "run_mbir")
         if lambdas.device != sinogram.device:
             lambdas = lambdas.to(sinogram.device)
         # The MBIR sweeps read lambdas through a raw linear pointer (CUDA) or
