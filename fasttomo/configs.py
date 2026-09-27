@@ -12,7 +12,8 @@ A note on the dual semantics of ``sparsity``:
   iteration as ``λ · mean(|f|)`` (used by ``run_ad_recon``).
 * :attr:`ConstraintConfig.sparsity` is a post-step soft-threshold
   ``f ← sign(f) · max(|f| − λ, 0)`` applied by :meth:`ConstraintConfig.apply`
-  (used by SIRT/SART/RESIRE/FISTA).
+  (used by SIRT/SART/RESIRE/FISTA) and, once per iteration after the
+  optimiser step, by ``run_ad_recon``.
 
 The two are different operations sharing the same name because they
 serve the same modelling goal in two different optimisation regimes.
@@ -140,7 +141,10 @@ class ConstraintConfig:
     """
     positivity: bool = False
     mask: bool | torch.Tensor | None = None
-    sparsity: float = 0.0           # post-step soft-threshold (not an AD loss term)
+    # Post-step L1 soft-threshold f <- sign(f) * max(|f| - sparsity, 0), in
+    # volume units, applied once per iteration after mask and positivity
+    # (run_ad_recon included). Not a loss term; see RegularizerConfig.sparsity.
+    sparsity: float = 0.0
 
     def apply(self, volume: torch.Tensor) -> torch.Tensor:
         if isinstance(self.mask, torch.Tensor):

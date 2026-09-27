@@ -172,3 +172,104 @@ def test_forward_project_3d_autograd_nx_ne_ndet(backend, Nx, N_det):
     small = ft.back_project_3d(w, eul.detach(), Nz=Nz, Nx=narrow)
     big = ft.back_project_3d(w, eul.detach(), Nz=Nz, Nx=wide)[:, :, off:off + narrow]
     torch.testing.assert_close(small, big, rtol=0, atol=0)
+
+
+# ── ConstraintConfig.sparsity honoured by run_ad_recon ─────────────────────
+
+class _MeanZProjector:
+    """CPU stand-in for ParallelProjector: every view is the Z-mean of the
+    volume. Linear, so the fidelity gradient is non-zero for every voxel."""
+
+    def __init__(self, n_angles: int):
+        self.n_angles = n_angles
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        return volume.mean(dim=1).unsqueeze(0).expand(self.n_angles, -1, -1)
+
+
+def _cpu_ad_recon(monkeypatch, *, n_angles=4, Ny=2, N=6, projector=None):
+    """Patch run_ad_recon's CUDA-only input check and projector class so the
+    loop runs on CPU with ``projector`` (default `_MeanZProjector`)."""
+    import fasttomo.algorithms as algo
+
+    proj = projector if projector is not None else _MeanZProjector(n_angles)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kwargs):
+        n, ny, nd = sinogram.shape
+        return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", type(proj))
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    return proj
+
+
+@pytest.mark.parametrize("lam,expected", [(0.0, 0.2), (0.05, 0.15), (0.3, 0.0)])
+def test_ad_recon_constraint_sparsity_soft_thresholds(monkeypatch, lam, expected):
+    """One Adam step from a zero volume moves every voxel by exactly
+    lr_volume (Adam's first step is lr * g / (|g| + eps)); the post-step
+    soft-threshold then leaves |v| = max(lr - lam, 0). Before the fix
+    ConstraintConfig.sparsity was ignored and |v| stayed 0.2."""
+    proj = _cpu_ad_recon(monkeypatch)
+    sino = torch.full((4, 2, 6), 3.0)           # target above the start: v grows
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=1, lr_volume=0.2, cosine_schedule=False),
+        constraints=ft.ConstraintConfig(sparsity=lam),
+    )
+    rec = ft.run_ad_recon(sino, torch.linspace(-30, 30, 4), Nz=6,
+                          projector=proj, config=cfg)
+    torch.testing.assert_close(rec, torch.full_like(rec, expected), rtol=0, atol=1e-6)
+
+
+def test_ad_recon_constraint_sparsity_matches_config_apply(monkeypatch):
+    """Several iterations: run_ad_recon's result equals a hand-written loop
+    (Adam step, then ConstraintConfig.apply) with the same settings."""
+    proj = _cpu_ad_recon(monkeypatch)
+    g = torch.Generator().manual_seed(5)
+    sino = torch.rand(4, 2, 6, generator=g) * 2 - 0.5
+    cons = ft.ConstraintConfig(positivity=False, sparsity=0.02)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=6, lr_volume=0.1, cosine_schedule=False),
+        constraints=cons,
+    )
+    rec = ft.run_ad_recon(sino, torch.linspace(-30, 30, 4), Nz=6,
+                          projector=proj, config=cfg)
+
+    v = torch.zeros(2, 6, 6, requires_grad=True)
+    opt = torch.optim.Adam([v], lr=0.1)
+    for _ in range(6):
+        opt.zero_grad()
+        torch.nn.functional.mse_loss(proj.forward(v), sino).backward()
+        opt.step()
+        with torch.no_grad():
+            v.copy_(cons.apply(v))
+    assert torch.equal(rec, v.detach())
+    cfg.constraints = ft.ConstraintConfig(positivity=False)
+    unthresholded = ft.run_ad_recon(sino, torch.linspace(-30, 30, 4), Nz=6,
+                                    projector=proj, config=cfg)
+    assert not torch.equal(rec, unthresholded)
+
+
+@needs_cuda
+def test_ad_recon_constraint_sparsity_cuda():
+    """Real projector: the soft-threshold zeroes the small background voxels
+    that plain AD leaves as noise, and sparsity=0 keeps the default result
+    bit-identical."""
+    torch.manual_seed(0)
+    N, n = 32, 25
+    ang = torch.linspace(-60, 60, n, device="cuda")
+    vol = torch.zeros(2, N, N, device="cuda")
+    vol[:, 10:20, 12:22] = 1.0
+    sino = ft.forward_project(vol, ang)
+    sino = sino + 0.05 * torch.randn_like(sino)
+    base = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=40, lr_volume=0.05))
+    rec0 = ft.run_ad_recon(sino, ang, Nz=N, config=base)
+    rec0b = ft.run_ad_recon(sino, ang, Nz=N, config=ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=40, lr_volume=0.05),
+        constraints=ft.ConstraintConfig(sparsity=0.0)))
+    assert torch.equal(rec0, rec0b)
+    rec = ft.run_ad_recon(sino, ang, Nz=N, config=ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=40, lr_volume=0.05),
+        constraints=ft.ConstraintConfig(sparsity=0.01)))
+    bg = vol == 0
+    assert (rec[bg] == 0).float().mean() > 0.5 > (rec0[bg] == 0).float().mean()
+    assert _rel(rec, vol) < 1.0

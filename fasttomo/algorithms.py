@@ -37,6 +37,7 @@ from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, t
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector, _drain_deferred_handles
 from fasttomo.configs import (
+    _apply_sparsity,
     AdReconConfig,
     ConstraintConfig,
     OptimConfig,
@@ -1241,6 +1242,15 @@ def run_ad_recon(
         * if ``return_pose`` only  — ``(volume, euler_or_None, shifts_or_None)``
         * if both                  — ``(volume, loss_history, euler_or_None, shifts_or_None)``
 
+    Constraints:
+        After every optimiser step, inside ``torch.no_grad``, the volume gets
+        ``ConstraintConfig.positivity`` (clamp at 0), then the support mask,
+        then ``ConstraintConfig.sparsity`` as a soft-threshold
+        ``f <- sign(f) * max(|f| - sparsity, 0)`` (the proximal step of an L1
+        penalty, in volume units, once per iteration). It is independent of
+        ``RegularizerConfig.sparsity``, which adds ``sparsity * mean(|f|)`` to
+        the loss and acts through the gradient instead; both may be set.
+
     Note:
         This function requires a CUDA device. The underlying projectors are
         CUDA-only; passing CPU tensors will raise a ``RuntimeError`` from
@@ -1498,6 +1508,10 @@ def run_ad_recon(
                 volume.clamp_(min=0.0)
             if _cmask_mul is not None:
                 volume.mul_(_cmask_mul)
+            if constraints_cfg.sparsity > 0.0:
+                # Post-step L1 soft-threshold (ConstraintConfig.sparsity),
+                # applied last as documented: mask -> positivity -> sparsity.
+                volume.copy_(_apply_sparsity(volume, constraints_cfg.sparsity))
             tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
                 tilt_angle_opt[:, 1].clamp_(
