@@ -11,13 +11,12 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from fasttomo.projection import back_project
+from fasttomo._operator import Geometry, _make_operator
 from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
 )
 from fasttomo.utilities import ramp_filter
-from fasttomo.projector import ParallelProjector
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
     _WBP_MIN_THRESHOLD,
@@ -99,11 +98,19 @@ def _bp_gather(
 
 
 def _wbp_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor,
-                     Nz: int, Nx: int) -> torch.Tensor:
+                     Nz: int, Nx: int, ops: dict | None = None) -> torch.Tensor:
     """The shift-invariant back-projection W-BP needs: the CUDA kernel, or
-    the same gather operator on CPU."""
+    the same gather operator on CPU. ``ops`` (CUDA) caches one projection
+    operator per chunk height, so repeated calls (wSIRT) reuse textures."""
     if sinogram.is_cuda:
-        return back_project(sinogram, angles_deg, Nz=Nz, Nx=Nx)
+        n_angles, ny, N_det = sinogram.shape
+        ops = {} if ops is None else ops
+        op = ops.get(ny)
+        if op is None:
+            op = ops[ny] = _make_operator(
+                Geometry("parallel", (ny, Nz, Nx), N_det, n_angles, angles_deg),
+                sinogram.device, sinogram.dtype)
+        return op.backproject(sinogram)
     return _bp_gather(sinogram, angles_deg, Nz, Nx)
 
 
@@ -163,6 +170,7 @@ def _make_wbp(
     # Y-slices are independent; chunk them so the padded layergram and its
     # spectrum stay around _WBP_CHUNK_VOXELS elements.
     y_chunk = max(1, _WBP_CHUNK_VOXELS // (Pz * Px))
+    ops: dict = {}      # CUDA back-projection operators by chunk height
 
     @torch.no_grad()
     def wbp(sinogram: torch.Tensor) -> torch.Tensor:
@@ -170,7 +178,7 @@ def _make_wbp(
         out = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sinogram.device)
         for y0 in range(0, Ny, y_chunk):
             sl = sinogram[:, y0:y0 + y_chunk]
-            spec = torch.fft.rfft2(_wbp_backproject(sl, angles_deg, Pz, Px))   # [ny, Pz, Px//2+1]
+            spec = torch.fft.rfft2(_wbp_backproject(sl, angles_deg, Pz, Px, ops))   # [ny, Pz, Px//2+1]
             spec.mul_(WF)
             filtered = torch.fft.irfft2(spec, s=(Pz, Px))
             del spec
@@ -207,10 +215,9 @@ def run_fbp(
     Nz, positivity, mask, support_mask, num_threads
         See Conventions.
     projector : ParallelProjector, optional
-        CUDA only: reuse its texture cache across calls (a tilt-series sweep).
+        Reuse its texture cache across calls (a tilt-series sweep on CUDA).
         Its angles and volume shape replace ``angles_deg`` and ``Nz`` for the
-        back-projection. Without it CUDA builds one internally; CPU uses the
-        functional ``back_project``. Numerics are identical either way.
+        back-projection. Numerics are identical to the call without it.
 
     Returns
     -------
@@ -236,16 +243,11 @@ def run_fbp(
     n_angles, Ny, N_det, Nz, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.device)
     filtered = ramp_filter(sinogram)
-    if projector is not None:
-        volume = projector.back(filtered)
-    elif sinogram.is_cuda:
-        _proj = ParallelProjector(
-            (Ny, Nz, N_det), angles_deg,
-            device=device, N_det=N_det,
-        )
-        volume = _proj.back(filtered)
-    else:
-        volume = back_project(filtered, angles_deg, Nz=Nz, num_threads=num_threads)
+    # one back-projection: the one-shot (scoped-texture) path on CUDA
+    op = _make_operator(
+        Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
+        device, filtered.dtype, projector, cached=False, num_threads=num_threads)
+    volume = op.backproject(filtered)
     # angular sampling normalisation: π / n_angles
     volume = volume * (math.pi / n_angles)
     if support_mask is not None:

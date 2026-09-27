@@ -274,7 +274,7 @@ def run_fista(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
 
-    _fp, _bp, _internal_proj = _build_fp_bp(
+    _fp, _bp, _op = _build_fp_bp(
         sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
         device, num_threads, projector, euler_zyz_deg,
     )
@@ -358,7 +358,7 @@ def run_fista_tv(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
 
-    _fp, _bp, _internal_proj = _build_fp_bp(
+    _fp, _bp, _op = _build_fp_bp(
         sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
         device, num_threads, projector, euler_zyz_deg,
     )

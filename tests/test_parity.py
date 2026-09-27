@@ -1,7 +1,8 @@
 """
-Agreement between backends and code paths: CPU <-> CUDA for the
-projection ops and algorithms, and cached projector <-> functional
-(uncached) API. Each test states its tolerance and why.
+Agreement between backends and code paths: the projection-operator
+adapters against each other (CPU, CUDA cached, CUDA uncached), CPU <-> CUDA
+for the algorithms, and cached projector <-> functional API. Each test
+states its tolerance and why.
 """
 
 from __future__ import annotations
@@ -17,42 +18,192 @@ from conftest import (
 )
 
 import fasttomo as ft
-from fasttomo.autograd import _euler_zyz_to_rotmat
 
-# ── CPU <-> CUDA ──────────────────────────────────────────────────────────────
+# ── projection-operator adapters ─────────────────────────────────────────────
+#
+# Every FP/BP runs through one of three adapters (fasttomo/_operator.py):
+# CPU (UncachedOperator on the CPU), CUDA uncached (one-shot scoped textures,
+# the functional API) and CUDA cached (ParallelProjector / RotmatProjector
+# and the algorithms). One parametrised test checks them against each other
+# for both geometries, fp32 and fp16, and three shapes: Ny = 5 (fp16 textures
+# single-channel), Ny = 8 and 4 (fp16 textures 4-channel packed), odd and
+# non-square Nz / Nx / N_det, and a small odd view count.
+#
+# Tolerances (relative L2, measured on this data with the listed maxima):
+#
+# * CUDA cached vs uncached: the same kernels on the same texture layout,
+#   so fp, bp and the autograd gradients are compared with torch.equal. The
+#   geometry gradients accumulate with fp32 atomics: 1e-5.
+# * CPU vs CUDA, fp and bp: the texture unit's 8-bit interpolation weights.
+#   Parallel (2-D bilinear texture): 5e-4 (4.7e-4 at 13 px, <= 2e-4 from
+#   16 px; the 3e-4 floor quoted for W-BP holds on the larger grids).
+#   Rotmat (3-D trilinear texture): 1e-3 (max 7.1e-4). fp16 textures add
+#   up to 2e-4: 7e-4 / 1.2e-3.
+# * The parallel CPU bp is the ray-driven transpose of the CPU fp, a
+#   different operator from the CUDA voxel-driven gather (10-20 % apart), so
+#   the CUDA bp is checked against `_bp_gather`, an independent PyTorch
+#   implementation of the gather, and the CPU bp by the inner-product test
+#   <A x, y> = <x, A^T y> (fp32 round-off: 1e-5).
+# * CPU vs CUDA geometry gradients (grad_angle / grad_rotmat): no texture
+#   filtering, fp32 atomics only: 5e-6 (max 1.1e-6).
 
 
-DEVICE = torch.device("cuda")
+def _smooth_volume(Ny, Nz, Nx):
+    y = torch.linspace(-1, 1, Ny)[:, None, None]
+    z = torch.linspace(-1, 1, Nz)[None, :, None]
+    x = torch.linspace(-1, 1, Nx)[None, None, :]
+    return torch.exp(-2 * ((x / 0.5) ** 2 + (z / 0.45) ** 2 + (y / 0.9) ** 2))
+
+
+def _smooth_sinogram(n, Ny, N_det):
+    a = torch.linspace(0, 1, n)[:, None, None]
+    y = torch.linspace(-1, 1, Ny)[None, :, None]
+    u = torch.linspace(-1, 1, N_det)[None, None, :]
+    return torch.exp(-2 * ((u - 0.2 * a) / 0.5) ** 2) * (1 + 0.3 * y)
+
+
+def _rl2(a, b):
+    a, b = a.detach().double().cpu(), b.detach().double().cpu()
+    return float((a - b).norm() / b.norm())
+
+
+_TEX_FLOOR = {("parallel", torch.float32): 5e-4, ("parallel", torch.float16): 7e-4,
+              ("rotmat", torch.float32): 1e-3, ("rotmat", torch.float16): 1.2e-3}
+_ADAPTER_SHAPES = [(5, 11, 13, 15, 7), (8, 16, 16, 16, 9), (4, 24, 20, 28, 13)]
+
+
+def _adapter_case(kind, shape):
+    from fasttomo._operator import Geometry
+    Ny, Nz, Nx, N_det, n = shape
+    ang = torch.linspace(-63, 57, n)
+    eul = torch.stack([torch.linspace(-7, 5, n), ang, torch.linspace(4, -6, n)], 1)
+    geometry = Geometry(kind, (Ny, Nz, Nx), N_det, n, ang if kind == "parallel" else None)
+    geom = None if kind == "parallel" else ft.euler_zyz_to_rotmat(eul)
+    return geometry, geom, ang, _smooth_volume(Ny, Nz, Nx), _smooth_sinogram(n, Ny, N_det)
+
+
+def _run_adapter(op, geom, vol, sino, gsino):
+    """fp, bp, grad_geom and the autograd gradients of one adapter."""
+    gsino = gsino.to(vol.dtype)
+    out = {"fp": op.fp(vol, geom), "bp": op.bp(sino, geom), "bp_g": op.bp(gsino, geom),
+           "grad_geom": op.grad_geom(vol, gsino, geom)}
+    v = vol.clone().requires_grad_(True)
+    g = None if geom is None else geom.clone().requires_grad_(True)
+    (op.project(v, g) * gsino).sum().backward()
+    out["autograd_vol"] = v.grad
+    out["autograd_geom"] = None if g is None else g.grad
+    s = sino.clone().requires_grad_(True)
+    (op.backproject(s, geom) * vol).sum().backward()
+    out["autograd_sino"] = s.grad
+    out["fp_again"] = op.fp(vol, geom)                    # a cached texture is reused
+    return out
 
 
 @needs_cuda
-def test_forward_project_matches_cpu():
-    """
-    CUDA forward projection must agree with CPU to within ~1% relative.
-
-    Both kernels integrate the same line integrals with the same boundary
-    convention, but CUDA uses tex2DLayered hardware bilinear filtering which
-    has 8 fractional bits of precision (~1/256 per sample). For a 64-step ray
-    on a unit-variance random volume the accumulated quantisation error is
-    O(0.1) absolute, ~1% relative — far above 1e-4. The 1% relative bound is
-    the practical accuracy floor for hardware-filtered textures.
-    """
-    N      = 64
-    angles_cpu = make_angles(30, device=DEVICE).cpu()
-    angles_gpu = angles_cpu.to(DEVICE)
-
-    vol_cpu = torch.randn(1, N, N)
-    vol_gpu = vol_cpu.to(DEVICE)
-
-    sino_cpu = ft.forward_project(vol_cpu, angles_cpu)
-    sino_gpu = ft.forward_project(vol_gpu, angles_gpu)
-
-    diff     = (sino_cpu - sino_gpu.cpu()).abs()
-    rel_err  = diff.max().item() / (sino_cpu.abs().max().item() + 1e-12)
-    assert rel_err < 1e-2, (
-        f"CPU/CUDA forward mismatch: max_diff={diff.max().item():.2e}, "
-        f"rel_err={rel_err:.2e}"
+@pytest.mark.parametrize("shape", _ADAPTER_SHAPES, ids=lambda s: "x".join(map(str, s)))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
+@pytest.mark.parametrize("kind", ["parallel", "rotmat"])
+def test_projection_adapters_agree(kind, dtype, shape):
+    from fasttomo._operator import (
+        CudaCachedOperator,
+        UncachedOperator,
+        _make_operator,
     )
+    from fasttomo.algorithms.analytic import _bp_gather
+    torch.manual_seed(0)
+    geometry, geom, ang, vol, sino = _adapter_case(kind, shape)
+    Ny, Nz, Nx, N_det, n = shape
+    gsino = _smooth_sinogram(n, Ny, N_det).flip(0).contiguous()
+    vol, sino = vol.to(dtype), sino.to(dtype)
+
+    cpu = _make_operator(geometry, "cpu")
+    unc = _make_operator(geometry, "cuda", cached=False)
+    cac = _make_operator(geometry, "cuda")
+    assert type(cpu) is UncachedOperator and type(unc) is UncachedOperator
+    assert type(cac) is CudaCachedOperator
+    gcu = None if geom is None else geom.cuda()
+    res = {"cpu": _run_adapter(cpu, geom, vol, sino, gsino),
+           "unc": _run_adapter(unc, gcu, vol.cuda(), sino.cuda(), gsino.cuda()),
+           "cac": _run_adapter(cac, gcu, vol.cuda(), sino.cuda(), gsino.cuda())}
+
+    # shapes and dtypes first
+    for name, r in res.items():
+        assert r["fp"].shape == (n, Ny, N_det) and r["fp"].dtype == dtype, name
+        assert r["bp"].shape == (Ny, Nz, Nx) and r["bp"].dtype == dtype, name
+        assert r["autograd_vol"].shape == (Ny, Nz, Nx), name
+        assert r["autograd_sino"].shape == (n, Ny, N_det), name
+        assert r["grad_geom"].shape == ((n,) if kind == "parallel" else (n, 9)), name
+        if geom is not None:
+            assert r["autograd_geom"].shape == geom.shape, name
+        # the autograd backward is the adapter's own adjoint pair
+        assert torch.equal(r["autograd_vol"], r["bp_g"]), name
+        assert torch.equal(r["autograd_sino"], r["fp"]), name
+        if geom is not None:
+            torch.testing.assert_close(r["autograd_geom"].reshape(n, 9), r["grad_geom"],
+                                       rtol=1e-5, atol=1e-5 * r["grad_geom"].abs().max().item())
+        assert torch.equal(r["fp_again"], r["fp"]), name
+
+    # CUDA cached == CUDA uncached
+    for key in ("fp", "bp", "autograd_vol", "autograd_sino"):
+        assert torch.equal(res["cac"][key], res["unc"][key]), key
+    torch.testing.assert_close(res["cac"]["grad_geom"], res["unc"]["grad_geom"],
+                               rtol=1e-5, atol=1e-5 * res["unc"]["grad_geom"].abs().max().item())
+    if geom is not None:
+        torch.testing.assert_close(res["cac"]["autograd_geom"], res["unc"]["autograd_geom"],
+                                   rtol=1e-5,
+                                   atol=1e-5 * res["unc"]["autograd_geom"].abs().max().item())
+
+    # CPU <-> CUDA
+    floor = _TEX_FLOOR[(kind, dtype)]
+    assert _rl2(res["unc"]["fp"], res["cpu"]["fp"]) < floor
+    if kind == "parallel":
+        ref_bp = _bp_gather(sino.float(), ang, Nz, Nx)
+        assert _rl2(res["unc"]["bp"], ref_bp) < floor
+        x, y = vol.float(), sino.float()
+        lhs = (cpu.fp(x) * y).double().sum()
+        rhs = (x * cpu.bp(y)).double().sum()
+        assert abs(lhs - rhs) / abs(lhs) < 1e-5
+    else:
+        assert _rl2(res["unc"]["bp"], res["cpu"]["bp"]) < floor
+    assert _rl2(res["unc"]["grad_geom"], res["cpu"]["grad_geom"]) < 5e-6
+
+    # A unit-variance random volume (the former test_forward_project_matches_cpu):
+    # 8-bit weights on rough data, ~1 % max-abs relative.
+    rv = torch.randn(Ny, Nz, Nx, generator=torch.Generator().manual_seed(1)).to(dtype)
+    a, b = unc.fp(rv.cuda(), gcu).float().cpu(), cpu.fp(rv, geom).float()
+    assert (a - b).abs().max() / b.abs().max() < 1e-2
+
+
+def test_cpu_adapter_autograd_and_layout():
+    """CPU adapter contract (runs without a GPU): the autograd backward of
+    ``project`` / ``backproject`` is the adapter's own ``bp`` / ``fp`` /
+    ``grad_geom``, bit for bit, and strided inputs give the contiguous
+    result."""
+    from fasttomo._operator import _make_operator
+    for kind in ("parallel", "rotmat"):
+        geometry, geom, _, vol, sino = _adapter_case(kind, _ADAPTER_SHAPES[0])
+        op = _make_operator(geometry, "cpu", num_threads=2)
+        gsino = sino.flip(0).contiguous()
+        v = vol.clone().requires_grad_(True)
+        g = None if geom is None else geom.clone().requires_grad_(True)
+        (op.project(v, g) * gsino).sum().backward()
+        assert torch.equal(v.grad, op.bp(gsino, geom))
+        if g is not None:
+            assert torch.equal(g.grad, op.grad_geom(vol, gsino, geom).reshape(g.shape))
+        s = sino.clone().requires_grad_(True)
+        (op.backproject(s, geom) * vol).sum().backward()
+        assert torch.equal(s.grad, op.fp(vol, geom))
+        strided_vol = vol.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not strided_vol.is_contiguous()
+        assert torch.equal(op.fp(strided_vol, geom), op.fp(vol, geom))
+        strided_sino = sino[:, :, :].transpose(0, 1).contiguous().transpose(0, 1)
+        assert torch.equal(op.bp(strided_sino, geom), op.bp(sino, geom))
+
+
+# ── CPU <-> CUDA (algorithms) ─────────────────────────────────────────────────
+
+
+DEVICE = torch.device("cuda")
 
 
 @needs_cuda
@@ -231,43 +382,6 @@ def workload():
 
 
 @needs_cuda
-def test_parallel_projector_forward_matches_functional(workload):
-    vol, _, ang = workload
-    proj = ft.ParallelProjector(vol.shape, ang, device=vol.device)
-    sino_func = ft.forward_project(vol, ang)
-    for _ in range(5):
-        sino_cached = proj.forward(vol)
-        torch.testing.assert_close(sino_cached, sino_func, rtol=0, atol=1e-5)
-
-
-@needs_cuda
-def test_parallel_projector_back_matches_functional(workload):
-    _, sino, ang = workload
-    Ny, N_det = sino.shape[1], sino.shape[2]
-    proj = ft.ParallelProjector((Ny, N_det, N_det), ang, device=sino.device)
-    vol_func = ft.back_project(sino, ang)
-    for _ in range(5):
-        vol_cached = proj.back(sino)
-        torch.testing.assert_close(vol_cached, vol_func, rtol=0, atol=1e-5)
-
-
-@needs_cuda
-def test_rotmat_projector_forward_matches_functional(workload):
-    vol, _, ang = workload
-    n_angles = ang.numel()
-    euler = torch.zeros(n_angles, 3, device=vol.device, dtype=torch.float32)
-    euler[:, 1] = ang
-    mats = _euler_zyz_to_rotmat(euler)
-
-    sino_func = ft.forward_project_3d(vol, euler, N_det=vol.shape[-1])
-
-    proj = ft.RotmatProjector(vol.shape, n_angles, device=vol.device)
-    for _ in range(5):
-        sino_cached = proj.forward(vol, mats)
-        torch.testing.assert_close(sino_cached, sino_func, rtol=0, atol=1e-5)
-
-
-@needs_cuda
 def test_run_fbp_projector_matches_functional(workload):
     _, sino, ang = workload
     n_angles, Ny, N_det = sino.shape
@@ -277,67 +391,6 @@ def test_run_fbp_projector_matches_functional(workload):
     for _ in range(5):
         rec_cached = ft.run_fbp(sino, ang, positivity=True, mask=True, projector=proj)
         torch.testing.assert_close(rec_cached, rec_func, rtol=0, atol=1e-5)
-
-
-@needs_cuda
-def test_rotmat_projector_back_matches_functional(workload):
-    _, sino, ang = workload
-    n_angles, Ny, N_det = sino.shape
-    euler = torch.zeros(n_angles, 3, device=sino.device, dtype=torch.float32)
-    euler[:, 1] = ang
-    mats = _euler_zyz_to_rotmat(euler)
-
-    vol_func = ft.back_project_3d(sino, euler)
-
-    proj = ft.RotmatProjector((Ny, N_det, N_det), n_angles, device=sino.device)
-    for _ in range(5):
-        vol_cached = proj.back(sino, mats)
-        torch.testing.assert_close(vol_cached, vol_func, rtol=0, atol=1e-5)
-
-
-@needs_cuda
-def test_grad_rotmat_cached_matches_uncached():
-    """grad_rotmat cached path (via RotmatProjector._grad_mats_raw) must match
-    the uncached path (_grad_rotmat_raw) to within 1e-5 relative error."""
-    from fasttomo.autograd import _euler_zyz_to_rotmat, _grad_rotmat_raw
-
-    torch.manual_seed(0)
-    N        = 32
-    n_angles = 24
-    device   = DEVICE
-
-    volume   = torch.randn(N, N, N, device=device, dtype=torch.float32)
-    grad_sino = torch.randn(n_angles, N, N, device=device, dtype=torch.float32)
-
-    # Pure-Y ZYZ Euler angles
-    euler = torch.zeros(n_angles, 3)
-    euler[:, 1] = torch.linspace(-60.0, 60.0, n_angles)
-    euler = euler.to(device)
-    mats = _euler_zyz_to_rotmat(euler)                 # [n_angles, 3, 3]
-    mats_flat = mats.reshape(n_angles, 9).contiguous().float()
-
-    # Uncached path (now routes through a transient cache internally, but is
-    # the reference since it was tested independently)
-    g_old = _grad_rotmat_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
-
-    # Cached path via RotmatProjector
-    from fasttomo.projector import RotmatProjector
-    proj = RotmatProjector((N, N, N), n_angles=n_angles, device=device)
-    # Populate _vol_handle by running forward()
-    _ = proj.forward(volume, mats_flat)
-    g_new = proj._grad_mats_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
-
-    assert g_old.shape == g_new.shape, f"shape mismatch: {g_old.shape} vs {g_new.shape}"
-    denom = g_old.abs().max()
-    if denom < 1e-8:
-        # Absolute fallback when denominator is near zero
-        assert (g_new - g_old).abs().max().item() < 1e-5, \
-            "absolute error too large (denominator near zero)"
-    else:
-        rel_err = (g_new - g_old).abs().max().item() / denom.item()
-        assert rel_err < 1e-5, (
-            f"grad_rotmat cached vs uncached max rel error: {rel_err:.2e} (threshold 1e-5)"
-        )
 
 
 @needs_cuda

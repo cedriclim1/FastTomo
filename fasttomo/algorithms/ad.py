@@ -13,13 +13,9 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
+from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import euler_zyz_to_rotmat
-from fasttomo.projection import (
-    apply_shifts_2d,
-    forward_project,
-    forward_project_3d,
-    forward_project_resire,
-)
+from fasttomo.projection import apply_shifts_2d
 from fasttomo.constraints import _soft_threshold
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_3d, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
@@ -117,7 +113,8 @@ class _AdRun:
     sinogram: torch.Tensor
     angles_deg: torch.Tensor              # nominal tilt angles, on the device
     volume: torch.Tensor                  # leaf tensor, requires_grad
-    proj: Any                             # ParallelProjector | RotmatProjector
+    fp: Callable[..., torch.Tensor]       # fp(volume) or fp(volume, mats), differentiable
+    op: Any                               # the projection operator (kept alive)
     tilt_angle_opt: torch.Tensor | None   # [n_angles, 3] ZYZ Euler, requires_grad
     shifts: torch.Tensor | None           # [n_angles, 2], requires_grad
     optimisers: list                      # [volume, (angles), (shifts)]
@@ -178,9 +175,9 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
     tilt, shifts = run.tilt_angle_opt, run.shifts
     if run.refine_pose and tilt is not None:
         mats = euler_zyz_to_rotmat(tilt)
-        pred = run.proj.forward(run.volume, mats)
+        pred = run.fp(run.volume, mats)
     else:
-        pred = run.proj.forward(run.volume)
+        pred = run.fp(run.volume)
 
     # A user-supplied projector built for another geometry would make
     # the loss broadcast silently (e.g. [1, Ny, N] against the sinogram).
@@ -343,8 +340,7 @@ def run_ad_recon(
     different: a loss term ``sparsity * mean(|f|)`` acting through the
     gradient; both may be set.
 
-    CUDA only: the projectors are CUDA-only, and CPU input raises
-    RuntimeError.
+    CUDA only: CPU input raises RuntimeError.
     """
     if config is None:
         config = AdReconConfig()
@@ -405,20 +401,11 @@ def run_ad_recon(
     # ── initialise volume ──────────────────────────────────────────────────
     volume = setup.volume0.requires_grad_(True)
 
-    # ── build projector ────────────────────────────────────────────────────
-    _internal_proj: object | None = None
-    if projector is not None:
-        _proj = projector
-    elif refine_pose:
-        _internal_proj = RotmatProjector(
-            (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
-        )
-        _proj = _internal_proj
-    else:
-        _internal_proj = ParallelProjector(
-            (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
-        )
-        _proj = _internal_proj
+    # ── projection operator (the caller's projector, else cached textures) ─
+    op = _make_operator(
+        Geometry("rotmat" if refine_pose else "parallel", (Ny, Nz, Nx), N_det, n_angles,
+                 None if refine_pose else angles_deg),
+        device, torch.float32, projector)
 
     # ── initialise pose / shift parameters ────────────────────────────────
     tilt_angle_opt: torch.Tensor | None = None
@@ -502,7 +489,7 @@ def run_ad_recon(
 
     # ── iteration ─────────────────────────────────────────────────────────
     run = _AdRun(
-        sinogram=sinogram, angles_deg=angles_deg, volume=volume, proj=_proj,
+        sinogram=sinogram, angles_deg=angles_deg, volume=volume, fp=op.project, op=op,
         tilt_angle_opt=tilt_angle_opt, shifts=shifts,
         optimisers=optimisers, schedulers=schedulers,
         optim_cfg=optim_cfg, reg_cfg=reg_cfg, constraints_cfg=constraints_cfg,
@@ -613,12 +600,21 @@ def run_grad_descent(
     volume = setup.volume0.requires_grad_(True)
     opt = optimizer_cls([volume], lr=lr)
 
+    # parallel: the angles are the operator's; rotmat: matrices computed
+    # once; RESIRE: its wrappers take the Euler angles themselves
+    if euler_zyz_deg is None:
+        kind, geom = "parallel", None
+    elif use_resire_projector:
+        kind, geom = "resire", euler_zyz_deg
+    else:
+        kind, geom = "rotmat", euler_zyz_to_rotmat(euler_zyz_deg.detach()).to(setup.device)
+    op = _make_operator(
+        Geometry(kind, (setup.Ny, setup.Nz, setup.Nx), N_det, setup.n_angles,
+                 angles_deg if kind == "parallel" else None),
+        setup.device, sinogram.dtype, num_threads=num_threads)
+
     def _fp(v):
-        if euler_zyz_deg is None:
-            return forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
-        if use_resire_projector:
-            return forward_project_resire(v, euler_zyz_deg, N_det=N_det)
-        return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
+        return op.project(v, geom)
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_grad_descent")

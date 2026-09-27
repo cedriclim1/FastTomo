@@ -247,13 +247,14 @@ RESIRE_NOISY = ("fp", "fp_ndet", "bp_grad_sq", "run", "run_loss", "run_euler")
 
 
 # The golden file was made on an RTX PRO 6000 Blackwell (sm_120) with torch
-# 2.12.1+cu130 and nvcc 13.0. Another GPU architecture, compiler or torch
-# version may round the rotation matrices or contract FMAs differently, so
-# the torch.equal comparison of the RESIRE_EXACT keys only holds in that
-# environment; elsewhere they are compared at the RESIRE_NOISY tolerance.
+# 2.12.1+cu130 and nvcc 13.0 (torch.equal re-verified with torch
+# 2.14.0+cu130). Another GPU architecture, compiler or torch version may
+# round the rotation matrices or contract FMAs differently, so the
+# torch.equal comparison of the RESIRE_EXACT keys only holds in those
+# environments; elsewhere they are compared at the RESIRE_NOISY tolerance.
 # To regenerate: check out origin/main's fasttomo/ at 98fa473 and save
 # `_resire_cases()` with torch.save.
-RESIRE_GOLDEN_ENV = {"capability": (12, 0), "torch": "2.12."}
+RESIRE_GOLDEN_ENV = {"capability": (12, 0), "torch": ("2.12.", "2.14.")}
 
 
 def _resire_golden_env_matches() -> bool:

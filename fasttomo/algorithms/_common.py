@@ -4,7 +4,8 @@ Shared machinery of the reconstruction algorithms.
 Module constants, the reconstruction prologue `_prepare_recon` (ARCH P5),
 the loss recorder `_LossRecorder` (ARCH P6, owns the frozen 2026-06-11
 ``loss_callback`` contract), deprecated-keyword handling and the FP/BP
-closure builder `_build_fp_bp` shared by SIRT and FISTA. The conventions
+closure builder `_build_fp_bp` shared by SIRT and FISTA (a projection
+operator from `fasttomo._operator._make_operator` plus two closures). The conventions
 every ``run_*`` follows are documented in :mod:`fasttomo.algorithms`.
 """
 
@@ -23,18 +24,12 @@ import torch
 from tqdm.auto import tqdm
 
 from fasttomo._backend import _assert_dtype_match
+from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import euler_zyz_to_rotmat
-from fasttomo.projection import (
-    forward_project,
-    back_project,
-    forward_project_3d,
-    back_project_3d,
-)
 from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
 )
-from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.configs import ConstraintConfig
 
 
@@ -561,51 +556,25 @@ def _build_fp_bp(
     projector: object | None,
     euler_zyz_deg: torch.Tensor | None,
 ):
-    """Build (_fp, _bp, _internal_proj) closures for iterative algorithms.
+    """Build ``(_fp, _bp, op)`` for an iterative algorithm.
 
-    Caller must hold ``_internal_proj`` until the algorithm finishes so the
-    texture cache stays alive.
+    ``op`` is the reconstruction's projection operator (`_make_operator`):
+    the caller's ``projector`` if given, else one for this geometry (CUDA:
+    cached textures reused by every iteration; CPU: the OpenMP kernels).
+    ``euler_zyz_deg`` selects the rotation-matrix geometry; its matrices are
+    computed once. ``_fp``/``_bp`` are differentiable. Hold ``op`` until the
+    algorithm finishes: it owns the textures and ``run_sirt``'s CUDA graphs.
     """
-    Ny, Nz, Nx = vol_shape
-    _internal_proj = None
-    if projector is None and sinogram.is_cuda:
-        # CUDA always goes through a cached projector (built here if needed)
-        if euler_zyz_deg is not None:
-            _internal_proj = RotmatProjector(
-                (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
-            )
-        else:
-            _internal_proj = ParallelProjector(
-                (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
-            )
-        projector = _internal_proj
+    rotmat = euler_zyz_deg is not None
+    op = _make_operator(
+        Geometry("rotmat" if rotmat else "parallel", vol_shape, N_det, n_angles,
+                 None if rotmat else angles_deg),
+        device, sinogram.dtype, projector, num_threads=num_threads)
+    geom = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device) if rotmat else None
 
-    if projector is not None:
-        proj = projector
-        if euler_zyz_deg is not None:
-            mats = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+    def _fp(v):
+        return op.project(v, geom)
 
-            def _fp(v):
-                return proj.forward(v, mats)
-
-            def _bp(s):
-                return proj.back(s, mats)
-        else:
-            def _fp(v):
-                return proj.forward(v)
-
-            def _bp(s):
-                return proj.back(s)
-    elif euler_zyz_deg is not None:
-        def _fp(v):
-            return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
-
-        def _bp(s):
-            return back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
-    else:
-        def _fp(v):
-            return forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
-
-        def _bp(s):
-            return back_project(s, angles_deg, Nz=Nz, num_threads=num_threads)
-    return _fp, _bp, _internal_proj
+    def _bp(s):
+        return op.backproject(s, geom)
+    return _fp, _bp, op

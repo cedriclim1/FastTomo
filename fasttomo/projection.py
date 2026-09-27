@@ -1,11 +1,13 @@
 """
 Projection primitives for FastTomo.
 
-Thin shims around torch.autograd.Function subclasses defined in
-fasttomo/autograd.py. When inputs do not require grad, Function.apply
-short-circuits and behaves identically to a direct kernel call. When a
-volume (or sinogram) has requires_grad=True, loss.backward() flows the
-adjoint partner kernel back into .grad.
+Each op builds a transient projection operator for its inputs' geometry
+(`fasttomo._operator._make_operator`, uncached adapter: CPU kernels, or a
+one-shot CUDA texture) and calls its differentiable ``project`` /
+``backproject``. When inputs do not require grad this behaves identically
+to a direct kernel call; when a volume (or sinogram, or the angles) has
+requires_grad=True, loss.backward() flows the adjoint partner kernel back
+into .grad.
 
 Every op raises ValueError, on CPU and CUDA alike, when a dimension of its
 input or output (n_angles, Ny, Nz, Nx, N_det) is zero.
@@ -19,9 +21,9 @@ import math
 
 import torch
 
+from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import (
-    _FPParallel, _BPParallel, _FPRotmat, _BPRotmat, _FPResire, _BPResire,
-    euler_zyz_to_rotmat, _resolve_num_threads,
+    _FPResire, _BPResire, euler_zyz_to_rotmat, _resolve_num_threads,
 )
 
 __all__ = [
@@ -108,6 +110,16 @@ def apply_shifts_2d(
 
 # ── projection ops ─────────────────────────────────────────────────────────
 
+def _transient(kind, shape, N_det, device, num_threads, angles_deg=None):
+    """The one-shot operator behind a functional call: uncached, with the
+    volume dims the call knows (``-1``: the raw kernels derive them from the
+    input, as they always did)."""
+    Nz, Nx = int(shape[-2]), int(shape[-1])
+    return _make_operator(
+        Geometry(kind, (-1, Nz, Nx), int(N_det), -1, angles_deg),
+        device, cached=False, num_threads=_resolve_num_threads(num_threads))
+
+
 def forward_project(
     volume: torch.Tensor,          # [Ny, Nz, Nx]
     angles_deg: torch.Tensor,      # [n_angles] degrees
@@ -130,8 +142,9 @@ def forward_project(
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    nt = _resolve_num_threads(num_threads)
-    return _FPParallel.apply(volume, angles_deg, N_det, nt)
+    op = _transient("parallel", volume.shape, N_det, volume.device, num_threads,
+                    angles_deg=angles_deg)
+    return op.project(volume, angles_deg)
 
 
 def back_project(
@@ -169,8 +182,9 @@ def back_project(
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    nt = _resolve_num_threads(num_threads)
-    return _BPParallel.apply(sinogram, angles_deg, Nz, nt, Nx)
+    op = _transient("parallel", (-1, Nz, Nx), sinogram.shape[-1], sinogram.device,
+                    num_threads, angles_deg=angles_deg)
+    return op.backproject(sinogram, angles_deg)
 
 
 def forward_project_3d(
@@ -214,9 +228,9 @@ def forward_project_3d(
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    nt = _resolve_num_threads(num_threads)
     mats = euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    sino = _FPRotmat.apply(volume, mats, N_det, nt)
+    op = _transient("rotmat", volume.shape, N_det, volume.device, num_threads)
+    sino = op.project(volume, mats)
     if shifts is not None:
         sino = apply_shifts_2d(sino, shifts)
     return sino
@@ -245,8 +259,11 @@ def back_project_3d(
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    nt = _resolve_num_threads(num_threads)
-    return _BPRotmat.apply(sinogram, euler_zyz_deg, Nz, nt, Nx)
+    # no gradient w.r.t. the angles through a back-projection
+    mats = euler_zyz_to_rotmat(euler_zyz_deg.detach())
+    op = _transient("rotmat", (-1, Nz, Nx), sinogram.shape[-1], sinogram.device,
+                    num_threads)
+    return op.backproject(sinogram, mats)
 
 
 def forward_project_resire(
