@@ -37,10 +37,14 @@
  * cannot drop a contributing sample. Non-finite ray parameters (a NaN or
  * Inf matrix) fall back to the full range, which is what the loop did.
  *
- * grad_rotmat_kernel marches the same steps but is NOT clipped: its loose
- * bounds test already skips the 8 texture fetches of an outside sample, so
- * clipping only saves that test, and measured 0.97-0.98x (block- or
- * warp-uniform range) and ~0.8x (per-lane range) against the full loop.
+ * grad_rotmat_kernel uses the same block-uniform clipping. A dropped step
+ * is one its loose bounds test would skip (the slab [-2, N+1] contains the
+ * contributing band (-1, N)), so no accumulator changes and the gradient is
+ * bit-identical to the full loop (tests compare both via the hook below).
+ * The gain is small because an outside step costs ~20 instructions against
+ * ~86 for an inside one: 0.97-0.98x with the old 9 KB smem-tree kernel
+ * (PR #92), 1.00-1.07x after the fixed-order reduction and the instruction
+ * cut (phase1b audit R1/R2/R10; per-lane ranges ~0.8x, not used).
  */
 __device__ __forceinline__ bool rotmat_clip_axis(float o, float d, int N,
                                                  float &t0, float &t1) {
@@ -405,7 +409,7 @@ __global__ static void grad_rotmat_kernel(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     float half_det, float half_x, float half_y, float half_z,
-    int ray_len
+    int ray_len, int clip
 ) {
     int iu = blockIdx.x * blockDim.x + threadIdx.x;
     int iv = blockIdx.y * blockDim.y + threadIdx.y;
@@ -415,17 +419,29 @@ __global__ static void grad_rotmat_kernel(
 
     float gM[9] = {0,0,0,0,0,0,0,0,0};
 
+    const float *M = mats + (size_t)ia * 9;
+    float u = (float)iu - half_det;
+    float v = (float)iv - half_y;
+    float ox = u * M[0] + v * M[3];
+    float oy = u * M[1] + v * M[4];
+    float oz = u * M[2] + v * M[5];
+    float dxs = M[6], dys = M[7], dzs = M[8];
+    float gs = 0.0f;
+    int step_lo = INT_MAX, step_hi = INT_MIN;
+
     if (iu < N_det && iv < Ny) {
-        const float *M = mats + (size_t)ia * 9;
-        float u = (float)iu - half_det;
-        float v = (float)iv - half_y;
-        float ox = u * M[0] + v * M[3];
-        float oy = u * M[1] + v * M[4];
-        float oz = u * M[2] + v * M[5];
-        float dxs = M[6], dys = M[7], dzs = M[8];
+        gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
+        /* Steps whose stencil can touch the volume (rotmat_ray_steps), for
+         * the rays that contribute at all (gs != 0). */
+        if (gs != 0.0f)
+            rotmat_ray_steps(ox + half_x, oy + half_y, oz + half_z, dxs, dys, dzs,
+                             Nx, Ny, Nz, ray_len, clip, &step_lo, &step_hi);
+    }
+    /* United over the block (every thread reaches the barriers; the empty
+     * range of an inactive thread is the identity). */
+    rotmat_block_union(&step_lo, &step_hi);
 
-        float gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
-
+    if (iu < N_det && iv < Ny) {
         if (gs != 0.0f) {
             /* dL/dM[3r+c] = gs * sum_s d_c(s) * {u, v, s}[r] with d = grad of
              * the trilinear sample: u, v and gs are per-ray constants, so the
@@ -433,7 +449,7 @@ __global__ static void grad_rotmat_kernel(
              * and they are applied once after it (phase1b audit R2). */
             float Sx = 0.0f, Sy = 0.0f, Sz = 0.0f;
             float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
-            for (int step = -ray_len; step <= ray_len; step++) {
+            for (int step = step_lo; step <= step_hi; step++) {
                 float s  = (float)step;
                 /* Same position arithmetic as before (and as grad_rotmat_cpu),
                  * so samples fall on the same side of the trilinear kinks. */
@@ -579,13 +595,13 @@ static void grad_rotmat_launch(
         grad_rotmat_kernel<float><<<grid, block, 0, stream>>>(
             vol_cache->tex_point, grad_sino, mats, partials.floats(),
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len, g_rotmat_ray_clip
         );
     else
         grad_rotmat_kernel<__half><<<grid, block, 0, stream>>>(
             vol_cache->tex_point, grad_sino, mats, partials.floats(),
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len, g_rotmat_ray_clip
         );
     CUDA_CHECK_KERNEL();
     grad_rotmat_finish_kernel<<<g.n_angles, dim3(32, 9, 1), 0, stream>>>(

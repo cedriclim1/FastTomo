@@ -186,9 +186,10 @@ def test_grad_rotmat_euler_cpu_cuda_agree_on_box_filling_volume():
 # stencil can touch the volume (slab test, widened by a voxel and a step on
 # each side, united over the thread block). The dropped steps read border
 # zeros, so the sinogram must be bit-identical to the full [-ray_len,
-# ray_len] loop, which `_debug_set_rotmat_ray_clip(0)` restores. The
-# gradient w.r.t. the matrices reuses the forward's sinogram and grad_rotmat
-# (not clipped), so it is checked too.
+# ray_len] loop, which `_debug_set_rotmat_ray_clip(0)` restores. grad_rotmat
+# clips its ray march the same way (a dropped step is one its loose bounds
+# test skips), and the same hook switches it, so the gradient w.r.t. the
+# matrices (cached and one-shot) must be bit-identical too.
 
 def _clip_cases():
     g = torch.Generator().manual_seed(77)
