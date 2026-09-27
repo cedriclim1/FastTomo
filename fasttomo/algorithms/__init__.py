@@ -47,7 +47,12 @@ Support: ``mask`` and ``support_mask``
     dtype and any device (cast and moved internally), values expected in
     ``{0, 1}`` (soft values weight voxels). The two are mutually exclusive
     (ValueError); a wrong shape raises ValueError. Out-of-support voxels of
-    the result are exactly 0 for a binary mask. Where it is applied:
+    the result are exactly 0 for a binary mask, with one exception: GENFIRE
+    applies the cylinder (``mask=True``, its default without
+    ``support_mask``) on the oversampled grid inside the loop but not to the
+    cropped output, so voxels outside the cylinder are 0 only up to FFT
+    round-off (~1e-7); a ``support_mask`` is multiplied into GENFIRE's
+    output and is exact. Where the support is applied:
 
     ==============================  =====================================
     algorithm                       support applied
@@ -59,7 +64,8 @@ Support: ``mask`` and ``support_mask``
     run_fista                       every iteration, in the projection P_C
     run_fista_tv                    every iteration, inside the TV prox
     run_genfire                     every iteration in real space (on the
-                                    oversampled grid) and to the output
+                                    oversampled grid); a ``support_mask``
+                                    also to the output, the cylinder not
     run_grad_descent, run_ad_recon  every optimiser step (``no_grad``)
     run_mbir                        initial volume of each level and after
                                     every outer ICD sweep, not inside the
