@@ -451,6 +451,32 @@ def _grad_rotmat_raw(
                    num_threads=num_threads)
 
 
+def _check_resire_shapes(op: str, data: torch.Tensor, data_name: str,
+                         euler_zyz_deg: torch.Tensor,
+                         n_views: int | None = None) -> None:
+    """Shape guard for the frozen RESIRE wrappers (validation only; the
+    kernel calls and their numerics are untouched).
+
+    ``data`` (volume or sinogram) must be 3-D with no zero-size dim, and
+    ``euler_zyz_deg`` must be ``[n_views, 3]``. For the back-projection
+    ``n_views`` is the sinogram's view count; the matrices are read per view,
+    so a count mismatch would otherwise surface as an opaque reshape error
+    (or, for a column count other than 3, silently use the wrong angles)."""
+    if data.ndim != 3:
+        raise ValueError(f"{op}: {data_name} must be 3-D, got shape {tuple(data.shape)}")
+    if data.numel() == 0:
+        raise ValueError(f"{op}: {data_name} has a zero-size dimension "
+                         f"{tuple(data.shape)}")
+    if euler_zyz_deg.ndim != 2 or euler_zyz_deg.shape[1] != 3:
+        raise ValueError(f"{op}: euler_zyz_deg must have shape [n_angles, 3], "
+                         f"got {tuple(euler_zyz_deg.shape)}")
+    if euler_zyz_deg.shape[0] == 0:
+        raise ValueError(f"{op}: euler_zyz_deg has no views")
+    if n_views is not None and euler_zyz_deg.shape[0] != n_views:
+        raise ValueError(f"{op}: sinogram has {n_views} views but euler_zyz_deg "
+                         f"has {euler_zyz_deg.shape[0]} rows")
+
+
 def _forward_project_resire_raw(
     volume: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
@@ -460,6 +486,9 @@ def _forward_project_resire_raw(
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
     _ensure_fp32(volume, "forward_project_resire")
+    _check_resire_shapes("forward_project_resire", volume, "volume", euler_zyz_deg)
+    if N_det == 0:
+        raise ValueError("forward_project_resire: N_det must be positive")
 
     Ny, Nz, Nx = volume.shape
     n_angles = euler_zyz_deg.shape[0]
@@ -490,6 +519,10 @@ def _back_project_resire_raw(
     if not _core.cuda_available:
         raise RuntimeError("fasttomo was compiled without CUDA support")
     _ensure_fp32(sinogram, "back_project_resire")
+    _check_resire_shapes("back_project_resire", sinogram, "sinogram", euler_zyz_deg,
+                         n_views=sinogram.shape[0] if sinogram.ndim == 3 else None)
+    if Nz == 0:
+        raise ValueError("back_project_resire: Nz must be positive")
 
     n_angles, Ny, N_det = sinogram.shape
     Nx = N_det

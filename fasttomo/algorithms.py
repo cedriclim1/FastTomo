@@ -2164,6 +2164,13 @@ def run_resire(
         # Wrap scalar tilt angles as ZYZ triples (φ=0, θ=angle, ψ=0)
         euler_zyz_deg = torch.zeros(n_angles, 3, dtype=torch.float32)
         euler_zyz_deg[:, 1] = angles_deg.cpu().float()
+    elif tuple(euler_zyz_deg.shape) != (n_angles, 3):
+        # A shorter table would broadcast the forward projection over the
+        # sinogram in the residual; fail before the first iteration instead.
+        raise ValueError(
+            f"run_resire: euler_zyz_deg must have shape ({n_angles}, 3) to "
+            f"match the sinogram, got {tuple(euler_zyz_deg.shape)}"
+        )
 
     _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
     _bp = lambda s: back_project_resire(s, euler_zyz_deg, Nz=Nz)
