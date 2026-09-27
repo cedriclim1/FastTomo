@@ -78,7 +78,10 @@ def _mbir_sino_self(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Te
 
 
 def test_mbir_cpu_runs():
-    """CPU MBIR end-to-end on a tiny phantom; assert convergence."""
+    """CPU MBIR end-to-end on a tiny phantom; assert convergence. 80
+    iterations (30 before the prior fix): from a zero start the
+    edge-preserving prior at this sigma_f dominates until sigma has fallen
+    (rel. error 0.83 / 0.23 / 0.16 at 30 / 50 / 80 iterations)."""
     Ny = Nz = Nx = 16
     n_angles = 24
     phantom = torch.zeros(Ny, Nz, Nx)
@@ -89,7 +92,7 @@ def test_mbir_cpu_runs():
         sino, angles,
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=True,
-        n_iter=30, multires_levels=1,
+        n_iter=80, multires_levels=1,
     )
     rel = (vol - phantom).norm().item() / phantom.norm().item()
     assert rel < 0.30, f"CPU MBIR rel error {rel:.4f} > 0.30"
@@ -102,7 +105,9 @@ DEVICE = torch.device("cuda")
 def test_mbir_perfect_data_recovers_phantom():
     """Conventional MBIR (T=∞, no anomaly modeling) on a noiseless solid
     cube should recover the phantom to high accuracy. Validates the
-    surrogate-MM ICD inner loop + qGGMRF prior + variance auto-tuning."""
+    surrogate-MM ICD inner loop + qGGMRF prior + variance auto-tuning.
+    300 iterations (80 before the prior fix, which made the prior
+    quadratic): rel. error 0.96 / 0.15 / 0.049 at 30 / 80 / 300."""
     Ny = Nz = Nx = 32
     n_angles = 40
     phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
@@ -116,7 +121,7 @@ def test_mbir_perfect_data_recovers_phantom():
         huber_T=float("inf"),
         estimate_offset=False,
         estimate_variance=True,
-        n_iter=80,
+        n_iter=300,
         multires_levels=1,
     )
     rel_err = (vol - phantom).norm().item() / phantom.norm().item()
@@ -191,6 +196,142 @@ def test_mbir_seed_reproducibility():
     v1 = ft.run_mbir(sino, angles, seed=42, **kw)
     v2 = ft.run_mbir(sino, angles, seed=42, **kw)
     assert torch.equal(v1, v2), "MBIR not reproducible with the same seed"
+
+
+# ── qGGMRF prior (Venkatakrishnan et al. 2015) ───────────────────────────────
+
+
+def _qggmrf_rho(d, p, q, c, sf):
+    """The paper's potential rho(D) = |D/sf|^q / (c + |D/sf|^(q-p)), fp64."""
+    t = np.abs(np.asarray(d, np.float64)) / sf
+    return t ** q / (c + t ** (q - p))
+
+
+def _qggmrf_a(d, p, q, c, sf):
+    """rho'(D)/D of `_qggmrf_rho` by a central fp64 finite difference of rho
+    (not the closed form the kernels use), and the limit 2/(sf^2 c) at 0."""
+    d = abs(float(d))
+    if d == 0.0:
+        return 2.0 / (sf * sf * c) if p < 2 else 2.0 / (sf * sf * (1 + c))
+    h = 1e-5 * d
+    return float(_qggmrf_rho(d + h, p, q, c, sf) - _qggmrf_rho(d - h, p, q, c, sf)) / (2 * h) / d
+
+
+@pytest.mark.parametrize("p,sf", [(1.2, 1.0), (1.2, 0.05), (1.2, 30.0), (1.5, 0.3), (1.0, 2.0),
+                                  (2.0, 0.7)])
+def test_mbir_qggmrf_surrogate_matches_the_paper_potential(backend, p, sf):
+    """The prior surrogate a = rho'(D)/D of the paper's qGGMRF (q = 2 near 0,
+    p for large differences) against an fp64 finite difference of rho. A
+    1 x 1 x 3 volume with zero data weight (lambdas = 0): one sweep moves the
+    middle voxel to (a0 f0 + a2 f2) / (a0 + a2), the surrogate-weighted mean
+    of its two face neighbours (the start-of-iteration snapshot), so its new
+    value gives the ratio a0 / a2. Neighbour differences span |D|/sf from
+    1e-6 to 1e3, and D = 0 (the smooth limit 2/(sf^2 c)). With p and q in
+    swapped roles (the bug fixed here) the weight of f0 is off by up to 0.5
+    for p < 2 (tolerance 2e-5); p = 2 is the quadratic prior either way."""
+    c = 1e-3
+    # (f0, f1, f2) in units of sf; rounded to fp32 before the fp64 reference,
+    # so the reference sees the kernel's inputs.
+    for case in ((0.0, 1e-6, 3.0), (0.5, 0.5, 1.5), (2.0, 2.1, 1.7), (0.0, 1e3, 2e3),
+                 (1.0, 1.0005, 21.0), (4.0, 3.0, 0.0)):
+        f0, f1, f2 = (float(np.float32(v * sf)) for v in case)
+        init = torch.tensor([[[f0, f1, f2]]], device=backend)
+        sino = torch.zeros(3, 1, 3, device=backend)
+        vol = ft.run_mbir(sino, torch.tensor([-30.0, 0.0, 30.0], device=backend), n_iter=1, Nz=1,
+                          sigma_f=sf, qggmrf_p=p, qggmrf_q=2.0, qggmrf_c=c,
+                          lambdas=torch.zeros_like(sino), warm_start=init, sigma_init=1.0,
+                          estimate_offset=False, estimate_variance=False, convergence_tol=0.0)
+        a0, a2 = _qggmrf_a(f1 - f0, p, 2.0, c, sf), _qggmrf_a(f1 - f2, p, 2.0, c, sf)
+        want = a0 / (a0 + a2)                       # weight of f0 in the new middle value
+        got = (f2 - vol[0, 0, 1].item()) / (f2 - f0)
+        assert got == pytest.approx(want, abs=2e-5), (case, got, want)
+
+
+def _dense_mbir_problem():
+    """A 2 x 16 x 16 volume and 21 views over +-60 degrees with the MBIR
+    forward model as a dense fp64 matrix (voxel-driven linear
+    interpolation, built here without the kernels), noisy data, and the
+    26-neighbour pairs with weights 1/distance normalised to sum 1."""
+    Ny, Nz, Nx, Nd, nA = 2, 16, 16, 16, 21
+    ang = np.linspace(-60, 60, nA)
+    th = np.deg2rad(ang)
+    A = np.zeros((nA * Ny * Nd, Ny * Nz * Nx))
+    iz, ix = np.meshgrid(np.arange(Nz), np.arange(Nx), indexing="ij")
+    x, z = (ix - 0.5 * (Nx - 1)).ravel(), (iz - 0.5 * (Nz - 1)).ravel()
+    for ia in range(nA):
+        u = x * np.cos(th[ia]) + z * np.sin(th[ia]) + 0.5 * (Nd - 1)
+        u0 = np.floor(u).astype(np.int64)
+        wu = u - u0
+        for iy in range(Ny):
+            cols = iy * Nz * Nx + np.arange(Nz * Nx)
+            for uk, wk in ((u0, 1 - wu), (u0 + 1, wu)):
+                ok = (uk >= 0) & (uk < Nd)
+                np.add.at(A, ((ia * Ny + iy) * Nd + uk[ok], cols[ok]), wk[ok])
+    f = np.zeros((Ny, Nz, Nx))
+    f[:] = 0.5 + 1.0 * (((ix - 6) ** 2 + (iz - 9) ** 2) < 12) + 0.6 * (((ix - 11) ** 2 + (iz - 5) ** 2) < 8)
+    g = A @ f.ravel() + np.random.default_rng(0).normal(0, 0.3, A.shape[0])
+    offs = [(dy, dz, dx) for dy in (-1, 0, 1) for dz in (-1, 0, 1) for dx in (-1, 0, 1)
+            if (dy, dz, dx) > (0, 0, 0)]
+    wsum = sum(1 / math.sqrt(dx * dx + dy * dy + dz * dz) for dy in (-1, 0, 1)
+               for dz in (-1, 0, 1) for dx in (-1, 0, 1) if (dx, dy, dz) != (0, 0, 0))
+    idx = np.arange(Ny * Nz * Nx).reshape(Ny, Nz, Nx)
+    J, K, W = [], [], []
+    for dy, dz, dx in offs:
+        a = idx[max(0, -dy):Ny - max(0, dy), max(0, -dz):Nz - max(0, dz), max(0, -dx):Nx - max(0, dx)]
+        b = idx[max(0, dy):Ny + min(0, dy), max(0, dz):Nz + min(0, dz), max(0, dx):Nx + min(0, dx)]
+        J.append(a.ravel())
+        K.append(b.ravel())
+        W.append(np.full(a.size, 1 / math.sqrt(dx * dx + dy * dy + dz * dz) / wsum))
+    return A, g, ang, (Ny, Nz, Nx, Nd, nA), np.concatenate(J), np.concatenate(K), np.concatenate(W)
+
+
+@pytest.mark.parametrize("p,T,sf", [(1.2, 1.5, 0.5), (1.5, 2.0, 0.2), (2.0, float("inf"), 0.5)])
+def test_mbir_converges_to_a_stationary_point_of_the_map_cost(backend, p, T, sf):
+    """ICD with the Huber and qGGMRF surrogates is a majorize-minimize scheme
+    for the MAP cost 1/2 sum beta(r) + sum_{j<k} w_jk rho(f_j - f_k) (paper
+    eq. (9), q = 2); its limit must satisfy the KKT conditions of that cost
+    (gradient 0 where f > 0), computed here in fp64 from a dense forward
+    model and the paper's rho, independently of the kernels. Measured:
+    KKT residual 8e-6 / 8e-6 / 6e-8 of the initial gradient after 800
+    iterations (it was 2e-3 / 2e-5 / 6e-8 after 200)."""
+    A, g, ang, (Ny, Nz, Nx, Nd, nA), J, K, W = _dense_mbir_problem()
+    c, sig, delta = 1e-3, 1.0, 0.5
+
+    def grad(f):
+        e = g - A @ f
+        r = np.abs(e / sig)
+        bw = np.ones_like(r) if not math.isfinite(T) else np.where(
+            r < T, 1.0, delta * T / np.maximum(r, 1e-30))
+        d = f[J] - f[K]
+        rp = W * np.array([_qggmrf_a(x, p, 2.0, c, sf) for x in d]) * d
+        gp = np.zeros_like(f)
+        np.add.at(gp, J, rp)
+        np.add.at(gp, K, -rp)
+        return -A.T @ (bw * e) / sig ** 2 + gp
+
+    sino = torch.tensor(g.reshape(nA, Ny, Nd), dtype=torch.float32, device=backend)
+    f = ft.run_mbir(sino, torch.tensor(ang, dtype=torch.float32, device=backend), n_iter=800, Nz=Nz,
+                    sigma_f=sf, qggmrf_p=p, qggmrf_q=2.0, qggmrf_c=c, huber_T=T, huber_delta=delta,
+                    estimate_offset=False, estimate_variance=False, sigma_init=sig,
+                    convergence_tol=0.0, seed=1, num_threads=4)
+    f = f.double().cpu().numpy().ravel()
+    gr, free = grad(f), f > 1e-6
+    kkt = max(np.abs(gr[free]).max(), max(0.0, -gr[~free].min()) if (~free).any() else 0.0)
+    assert kkt / np.abs(grad(np.zeros_like(f))).max() < 1e-4
+
+
+@pytest.mark.parametrize("kw,match", [
+    (dict(qggmrf_p=2.0, qggmrf_q=1.2), "1 <= qggmrf_p <= qggmrf_q <= 2"),
+    (dict(qggmrf_p=0.8), "1 <= qggmrf_p"), (dict(qggmrf_q=2.5), "1 <= qggmrf_p"),
+    (dict(qggmrf_c=0.0), "qggmrf_c"), (dict(sigma_f=0.0), "sigma_f"),
+    (dict(sigma_f=float("nan")), "sigma_f"), (dict(sigma_f_per_scale=[-1.0]), "sigma_f"),
+])
+def test_mbir_rejects_invalid_prior_parameters(kw, match):
+    """p and q had swapped roles in the kernels before the prior fix; the old
+    workaround for the paper's prior (qggmrf_p=2, qggmrf_q=1.2) now means
+    something else, so it raises rather than run silently."""
+    with pytest.raises(ValueError, match=match):
+        ft.run_mbir(torch.zeros(5, 2, 16), torch.linspace(-70, 70, 5), n_iter=1, **kw)
 
 
 # ── voxel order (generated in the CUDA kernel, mirrored in NumPy) ─────────────
@@ -622,15 +763,19 @@ def test_mbir_multires_hands_over_fine_grid_values(backend, monkeypatch):
 
 
 def test_mbir_two_levels_converge_to_the_single_level_solution(backend):
-    """Coarse-to-fine reaches the single-level MAP estimate: at 60
-    iterations per level the two agree to 2e-3 relative (5e-4 measured on a
-    64^2 cylinder, 1e-3 before the hand-over rescale), and at 5 iterations
-    the two-level run is already at the object's level."""
+    """Coarse-to-fine reaches the single-level MAP estimate, and at 5
+    iterations the two-level run is already at the object's level. With the
+    edge-preserving prior both converge slowly on this noise-free cylinder:
+    2-level vs 1-level 6.5e-2 / 7e-3 / 6.5e-5 at 100 / 1000 / 3000
+    iterations per level (the single level itself still moves 3.7 % from
+    300 to 1000); with the quadratic prior of earlier versions they agreed
+    to 5e-4 at 60."""
     vol, ang, sino, inner = _mbir_cylinder(backend)
     kw = dict(estimate_offset=False, estimate_variance=False, seed=1)
-    one = ft.run_mbir(sino, ang, n_iter=60, **kw)
-    two = ft.run_mbir(sino, ang, n_iter=60, multires_levels=2, **kw)
-    assert ((two - one).norm() / one.norm()).item() < 2e-3
+    long = dict(kw, n_iter=3000, convergence_tol=0.0, num_threads=4)
+    one = ft.run_mbir(sino, ang, **long)
+    two = ft.run_mbir(sino, ang, multires_levels=2, **long)
+    assert ((two - one).norm() / one.norm()).item() < 1e-3
     early = ft.run_mbir(sino, ang, n_iter=5, multires_levels=2, **kw)
     assert abs(early[:, inner].mean().item() / vol[:, inner].mean().item() - 1.0) < 0.05
 

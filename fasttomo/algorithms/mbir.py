@@ -509,6 +509,29 @@ def _run_mbir_single_scale(
     return state, history
 
 
+def _check_qggmrf(p: float, q: float, c: float, sigma_f: float,
+                  sigma_f_per_scale: list[float] | None) -> None:
+    """The qGGMRF potential ``|D/sigma_f|^q / (c + |D/sigma_f|^(q-p))`` is a
+    valid (majorizable, edge-preserving) prior only for ``1 <= p <= q <= 2``
+    and ``c > 0``; ``sigma_f`` divides. ``p`` and ``q`` used to have swapped
+    roles in the kernels (see CHANGELOG), so the old workaround ``qggmrf_p=2, qggmrf_q=1.2``
+    now raises instead of silently meaning something else."""
+    vals = dict(qggmrf_p=p, qggmrf_q=q, qggmrf_c=c, sigma_f=sigma_f)
+    for name, v in vals.items():
+        if not math.isfinite(float(v)):
+            raise ValueError(f"run_mbir: {name} must be finite, got {v}")
+    if not 1.0 <= float(p) <= float(q) <= 2.0:
+        raise ValueError(
+            "run_mbir: the qGGMRF exponents need 1 <= qggmrf_p <= qggmrf_q <= 2 "
+            f"(p: exponent for large differences, q: near zero), got p={p}, q={q}")
+    if float(c) <= 0.0:
+        raise ValueError(f"run_mbir: qggmrf_c must be > 0, got {c}")
+    sfs = [sigma_f] if sigma_f_per_scale is None else [sigma_f, *sigma_f_per_scale]
+    for v in sfs:
+        if not (math.isfinite(float(v)) and float(v) > 0.0):
+            raise ValueError(f"run_mbir: sigma_f must be finite and > 0, got {v}")
+
+
 def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
     """Avg-pool the sinogram in the detector axis only. Y (tilt-axis row)
     is preserved because each Y-slice is an independent MBIR sub-problem
@@ -609,8 +632,25 @@ def run_mbir(
         Maximum outer iterations per level (default 100; formerly
         ``outer_iters``, still accepted with a DeprecationWarning).
     sigma_f, qggmrf_p, qggmrf_q, qggmrf_c : float
-        qGGMRF prior; ``p=1.2, q=2, c=1e-3`` follow the paper, ``sigma_f`` sets
-        its strength.
+        qGGMRF prior of the paper (its eq. after (9)): the potential
+        ``rho(D) = |D/sigma_f|^q / (c + |D/sigma_f|^(q-p))`` on the
+        differences ``D`` to the 26 neighbours (weights 1/distance, summing
+        to 1). ``q=2`` is the exponent near ``D = 0`` (quadratic, smooth),
+        ``p=1.2`` the one for large differences (edge preserving), and
+        ``c=1e-3`` puts the transition at ``|D| ~ c^(1/(q-p)) sigma_f``
+        (1.8e-4 ``sigma_f`` at the defaults); ``1 <= p <= q <= 2`` and
+        ``c > 0`` are required (ValueError otherwise). ``sigma_f`` sets the
+        strength: smaller is smoother. A good start is about a tenth of the
+        expected contrast between neighbouring regions (0.1 for a
+        0.5-2.2 phantom with 1 % noise: RMSE 0.046). Near ``D = 0`` the prior
+        is ``1/c`` stiffer than ``(D/sigma_f)^2``, so ICD needs more
+        iterations than with a quadratic prior, and a small ``sigma_f`` on a
+        zero start with ``estimate_variance=True`` can barely move for tens of
+        iterations (the prior's curvature dominates the data term until
+        ``sigma`` falls). Until this release the kernels had ``p`` and ``q``
+        in swapped roles, which made the prior quadratic up to ~1e4
+        ``sigma_f``; results and good ``sigma_f`` values differ from earlier
+        versions (see CHANGELOG).
     huber_T, huber_delta : float
         Generalised-Huber threshold (``inf``, the default, is conventional
         MBIR; 3 is the paper's choice for BF-TEM with Bragg scatter) and tail
@@ -724,6 +764,7 @@ def run_mbir(
             getattr(config, k) for k in tuning)
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
+    _check_qggmrf(qggmrf_p, qggmrf_q, qggmrf_c, sigma_f, sigma_f_per_scale)
     # fp32 only, like every other fp32 algorithm: other dtypes raise instead
     # of being cast silently. The ICD kernels are fp32-only.
     setup = _prepare_recon(

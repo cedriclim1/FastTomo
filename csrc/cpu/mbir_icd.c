@@ -30,6 +30,7 @@
 
 #include "ops.h"
 #include "../include/proj_geom.h"
+#include <float.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -40,10 +41,16 @@
  *   6 face-neighbors at dist 1     → unnormalized 1
  *   12 edge-neighbors at dist √2   → unnormalized 1/√2 ≈ 0.7071
  *   8 corner-neighbors at dist √3  → unnormalized 1/√3 ≈ 0.5774
- *   Sum = 6 + 12/√2 + 8/√3 ≈ 19.104
+ *   Sum = 6 + 12/√2 + 8/√3 ≈ 19.1040835
+ * so face 1/19.1040835 = 0.0523448298, edge 0.0370133841, corner
+ * 0.0302213016 (the literals below are these values to 9 digits; the
+ * corner weight used to read 0.030219, which left Σ w = 0.99999).
  * Index layout matches the (dx, dy, dz) triples below: 26 entries in
  * the order produced by iterating (dy, dz, dx) ∈ {-1,0,1}^3 with the
  * (0,0,0) self entry skipped. */
+#define NB_FACE   0.0523448298f
+#define NB_EDGE   0.0370133841f
+#define NB_CORNER 0.0302213016f
 static const int NB_DX[26] = {
     -1,  0,  1, -1,  0,  1, -1,  0,  1,
     -1,  0,  1, -1,      1, -1,  0,  1,
@@ -61,35 +68,77 @@ static const int NB_DY[26] = {
 };
 static const float NB_W[26] = {
     /* dy=-1 plane: 4 corners (√3), 4 edges (√2), 1 face (1) */
-    0.030219f, 0.037014f, 0.030219f, 0.037014f, 0.052345f, 0.037014f, 0.030219f, 0.037014f, 0.030219f,
+    NB_CORNER, NB_EDGE, NB_CORNER, NB_EDGE, NB_FACE, NB_EDGE, NB_CORNER, NB_EDGE, NB_CORNER,
     /* dy=0 plane: 4 edges (√2), 4 faces (1) — center self excluded */
-    0.037014f, 0.052345f, 0.037014f, 0.052345f,           0.052345f, 0.037014f, 0.052345f, 0.037014f,
+    NB_EDGE,   NB_FACE, NB_EDGE,   NB_FACE,          NB_FACE, NB_EDGE, NB_FACE,   NB_EDGE,
     /* dy=+1 plane: 4 corners, 4 edges, 1 face */
-    0.030219f, 0.037014f, 0.030219f, 0.037014f, 0.052345f, 0.037014f, 0.030219f, 0.037014f, 0.030219f
+    NB_CORNER, NB_EDGE, NB_CORNER, NB_EDGE, NB_FACE, NB_EDGE, NB_CORNER, NB_EDGE, NB_CORNER
 };
 
-/* qGGMRF surrogate coefficient a_jk = ρ'(Δ)/Δ.
+/* ── qGGMRF prior ────────────────────────────────────────────────────────────
+ * Potential (Venkatakrishnan et al. 2015, IEEE TCI 1(1), after eq. (9); the
+ * qGGMRF of Thibault et al. 2007 in the normalisation of OpenMBIR-TEM):
  *
- * For ρ(Δ) = |Δ|^p / (σ_f^p · (c + |Δ|^(p-q)/σ_f^(p-q))) with q = 2, the
- * closed-form derivative gives:
+ *   ρ(Δ) = |Δ/σ_f|^q / (c + |Δ/σ_f|^(q-p)),        1 ≤ p ≤ q ≤ 2
  *
- *   ρ'(u)/u = (p·c·σ_f^p · u^(p-2) + q·σ_f^q · u^(2p-q-2))
- *              / (σ_f^p · c + u^(p-q) · σ_f^q)^2          for u = |Δ| > 0
+ * q is the exponent near Δ = 0 (q = 2: quadratic, smooth at 0) and p the
+ * exponent for large |Δ| (p = 1.2 in the paper: edge preserving); c sets the
+ * transition, |Δ| ≈ c^(1/(q-p))·σ_f (1.8e-4·σ_f for the defaults
+ * p = 1.2, q = 2, c = 1e-3). Near 0, ρ ≈ (Δ/σ_f)²/c: 1/c times stiffer than
+ * (Δ/σ_f)², which is what σ_f has to be tuned against.
  *
- * The limit at u → 0 is q/σ_f^q (quadratic near 0), giving smooth behaviour
- * across the Δ = 0 boundary. We clamp |Δ| to a small floor for numerical
- * stability. */
-static inline float qggmrf_a_jk(float delta, float p, float q, float c, float sigma_f) {
-    float u  = fabsf(delta);
-    if (u < 1e-12f) u = 1e-12f;
-    float sp = powf(sigma_f, p);
-    float sq = powf(sigma_f, q);
-    float u_pmq = powf(u, p - q);             /* u^(p-q),  negative exponent for p<q */
-    float u_pm2 = powf(u, p - 2.0f);
-    float u_2pmqm2 = powf(u, 2.0f*p - q - 2.0f);
-    float D = sp * c + u_pmq * sq;
-    float num = p * c * sp * u_pm2 + q * sq * u_2pmqm2;
-    return num / (D * D);
+ * ICD uses the symmetric-bound surrogate a·Δ²/2 with a = ρ'(Δ)/Δ.
+ * Derivation, with t = |Δ|/σ_f and T = t^(q-p):
+ *
+ *   dρ/dt   = [q t^(q-1) (c + T) - t^q (q-p) t^(q-p-1)] / (c + T)²
+ *           = t^(q-1) (q c + p T) / (c + T)²
+ *   ρ'(Δ)   = sign(Δ) · (1/σ_f) · dρ/dt,   Δ = sign(Δ) · σ_f · t
+ *   a(Δ)    = ρ'(Δ)/Δ = t^(q-2) (q c + p T) / (σ_f² (c + T)²)
+ *
+ * q = 2 (the paper, and the default): a = (2c + p T) / (σ_f² (c + T)²) with
+ * T = t^(2-p), one pow per neighbour. The limit at Δ → 0 is smooth:
+ * a → 2/(σ_f² c) for p < 2 (T → 0; OpenMBIR's second derivative at zero) and
+ * a = 2/(σ_f² (1 + c)) for p = q = 2 (a quadratic prior). For q < 2 the
+ * factor t^(q-2) diverges at 0 (ρ is not smooth there). t is floored at
+ * FLT_MIN for q = 2 (so t^0 = 1 when p = 2 and no pow sees 0 with a
+ * negative exponent) and at 1e-12 otherwise.
+ *
+ * a is non-increasing in |Δ| for p ≤ q ≤ 2 (for q = 2: da/dT ∝
+ * (p - 4) c - p T < 0), so a·Δ²/2 majorizes ρ (Bouman-Sauer surrogate).
+ *
+ * csrc/cuda/mbir_icd.cu::qggmrf_a_jk_dev evaluates the same expressions. */
+typedef struct {
+    float p, q, c;
+    float inv_sf2;     /* 1/σ_f² */
+    float inv_sf;      /* 1/σ_f */
+    float qmp;         /* q - p */
+    float qm2;         /* q - 2 */
+    int   q_is_2;
+} QggmrfParams;
+
+static QggmrfParams qggmrf_params(float p, float q, float c, float sigma_f) {
+    QggmrfParams P;
+    P.p = p; P.q = q; P.c = c;
+    P.inv_sf = 1.0f / sigma_f;
+    P.inv_sf2 = 1.0f / (sigma_f * sigma_f);
+    P.qmp = q - p;
+    P.qm2 = q - 2.0f;
+    P.q_is_2 = (q == 2.0f);
+    return P;
+}
+
+static inline float qggmrf_a_jk(float delta, const QggmrfParams *P) {
+    float t = fabsf(delta) * P->inv_sf;
+    if (P->q_is_2) {
+        if (t < FLT_MIN) t = FLT_MIN;
+        float T = powf(t, P->qmp);
+        float D = P->c + T;
+        return (2.0f * P->c + P->p * T) * P->inv_sf2 / (D * D);
+    }
+    if (t < 1e-12f) t = 1e-12f;
+    float T = powf(t, P->qmp);
+    float D = P->c + T;
+    return powf(t, P->qm2) * (P->q * P->c + P->p * T) * P->inv_sf2 / (D * D);
 }
 
 /* Generalized-Huber surrogate weight b(r) such that the upper-bound
@@ -189,6 +238,7 @@ int mbir_icd_sweep_cpu(
     if (num_threads < 1) num_threads = 1;
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
     const float half_x = g.half_x, half_z = g.half_z, half_det = g.half_det;
+    const QggmrfParams QP = qggmrf_params(qggmrf_p, qggmrf_q, qggmrf_c, sigma_f);
 
     /* ── ICD sweep ─────────────────────────────────────────────────────────
      * Every qGGMRF neighbour read (in-slice and cross-slice) comes from the
@@ -247,7 +297,7 @@ int mbir_icd_sweep_cpu(
                 if (jx < 0 || jx >= Nx || jy < 0 || jy >= Ny || jz < 0 || jz >= Nz)
                     continue;
                 float fk = volume_snapshot[((size_t)jy * Nz + jz) * Nx + jx];
-                float a  = qggmrf_a_jk(fj_old - fk, qggmrf_p, qggmrf_q, qggmrf_c, sigma_f);
+                float a  = qggmrf_a_jk(fj_old - fk, &QP);
                 float w  = NB_W[nb];
                 n1 += w * a * fk;
                 n2 += w * a;

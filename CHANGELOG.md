@@ -180,6 +180,45 @@ the exact transpose of the CPU forward (gap 5e-9). The back-projection step
 is also faster (5x at 8x128^2, 61 views, with the Y-batched gather above).
 Only
 the `cpu/fbp`, `cpu/fbp_h` and `cpu/fbp_mask` golden keys were regenerated.
+### ⚠ `run_mbir`: the qGGMRF prior is now the paper's (all MBIR results change)
+
+The kernels computed the surrogate of `|D|^p / (c sigma_f^p + |D|^(p-q) sigma_f^q)`
+with `p=1.2, q=2`, i.e. `(D/sigma_f)^2 / (1 + c |D/sigma_f|^0.8)`: `p` and `q`
+had swapped roles, so the prior stayed quadratic (Gaussian MRF) for
+differences up to ~1e4 `sigma_f` and did not preserve edges. Both backends now
+implement the potential of Venkatakrishnan et al. 2015 (and OpenMBIR-TEM),
+`rho(D) = |D/sigma_f|^q / (c + |D/sigma_f|^(q-p))`: quadratic (`q=2`) below
+about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
+(`p=1.2`) above. The keyword names and defaults (`qggmrf_p=1.2`,
+`qggmrf_q=2`, `qggmrf_c=1e-3`, `sigma_f=1.0`) are unchanged.
+
+- **Every MBIR output changes**, CPU and CUDA. On a 96^3 three-ellipsoid
+  phantom (41 views +-60 degrees, 1 % noise, fixed sigma, 80 iterations) the
+  best RMSE over `sigma_f` goes from 0.0591 to 0.0463 (-22 %), at the same
+  best `sigma_f = 0.1`; at the default `sigma_f = 1`, 0.0985 -> 0.0766, and a
+  fully default call 0.131 -> 0.100. The BF-TEM demo
+  (`benchmarks/scripts/run_mbir_bftem_demo.py`, its `sigma_f = 0.1`):
+  conventional MBIR 0.0283 -> 0.0256, MBIR-AM 0.0210 -> 0.0187 (SIRT 0.0296).
+  The default `sigma_f` stays 1.0: it was already 10x above the best value
+  on these phantoms and improves as much as the best value does.
+- **`sigma_f` changes meaning near zero**: the prior is `1/c` = 1000x stiffer
+  than `(D/sigma_f)^2` there. Re-tune values chosen for the old prior (a
+  tenth of the expected contrast between neighbouring regions is a good
+  start). ICD needs more iterations than with the old, quadratic prior: a
+  noise-free 32^3 cube (`sigma_f=0.1`, `estimate_variance=True`) reaches a
+  relative error of 0.15 / 0.049 at 80 / 300 iterations (0.086 at 80
+  before), 2 multires levels meet the single-level estimate to 6.5e-5 after
+  3000 iterations per level (5e-4 after 60 before), and a zero start with a
+  small `sigma_f` and `estimate_variance=True` can barely move for tens of
+  iterations.
+- `qggmrf_p`, `qggmrf_q` must satisfy `1 <= p <= q <= 2` and `qggmrf_c`,
+  `sigma_f` (and `sigma_f_per_scale`) must be positive: `ValueError`
+  otherwise. The old workaround for the paper's prior,
+  `qggmrf_p=2, qggmrf_q=1.2`, now raises instead of meaning something else.
+- The 26-neighbour weights are exact to 9 digits (the corner weight read
+  0.030219 instead of 0.0302213, so they summed to 0.99999).
+- Golden keys `cpu/mbir`, `cuda/mbir` and every key of
+  `tests/data/mbir_sweep_golden.pt` were regenerated.
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 

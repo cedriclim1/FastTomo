@@ -29,6 +29,7 @@
  */
 
 #include "common.cuh"
+#include <cfloat>
 #include <cmath>
 #include <stdexcept>
 #include "ops.h"
@@ -39,7 +40,10 @@
  * broadcast to every thread). A kernel argument instead of a module-global
  * __constant__ symbol keeps two sweeps on two streams from racing on it. */
 struct MbirHyper {
-    float p, q, c, sigma_f;        /* qGGMRF: p ∈ [1,2], q = 2, c, σ_f */
+    float p, q, c, sigma_f;        /* qGGMRF: 1 <= p <= q <= 2, c, σ_f */
+    float inv_sf, inv_sf2;         /* 1/σ_f, 1/σ_f² (host) */
+    float qmp, qm2;                /* q - p, q - 2 (host) */
+    int   q_is_2;                  /* q == 2: the one-pow form */
     float huber_T, huber_delta;    /* Huber: T (threshold), δ (tail slope) */
     float sigma;                   /* current noise std */
     float half_x, half_z, half_det;
@@ -47,7 +51,12 @@ struct MbirHyper {
 
 /* 26-neighbour stencil constants — same as in csrc/cpu/mbir_icd.c.
  * Indexing order: (dy, dz, dx) sweep over {-1,0,+1}^3 with the self entry
- * (0,0,0) skipped. Weights w_jk ∝ 1/dist, normalized to sum to 1. */
+ * (0,0,0) skipped. Weights w_jk ∝ 1/dist, normalized to sum to 1 (face
+ * 1/19.1040835, edge (1/√2)/19.1040835, corner (1/√3)/19.1040835; see the
+ * CPU file). */
+#define NB_FACE   0.0523448298f
+#define NB_EDGE   0.0370133841f
+#define NB_CORNER 0.0302213016f
 __constant__ int   d_NB_DX[26] = {
     -1,  0,  1, -1,  0,  1, -1,  0,  1,
     -1,  0,  1, -1,      1, -1,  0,  1,
@@ -64,24 +73,32 @@ __constant__ int   d_NB_DY[26] = {
      1,  1,  1,  1,  1,  1,  1,  1,  1
 };
 __constant__ float d_NB_W[26] = {
-    0.030219f, 0.037014f, 0.030219f, 0.037014f, 0.052345f, 0.037014f, 0.030219f, 0.037014f, 0.030219f,
-    0.037014f, 0.052345f, 0.037014f, 0.052345f,           0.052345f, 0.037014f, 0.052345f, 0.037014f,
-    0.030219f, 0.037014f, 0.030219f, 0.037014f, 0.052345f, 0.037014f, 0.030219f, 0.037014f, 0.030219f
+    NB_CORNER, NB_EDGE, NB_CORNER, NB_EDGE, NB_FACE, NB_EDGE, NB_CORNER, NB_EDGE, NB_CORNER,
+    NB_EDGE,   NB_FACE, NB_EDGE,   NB_FACE,          NB_FACE, NB_EDGE, NB_FACE,   NB_EDGE,
+    NB_CORNER, NB_EDGE, NB_CORNER, NB_EDGE, NB_FACE, NB_EDGE, NB_CORNER, NB_EDGE, NB_CORNER
 };
 
-/* qGGMRF surrogate a_jk = ρ'(Δ)/Δ; see csrc/cpu/mbir_icd.c for derivation. */
+/* qGGMRF surrogate a_jk = ρ'(Δ)/Δ for ρ(Δ) = |Δ/σ_f|^q / (c + |Δ/σ_f|^(q-p))
+ * (Venkatakrishnan et al. 2015): the derivation, the Δ → 0 limit and the
+ * floors are in csrc/cpu/mbir_icd.c (qggmrf_a_jk), which evaluates the same
+ * expressions. With t = |Δ|/σ_f and T = t^(q-p):
+ *   q = 2: a = (2c + p T) / (σ_f² (c + T)²)                  (one powf)
+ *   else : a = t^(q-2) (q c + p T) / (σ_f² (c + T)²)          (two)
+ * powf, not __powf: the prepare kernel is bound by its stencil loads either
+ * way (3.04 vs 3.18 ms at 256^3), and the accurate powf keeps a within an
+ * ulp or two of the CPU's. */
 __device__ __forceinline__ float qggmrf_a_jk_dev(float delta, const MbirHyper &H) {
-    float u = fabsf(delta);
-    if (u < 1e-12f) u = 1e-12f;
-    float p = H.p, q = H.q, c = H.c, sf = H.sigma_f;
-    float sp = __powf(sf, p);
-    float sq = __powf(sf, q);
-    float u_pmq    = __powf(u, p - q);
-    float u_pm2    = __powf(u, p - 2.0f);
-    float u_2pmqm2 = __powf(u, 2.0f * p - q - 2.0f);
-    float D   = sp * c + u_pmq * sq;
-    float num = p * c * sp * u_pm2 + q * sq * u_2pmqm2;
-    return num / (D * D);
+    float t = fabsf(delta) * H.inv_sf;
+    if (H.q_is_2) {
+        t = fmaxf(t, FLT_MIN);
+        const float T = powf(t, H.qmp);
+        const float D = H.c + T;
+        return (2.0f * H.c + H.p * T) * H.inv_sf2 / (D * D);
+    }
+    t = fmaxf(t, 1e-12f);
+    const float T = powf(t, H.qmp);
+    const float D = H.c + T;
+    return powf(t, H.qm2) * (H.q * H.c + H.p * T) * H.inv_sf2 / (D * D);
 }
 
 /* Huber surrogate weight b(r): 1 inside threshold, δ·T/|r| outside.
@@ -669,6 +686,11 @@ void mbir_icd_sweep_cuda(
 
     MbirHyper H{};
     H.p = qggmrf_p; H.q = qggmrf_q; H.c = qggmrf_c; H.sigma_f = sigma_f;
+    H.inv_sf = 1.0f / sigma_f;               /* same host arithmetic as the CPU */
+    H.inv_sf2 = 1.0f / (sigma_f * sigma_f);  /* qggmrf_params()                  */
+    H.qmp = qggmrf_q - qggmrf_p;
+    H.qm2 = qggmrf_q - 2.0f;
+    H.q_is_2 = (qggmrf_q == 2.0f);
     H.huber_T = huber_T; H.huber_delta = huber_delta; H.sigma = sigma;
     H.half_x = g.half_x; H.half_z = g.half_z; H.half_det = g.half_det;
 
