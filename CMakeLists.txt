@@ -143,6 +143,20 @@ else()
     message(STATUS "CUDA backend forced OFF via FASTTOMO_USE_CUDA")
 endif()
 
+# Default CUDA architectures. This must be set before project() enables the
+# CUDA language: once CUDA is enabled, CMake (policy CMP0104) initialises
+# CMAKE_CUDA_ARCHITECTURES to nvcc's own default (sm_75 for CUDA 13), and a
+# later `if(NOT DEFINED ...)` never fires. sm_70 is not listed because CUDA 13
+# dropped offline compilation for architectures below sm_75.
+# Override with -DCMAKE_CUDA_ARCHITECTURES="..." (pip/uv:
+# --config-settings=cmake.define.CMAKE_CUDA_ARCHITECTURES=...) or the
+# CUDAARCHS environment variable.
+if(FASTTOMO_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES
+   AND NOT DEFINED ENV{CUDAARCHS})
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120" CACHE STRING
+        "CUDA architectures to build for")
+endif()
+
 if(FASTTOMO_CUDA)
     project(fasttomo LANGUAGES C CXX CUDA)
 else()
@@ -213,10 +227,7 @@ if(FASTTOMO_CUDA)
         CUDA_STANDARD 14
         CUDA_RUNTIME_LIBRARY Shared
     )
-    # Override at configure time via -DCMAKE_CUDA_ARCHITECTURES="80;86"
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 70 80 86 120)
-    endif()
+    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 target_compile_options(_core PRIVATE
