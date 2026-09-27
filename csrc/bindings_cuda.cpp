@@ -363,7 +363,7 @@ static void py_sirt_update_cuda(
     long mask_ptr, int mask_full,
     float omega, int positivity, float soft_thr,
     int Ny, int Nz, int Nx,
-    long stream_ptr, long vol_cache_ptr
+    long stream_ptr, long vol_cache_ptr, int C_full
 ) {
     sirt_update_cuda(
         io_dtype, eager_order,
@@ -374,7 +374,7 @@ static void py_sirt_update_cuda(
         reinterpret_cast<const void *>(mask_ptr), mask_full,
         omega, positivity, soft_thr, Ny, Nz, Nx,
         reinterpret_cast<TextureCache *>(vol_cache_ptr),
-        to_stream(stream_ptr));
+        to_stream(stream_ptr), C_full);
 }
 
 static void py_sirt_residual_tex_cuda(
@@ -392,6 +392,46 @@ static void py_sirt_residual_tex_cuda(
         reinterpret_cast<void *>(raw_out_ptr),
         reinterpret_cast<TextureCache *>(cache_ptr),
         n_angles, Ny, N_det, to_stream(stream_ptr));
+}
+
+static int py_fista_update_cuda(
+    int io_dtype, int mode,
+    long a_ptr, long grad_ptr, long xp_ptr,
+    long mask_ptr, int mask_full,
+    long x_out_ptr, long y_out_ptr,
+    float step, float beta, int positivity,
+    int Ny, int Nz, int Nx,
+    long stream_ptr, long vol_cache_ptr
+) {
+    return fista_update_cuda(
+        io_dtype, mode,
+        reinterpret_cast<const void *>(a_ptr),
+        reinterpret_cast<const void *>(grad_ptr),
+        reinterpret_cast<const void *>(xp_ptr),
+        reinterpret_cast<const void *>(mask_ptr), mask_full,
+        reinterpret_cast<void *>(x_out_ptr),
+        reinterpret_cast<void *>(y_out_ptr),
+        step, beta, positivity, Ny, Nz, Nx,
+        reinterpret_cast<TextureCache *>(vol_cache_ptr),
+        to_stream(stream_ptr));
+}
+
+static void py_tv_prox_cuda(
+    int io_dtype, int fgp,
+    long z_ptr, long v_out_ptr, long work_ptr,
+    long mask_ptr, int mask_full, int positivity,
+    float step, float inv_lam, long betas_ptr, int n_iter,
+    int Ny, int Nz, int Nx,
+    long stream_ptr
+) {
+    tv_prox_cuda(
+        io_dtype, fgp,
+        reinterpret_cast<const void *>(z_ptr),
+        reinterpret_cast<void *>(v_out_ptr),
+        reinterpret_cast<void *>(work_ptr),
+        reinterpret_cast<const void *>(mask_ptr), mask_full, positivity,
+        step, inv_lam, reinterpret_cast<const float *>(betas_ptr), n_iter,
+        Ny, Nz, Nx, to_stream(stream_ptr));
 }
 
 static void py_tc_upload(long handle, long src_ptr, long stream_ptr) {
@@ -731,14 +771,16 @@ void register_cuda(py::module_ &m) {
           "(else [1, Nz, Nx]); soft_thr <= 0 disables the soft threshold. "
           "vol_cache_ptr (0 = none): a volume texture cache with a surface "
           "that also receives vol_out; with it, vol_in_ptr = 0 reads the "
-          "volume from the texture and vol_out_ptr = 0 skips the global write.",
+          "volume from the texture and vol_out_ptr = 0 skips the global write. "
+          "C_full = 0: C_ptr is one [1, Nz, Nx] plane used for every Y-slice.",
           py::arg("io_dtype"), py::arg("eager_order"),
           py::arg("vol_in_ptr"), py::arg("vol_out_ptr"),
           py::arg("upd_ptr"), py::arg("C_ptr"),
           py::arg("mask_ptr"), py::arg("mask_full"),
           py::arg("omega"), py::arg("positivity"), py::arg("soft_thr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L,
+          py::arg("C_full") = 1);
 
     m.def("sirt_residual_tex_cuda", &py_sirt_residual_tex_cuda,
           py::call_guard<py::gil_scoped_release>(),
@@ -748,6 +790,35 @@ void register_cuda(py::module_ &m) {
           py::arg("io_dtype"), py::arg("sino_ptr"), py::arg("fp_ptr"), py::arg("R_ptr"),
           py::arg("raw_out_ptr"), py::arg("cache_ptr"),
           py::arg("n_angles"), py::arg("Ny"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("fista_update_cuda", &py_fista_update_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused FISTA steps (io_dtype 0 = fp32, 1 = fp16). mode 0: x_out = "
+          "constraints(a - step * grad), y_out = x + beta * (x - xp); mode 1: "
+          "x_out = a - step * grad; mode 2: y_out = a + beta * (a - xp). "
+          "mask_ptr 0 = no support mask (mask_full = 1 for [Ny, Nz, Nx]). "
+          "vol_cache_ptr (0 = none): a volume texture cache with a surface "
+          "that also receives y_out (modes 0, 2); returns 1 if it did.",
+          py::arg("io_dtype"), py::arg("mode"),
+          py::arg("a_ptr"), py::arg("grad_ptr"), py::arg("xp_ptr"),
+          py::arg("mask_ptr"), py::arg("mask_full"),
+          py::arg("x_out_ptr"), py::arg("y_out_ptr"),
+          py::arg("step"), py::arg("beta"), py::arg("positivity"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L);
+
+    m.def("tv_prox_cuda", &py_tv_prox_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "3-D isotropic TV prox (FGP fgp=1 / Chambolle fgp=0), bit for bit "
+          "fasttomo.algorithms.fista._tv_prox_3d. betas_ptr: host fp32 array "
+          "of n_iter FGP momenta. work_ptr: (fgp ? 6 : 3) * Ny*Nz*Nx elements "
+          "of the I/O dtype. mask_ptr 0 = none (mask_full = 1 for [Ny, Nz, Nx]).",
+          py::arg("io_dtype"), py::arg("fgp"),
+          py::arg("z_ptr"), py::arg("v_out_ptr"), py::arg("work_ptr"),
+          py::arg("mask_ptr"), py::arg("mask_full"), py::arg("positivity"),
+          py::arg("step"), py::arg("inv_lam"), py::arg("betas_ptr"), py::arg("n_iter"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("stream_ptr") = 0L);
 
     m.def("tc_upload", &py_tc_upload,

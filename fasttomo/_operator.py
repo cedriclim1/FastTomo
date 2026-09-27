@@ -536,9 +536,11 @@ class CudaCachedOperator(ProjectionOperator):
         vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom)
         # the fp16 overflow check `backproject` runs (inside an fp16
         # run_sirt: a device-side flag); the input sinogram is the texture,
-        # so the output stands in for it (an inf is then never blamed on
-        # the input, which the fused residual kernel produced finite)
-        _check_fp16_range(vol, vol.new_zeros(()), self._name)
+        # so a zero stands in for it (an inf is then never blamed on the
+        # input, which the fused residual kernel produced finite). fp32 has
+        # no check: no zero tensor (one fill kernel per SIRT iteration).
+        if vol.dtype == torch.float16:
+            _check_fp16_range(vol, vol.new_zeros(()), self._name)
         return vol
 
     def _bp(self, io_dtype, sino, geom):

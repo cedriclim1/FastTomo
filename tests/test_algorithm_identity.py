@@ -41,6 +41,13 @@ ray-driven to the gather back-projection, and ``cpu/fp_grad_angles`` when
 the CPU ``grad_angle`` kernel moved to fixed-order fp64 sums (2.5e-7 of
 0.23). ``tests/data/regenerate_golden_keys.py`` replaced only those keys.
 
+Exception: ``cpu/fista_h`` and ``cuda/fista_h`` were regenerated when the
+FISTA Lipschitz power iteration took its norms in fp32 (solver audit A4:
+the fp16 norm overflowed to inf above 65504 and made run_fista raise
+ZeroDivisionError); the fp16 estimate of L moved in its last bits (max
+change 2.9e-3 CPU / 2.0e-3 CUDA, 2 fp16 ulps at the peak 1.6). fp32 FISTA
+is unchanged bit for bit.
+
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
 

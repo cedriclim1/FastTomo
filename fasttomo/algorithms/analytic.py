@@ -6,6 +6,8 @@ Direct (non-iterative) reconstructions: FBP and weighted back-projection
 from __future__ import annotations
 
 import math
+import threading
+from collections import OrderedDict
 from typing import Callable
 
 import torch
@@ -18,7 +20,7 @@ from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
 )
-from fasttomo.utilities import _ramp_filter_fp32
+from fasttomo.utilities import _ramp_filter_coeffs, _ramp_filter_fp32
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
     _WBP_MIN_THRESHOLD,
@@ -198,6 +200,54 @@ def _compute_exact_wf(
     return torch.where(TF_amp > thresh, 1.0 / TF_amp, torch.zeros_like(TF_amp))
 
 
+# The weighting filters of recent geometries (solver audit P3): building one
+# is ~20 small device ops per view plus a host sync (5 ms, host-bound, at any
+# volume size), 4-11x the cost of applying it, and a W-BP sweep or repeated
+# wSIRT calls use the same geometry. The filter depends only on the key
+# below (the angles enter `_bp_gather` as fp32 values), so a hit returns the
+# identical tensor. At most _WF_CACHE_SIZE entries of [Pz, Px // 2 + 1] fp32
+# on the filter's device (Pz, Px ~ 1.125 N: ~10.6 MiB per entry at 2048^2,
+# 85 MiB for 8), kept until `release_cached_projectors()` clears them.
+_WF_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_WF_CACHE_SIZE = 8
+_WF_CACHE_LOCK = threading.Lock()
+
+
+def _clear_wf_cache() -> int:
+    """Drop every cached weighting filter; returns how many were kept."""
+    with _WF_CACHE_LOCK:
+        n = len(_WF_CACHE)
+        _WF_CACHE.clear()
+    return n
+
+
+def _cached_exact_wf(
+    angles_deg: torch.Tensor,
+    Nz: int, Nx: int, N_det: int,
+    device: torch.device,
+    threshold_scale: float,
+) -> torch.Tensor:
+    """`_compute_exact_wf`, memoised per (fp32 angle values, sizes,
+    threshold, device). The key reads the angles on the host (one transfer
+    if they live on a GPU)."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    ang = tuple(angles_deg.detach().reshape(-1).to(device="cpu", dtype=torch.float32).tolist())
+    key = (ang, int(Nz), int(Nx), int(N_det), float(threshold_scale), dev)
+    with _WF_CACHE_LOCK:
+        wf = _WF_CACHE.get(key)
+        if wf is not None:
+            _WF_CACHE.move_to_end(key)
+            return wf
+    wf = _compute_exact_wf(angles_deg, Nz, Nx, N_det, dev, threshold_scale)
+    with _WF_CACHE_LOCK:
+        _WF_CACHE[key] = wf
+        while len(_WF_CACHE) > _WF_CACHE_SIZE:
+            _WF_CACHE.popitem(last=False)
+    return wf
+
+
 def _make_wbp(
     angles_deg: torch.Tensor,
     Nz: int, Nx: int, N_det: int,
@@ -207,9 +257,9 @@ def _make_wbp(
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return ``wbp(sinogram) -> [Ny, Nz, Nx]``: the exact weighted
     back-projection shared by `run_weighted_backprojection` and `run_wsirt`
-    (the filter is built once per geometry). ``num_threads`` drives the CPU
-    back-projection."""
-    WF = _compute_exact_wf(angles_deg, Nz, Nx, N_det, device, threshold_scale)
+    (the filter is built once per geometry and kept for later calls,
+    `_cached_exact_wf`). ``num_threads`` drives the CPU back-projection."""
+    WF = _cached_exact_wf(angles_deg, Nz, Nx, N_det, device, threshold_scale)
     oz, ox = _wbp_margin(Nz), _wbp_margin(Nx)
     Pz, Px = Nz + 2 * oz, Nx + 2 * ox       # symmetric margin: the crop is centred for odd N too
     angles_deg = angles_deg.to(device)
@@ -237,6 +287,47 @@ def _make_wbp(
     return wbp
 
 
+# ── FBP apodisation windows (solver audit H4) ─────────────────────────────
+#
+# The Ram-Lak ramp passes the highest frequencies at full gain, which is
+# what makes FBP noisy. A window W(f) multiplies the ramp's frequency
+# response on the zero-padded grid of `_ramp_filter_coeffs` (bin k of P,
+# f = k / P cycles per detector pixel, 0 <= f <= 1/2):
+#   "hann":    W = 0.5 + 0.5 cos(2 pi f)     (1 at DC, 0 at Nyquist)
+#   "hamming": W = 0.54 + 0.46 cos(2 pi f)   (1 at DC, 0.08 at Nyquist)
+# Built in fp64 (ramp times window) and cast once, cached per
+# (N_det, device, window) like the ramp itself. "none" is the bare ramp.
+_FBP_WINDOWS = ("none", "hann", "hamming")
+_WINDOWED_RAMP_CACHE: dict[tuple, tuple[int, torch.Tensor]] = {}
+
+
+def _windowed_ramp_coeffs(N_det: int, device: torch.device, window: str
+                          ) -> tuple[int, torch.Tensor]:
+    """``(P, H * W)``: the ramp's padded length and fp32 frequency response
+    times the window (see above)."""
+    key = (int(N_det), device, window)
+    hit = _WINDOWED_RAMP_CACHE.get(key)
+    if hit is None:
+        P, H = _ramp_filter_coeffs(N_det, torch.device("cpu"), torch.float64)
+        f = torch.arange(P // 2 + 1, dtype=torch.float64) / P
+        a = 0.5 if window == "hann" else 0.54
+        W = a + (1.0 - a) * torch.cos(2.0 * math.pi * f)
+        hit = (P, (H * W).to(device=device, dtype=torch.float32).contiguous())
+        _WINDOWED_RAMP_CACHE[key] = hit
+    return hit
+
+
+def _fbp_filter_fp32(sinogram: torch.Tensor, window: str) -> torch.Tensor:
+    """The ramp-filtered sinogram in fp32, apodised by ``window``."""
+    if window == "none":
+        return _ramp_filter_fp32(sinogram)
+    N_det = sinogram.shape[-1]
+    sino_f = sinogram.float() if sinogram.dtype != torch.float32 else sinogram
+    P, HW = _windowed_ramp_coeffs(N_det, sino_f.device, window)
+    f = torch.fft.rfft(sino_f, n=P, dim=-1) * HW
+    return torch.fft.irfft(f, n=P, dim=-1)[..., :N_det].contiguous()
+
+
 def run_fbp(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
@@ -247,6 +338,7 @@ def run_fbp(
     support_mask: torch.Tensor | None = None,
     projector: object | None = None,
     num_threads: int | None = None,
+    window: str = "none",
 ) -> torch.Tensor:
     """Filtered back-projection.
 
@@ -273,6 +365,12 @@ def run_fbp(
         Reuse its texture cache across calls (a tilt-series sweep on CUDA).
         Its angles and volume shape replace ``angles_deg`` and ``Nz`` for the
         back-projection. Numerics are identical to the call without it.
+    window : {"none", "hann", "hamming"}
+        Apodisation of the ramp filter (default ``"none"``: the bare Ram-Lak
+        ramp, as before). With f the frequency in cycles per detector pixel
+        (0 to 1/2), ``"hann"`` multiplies the ramp by ``0.5 + 0.5 cos(2 pi
+        f)`` and ``"hamming"`` by ``0.54 + 0.46 cos(2 pi f)``: less noise
+        and ringing, a little blur. The mean level (DC) is unchanged.
 
     Returns
     -------
@@ -289,6 +387,9 @@ def run_fbp(
             "run_fbp: mask=True and support_mask are mutually exclusive — "
             "pass one support per reconstruction."
         )
+    if window not in _FBP_WINDOWS:
+        raise ValueError(
+            f"run_fbp: window must be one of {_FBP_WINDOWS}, got {window!r}")
     # Validation only: the support is resolved below against the actual
     # output shape (a cached projector may reconstruct with Nz != N_det).
     setup = _prepare_recon(
@@ -300,7 +401,7 @@ def run_fbp(
     # angular sampling normalisation: π / n_angles (π times the mean over
     # the measured views; keeps the mean level right at limited tilt too)
     scale = math.pi / n_angles
-    filtered32 = _ramp_filter_fp32(sinogram)
+    filtered32 = _fbp_filter_fp32(sinogram, window)
     # one back-projection: the one-shot (scoped-texture) path on CUDA
     op = _make_operator(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
@@ -375,7 +476,11 @@ def run_weighted_backprojection(
     each side of Z and X (the circular deconvolution otherwise destabilises
     the volume edge) and use the voxel-driven back-projection on both
     backends, so CPU and CUDA agree up to the CUDA texture interpolation;
-    see the notes above `_bp_gather`. Extra memory: one padded layergram and
+    see the notes above `_bp_gather`. The weighting filter is built once per
+    geometry (angles, sizes, ``threshold_scale``, device) and kept for later
+    calls (``run_wsirt`` too): up to 8 filters of ``[Pz, Px // 2 + 1]`` fp32
+    on their device (~10.6 MiB each at 2048^2), until
+    :func:`release_cached_projectors`. Extra memory: one padded layergram and
     its spectrum per Y-chunk (at most ~64 Mi elements). fp32 only.
 
     Parameters

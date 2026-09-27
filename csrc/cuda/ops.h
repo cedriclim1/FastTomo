@@ -243,7 +243,9 @@ void grad_angle_cuda(
  *   sirt_update_cuda: vol_out = constraints(vol_in + omega * C * upd) over
  *     [Ny, Nz, Nx], rounded in run_sirt's eager order (eager_order = 1) or
  *     its CUDA-graph order (0); mask is [1 | Ny, Nz, Nx] (mask_full = 1 for
- *     the latter) or null; soft_thr <= 0 disables the soft threshold.
+ *     the latter) or null, and so is C (C_full = 1 for the latter; a
+ *     [1, Nz, Nx] plane is used for every Y-slice); soft_thr <= 0 disables
+ *     the soft threshold.
  *     vol_out may alias vol_in. A non-null vol_tc (a volume TextureCache
  *     with a surface, tc_create_ex) also receives vol_out, so the next
  *     cached forward projection can skip its upload (upload = 0); with a
@@ -271,7 +273,8 @@ void sirt_update_cuda(
     float omega, int positivity, float soft_thr,
     int Ny, int Nz, int Nx,
     TextureCache *vol_tc,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int C_full = 1
 );
 
 void sirt_residual_tex_cuda(
@@ -280,6 +283,52 @@ void sirt_residual_tex_cuda(
     void *raw_out,
     TextureCache *res_tc,
     int n_angles, int Ny, int N_det,
+    cudaStream_t stream
+);
+
+/*
+ * Fused elementwise steps of one FISTA iteration (fista_update.cu), bit for
+ * bit the PyTorch op chains they replace. io_dtype 0 = fp32, 1 = fp16;
+ * every tensor contiguous [Ny, Nz, Nx]; step = 1/L and beta as floats.
+ *   mode 0 (FISTA):    x_out = constraints(a_in - step * grad),
+ *                      y_out = x + beta * (x - xp_in)
+ *   mode 1 (step):     x_out = a_in - step * grad
+ *   mode 2 (momentum): y_out = a_in + beta * (a_in - xp_in)
+ * a_in is y (modes 0, 1) or the prox output x (mode 2). constraints: the
+ * support mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter, or null)
+ * then clamp(min=0) if positivity. y_out may alias a_in, x_out may alias
+ * xp_in. A non-null vol_tc (volume TextureCache with a surface) also
+ * receives y_out in modes 0 and 2 when its layout allows (1 channel, or
+ * fp16 4-channel packed layered); returns 1 if it did, else 0.
+ */
+int fista_update_cuda(
+    int io_dtype, int mode,
+    const void *a_in, const void *grad, const void *xp_in,
+    const void *mask, int mask_full,
+    void *x_out, void *y_out,
+    float step, float beta, int positivity,
+    int Ny, int Nz, int Nx,
+    TextureCache *vol_tc,
+    cudaStream_t stream
+);
+
+/*
+ * 3-D isotropic TV proximal operator of run_fista_tv (tv_prox.cu), bit for
+ * bit fasttomo.algorithms.fista._tv_prox_3d: n_iter dual iterations of FGP
+ * (fgp = 1; betas[it] the momentum of iteration it, a host array) or
+ * Chambolle (fgp = 0; betas ignored), dual step `step`, inv_lam = 1/lam
+ * computed in double and rounded once to fp32 (what CUDA ATen multiplies by
+ * for `tensor / lam`), then v_out = P_C(z - div(p)), P_C = clamp(min=0) if
+ * positivity then * mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter,
+ * or null). work: (fgp ? 6 : 3) * Ny*Nz*Nx elements of the I/O dtype
+ * (zeroed here). io_dtype 0 = fp32, 1 = fp16; tensors contiguous.
+ */
+void tv_prox_cuda(
+    int io_dtype, int fgp,
+    const void *z, void *v_out, void *work,
+    const void *mask, int mask_full, int positivity,
+    float step, float inv_lam, const float *betas, int n_iter,
+    int Ny, int Nz, int Nx,
     cudaStream_t stream
 );
 

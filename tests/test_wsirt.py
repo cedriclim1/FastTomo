@@ -212,3 +212,35 @@ def test_gather_back_projection_matches_cuda_kernel():
         out = _bp_gather(sino, ang, Nz, Nx)
         assert out.shape == ref.shape
         assert _rel(out, ref) < 3e-4
+
+
+def _sphere_slice(N: int, Ny: int = 2) -> torch.Tensor:
+    """The phantom of the solver audit's long-run tables: the central slice
+    of a sphere with a denser inclusion, repeated over Ny."""
+    y = torch.linspace(-1, 1, N)[:, None, None]
+    z = torch.linspace(-1, 1, N)[None, :, None]
+    x = torch.linspace(-1, 1, N)[None, None, :]
+    v = ((x ** 2 + z ** 2 + (y * 0.9) ** 2) < 0.36).float()
+    v += 0.5 * (((x - 0.2) ** 2 + (z + 0.1) ** 2 + y ** 2) < 0.04).float()
+    return v[N // 2:N // 2 + 1].repeat(Ny, 1, 1).contiguous()
+
+
+@needs_cuda
+def test_wsirt_long_run_behaviour():
+    """Solver audit A3, pinned as documented in run_wsirt: without
+    positivity wSIRT is accurate for ~200 iterations and then diverges
+    slowly (spectral radius of I - W A slightly above 1); with positivity it
+    keeps converging. If this starts failing because the long run became
+    stable, update the run_wsirt docstring."""
+    N = 64
+    ang = torch.linspace(-60, 60, 61)
+    xt = _sphere_slice(N)
+    b = ft.forward_project(xt, ang).cuda()
+    a = ang.cuda()
+    e200 = _rel(ft.run_wsirt(b, a, 200), xt)
+    e3000 = _rel(ft.run_wsirt(b, a, 3000), xt)
+    assert e200 < 0.25
+    assert e3000 > 4 * e200, (e200, e3000)               # the slow divergence
+    p200 = _rel(ft.run_wsirt(b, a, 200, positivity=True), xt)
+    p3000 = _rel(ft.run_wsirt(b, a, 3000, positivity=True), xt)
+    assert p3000 < p200 < 0.16, (p200, p3000)            # stable with positivity
