@@ -334,6 +334,42 @@ def test_mbir_rejects_invalid_prior_parameters(kw, match):
         ft.run_mbir(torch.zeros(5, 2, 16), torch.linspace(-70, 70, 5), n_iter=1, **kw)
 
 
+def test_mbir_support_mask_reproducibility(backend):
+    """With a support_mask the part removed after each sweep is
+    forward-projected into the error sinogram. On CUDA that projection uses
+    fp32 atomics, so identical runs are NOT bit-reproducible (documented in
+    run_mbir); what is asserted there is closeness, in a case where the
+    difference stays at rounding level (quadratic prior, no Huber weights:
+    measured max 3e-6 over 8 runs; the default edge-preserving prior and the
+    Huber classification amplify it, see the docstring). On CPU the
+    projection is deterministic and the runs are bit-identical. The sweep
+    must put mass outside the support for the case to mean anything."""
+    import math
+
+    from fasttomo.algorithms import mbir as M
+    N = 32
+    z = torch.arange(N) - (N - 1) / 2
+    r2 = z[:, None] ** 2 + z[None, :] ** 2
+    vol = ((r2 <= (N / 3) ** 2).float() + 0.5 * (r2 <= (N / 8) ** 2).float())
+    vol = vol.expand(4, N, N).contiguous().to(backend)
+    ang = torch.linspace(-60, 60, 41, device=backend)
+    a = ang * math.pi / 180
+    sino = M._mbir_forward_project(vol, N, torch.cos(a), torch.sin(a))
+    sino = sino + 0.05 * torch.randn(sino.shape, generator=torch.Generator().manual_seed(0)).to(backend)
+    sup = (r2 <= (N / 2.8) ** 2).float()[None].to(backend)
+    kw = dict(n_iter=20, huber_T=float("inf"), seed=3, sigma_f=0.3, qggmrf_p=2.0,
+              estimate_offset=False, estimate_variance=False, sigma_init=0.05,
+              convergence_tol=0.0)
+    free = ft.run_mbir(sino, ang, **kw)
+    assert (free * (1 - sup)).abs().max() > 0.1          # the support removes something
+    runs = [ft.run_mbir(sino, ang, support_mask=sup, **kw) for _ in range(3)]
+    for v in runs[1:]:
+        if backend.type == "cpu":
+            assert torch.equal(v, runs[0])
+        else:
+            torch.testing.assert_close(v, runs[0], rtol=0, atol=1e-4)
+
+
 # ── voxel order (generated in the CUDA kernel, mirrored in NumPy) ─────────────
 
 _PERM_SIZES = [(1, 1), (3, 2), (4, 5), (2, 144), (5, 1000), (3, 4097), (2, 40000)]

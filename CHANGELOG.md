@@ -84,6 +84,16 @@ about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
   (instead of reducing them separately): serial CUDA results change at the
   ulp level too, and the serial sweep costs ~3 % more per iteration.
 
+### `run_mbir`: CUDA runs with a `support_mask` are not bit-reproducible (documented)
+
+The part a support mask removes after each sweep is forward-projected with
+fp32 atomics on CUDA, so two identical runs differ in the last bits, and
+the ICD iterations amplify that (4 x 32^2 cylinder, 20 iterations: max
+volume difference 3e-6 with the quadratic prior, 1e-3 with the default
+prior, 0.2 with `huber_T=2`). CPU runs and CUDA runs without a mask stay
+bit-reproducible for a fixed `seed`. Documented in `run_mbir` and tested
+(bitwise on CPU, within 1e-4 on CUDA for the quadratic prior).
+
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
 `ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes
