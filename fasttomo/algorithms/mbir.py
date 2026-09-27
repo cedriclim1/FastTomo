@@ -131,10 +131,73 @@ def _mbir_update_offset_variance(
     return d_offsets, sigma_new
 
 
+_M64 = (1 << 64) - 1
+
+
+def _mix64(z: int) -> int:
+    """splitmix64 finalizer on a Python int (mod 2**64); ``mbir_mix64`` in
+    csrc/cuda/mbir_icd.cu."""
+    z = (z + 0x9E3779B97F4A7C15) & _M64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _M64
+    return z ^ (z >> 31)
+
+
+def _mbir_perm_key(seed: int, it: int) -> int:
+    """64-bit key of the voxel order of outer iteration ``it`` for ``seed``."""
+    return _mix64((_mix64(int(seed) & _M64) + int(it)) & _M64)
+
+
+def _hash32(x: np.ndarray) -> np.ndarray:
+    """lowbias32 on a uint32 array (wrapping); ``mbir_hash32`` on the GPU."""
+    x = x ^ (x >> np.uint32(16))
+    x = x * np.uint32(0x7FEB352D)
+    x = x ^ (x >> np.uint32(15))
+    x = x * np.uint32(0x846CA68B)
+    return x ^ (x >> np.uint32(16))
+
+
+def _mbir_permutation(Ny: int, Nvox: int, key: int) -> np.ndarray:
+    """Per-Y-slice voxel order, int32 ``[Ny, Nvox]``: row ``iy`` is a
+    pseudo-random permutation of ``range(Nvox)`` given by a keyed 4-round
+    Feistel network on ``2h`` bits (``4**h >= Nvox``) with cycle-walking.
+
+    The CUDA sweep generates the same order inside the kernel (``mbir_perm_*``
+    in csrc/cuda/mbir_icd.cu) instead of receiving this array, so nothing is
+    copied to the device per outer iteration; this NumPy mirror feeds the
+    CPU sweep and is bit-identical to it (tested). Distinct keys give
+    distinct orders across slices and iterations."""
+    h = 0
+    while (1 << (2 * h)) < Nvox:
+        h += 1
+    mask = np.uint32((1 << h) - 1)
+    sh = np.uint32(h)
+    rk = np.empty((Ny, 4), dtype=np.uint32)
+    for iy in range(Ny):
+        k1 = _mix64((key + iy) & _M64)
+        k2 = _mix64(k1)
+        rk[iy] = (k1 & 0xFFFFFFFF, k1 >> 32, k2 & 0xFFFFFFFF, k2 >> 32)
+
+    def feistel(x: np.ndarray, rows: np.ndarray | slice) -> np.ndarray:
+        L, R = x >> sh, x & mask
+        for r in range(4):
+            k = rk[rows, r] if isinstance(rows, np.ndarray) else rk[:, r:r + 1]
+            L, R = R, L ^ (_hash32(R ^ k) & mask)
+        return (L << sh) | R
+
+    y = feistel(np.broadcast_to(np.arange(Nvox, dtype=np.uint32), (Ny, Nvox)), slice(None))
+    rows, cols = np.nonzero(y >= np.uint32(Nvox))
+    while rows.size:                        # cycle-walk back into [0, Nvox)
+        y[rows, cols] = feistel(y[rows, cols], rows)
+        still = y[rows, cols] >= np.uint32(Nvox)
+        rows, cols = rows[still], cols[still]
+    return y.astype(np.int32)
+
+
 def _generate_permutation(Ny: int, Nvox: int, rng: np.random.Generator) -> np.ndarray:
-    """Per-Y-slice independent random permutation, returned as int32
-    [Ny, Nvox]. Distinct shuffles across slices match the paper's
-    randomized ICD ordering. Reproducible for a given seeded rng."""
+    """Legacy NumPy voxel order (independent ``rng.permutation`` per Y-slice,
+    int32 ``[Ny, Nvox]``). ``run_mbir`` no longer uses it (see
+    `_mbir_permutation`); kept because ``fasttomo.algorithms`` exposed it."""
     perm = np.empty((Ny, Nvox), dtype=np.int32)
     for iy in range(Ny):
         perm[iy] = rng.permutation(Nvox).astype(np.int32, copy=False)
@@ -296,7 +359,6 @@ def _run_mbir_single_scale(
     if d_offsets.abs().sum().item() > 0.0:
         e_sino.sub_(d_offsets.view(n_angles, 1, 1))
 
-    rng = np.random.default_rng(seed)
     Nvox = Nz * Nx
     history: list[float] = []
     sigma_cur = float(sigma)
@@ -305,10 +367,12 @@ def _run_mbir_single_scale(
     for it in range(outer_iters):
         n_done = it + 1
         vol_snap = volume.clone().contiguous()
-        perm = _generate_permutation(Ny, Nvox, rng)
+        # Random voxel order per Y-slice, new every outer iteration. CUDA
+        # builds it inside the sweep kernel from the key (no host array, no
+        # copy); the CPU sweep gets the identical order as an array.
+        perm_key = _mbir_perm_key(seed, it)
 
         if device.type == "cuda":
-            perm_dev = torch.from_numpy(perm).to(device).contiguous()
             stream_ptr = torch.cuda.current_stream(device).cuda_stream
             with torch.cuda.device(device):   # D7: launch on the data's device
                 _core.mbir_icd_sweep_cuda(
@@ -316,7 +380,7 @@ def _run_mbir_single_scale(
                     e_sino_ptr=e_sino.data_ptr(),
                     vol_snapshot_ptr=vol_snap.data_ptr(),
                     lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
-                    perm_ptr=perm_dev.data_ptr(),
+                    perm_ptr=0, perm_key=perm_key,
                     cos_ptr=cos_a.data_ptr(),
                     sin_ptr=sin_a.data_ptr(),
                     Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
@@ -330,7 +394,8 @@ def _run_mbir_single_scale(
             _mbir_icd_sweep_cpu(
                 volume, e_sino,
                 lambdas.contiguous() if lambdas is not None else None,
-                vol_snap, torch.from_numpy(perm), cos_a, sin_a,
+                vol_snap, torch.from_numpy(_mbir_permutation(Ny, Nvox, perm_key)),
+                cos_a, sin_a,
                 qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
                 sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
                 sigma=sigma_cur, num_threads=num_threads,

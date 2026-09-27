@@ -191,6 +191,79 @@ def test_mbir_seed_reproducibility():
     assert torch.equal(v1, v2), "MBIR not reproducible with the same seed"
 
 
+# ── voxel order (generated in the CUDA kernel, mirrored in NumPy) ─────────────
+
+_PERM_SIZES = [(1, 1), (3, 2), (4, 5), (2, 144), (5, 1000), (3, 4097), (2, 40000)]
+
+
+@pytest.mark.parametrize("Ny,nvox", _PERM_SIZES)
+def test_mbir_permutation_rows_are_distinct_permutations(Ny, nvox):
+    """Each slice's order is a permutation of range(nvox) (cycle-walking
+    included: 4097 and 40000 are not powers of four), slices and outer
+    iterations get different orders, and the order is a pure function of
+    (seed, iteration)."""
+    from fasttomo.algorithms.mbir import _mbir_perm_key, _mbir_permutation
+    p = _mbir_permutation(Ny, nvox, _mbir_perm_key(7, 0))
+    assert p.dtype == np.int32 and p.shape == (Ny, nvox)
+    for row in p:
+        assert np.array_equal(np.sort(row), np.arange(nvox))
+    assert np.array_equal(p, _mbir_permutation(Ny, nvox, _mbir_perm_key(7, 0)))
+    if nvox >= 16:
+        assert not np.array_equal(p, _mbir_permutation(Ny, nvox, _mbir_perm_key(7, 1)))
+        assert not np.array_equal(p, _mbir_permutation(Ny, nvox, _mbir_perm_key(8, 0)))
+        if Ny > 1:
+            assert not np.array_equal(p[0], p[1])
+
+
+@needs_cuda
+@pytest.mark.parametrize("Ny,nvox", _PERM_SIZES)
+@pytest.mark.parametrize("seed,it", [(0, 0), (3, 1), (-5, 7), (2**40 + 1, 99)])
+def test_mbir_permutation_cuda_matches_numpy(Ny, nvox, seed, it):
+    """The order the CUDA sweep builds in the kernel is the NumPy order the
+    CPU sweep gets, element for element (so CPU and CUDA visit the voxels
+    in the same order and the parity tests compare like with like)."""
+    import fasttomo._core as _core
+    from fasttomo.algorithms.mbir import _mbir_perm_key, _mbir_permutation
+    key = _mbir_perm_key(seed, it)
+    out = torch.full((Ny, nvox), -1, dtype=torch.int32, device=DEVICE)
+    _core.mbir_permutation_cuda(out_ptr=out.data_ptr(), Ny=Ny, nvox=nvox, perm_key=key,
+                                stream_ptr=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert np.array_equal(out.cpu().numpy(), _mbir_permutation(Ny, nvox, key))
+
+
+@needs_cuda
+def test_mbir_cuda_in_kernel_order_matches_explicit_perm():
+    """The sweep with perm_ptr=0 (order built in the kernel) equals the sweep
+    given the same order as an explicit [Ny, Nz*Nx] array, bit for bit."""
+    import fasttomo._core as _core
+    from fasttomo.algorithms.mbir import _mbir_perm_key, _mbir_permutation
+    g = torch.Generator().manual_seed(4)
+    Ny, Nz, Nx, n = 5, 11, 13, 17
+    ang = make_angles(n, max_deg=70.0) * math.pi / 180
+    cos_a, sin_a = torch.cos(ang).to(DEVICE), torch.sin(ang).to(DEVICE)
+    vol0 = torch.rand(Ny, Nz, Nx, generator=g).to(DEVICE)
+    e0 = torch.randn(n, Ny, Nx, generator=g).to(DEVICE)
+    lam = (torch.rand(n, Ny, Nx, generator=g) + 0.5).to(DEVICE)
+    key = _mbir_perm_key(11, 2)
+    perm = torch.from_numpy(_mbir_permutation(Ny, Nz * Nx, key)).to(DEVICE)
+    outs = []
+    for perm_ptr in (0, perm.data_ptr()):
+        vol, e = vol0.clone(), e0.clone()
+        _core.mbir_icd_sweep_cuda(
+            vol_ptr=vol.data_ptr(), e_sino_ptr=e.data_ptr(), vol_snapshot_ptr=vol0.data_ptr(),
+            lambdas_ptr=lam.data_ptr(), perm_ptr=perm_ptr, perm_key=key,
+            cos_ptr=cos_a.data_ptr(), sin_ptr=sin_a.data_ptr(),
+            Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n, N_det=Nx,
+            qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.3,
+            huber_T=2.0, huber_delta=0.5, sigma=0.7,
+            stream_ptr=torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        outs.append((vol, e))
+    assert not torch.equal(outs[0][0], vol0)
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
 @needs_cuda
 def test_mbir_estimate_offset_disabled_keeps_d_zero():
     """When estimate_offset=False, the per-tilt offset must remain at its

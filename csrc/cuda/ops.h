@@ -272,7 +272,10 @@ void mbir_forward_project_cuda(
  *                       tex3D for the qGGMRF 26-neighbour reads. Caller
  *                       guarantees this is a valid snapshot.
  *   d_lambdas         : per-pixel data weights or nullptr → uniform 1.
- *   d_perm            : [Ny, Nz*Nx] int32 host-generated permutation.
+ *   d_perm            : [Ny, Nz*Nx] int32 explicit voxel order, or nullptr
+ *                       (the normal case): the kernel generates each slice's
+ *                       order from perm_key (see mbir_perm_* in mbir_icd.cu).
+ *   perm_key          : 64-bit key of this outer iteration's order.
  *   sigma             : current noise std for the Huber surrogate.
  */
 void mbir_icd_sweep_cuda(
@@ -281,12 +284,22 @@ void mbir_icd_sweep_cuda(
     const float *d_volume_snapshot,
     const float *d_lambdas,
     const int   *d_perm,
+    unsigned long long perm_key,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
     float huber_T, float huber_delta, float sigma,
     cudaStream_t stream
+);
+
+/*
+ * Test hook: the voxel order mbir_icd_sweep_cuda uses when d_perm is null,
+ * written to d_out as [Ny, nvox] int32. Mirrors
+ * fasttomo.algorithms.mbir._mbir_permutation bit for bit.
+ */
+void mbir_permutation_cuda(
+    int *d_out, int Ny, int nvox, unsigned long long perm_key, cudaStream_t stream
 );
 
 #endif /* FASTTOMO_CUDA_OPS_H */

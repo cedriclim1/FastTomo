@@ -344,7 +344,8 @@ static void py_mbir_icd_sweep_cuda(
     long vol_ptr, long e_sino_ptr,
     long vol_snapshot_ptr,
     long lambdas_ptr,          /* 0 → nullptr */
-    long perm_ptr,
+    long perm_ptr,             /* 0 → in-kernel order from perm_key */
+    unsigned long long perm_key,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
@@ -357,6 +358,7 @@ static void py_mbir_icd_sweep_cuda(
         reinterpret_cast<const float *>(vol_snapshot_ptr),
         reinterpret_cast<const float *>(lambdas_ptr),
         reinterpret_cast<const int *>(perm_ptr),
+        perm_key,
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -364,6 +366,13 @@ static void py_mbir_icd_sweep_cuda(
         huber_T, huber_delta, sigma,
         to_stream(stream_ptr)
     );
+}
+
+static void py_mbir_permutation_cuda(
+    long out_ptr, int Ny, int nvox, unsigned long long perm_key, long stream_ptr
+) {
+    mbir_permutation_cuda(reinterpret_cast<int *>(out_ptr), Ny, nvox, perm_key,
+                          to_stream(stream_ptr));
 }
 
 void register_cuda(py::module_ &m) {
@@ -581,19 +590,27 @@ void register_cuda(py::module_ &m) {
           py::call_guard<py::gil_scoped_release>(),
           "One outer iteration of MBIR-AM-PE (CUDA). In-place mutates "
           "volume and e_sino. Pass lambdas_ptr=0 for uniform weights "
-          "(treated as nullptr). Per-tilt offset d_k and noise variance σ "
+          "(treated as nullptr). The voxel order of each Y-slice is generated "
+          "in the kernel from perm_key unless perm_ptr ([Ny, Nz*Nx] int32) "
+          "is non-zero. Per-tilt offset d_k and noise variance σ "
           "are updated in PyTorch by the Python wrapper using the post-call "
           "e_sino (the kernel never reads d_k: e = g - Af - d).",
           py::arg("vol_ptr"), py::arg("e_sino_ptr"),
           py::arg("vol_snapshot_ptr"),
           py::arg("lambdas_ptr"),
-          py::arg("perm_ptr"),
+          py::arg("perm_ptr"), py::arg("perm_key"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("qggmrf_p"), py::arg("qggmrf_q"),
           py::arg("qggmrf_c"), py::arg("sigma_f"),
           py::arg("huber_T"), py::arg("huber_delta"), py::arg("sigma"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("mbir_permutation_cuda", &py_mbir_permutation_cuda,
+          "Test hook: write the in-kernel MBIR voxel order ([Ny, nvox] int32) "
+          "for perm_key to out_ptr.",
+          py::arg("out_ptr"), py::arg("Ny"), py::arg("nvox"), py::arg("perm_key"),
           py::arg("stream_ptr") = 0L);
 
     m.def("_tc_debug_fail_next_create", &tc_debug_fail_next_create,
@@ -611,6 +628,13 @@ void register_cuda(py::module_ &m) {
 #include "bindings_cuda.h"
 
 namespace py = pybind11;
+
+static void py_mbir_permutation_cuda(
+    long out_ptr, int Ny, int nvox, unsigned long long perm_key, long stream_ptr
+) {
+    mbir_permutation_cuda(reinterpret_cast<int *>(out_ptr), Ny, nvox, perm_key,
+                          to_stream(stream_ptr));
+}
 
 void register_cuda(py::module_ &m) {
     m.attr("cuda_available") = false;

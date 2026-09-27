@@ -90,6 +90,70 @@ __device__ __forceinline__ float huber_surr_weight_dev(float r) {
     return mbir_H.huber_delta * mbir_H.huber_T / ar;
 }
 
+/* ── Per-slice voxel ordering, generated in the kernel ───────────────────────
+ * The ICD sweep visits the voxels of each Y-slice in a pseudo-random order
+ * that changes every outer iteration (HANDOFF-mbir decision 4). The order is
+ * a keyed bijection on [0, nvox): a 4-round Feistel network on 2h bits
+ * (4^h >= nvox) with cycle-walking, so no [Ny, Nz*Nx] permutation has to be
+ * built on the host and copied every outer iteration. The key is
+ * `perm_key` (host: _mbir_perm_key(seed, it)) mixed with the slice index.
+ * fasttomo/algorithms/mbir.py::_mbir_permutation is the bit-exact NumPy
+ * mirror used by the CPU sweep; tests compare the two element for element. */
+__host__ __device__ __forceinline__ unsigned long long mbir_mix64(unsigned long long z) {
+    z += 0x9E3779B97F4A7C15ull;                     /* splitmix64 */
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+__device__ __forceinline__ unsigned int mbir_hash32(unsigned int x) {
+    x ^= x >> 16; x *= 0x7feb352dU;                 /* lowbias32 */
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+struct MbirPerm {
+    unsigned int rk[4];   /* round keys of this slice */
+    unsigned int h;       /* half width in bits: 4^h >= nvox */
+    unsigned int mask;    /* (1 << h) - 1 */
+    unsigned int n;       /* nvox */
+};
+
+__device__ __forceinline__ MbirPerm mbir_perm_setup(unsigned long long key, int iy, int nvox) {
+    MbirPerm P;
+    unsigned long long k1 = mbir_mix64(key + (unsigned long long)iy);
+    unsigned long long k2 = mbir_mix64(k1);
+    P.rk[0] = (unsigned int)k1; P.rk[1] = (unsigned int)(k1 >> 32);
+    P.rk[2] = (unsigned int)k2; P.rk[3] = (unsigned int)(k2 >> 32);
+    unsigned int h = 0;
+    while ((1ull << (2 * h)) < (unsigned long long)nvox) h++;
+    P.h = h;
+    P.mask = (1u << h) - 1u;
+    P.n = (unsigned int)nvox;
+    return P;
+}
+
+__device__ __forceinline__ unsigned int mbir_feistel(const MbirPerm &P, unsigned int x) {
+    unsigned int L = x >> P.h, R = x & P.mask;
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        unsigned int F = mbir_hash32(R ^ P.rk[r]) & P.mask;
+        unsigned int nl = R;
+        R = L ^ F;
+        L = nl;
+    }
+    return (L << P.h) | R;
+}
+
+/* s-th voxel of the slice (0 <= s < nvox). Cycle-walking terminates: the
+ * Feistel map is a permutation of [0, 4^h) and s itself lies in [0, nvox). */
+__device__ __forceinline__ int mbir_perm_index(const MbirPerm &P, int s) {
+    unsigned int y = mbir_feistel(P, (unsigned int)s);
+    while (y >= P.n) y = mbir_feistel(P, y);
+    return (int)y;
+}
+
 /* Block reduction (64 threads = 2 warps) using warp shuffle + 1 shared slot.
  * `sh2` must point to a 2-element __shared__ scratch (one slot per warp). */
 __device__ __forceinline__ float block_reduce_sum_64(float v, float *sh2) {
@@ -177,7 +241,8 @@ __global__ static void icd_sweep_mbir_kernel(
     float *__restrict__       volume,           /* [Ny, Nz, Nx] live (read+write) */
     float *__restrict__       e_sino,           /* [n_angles, Ny, N_det] live */
     const float *__restrict__ lambdas,          /* [n_angles, Ny, N_det] or nullptr */
-    const int   *__restrict__ perm,             /* [Ny, Nz*Nx] permutation */
+    const int   *__restrict__ perm,             /* [Ny, Nz*Nx] or nullptr: in-kernel order */
+    unsigned long long        perm_key,
     const float *__restrict__ cos_a,
     const float *__restrict__ sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det
@@ -187,7 +252,8 @@ __global__ static void icd_sweep_mbir_kernel(
     if (iy >= Ny) return;
 
     const int nvox = Nz * Nx;
-    const int *perm_slice = perm + (size_t)iy * nvox;
+    const int *perm_slice = perm ? perm + (size_t)iy * nvox : nullptr;
+    const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
     float *vol_slice = volume + (size_t)iy * Nz * Nx;
 
     /* Shared: 2-element scratch for block reduction (one slot per warp);
@@ -196,7 +262,7 @@ __global__ static void icd_sweep_mbir_kernel(
     __shared__ float sh_t1, sh_t2, sh_n1, sh_n2, sh_df;
 
     for (int s = 0; s < nvox; s++) {
-        int lin = perm_slice[s];
+        int lin = perm_slice ? perm_slice[s] : mbir_perm_index(P, s);
         int ix  = lin % Nx;
         int iz  = lin / Nx;
         float fj_old = vol_slice[(size_t)iz * Nx + ix];
@@ -332,7 +398,8 @@ void mbir_icd_sweep_cuda(
     float       *d_e_sino,         /* [n_angles, Ny, N_det] in-place */
     const float *d_volume_snapshot,/* host uploads its own snapshot tex3D */
     const float *d_lambdas,        /* [n_angles, Ny, N_det] or nullptr */
-    const int   *d_perm,           /* [Ny, Nz*Nx] int32 */
+    const int   *d_perm,           /* [Ny, Nz*Nx] int32, or nullptr */
+    unsigned long long perm_key,   /* in-kernel order when d_perm is null */
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
@@ -360,10 +427,31 @@ void mbir_icd_sweep_cuda(
     dim3 grid(Ny, 1, 1);
     icd_sweep_mbir_kernel<<<grid, block, 0, stream>>>(
         snap.get()->tex,
-        d_volume, d_e_sino, d_lambdas, d_perm,
+        d_volume, d_e_sino, d_lambdas, d_perm, perm_key,
         d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det
     );
     CUDA_CHECK_KERNEL();
     snap.finish();
+}
+
+/* Test hook: write the in-kernel voxel order of every slice, [Ny, nvox]. */
+__global__ static void mbir_permutation_kernel(
+    int *__restrict__ out, int Ny, int nvox, unsigned long long perm_key
+) {
+    int iy = blockIdx.y;
+    int s  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (iy >= Ny || s >= nvox) return;
+    const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
+    out[(size_t)iy * nvox + s] = mbir_perm_index(P, s);
+}
+
+void mbir_permutation_cuda(
+    int *d_out, int Ny, int nvox, unsigned long long perm_key, cudaStream_t stream
+) {
+    if (Ny <= 0 || nvox <= 0) return;
+    dim3 block(256, 1, 1);
+    dim3 grid((nvox + 255) / 256, Ny, 1);
+    mbir_permutation_kernel<<<grid, block, 0, stream>>>(d_out, Ny, nvox, perm_key);
+    CUDA_CHECK_KERNEL();
 }

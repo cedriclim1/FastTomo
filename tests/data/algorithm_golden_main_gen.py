@@ -13,7 +13,9 @@ PYTHONPATH: drop its ``ScikitBuildRedirectingFinder`` from ``sys.meta_path``
 (or use a venv without the editable install) so the export is imported.
 The ``_fft_*`` fingerprint keys were added later from the same export; the
 other keys are the first generation (the atomics ones differ run to run).
-The cases live in ``tests/test_algorithm_identity.py::_cases`` (public API
+The ``cpu/mbir`` and ``cuda/mbir`` keys were later regenerated on the
+branch that moved the MBIR voxel order into the CUDA kernel (see
+test_algorithm_identity.py). The cases live in ``tests/test_algorithm_identity.py::_cases`` (public API
 only), so generator and test cannot drift apart.
 """
 import sys

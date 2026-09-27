@@ -221,6 +221,8 @@ from fasttomo.algorithms.mbir import (
     run_mbir,
     _downsample_sino_det,
     _generate_permutation,
+    _mbir_perm_key,
+    _mbir_permutation,
     _huber_surr_weight,
     _mbir_forward_project,
     _mbir_icd_sweep_cpu,

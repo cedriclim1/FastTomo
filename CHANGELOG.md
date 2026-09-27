@@ -11,6 +11,19 @@ call is up to ~4x slower than before**. Results are unchanged. To restore
 the old speed pass `num_threads=4` (or more), or set `OMP_NUM_THREADS`
 before starting Python. CUDA runs are not affected.
 
+### ⚠ `run_mbir`: faster outer iterations, different voxel order per `seed`
+
+- The random per-slice voxel order of the ICD sweep is now generated inside
+  the CUDA kernel (a keyed Feistel permutation per Y-slice and outer
+  iteration) instead of by NumPy on the host and copied to the GPU every
+  outer iteration (`Ny*Nz*Nx*4` bytes: 67 MB at 256^3, 537 MB at 512^3).
+  One CUDA outer iteration at 256^3 x 61 views: 300 ms -> 174 ms. The CPU
+  sweep uses a bit-identical NumPy mirror of the same order, so CPU and
+  CUDA still visit the voxels in the same order.
+- **Results for a given `seed` differ from earlier versions** (a different,
+  equally random order); a fixed `seed` is still bit-reproducible run to
+  run. `_generate_permutation` is no longer used by `run_mbir`.
+
 ### Projection-operator seam (internal; outputs unchanged)
 
 - Every forward/back projection now goes through one internal interface,
