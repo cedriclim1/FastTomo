@@ -54,8 +54,8 @@ import fasttomo as ft
 #   CUDA block reduction and atomics, not thread-count variance). That
 #   shape gets 5e-5. The CPU parallel gradient (grad_angle) sums in fp64 in
 #   a fixed order since phase 1b (it used to move by 1.9e-5 between 1 and 8
-#   threads): CPU vs CUDA is <= 1.0e-6 on all four shapes, the CUDA fp32
-#   atomics.
+#   threads): CPU vs CUDA is <= 1.1e-6 on all four shapes, the CUDA
+#   kernel's fp32 partial sums (fixed-order since #99, no atomics).
 
 
 def _smooth_volume(Ny, Nz, Nx):
