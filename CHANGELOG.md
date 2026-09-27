@@ -104,15 +104,16 @@ the block with a SIMD loop, over a clipped step range; every lane does the
 scalar loop's fp32 operations in the same order, so the results are
 **bit-identical** to the previous kernels (memcmp over 11 shapes x
 1/3/8/16 threads). Interleaved A/B on an EPYC 9555 (default portable
-build), 1 / 8 threads:
+build, median of 20 alternating calls), 1 / 8 / 16 threads:
 
 | kernel | 8x128^2, 61 views | 32x256^2, 61 views |
 |---|---|---|
-| `forward_project` (parallel) | 5.8x / 5.7x | 8.7x / 8.8x |
-| `back_project` (ray-driven, parallel) | 5.6x / 3.8x | 8.7x / 7.3x |
-| gather back-projection (W-BP, wSIRT, CPU FBP) | 5.3x / 5.0x | 6.4x / 6.4x |
-| `grad_angle` | 5.6x / 5.5x | 7.3x / 7.3x |
-| `forward_project_3d` (rotmat) | 1.7x / 1.7x | |
+| `forward_project` (parallel) | 5.8x / 5.7x / 5.2x | 8.6x / 7.2x / 6.8x |
+| `back_project` (ray-driven, parallel) | 5.8x / 3.7x / 4.2x | 8.8x / 6.7x / 4.8x |
+| gather back-projection (W-BP, wSIRT, CPU FBP) | 5.3x / 5.1x / 4.5x | 6.5x / 6.8x / 6.2x |
+| `grad_angle` | 5.6x / 5.5x / 5.4x | 7.3x / 7.8x / 7.4x |
+| `forward_project_3d` (rotmat) | 1.7x / 1.7x / 1.7x | 1.8x / 1.5x / 1.5x |
+| `grad_rotmat` | 1.2x / 1.2x / 1.2x | 1.2x / 1.2x / 1.4x |
 
 - The parallel back-projection now uses all threads for any Ny (it
   parallelised over Y only; Ny = 1 ran on one thread: 7x at 8 threads for
