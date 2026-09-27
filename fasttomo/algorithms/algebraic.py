@@ -626,10 +626,22 @@ def run_wsirt(
 
     ``x <- x + omega * W-BP(b - A x)``, then the constraints, where W-BP is
     the exact weighted back-projection of :func:`run_weighted_backprojection`
-    (edge margin, voxel-driven on both backends). It does not diverge at the
-    default ``omega=1``; CPU and CUDA agree to ~2e-4, the floor set by the
-    CUDA texture unit's 8-bit interpolation weights. Recorded loss: the data
-    MSE before each update.
+    (edge margin, voxel-driven on both backends). CPU and CUDA agree to
+    ~2e-4, the floor set by the CUDA texture unit's 8-bit interpolation
+    weights. Recorded loss: the data MSE before each update.
+
+    Long runs: W-BP is not an exact inverse of the projector (the weighting
+    filter is cropped to the volume, which is not positive semi-definite),
+    so without ``positivity`` the iteration is slowly unstable: the spectral
+    radius of ``I - omega W A`` is 1.0013-1.008 for every ``omega > 0``
+    (dense eigenvalues at N = 32 and 48, solver audit A3). The first ~200
+    iterations are accurate, then the error grows, on both backends alike
+    (64^2 slice, 61 views over +-60 degrees, relative error to the phantom
+    after 20 / 200 / 1000 / 3000 iterations: noise-free 0.28 / 0.24 / 0.31
+    / 1.46, 1 % noise 0.29 / 0.28 / 0.65 / 6.1). ``positivity=True`` makes
+    it stable (noise-free 0.18 / 0.145 / 0.112 / 0.097; with 1 % noise it
+    fits the noise as any unregularised iteration does, 0.19 / 0.21 / 0.32
+    / 0.42). Without positivity keep ``n_iter`` at a few hundred at most.
 
     Parameters
     ----------
