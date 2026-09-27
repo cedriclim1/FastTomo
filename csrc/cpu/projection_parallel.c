@@ -38,8 +38,11 @@ void forward_project_parallel_cpu(
                     float fx = x + g.half_x;
                     float fz = z + g.half_z;
 
-                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                        fz < 0.0f || fz >= (float)(Nz - 1))
+                    /* negated conjunction: a NaN sample (NaN/Inf angle)
+                     * fails every comparison and is skipped, instead of
+                     * indexing with (int)NaN = INT_MIN */
+                    if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+                          fz >= 0.0f && fz < (float)(Nz - 1)))
                         continue;
 
                     int ix0 = (int)fx, iz0 = (int)fz;
@@ -94,8 +97,11 @@ void back_project_parallel_cpu(
                     float fx = (t * ca - s * sa) + g.half_x;
                     float fz = (t * sa + s * ca) + g.half_z;
 
-                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                        fz < 0.0f || fz >= (float)(Nz - 1))
+                    /* negated conjunction: a NaN sample (NaN/Inf angle)
+                     * fails every comparison and is skipped, instead of
+                     * indexing with (int)NaN = INT_MIN */
+                    if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+                          fz >= 0.0f && fz < (float)(Nz - 1)))
                         continue;
 
                     int ix0 = (int)fx, iz0 = (int)fz;
@@ -252,8 +258,11 @@ void grad_angle_cpu(
                     float fx = x + g.half_x;
                     float fz = z + g.half_z;
 
-                    if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                        fz < 0.0f || fz >= (float)(Nz - 1))
+                    /* negated conjunction: a NaN sample (NaN/Inf angle)
+                     * fails every comparison and is skipped, instead of
+                     * indexing with (int)NaN = INT_MIN */
+                    if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+                          fz >= 0.0f && fz < (float)(Nz - 1)))
                         continue;
 
                     int ix0 = (int)fx, iz0 = (int)fz;

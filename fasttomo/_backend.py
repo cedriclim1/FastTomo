@@ -53,6 +53,25 @@ def _assert_dtype_match(a: torch.Tensor, b: torch.Tensor,
         )
 
 
+def _check_finite_geometry(t: torch.Tensor, what: str) -> None:
+    """Raise ValueError if the host tensor ``t`` (tilt angles or rotation
+    matrices) holds a NaN or an Inf.
+
+    A non-finite angle used to crash the process on CPU: the parallel
+    kernels turned the NaN sample coordinate into the index ``(int)NaN``
+    (INT_MIN on x86) and the back-projection wrote there. The kernels now
+    skip NaN samples as well, but a NaN geometry has no meaningful
+    projection, so the Python entry points refuse it. The check is one
+    reduction over ``n_angles`` values on the host; CUDA-resident tensors are
+    skipped, because reading the result back would add a stream sync to
+    every CUDA projection (the CUDA kernels sample through textures or clamp
+    and return NaN instead of crashing)."""
+    if t.is_cuda:
+        return
+    if not bool(torch.isfinite(t).all()):
+        raise ValueError(f"{what} must be finite; got NaN or Inf in {tuple(t.shape)} values")
+
+
 # ── thread-count resolution ──────────────────────────────────────────────────
 #
 # Resolution order for the CPU 3D rotmat kernels:
