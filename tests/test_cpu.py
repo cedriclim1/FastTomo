@@ -454,7 +454,6 @@ def test_fista_tv_reduces_tv_vs_fista():
     # CPU pure-PyTorch TV (tv_loss_3d's CUDA path is fp32-only and Ny=1 hits an
     # empty Y-diff; recompute here for portability)
     def tv(v):
-        dy = v[1:, :, :] - v[:-1, :, :]
         dz = v[:, 1:, :] - v[:, :-1, :]
         dx = v[:, :, 1:] - v[:, :, :-1]
         return (dz[:, :, :-1].pow(2) + dx[:, :-1, :].pow(2) + 1e-8).sqrt().mean().item()

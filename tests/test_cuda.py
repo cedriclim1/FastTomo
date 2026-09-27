@@ -2110,9 +2110,7 @@ def test_mbir_fp_matches_standard_fp_off_axis_voxel_cuda():
     standard ft.forward_project must agree on detector hit positions for a
     single off-Z-centre voxel. Placing the voxel at iz=8 (well off the
     iz=Nz//2 centre) makes a z-sign error visible as a shifted COM."""
-    import math
     import numpy as np
-    import fasttomo._core as _core
     Ny, Nz, Nx = 4, 32, 32
     N_det = Nx
     n_angles = 12

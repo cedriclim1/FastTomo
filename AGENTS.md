@@ -42,12 +42,12 @@ CUDACXX=$C/bin/nvcc uv pip install --python .venv/bin/python -e . \
 
 ## CI
 
-- `.github/workflows/test-cpu.yml`: on every pull request and push to `main`, builds CPU-only on Python 3.10 and 3.12 and runs `pytest tests`. Superseded pull-request runs are cancelled; runs on `main` are not. `ruff check fasttomo tests` runs as a non-blocking step.
+- `.github/workflows/test-cpu.yml`: on every pull request and push to `main`, builds CPU-only on Python 3.10 and 3.12 and runs `pytest tests`. Superseded pull-request runs are cancelled; runs on `main` are not. `ruff check fasttomo tests` must pass (rule set pinned in `pyproject.toml`).
 - `.github/workflows/wheels.yml`: on `v*` tags and manual dispatch, builds CPU and CUDA 13.0 manylinux wheels for cp310-cp313.
 
 ## Linting
 
-`ruff check fasttomo tests` (no ruff config in the repo yet). There are pre-existing warnings, so CI does not fail on it.
+`ruff check fasttomo tests`. The rule set is pinned in `pyproject.toml` (`[tool.ruff.lint]`: ruff's classic E4/E7/E9/F defaults) and the tree is clean; CI fails on new findings.
 
 ## Key gotchas
 

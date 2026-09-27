@@ -128,28 +128,28 @@ def test_ad_recon_identical_to_main():
     golden = _golden()
     exact = _exact_env()
     sino, ang, _, sm, N = _inputs("cuda")
-    C, O, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
+    C, Opt, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
                      ft.ConstraintConfig, ft.PoseRefinementConfig)
     extra = dict(loss_callback=_Calls(), progress=False, warm_start=None)
-    out = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=O(n_iter=6)), return_loss=True, **extra)
+    out = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=Opt(n_iter=6)), return_loss=True, **extra)
     _check(out, golden["ad"], exact, "ad")
     out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=O(n_iter=6, loss_fn="l1"),
+        optim=Opt(n_iter=6, loss_fn="l1"),
         reg=R(tv_weight=1e-3, tv_xz_weight=1e-3, sparsity=1e-3),
         constraints=K(positivity=True, cylinder=True, soft_threshold=1e-3)),
         return_loss=True, **extra)
     _check(out, golden["ad_reg"], exact, "ad_reg")
     out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=O(n_iter=6),
+        optim=Opt(n_iter=6),
         pose=P(refine_pose=True, refine_shifts=True, in_plane_weight=1e-2,
                anchor_reference=True)), return_loss=True, return_pose=True, **extra)
     _check(out, golden["ad_pose"], exact, "ad_pose")
     out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=O(n_iter=8), constraints=K(soft_threshold=1e-3),
+        optim=Opt(n_iter=8), constraints=K(soft_threshold=1e-3),
         pose=P(refine_shifts=True, pose_warmup_iters=2, alternating_period=2)),
         return_loss=True, return_pose=True, **extra)
     _check(out, golden["ad_staged"], exact, "ad_staged")
     # the n_iter positional overrides config.optim.n_iter
-    out = ft.run_ad_recon(sino, ang, 5, Nz=N, config=C(optim=O(n_iter=99)), support_mask=sm,
+    out = ft.run_ad_recon(sino, ang, 5, Nz=N, config=C(optim=Opt(n_iter=99)), support_mask=sm,
                           **extra)
     _check(out, golden["ad_support"], exact, "ad_support")

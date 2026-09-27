@@ -53,7 +53,6 @@ import torch
 import fasttomo._core as _core
 from fasttomo.autograd import (
     _FPParallelCached, _BPParallelCached, _FPRotmatCached, _BPRotmatCached, _io_dtype_code,
-    _on_device,
 )
 
 
@@ -364,11 +363,15 @@ class ParallelProjector(_ProjectorBase):
 
     # ── public differentiable API ──
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        """Forward-project ``volume [Ny, Nz, Nx]`` to ``[n_angles, Ny, N_det]``
+        (differentiable w.r.t. ``volume``). The first call locks the dtype."""
         self._check_device(volume, "volume")
         self._check_volume_shape(volume)
         return _FPParallelCached.apply(volume, self)
 
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
+        """Back-project ``sinogram [n_angles, Ny, N_det]`` to ``[Ny, Nz, Nx]``
+        (differentiable w.r.t. ``sinogram``)."""
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
         return _BPParallelCached.apply(sinogram, self)
@@ -532,6 +535,10 @@ class RotmatProjector(_ProjectorBase):
         )
 
     def forward(self, volume: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
+        """Forward-project ``volume [Ny, Nz, Nx]`` with rotation matrices
+        ``mats [n_angles, 3, 3]`` (or ``[n_angles, 9]``, e.g. from
+        :func:`fasttomo.euler_zyz_to_rotmat`). Differentiable w.r.t.
+        ``volume`` and ``mats``."""
         self._check_device(volume, "volume")
         self._check_volume_shape(volume)
         self._check_device(mats, "mats")
@@ -539,6 +546,8 @@ class RotmatProjector(_ProjectorBase):
         return _FPRotmatCached.apply(volume, mats_flat, self)
 
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
+        """Back-project ``sinogram [n_angles, Ny, N_det]`` with ``mats`` to
+        ``[Ny, Nz, Nx]`` (differentiable w.r.t. ``sinogram``)."""
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
         self._check_device(mats, "mats")

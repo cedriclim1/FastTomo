@@ -47,23 +47,23 @@ def cases_old():
                                        sparsity=1e-3, positivity=False, step_size=0.5)
     out["resire_euler"] = ft.run_resire(sino, ang, n_iter=4, Nz=N, euler_zyz_deg=eul,
                                         return_loss=True)
-    C, O, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
+    C, Opt, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
                      ft.ConstraintConfig, ft.PoseRefinementConfig)
-    out["ad"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=O(n_iter=6)),
+    out["ad"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=Opt(n_iter=6)),
                                 return_loss=True)
     out["ad_reg"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=O(n_iter=6, loss_fn="l1"),
+        optim=Opt(n_iter=6, loss_fn="l1"),
         reg=R(tv_weight=1e-3, tv_xz_weight=1e-3, sparsity=1e-3),
         constraints=K(positivity=True, mask=True, sparsity=1e-3)), return_loss=True)
     out["ad_pose"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=O(n_iter=6),
+        optim=Opt(n_iter=6),
         pose=P(refine_pose=True, refine_shifts=True, in_plane_weight=1e-2,
                anchor_reference=True)), return_loss=True, return_pose=True)
     out["ad_staged"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=O(n_iter=8), constraints=K(sparsity=1e-3),
+        optim=Opt(n_iter=8), constraints=K(sparsity=1e-3),
         pose=P(refine_shifts=True, pose_warmup_iters=2, alternating_period=2)),
         return_loss=True, return_pose=True)
-    out["ad_support"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=O(n_iter=5)),
+    out["ad_support"] = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=Opt(n_iter=5)),
                                         support_mask=sm)
     return out
 

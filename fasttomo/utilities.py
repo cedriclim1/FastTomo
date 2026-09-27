@@ -1,7 +1,9 @@
 """
-Utility functions for FastTomo: masks, filters, and shift helpers.
+Utility functions for FastTomo: the ramp filter, the 3-D TV loss, and
+shift estimation and correction.
 
-All public functions accept and return torch.Tensor (float32).
+``cylindrical_mask`` lives in :mod:`fasttomo.constraints` and is
+re-exported here, its historical home.
 """
 
 from __future__ import annotations

@@ -1,11 +1,106 @@
 """
 Reconstruction algorithms for FastTomo.
 
-All public functions accept and return torch.Tensor (float32).
+Conventions
+===========
 
-Volume convention:  [Ny, Nz, Nx]
-Sinogram convention: [n_angles, Ny, N_det]
-Angles: 1-D tensor, degrees.
+Every ``run_*`` function follows the conventions below; the function
+docstrings only describe what is specific to each algorithm and refer here
+for the rest.
+
+Shapes and units
+    Volume ``[Ny, Nz, Nx]``, sinogram ``[n_angles, Ny, N_det]``, angles a
+    1-D tensor in degrees. ``Ny`` runs along the tilt axis. ``Nz`` (keyword,
+    ``-1``) defaults to ``N_det``; ``Nx = N_det``.
+
+Call signature
+    ``run_x(sinogram, angles_deg, n_iter, *, ...)``: the sinogram, the
+    angles and, for iterative algorithms, ``n_iter`` are positional; every
+    other argument is keyword-only, so a call written for an older
+    positional order raises TypeError instead of binding to another
+    parameter. Exceptions: the direct methods (``run_fbp``,
+    ``run_weighted_backprojection``) have no ``n_iter``, and ``run_genfire``
+    takes ``n_iter`` as a keyword for one release (its third positional
+    used to be ``Nz``). Integers (``n_iter``, ``Nz``) may be Python, numpy
+    or 0-d tensor integers. Renamed keywords keep working for one release
+    with a DeprecationWarning (see CHANGELOG.md).
+
+Returns
+    ``volume`` (``[Ny, Nz, Nx]``, the sinogram's dtype and device), or
+    ``(volume, loss_history)`` with ``return_loss=True``: a float32 CPU
+    tensor with one entry per iteration run (each algorithm's docstring
+    says which loss it records). Algorithm-specific extras are appended
+    after these: ``(..., euler, shifts)`` with ``run_ad_recon``'s
+    ``return_pose=True``, ``(..., d_offsets, sigma)`` with ``run_mbir``'s
+    ``return_state=True``.
+
+dtypes
+    fp32 everywhere; fp16 also for FBP, SIRT, SART, FISTA and FISTA-TV
+    (output in the input dtype). Anything else (fp64, bf16) raises
+    TypeError; nothing is cast silently. A ``warm_start`` must have the
+    sinogram's dtype.
+
+Support: ``mask`` and ``support_mask``
+    ``mask=True`` restricts the volume to the inscribed cylinder of the XZ
+    plane; ``support_mask`` is an arbitrary support tensor of shape
+    ``[Nz, Nx]``, ``[1, Nz, Nx]`` or ``[Ny, Nz, Nx]``, any real or bool
+    dtype and any device (cast and moved internally), values expected in
+    ``{0, 1}`` (soft values weight voxels). The two are mutually exclusive
+    (ValueError); a wrong shape raises ValueError. Out-of-support voxels of
+    the result are exactly 0 for a binary mask. Where it is applied:
+
+    ==============================  =====================================
+    algorithm                       support applied
+    ==============================  =====================================
+    run_fbp, run_weighted_back...   once, to the final volume
+    run_sirt, run_wsirt, run_resire every iteration, after the update
+    run_sart                        every outer iteration (after all
+                                    subsets)
+    run_fista                       every iteration, in the projection P_C
+    run_fista_tv                    every iteration, inside the TV prox
+    run_genfire                     every iteration in real space (on the
+                                    oversampled grid) and to the output
+    run_grad_descent, run_ad_recon  every optimiser step (``no_grad``)
+    run_mbir                        initial volume of each level and after
+                                    every outer ICD sweep, not inside the
+                                    voxel update
+    ==============================  =====================================
+
+    ``run_ad_recon`` takes the cylinder as ``ConstraintConfig.cylinder``.
+    The contract is frozen for the desktop app (2026-06-12 handoff), which
+    probes ``inspect.signature(fn).parameters`` for ``support_mask``.
+
+Constraints order
+    After each update: support (multiply), positivity (``positivity=True``,
+    clamp at 0), soft-threshold (``sparsity=t``: ``sign(v) * max(|v| - t,
+    0)``, the proximal step of ``t * ||v||_1``). See
+    :mod:`fasttomo.constraints`.
+
+``loss_callback`` (frozen, 2026-06-11 handoff)
+    Called once per iteration as ``loss_callback(i, loss)``: ``i`` is the
+    0-based iteration index, ``loss`` the plain CPU float also stored in
+    ``loss_history[i]`` (NaN/Inf passed through). A callback that declares
+    a ``components`` keyword (or ``**kwargs``) also receives
+    ``components={...}``: CPU floats keyed ``"fidelity"`` plus only the
+    regularisers active in the run, summing to ``loss``. A raising callback
+    is logged and called again on the next iteration; the reconstruction
+    never stops because of it. The loss (and its host sync) is only
+    computed when ``return_loss`` or a callback asks for it; computing it
+    does not change the iterates (one exception: CUDA ``run_sirt`` then
+    runs its eager loop instead of the CUDA graph, which can differ in the
+    last bit when ``omega != 1``). The desktop app probes
+    ``inspect.signature(fn).parameters`` for ``loss_callback``.
+
+``warm_start``
+    Initial volume ``[Ny, Nz, Nx]`` (default zeros), in the sinogram's
+    dtype; moved to the sinogram's device and copied, never modified.
+
+``progress``
+    ``True`` shows a tqdm progress bar (stderr); off by default.
+
+``num_threads``
+    OpenMP threads for the CPU kernels: keyword, else ``OMP_NUM_THREADS``,
+    else 1. Ignored on CUDA.
 """
 
 from __future__ import annotations
@@ -54,6 +149,22 @@ from fasttomo.configs import (
     PoseRefinementConfig,
     RegularizerConfig,
 )
+
+__all__ = [
+    "run_fbp",
+    "run_weighted_backprojection",
+    "run_sirt",
+    "run_sart",
+    "run_wsirt",
+    "run_fista",
+    "run_fista_tv",
+    "run_genfire",
+    "run_resire",
+    "run_grad_descent",
+    "run_ad_recon",
+    "run_mbir",
+    "refine_angles",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -806,35 +917,35 @@ def run_fbp(
     projector: object | None = None,
     num_threads: int | None = None,
 ) -> torch.Tensor:
-    """
-    Filtered Back-Projection.
+    """Filtered back-projection.
 
-    Applies ramp filter to each sinogram row then back-projects.
-    Returns volume [Ny, Nz, Nx].
-    mask=True zeros voxels outside the inscribed cylinder (common in ET).
+    Ramp-filters every detector row, back-projects and scales by
+    ``pi / n_angles``. Shapes, dtypes (fp32/fp16), the support contract and
+    the return value follow the Conventions of :mod:`fasttomo.algorithms`;
+    the support is applied once, to the final volume
+    (``run_fbp(s, a, support_mask=M) == run_fbp(s, a) * M`` bit for bit).
 
-    support_mask: optional precomputed support tensor applied once to the
-    final volume (hard constraint: ``volume * support_mask``). Shape
-    ``[Nz, Nx]``, ``[1, Nz, Nx]``, or ``[Ny, Nz, Nx]``; binary {0, 1}
-    expected (soft [0, 1] values act as a smooth weighting); cast to the
-    volume dtype/device internally. Mutually exclusive with ``mask=True``
-    — one support per reconstruction.
+    Parameters
+    ----------
+    sinogram, angles_deg
+        ``[n_angles, Ny, N_det]`` and ``[n_angles]`` degrees.
+    Nz, positivity, mask, support_mask, num_threads
+        See Conventions.
+    projector : ParallelProjector, optional
+        CUDA only: reuse its texture cache across calls (a tilt-series sweep).
+        Its angles and volume shape replace ``angles_deg`` and ``Nz`` for the
+        back-projection. Without it CUDA builds one internally; CPU uses the
+        functional ``back_project``. Numerics are identical either way.
 
-    On CUDA a :class:`ParallelProjector` is built internally if ``projector``
-    is None — the BP runs through a persistent cudaArray + texture handle that
-    is torn down when the function returns. Pass an explicit projector to
-    amortize the texture-cache allocation across many calls (e.g. a
-    tilt-series sweep). Geometry must match: the projector's ``angles_deg``
-    replaces the ``angles_deg`` argument for BP. Numerics are bit-identical
-    to the functional path. On CPU the functional ``back_project`` is used
-    regardless (cached projectors are CUDA-only).
+    Returns
+    -------
+    volume : Tensor ``[Ny, Nz, Nx]`` in the sinogram's dtype.
 
-    Input dtype is preserved end-to-end (fp32 / fp16). The ramp filter
-    internally runs in fp32 (cuFFT requires power-of-two N_det for fp16 —
-    we sidestep that by upcasting around the FFT only) and the BP runs in
-    the input dtype. fp16 FBP gets the BP speedup; quality is comparable
-    to fp32 on visualization-grade reconstructions but visibly noisier
-    on edges — use fp32 for quantitative work. bf16 raises.
+    Notes
+    -----
+    fp16 runs the ramp filter in fp32 (cuFFT needs power-of-two sizes for
+    fp16) and the back-projection in fp16: faster, visibly noisier on edges;
+    use fp32 for quantitative work.
     """
     if support_mask is not None and mask:
         raise ValueError(
@@ -891,28 +1002,38 @@ def run_weighted_backprojection(
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Exact Weighted Back-Projection (Wolf et al. 2014).
+    """Exact weighted back-projection (W-BP, Wolf et al. 2014).
 
-    Computes the exact numerical weighting filter from the PSF of a
-    central point, then applies it slice-by-slice in Fourier space. The
-    back-projection and the filter run on a grid with a max(2, N // 16)
-    voxel margin on each side of Z and X (the circular deconvolution
-    otherwise destabilises the volume edge) and use the voxel-driven
-    back-projection on both backends, so CPU and CUDA give the same result
-    up to the CUDA texture interpolation; see the "exact weighting filter"
-    notes above `_bp_gather`. Extra memory: one padded layergram and its
-    spectrum per Y-chunk (at most ~64 Mi elements).
+    Back-projects, then deconvolves every XZ slice by the numerically
+    computed exact weighting filter (the inverse transfer function of the
+    back-projection of a central point, zeroed inside the missing wedge
+    below ``threshold_scale * TF[0, 0] / n_angles``). The back-projection
+    and the filter run on a grid with a margin of max(2, N // 16) voxels on
+    each side of Z and X (the circular deconvolution otherwise destabilises
+    the volume edge) and use the voxel-driven back-projection on both
+    backends, so CPU and CUDA agree up to the CUDA texture interpolation;
+    see the notes above `_bp_gather`. Extra memory: one padded layergram and
+    its spectrum per Y-chunk (at most ~64 Mi elements). fp32 only.
 
-    Returns volume [Ny, Nz, Nx].
-    mask=True zeros voxels outside the inscribed cylinder (common in ET).
+    Parameters
+    ----------
+    sinogram, angles_deg
+        ``[n_angles, Ny, N_det]`` fp32 and ``[n_angles]`` degrees.
+    Nz, positivity, mask, support_mask
+        See Conventions of :mod:`fasttomo.algorithms` (support applied once,
+        to the final volume).
+    threshold_scale : float
+        Missing-wedge threshold of the filter (default 1.0).
+
+    Returns
+    -------
+    volume : Tensor ``[Ny, Nz, Nx]`` fp32.
     """
     setup = _prepare_recon(
         "run_weighted_backprojection", sinogram, angles_deg, Nz=Nz,
         init_volume=False, positivity=positivity, mask=mask, support_mask=support_mask,
     )
-    n_angles, Ny, N_det, Nz, Nx, device = (
-        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    N_det, Nz, Nx, device = setup.N_det, setup.Nz, setup.Nx, setup.device
 
     volume = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale)(sinogram)
 
@@ -939,61 +1060,42 @@ def run_sirt(
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    Simultaneous Iterative Reconstruction Technique.
+    """Simultaneous Iterative Reconstruction Technique.
 
-    x^{k+1} = x^k + ω · C · A^T · R · (b - A·x^k)
+    ``x <- x + omega * C * A^T (R * (b - A x))`` with the voxel and ray
+    normalisations ``C = 1 / A^T 1`` and ``R = 1 / A 1``, then the
+    constraints (support, positivity, soft-threshold ``sparsity``) every
+    iteration. Recorded loss: the data MSE ``mean((b - A x)^2)`` *before*
+    each update (components ``{"fidelity": loss}``).
 
-    C = 1 / A^T(ones)   (voxel normalisation)
-    R = 1 / A(ones)     (ray normalisation)
+    On CUDA the projections go through a cached projector (built internally
+    unless ``projector`` is given) and, when no loss is needed, ``n_iter > 1``
+    and ``euler_zyz_deg`` is None, the iteration body runs as a captured
+    CUDA graph cached on the projector.
 
-    euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
-    (forward_project_3d / back_project_3d) instead of the scalar-angle
-    single-axis projector. ``num_threads`` is forwarded to the CPU 3D
-    kernels (kwarg → OMP_NUM_THREADS → 1).
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        ``[n_angles, Ny, N_det]`` fp32/fp16, ``[n_angles]`` degrees, and the
+        number of iterations (default 50).
+    omega : float
+        Relaxation (default 1.0).
+    Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`. ``warm_start``'s dtype
+        is the compute dtype (it must match the sinogram's).
+    euler_zyz_deg : Tensor ``[n_angles, 3]``, optional
+        ZYZ Euler angles (degrees, the convention of
+        :func:`fasttomo.euler_zyz_to_rotmat`); switches to the rotation-matrix
+        projector.
+    projector : ParallelProjector or RotmatProjector, optional
+        CUDA only: reuse its texture cache (and CUDA graphs) across calls. Must
+        be sized for this volume and sinogram; its angles replace
+        ``angles_deg``, and a RotmatProjector needs ``euler_zyz_deg``.
 
-    projector: on CUDA a cached projector is always used — built internally
-    if not supplied. Pass an explicit :class:`ParallelProjector` (or
-    :class:`RotmatProjector` when using ``euler_zyz_deg``) to reuse a
-    persistent cudaArray + texture handle across multiple ``run_sirt`` calls;
-    otherwise the internal projector is torn down on return. Must be sized
-    to the volume / sinogram shape; angles passed via the projector replace
-    ``angles_deg`` / ``euler_zyz_deg`` for FP/BP. CPU SIRT uses the
-    functional API (cached projectors are CUDA-only).
-
-    return_loss: if True, returns (volume, loss_history) where loss_history
-    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
-    ||b - A·x^k||² / numel at each iteration.
-
-    sparsity: L1 soft-threshold applied after each update (proximal operator
-    of sparsity·‖x‖₁). 0.0 disables it.
-
-    volume: optional warm-start [Ny, Nz, Nx]. When provided, ``volume.dtype``
-    sets the compute dtype (and must match the sinogram). When None, the
-    algorithm zero-initialises in ``sinogram.dtype`` (fp32 or fp16). All
-    internal tensors (normalisers, residuals, masks) inherit the compute
-    dtype so the projector locks consistently. Output preserves the compute
-    dtype — fp16 in, fp16 out.
-
-    support_mask: optional precomputed support tensor enforced as a hard
-    constraint each iteration (``volume * support_mask`` after every
-    update, like ``mask=True`` but with an arbitrary support). Shape
-    ``[Nz, Nx]``, ``[1, Nz, Nx]``, or ``[Ny, Nz, Nx]``; binary {0, 1}
-    expected (soft [0, 1] values act as a smooth weighting); cast to the
-    compute dtype/device internally. Mutually exclusive with ``mask=True``
-    — one support per reconstruction.
-    loss_callback: optional hook invoked once per iteration as
-    ``loss_callback(i, loss)`` — 0-based index and the same plain CPU float
-    that lands in ``loss_history[i]`` (NaN/Inf passed through). Callbacks
-    whose signature accepts a ``components`` keyword also receive
-    ``components={"fidelity": loss}`` (SIRT's loss is pure data fidelity;
-    ``sparsity`` acts as a proximal constraint, not a loss term). Exceptions
-    raised by the callback are logged and swallowed. Independent of
-    ``return_loss``; supplying a callback forces the eager loop (no CUDA
-    Graph capture).
-
-    Returns volume [Ny, Nz, Nx].
-    mask=True enforces cylindrical support at each iteration (GENFIRE-style).
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sirt")
     _reject_unknown_kwargs(deprecated, "run_sirt")
@@ -1136,9 +1238,6 @@ def _project_dual_ball(
     own diff axis); zero-pad each to the full grid before computing the
     per-voxel norm, divide, then slice back.
     """
-    Ny = q_z.shape[0]
-    Nz = q_y.shape[1]
-    Nx = q_y.shape[2]
     full_y = F.pad(q_y, (0, 0, 0, 0, 0, 1))  # pad +1 at end of dim -3 (Ny)
     full_z = F.pad(q_z, (0, 0, 0, 1, 0, 0))  # pad +1 at end of dim -2 (Nz)
     full_x = F.pad(q_x, (0, 1, 0, 0, 0, 0))  # pad +1 at end of dim -1 (Nx)
@@ -1278,34 +1377,46 @@ def _build_fp_bp(
     """
     Ny, Nz, Nx = vol_shape
     _internal_proj = None
-    if projector is not None:
+    if projector is None and sinogram.is_cuda:
+        # CUDA always goes through a cached projector (built here if needed)
         if euler_zyz_deg is not None:
-            mats = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
-            _fp = lambda v: projector.forward(v, mats)
-            _bp = lambda s: projector.back(s, mats)
-        else:
-            _fp = lambda v: projector.forward(v)
-            _bp = lambda s: projector.back(s)
-    elif sinogram.is_cuda:
-        if euler_zyz_deg is not None:
-            mats = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
             _internal_proj = RotmatProjector(
                 (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
             )
-            _fp = lambda v: _internal_proj.forward(v, mats)
-            _bp = lambda s: _internal_proj.back(s, mats)
         else:
             _internal_proj = ParallelProjector(
                 (Ny, Nz, Nx), angles_deg, device=device, N_det=N_det,
             )
-            _fp = lambda v: _internal_proj.forward(v)
-            _bp = lambda s: _internal_proj.back(s)
+        projector = _internal_proj
+
+    if projector is not None:
+        proj = projector
+        if euler_zyz_deg is not None:
+            mats = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+
+            def _fp(v):
+                return proj.forward(v, mats)
+
+            def _bp(s):
+                return proj.back(s, mats)
+        else:
+            def _fp(v):
+                return proj.forward(v)
+
+            def _bp(s):
+                return proj.back(s)
     elif euler_zyz_deg is not None:
-        _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
-        _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
+        def _fp(v):
+            return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
+
+        def _bp(s):
+            return back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
     else:
-        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
-        _bp = lambda s: back_project(s, angles_deg, Nz=Nz, num_threads=num_threads)
+        def _fp(v):
+            return forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
+
+        def _bp(s):
+            return back_project(s, angles_deg, Nz=Nz, num_threads=num_threads)
     return _fp, _bp, _internal_proj
 
 
@@ -1329,45 +1440,37 @@ def run_fista(
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    FISTA (Beck & Teboulle 2009) on the smooth least-squares problem
-    ``f(x) = ½ ‖A·x − b‖²``.
+    """FISTA (Beck & Teboulle 2009) on ``f(x) = 1/2 ||A x - b||^2``.
 
-        y_k     = x_k + ((t_{k-1} - 1) / t_k) · (x_k − x_{k-1})  (momentum)
-        x_{k+1} = P_C( y_k − (1/L) · A^T (A·y_k − b) )
-        t_{k+1} = (1 + √(1 + 4·t_k²)) / 2
+    ::
 
-    where ``L = ||A^T A||_op`` is estimated by power iteration and ``P_C`` is
-    the projection onto positivity and/or cylindrical mask. Achieves
-    O(1/k²) convergence on the data-fit objective vs. SIRT's O(1/k).
+        y_k     = x_k + ((t_{k-1} - 1) / t_k) (x_k - x_{k-1})
+        x_{k+1} = P_C(y_k - (1/L) A^T (A y_k - b))
+        t_{k+1} = (1 + sqrt(1 + 4 t_k^2)) / 2
 
-    Args:
-        sinogram:     [n_angles, Ny, N_det] — measured tilt series.
-        angles_deg:   [n_angles] — single-axis tilt angles.
-        n_iter:       outer FISTA iterations.
-        Nz:           reconstruction depth; defaults to N_det.
-        positivity:   project onto ``x ≥ 0`` each iteration.
-        mask:         apply inscribed-cylinder support each iteration.
-        euler_zyz_deg: [n_angles, 3] — switches to the 3-D rotmat projector
-                      (matches ``run_sirt``'s ZYZ branch).
-        return_loss:  if True, also return a float32 CPU tensor of shape
-                      [n_iter] containing ``||b − A·y_k||²`` (data-fit MSE at
-                      the momentum point — zero extra cost; a tight surrogate
-                      for the MSE at ``x_k``).
-        n_power_iter: power-iteration steps for the Lipschitz estimate.
-        L:            user-supplied Lipschitz constant ``||A^T A||_op``;
-                      ``None`` triggers power iteration.
-        num_threads:  CPU 3-D path only.
-        projector:    optional cached :class:`ParallelProjector` /
-                      :class:`RotmatProjector` (CUDA reuse).
-        volume:       optional warm-start ``[Ny, Nz, Nx]``.
-        loss_callback: optional per-iteration hook ``loss_callback(i, loss)``
-                      streaming the same value recorded in ``loss_history``
-                      (see :func:`run_sirt` for the full contract).
+    ``L = ||A^T A||`` is estimated by power iteration (times a 1.01 safety
+    margin) unless given; ``P_C`` applies the support and positivity. O(1/k^2)
+    on the data term versus SIRT's O(1/k). Recorded loss: the data MSE at
+    the momentum point ``y_k`` (free, a tight surrogate for ``x_k``). No
+    CUDA graph (``t_k`` changes every iteration).
 
-    Returns the reconstructed volume (or ``(volume, loss_history)`` when
-    ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
-    ``t_k`` changes every iteration.
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32/fp16 sinogram, degrees, iterations (default 50).
+    Nz, positivity, mask, support_mask, warm_start, num_threads, return_loss,
+    loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
+    euler_zyz_deg, projector
+        As in :func:`run_sirt`.
+    n_power_iter : int
+        Power-iteration steps for the Lipschitz estimate (default 10).
+    L : float, optional
+        Lipschitz constant ``||A^T A||``; skips the power iteration.
+
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_fista")
     _reject_unknown_kwargs(deprecated, "run_fista")
@@ -1419,30 +1522,33 @@ def run_fista_tv(
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    FISTA-TV (Beck & Teboulle 2009 + 2009b) on the composite problem
-    ``½ ‖A·x − b‖² + tv_weight · TV(x) + ι_C(x)``.
+    """FISTA-TV: ``1/2 ||A x - b||^2 + tv_weight * TV(x) + i_C(x)``.
 
-    Same outer Nesterov loop as :func:`run_fista`; the projection prox is
-    swapped for the TV-l2 proximal operator (:func:`_tv_prox_3d`), solved on
-    the dual by either Beck-Teboulle 2009b Fast Gradient Projection
-    (``tv_inner="fgp"``) or Chambolle 2004 (``tv_inner="chambolle"``).
-    Positivity and cylindrical mask are baked into the prox itself so the
-    composite-convex theory applies.
+    The outer loop of :func:`run_fista` with the TV-L2 proximal operator,
+    solved on the dual by Fast Gradient Projection (``tv_inner="fgp"``, Beck
+    & Teboulle 2009b) or Chambolle 2004 (``"chambolle"``). The support and
+    positivity sit inside the prox, so the composite convex theory applies.
+    Recorded loss: the data MSE at ``y_k``, not the composite objective.
 
-    Args:
-        sinogram, angles_deg, n_iter, Nz, positivity, mask, euler_zyz_deg,
-        return_loss, n_power_iter, L, num_threads, projector, volume,
-        loss_callback:
-                      see :func:`run_fista`.
-        tv_weight:    isotropic TV regularisation weight (required, > 0).
-                      Pass ``tv_weight=0`` and use :func:`run_fista` directly.
-        tv_inner_iter: inner dual-projection iterations (default 20).
-        tv_inner:     ``"fgp"`` (default; O(1/k²) inner) or ``"chambolle"``
-                      (O(1/k) inner).
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32/fp16 sinogram, degrees, iterations (default 50).
+    tv_weight : float
+        Isotropic TV weight, required and > 0 (use :func:`run_fista` for 0).
+        Keyword-only (it used to be the third positional).
+    tv_inner_iter : int
+        Inner dual iterations (default 20).
+    tv_inner : {"fgp", "chambolle"}
+    Nz, positivity, mask, support_mask, warm_start, num_threads, return_loss,
+    loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
+    euler_zyz_deg, projector, n_power_iter, L
+        As in :func:`run_fista`.
 
-    Returns same shape/format as :func:`run_fista`. Loss history records
-    ``||b − A·y_k||²``, *not* the composite objective.
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_fista_tv")
     _reject_unknown_kwargs(deprecated, "run_fista_tv")
@@ -1473,7 +1579,9 @@ def run_fista_tv(
 
     _mask = setup.constraints.support_mask
     lam = tv_weight / L_eff
-    prox = lambda u: _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
+
+    def prox(u):
+        return _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
     return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec)
@@ -1499,48 +1607,37 @@ def run_sart(
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
+    """SART / OS-SART (Andersen & Kak 1984; Wang & Yu 2007).
 
-    Per-subset ordered-subsets update:
+    For each subset ``S`` of consecutive angles (``[0:subset_size]``,
+    ``[subset_size:2*subset_size]``, ...; the last may be shorter):
+    ``x += omega * C_S * A_S^T ((b_S - A_S x) / R_S)`` with
+    ``R_S = A_S 1`` and ``C_S = 1 / A_S^T 1``. ``subset_size=1`` is plain
+    SART, ``subset_size=n_angles`` one SIRT step. The constraints run once
+    per outer iteration, after all subsets. Recorded loss: the full-sinogram
+    data MSE after the subset sweep, before the constraints (one extra
+    forward projection per iteration, only when the loss is needed).
 
-        for each subset S of size subset_size:
-            r_S  = b_S - A_S · x
-            x   += ω · A_Sᵀ(r_S / R_S) · C_S
+    A reference implementation: functional projections, no projector cache,
+    no CUDA graph. Use :func:`run_sirt` when speed matters.
 
-    where:
-        R_S = A_S(1)    (row normalisation per subset — safeguarded against /0)
-        C_S = 1/A_Sᵀ(1) (column normalisation per subset — safeguarded against /0)
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32/fp16 sinogram, degrees, outer iterations (default 5).
+    subset_size : int
+        Angles per subset (default 1; clamped to ``[1, n_angles]``).
+    omega : float
+        Relaxation (default 1.0).
+    Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
+    euler_zyz_deg
+        As in :func:`run_sirt`.
 
-    With subset_size=1 this is plain SART (Andersen & Kak 1984).
-    With subset_size=n_angles this is equivalent to one SIRT outer step
-    (Wang & Yu 2007 OS-SART degenerate case).
-
-    Subsets are formed by sequential splitting of the angle index:
-    [0:subset_size], [subset_size:2*subset_size], …, remainder.
-    The last subset may be smaller than subset_size.
-
-    sparsity / positivity / mask are applied once per outer iteration
-    (after all subsets have been processed), mirroring run_sirt.
-
-    return_loss: if True, returns (volume, loss_history) where loss_history
-    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
-    ||b - A·x||² / numel evaluated over the *full* sinogram after each
-    outer iteration.
-
-    euler_zyz_deg: if provided, uses the full 3D rotation-matrix projector
-    (forward_project_3d / back_project_3d) instead of the scalar-angle
-    single-axis projector. num_threads is forwarded to the CPU 3D kernels.
-
-    This is a frozen baseline — no projector caching, no CUDA-Graph capture.
-    Use run_sirt (or the AD path) for performance-critical workloads.
-
-    volume: optional warm-start [Ny, Nz, Nx]. When provided, ``volume.dtype``
-    sets the compute dtype (and must match the sinogram). When None, the
-    algorithm zero-initialises in ``sinogram.dtype`` (fp32 or fp16). Output
-    preserves the compute dtype.
-
-    Returns volume [Ny, Nz, Nx].
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sart")
     _reject_unknown_kwargs(deprecated, "run_sart")
@@ -1793,87 +1890,66 @@ def run_ad_recon(
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple:
-    """
-    Autograd-based reconstruction with optional pose and shift refinement.
+    """Autograd reconstruction with optional pose and shift refinement (CUDA, fp32).
 
-    Library entry point for the AD reconstruction loop demonstrated in
-    ``Notebooks/test.ipynb``. Knobs live on :class:`AdReconConfig` and its
-    sub-configs (:class:`OptimConfig`, :class:`RegularizerConfig`,
-    :class:`ConstraintConfig`, :class:`PoseRefinementConfig`); see those
-    classes for per-field semantics.
+    Adam on the volume (and, with ``config.pose``, on per-view ZYZ Euler
+    angles and detector shifts) minimising the data term plus the
+    regularisers of ``config.reg``. Knobs live on :class:`AdReconConfig` and
+    its sub-configs; see those classes for per-field semantics. Recorded
+    loss: the total loss of each iteration, with components ``fidelity``
+    plus the active regularisers (``tv``, ``tv_xz``, ``sparsity``,
+    ``in_plane``, ``s3im``, ``tilt_ssim``), each already weighted.
 
-    Args:
-        sinogram:        [n_angles, Ny, N_det] float32 CUDA tensor.
-        angles_deg:      [n_angles] tilt angles in degrees.
-        Nz:              Reconstruction depth; defaults to ``N_det``.
-        projector:       Optional pre-built :class:`RotmatProjector` (when
-                         ``config.pose.refine_pose=True``) or
-                         :class:`ParallelProjector` (otherwise). A projector
-                         whose class does not match the requested mode raises
-                         ``ValueError``. If ``None``, one is built internally
-                         and torn down on return.
-        config:          :class:`AdReconConfig` bundling optimiser,
-                         regulariser, constraint, and pose-refinement knobs.
-                         ``None`` (default) constructs ``AdReconConfig()``
-                         which runs vanilla AD volume-only refinement.
-        support_mask:    Optional precomputed support tensor enforced as a
-                         hard constraint each iteration (``volume *=
-                         support_mask`` after every optimiser step). Shape
-                         ``[Nz, Nx]``, ``[1, Nz, Nx]``, or ``[Ny, Nz, Nx]``;
-                         binary {0, 1} expected. Convenience alias for
-                         ``config.constraints.mask`` — passing both raises
-                         ``ValueError`` (one support per reconstruction).
-        return_loss:     If True, also return the per-iteration loss history.
-        return_pose:     If True, also return ``(refined_euler, refined_shifts)``
-                         where each is ``None`` if the corresponding refinement
-                         was disabled.
-        loss_callback:   Optional hook invoked once per iteration as
-                         ``loss_callback(i, loss)`` — 0-based index and the
-                         same plain CPU float that lands in ``loss_history[i]``
-                         (NaN/Inf passed through). Callbacks whose signature
-                         accepts a ``components`` keyword also receive
-                         ``components={...}``: per-term CPU floats keyed
-                         ``fidelity`` plus only the regularisers active this
-                         run (``tv``, ``tv_xz``, ``sparsity``, ``in_plane``,
-                         ``s3im``, ``tilt_ssim``), each already weighted so
-                         ``sum(components.values()) ≈ loss``. Exceptions
-                         raised by the callback are logged and swallowed.
+    Parameters
+    ----------
+    sinogram, angles_deg
+        ``[n_angles, Ny, N_det]`` fp32 CUDA tensor and ``[n_angles]`` degrees.
+    n_iter : int, optional
+        Iterations; ``None`` (default) uses ``config.optim.n_iter``. Given, it
+        overrides the config without modifying it.
+    config : AdReconConfig, optional
+        Optimiser, regulariser, constraint and pose knobs; ``None`` means
+        ``AdReconConfig()`` (volume-only refinement). ``config.validate()``
+        runs on entry, so fields edited after construction are checked too.
+    support_mask : Tensor, optional
+        Support enforced after every optimiser step (see Conventions). Same as
+        ``config.constraints.support_mask``; setting both, or this and
+        ``config.constraints.cylinder``, raises ValueError.
+    projector : ParallelProjector or RotmatProjector, optional
+        Prebuilt projector: a RotmatProjector when ``config.pose.refine_pose``,
+        else a ParallelProjector (ValueError otherwise). Built internally when
+        None.
+    Nz, warm_start, return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
+    return_pose : bool
+        Also return ``(euler, shifts)``: the refined ``[n_angles, 3]`` Euler
+        angles and ``[n_angles, 2]`` shifts on CPU, each None if not refined.
 
-    Returns:
-        * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
-        * if ``return_loss`` only  — ``(volume, loss_history)``
-        * if ``return_pose`` only  — ``(volume, euler_or_None, shifts_or_None)``
-        * if both                  — ``(volume, loss_history, euler_or_None, shifts_or_None)``
+    Returns
+    -------
+    ``volume``, ``(volume, loss_history)``, ``(volume, euler, shifts)`` or
+    ``(volume, loss_history, euler, shifts)``; see Conventions.
 
-    Validation:
-        ``config.validate()`` runs on entry, so fields edited after the
-        dataclasses were constructed are checked too (for example an
-        ``alternating_period`` or ``pose_init_shifts`` set without the
-        matching refine flag, a negative weight, or an unknown ``loss_fn``).
+    Notes
+    -----
+    Staging: ``PoseRefinementConfig.pose_warmup_iters`` and
+    ``alternating_period`` schedule volume-only, pose-only and joint
+    iterations; ``n_iter`` counts all of them and each cosine schedule spans
+    only its optimiser's active iterations. See :class:`PoseRefinementConfig`
+    for the Euler convention and how the pose constraints treat an
+    initialiser.
 
-    Staging:
-        ``PoseRefinementConfig.pose_warmup_iters`` and ``alternating_period``
-        schedule volume-only, pose-only and joint iterations; ``n_iter``
-        counts all of them, and each cosine schedule spans only its
-        optimiser's active iterations. See :class:`PoseRefinementConfig`
-        for the Euler convention and how the pose constraints treat a pose
-        initialiser.
+    Constraints, after every optimiser step inside ``torch.no_grad``:
+    positivity, the support, then ``ConstraintConfig.soft_threshold`` (only
+    in iterations that stepped the volume: it is not idempotent and would
+    shrink a frozen volume), then the tilt bound and ``psi = -phi``.
+    Positivity and a non-negative support commute, so this is the
+    constraints order of the Conventions. ``RegularizerConfig.sparsity`` is
+    different: a loss term ``sparsity * mean(|f|)`` acting through the
+    gradient; both may be set.
 
-    Constraints:
-        After every optimiser step, inside ``torch.no_grad``, the volume gets
-        ``ConstraintConfig.positivity`` (clamp at 0), then the support mask
-        (multiplied in, so a soft mask scales voxels), then
-        ``ConstraintConfig.sparsity`` as a soft-threshold
-        ``f <- sign(f) * max(|f| - sparsity, 0)`` (the proximal step of an L1
-        penalty, in volume units, once per iteration in which the volume
-        was stepped, so not in pose-only iterations). It is independent of
-        ``RegularizerConfig.sparsity``, which adds ``sparsity * mean(|f|)`` to
-        the loss and acts through the gradient instead; both may be set.
-
-    Note:
-        This function requires a CUDA device. The underlying projectors are
-        CUDA-only; passing CPU tensors will raise a ``RuntimeError`` from
-        the projector constructor.
+    CUDA only: the projectors are CUDA-only, and CPU input raises
+    RuntimeError.
     """
     if config is None:
         config = AdReconConfig()
@@ -2275,28 +2351,48 @@ def run_genfire(
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    GENFIRE reconstruction (Pryor et al. 2017).
+    """GENFIRE (Pryor et al. 2017). fp32, CPU and CUDA. Frozen numerics.
 
-    Assembles a 2D Fourier grid per Y-slice via inverse-distance weighted
-    gridding of oversampled 1D FFT projections, then iterates between
-    Fourier-space data enforcement and real-space constraints (support,
-    positivity).  Optional resolution extension/suppression schedule
-    gradually widens then narrows the enforced frequency band to improve
-    convergence under limited tilt range.
+    Grids the oversampled 1-D FFTs of the projections onto a 2-D Fourier grid
+    per Y-slice (inverse-distance weighting), then alternates Fourier-space
+    data enforcement and real-space constraints (support, positivity,
+    soft-threshold). The resolution extension/suppression schedule widens
+    then narrows the enforced frequency band. Returns the best iterate, not
+    the last. Recorded loss: the mean L1 Fourier error on the known grid
+    points of each iterate (computed every iteration anyway).
 
-    return_loss: if True, returns (volume, loss_history) where loss_history
-    is a float32 CPU tensor of shape [n_iter] containing the mean L1 Fourier
-    error on known grid points at each iteration.
+    Parameters
+    ----------
+    sinogram, angles_deg
+        ``[n_angles, Ny, N_det]`` fp32 and ``[n_angles]`` degrees.
+    n_iter : int
+        Iterations (default 100). Keyword-only for one release: the third
+        positional used to be ``Nz``.
+    mask : bool, optional
+        Inscribed cylinder support. ``None`` (default) means the cylinder
+        unless ``support_mask`` is given (the historical default was
+        ``mask=True``).
+    support_mask : Tensor, optional
+        User support (Conventions), applied in real space every iteration and
+        to the output; mutually exclusive with ``mask=True``.
+    positivity : bool
+        Default True.
+    oversampling_ratio : float
+        Fourier grid size ``N_det * oversampling_ratio`` (default 2.0).
+    cutoff_dist : float
+        Gridding radius in grid units (default 0.5).
+    resolution_extension : bool
+        Use the resolution extension/suppression schedule (default True).
+    warm_start : Tensor, optional
+        Initial volume: its Fourier transform, with the measured values on the
+        known grid points, seeds the iteration instead of the zero-filled
+        data.
+    Nz, sparsity, return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
 
-    sparsity: L1 soft-threshold applied in real space after each IFFT step
-    (proximal operator of sparsity·‖x‖₁). 0.0 disables it.
-
-    Returns volume [Ny, Nz, Nx].
-    mask=True inscribes a cylindrical support in the reconstruction plane.
-
-    fp32 only — the GENFIRE gridding kernel (`csrc/cuda/genfire.cu`) has no
-    half-precision path. Cast your sinogram to ``torch.float32`` first.
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     # mask=None: the cylinder unless a support_mask is given (the default
     # stays the historical mask=True for calls without support_mask).
@@ -2387,8 +2483,10 @@ def run_genfire(
     ).bool()                                         # [bigN, bigN]
 
     # ── real-space support mask ─────────────────────────────────────────────
-    z0 = (bigN - Nz) // 2;  z1 = z0 + Nz
-    x0 = (bigN - Nx) // 2;  x1 = x0 + Nx
+    z0 = (bigN - Nz) // 2
+    z1 = z0 + Nz
+    x0 = (bigN - Nx) // 2
+    x1 = x0 + Nx
     if support_mask is not None:
         # [1|Ny, Nz, Nx] support, zero on the oversampling margin
         user_support = setup.constraints.support_mask
@@ -2505,41 +2603,37 @@ def run_wsirt(
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    Weighted SIRT (Wolf et al. 2014).
+    """Weighted SIRT (Wolf et al. 2014). fp32, CPU and CUDA.
 
-    Replaces the simple back-projection at each SIRT step with the
-    exact-filter W-BP. Converges faster and gives higher fidelity than
-    SIRT, especially under limited tilt range.
+    ``x <- x + omega * W-BP(b - A x)``, then the constraints, where W-BP is
+    the exact weighted back-projection of :func:`run_weighted_backprojection`
+    (edge margin, voxel-driven on both backends). It does not diverge at the
+    default ``omega=1``; CPU and CUDA agree to ~2e-4, the floor set by the
+    CUDA texture unit's 8-bit interpolation weights. Recorded loss: the data
+    MSE before each update.
 
-    f^k = f^{k-1} + ω · W-BP(b - A·f^{k-1})
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32 sinogram, degrees, iterations (default 50).
+    omega : float
+        Relaxation (default 1.0).
+    threshold_scale : float
+        Missing-wedge threshold of the weighting filter (default 1.0).
+    Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms` (``num_threads`` drives
+        the CPU forward projection; the CPU W-BP is PyTorch).
 
-    W-BP is the exact weighted back-projection of
-    `run_weighted_backprojection` (edge margin, voxel-driven on both
-    backends). With it wSIRT does not diverge at the default ``omega=1``;
-    without the margin it diverged on most geometries tested. CPU and CUDA
-    results agree to ~2e-4, the floor set by the CUDA texture unit's 8-bit
-    interpolation weights in the forward and back projectors.
-
-    return_loss: if True, returns (volume, loss_history) where loss_history
-    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
-    ||b - A·f^k||² / numel at each iteration.
-
-    sparsity: L1 soft-threshold applied after each update (proximal operator
-    of sparsity·‖x‖₁). 0.0 disables it.
-
-    mask=True enforces cylindrical support at each iteration (GENFIRE-style).
-
-    fp32 only — the exact WF construction goes through `_compute_exact_wf`
-    which builds the PSF in fp32 and applies a 2-D rfft, both fp32-pinned.
-    Cast your sinogram to ``torch.float32`` first.
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     setup = _prepare_recon(
         "run_wsirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter, warm_start=warm_start,
         positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
     )
-    n_angles, Ny, N_det, Nz, Nx, device = (
-        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    N_det, Nz, Nx, device = setup.N_det, setup.Nz, setup.Nx, setup.device
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
     # exact W-BP operator, built once per tilt geometry
@@ -2568,33 +2662,45 @@ def refine_angles(
     n_steps: int = 31,
     num_threads: int | None = None,             # CPU paths
 ) -> torch.Tensor:
-    """
-    RESIRE angular refinement — brute-force grid search per projection.
+    """Angular refinement by brute-force search (RESIRE style). Not a reconstruction.
 
-    **Single-axis mode** (angles_deg: [n_angles]):
-      For each projection j, searches n_steps candidates in
-      [θ_j ± search_range_deg] and picks the one minimising the L1 R-factor.
-      Returns refined angles [n_angles] on CPU.
+    Single-axis mode (``angles_deg``): for each projection ``j``, tries
+    ``n_steps`` angles in ``angle_j +- search_range_deg`` and keeps the one
+    with the lowest L1 R-factor against ``sinogram[j]``. Returns refined
+    angles ``[n_angles]`` on CPU.
 
-    **ZYZ mode** (euler_zyz_deg: [n_angles, 3]):
-      Coordinate descent over three Euler angles (φ, θ, ψ) per projection.
-      For each projection j, iterates through axes 0→1→2, fixing the other
-      two and searching n_steps candidates along the active axis. One call
-      performs one full coordinate-descent round per projection.
-      Uses forward_project_3d (CUDA only).
-      Returns refined euler_zyz_deg [n_angles, 3] on CPU.
+    ZYZ mode (``euler_zyz_deg``): one round of coordinate descent over
+    ``(phi, theta, psi)`` per projection, each axis searched like above with
+    the others fixed. Returns refined ``[n_angles, 3]`` on CPU.
 
-    Typical usage:
+    Parameters
+    ----------
+    volume : Tensor ``[Ny, Nz, Nx]``
+        Current reconstruction (same dtype as ``sinogram``).
+    sinogram : Tensor ``[n_angles, Ny, N_det]``
+    angles_deg : Tensor ``[n_angles]``, optional
+        Single-axis angles; exactly one of ``angles_deg`` and
+        ``euler_zyz_deg`` must be given.
+    euler_zyz_deg : Tensor ``[n_angles, 3]``, optional (keyword-only)
+    search_range_deg : float
+        Half-width of the search window (default 3.0).
+    n_steps : int
+        Candidates per window (default 31).
+    num_threads : int, optional
+        CPU threads for the forward projections (Conventions).
+
+    Examples
+    --------
+    ::
 
         angles = initial_angles
         for _ in range(n_outer):
-            vol    = ft.run_resire(sino, angles, n_iter=100)
-            angles = ft.refine_angles(vol, sino, angles_deg=angles)
+            vol = ft.run_resire(sino, angles, 100)
+            angles = ft.refine_angles(vol, sino, angles)
 
-        # ZYZ version:
         euler = torch.zeros(n_angles, 3); euler[:, 1] = tilt_angles
         for _ in range(n_outer):
-            vol   = ft.run_resire(sino, None, n_iter=100, euler_zyz_deg=euler)
+            vol = ft.run_resire(sino, tilt_angles, 100, euler_zyz_deg=euler)
             euler = ft.refine_angles(vol, sino, euler_zyz_deg=euler)
     """
     _assert_dtype_match(sinogram, volume, "sinogram", "volume", "refine_angles")
@@ -2676,36 +2782,37 @@ def run_resire(
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    REal Space Iterative REconstruction (RESIRE, Miao group).  CUDA only.
+    """RESIRE, REal Space Iterative REconstruction (Miao group). CUDA, fp32. Frozen numerics.
 
-    Projected gradient descent on ||Ax - b||²:
+    Projected gradient descent on ``||A x - b||^2``:
+    ``x <- P_C(x + alpha * A^T (b - A x))`` with
+    ``alpha = step_size / (n_angles * Nz)``, using the RESIRE voxel-driven
+    scatter/gather projectors with 4-point supersampling
+    (:func:`forward_project_resire`). Single-axis angles are wrapped as ZYZ
+    triples ``(0, angle, 0)``; pass ``euler_zyz_deg`` for dual-axis tilt or
+    general orientations. ``P_C``: support, positivity (default on),
+    soft-threshold, in that order. Recorded loss: the data MSE before each
+    update.
 
-        x^{k+1} = P_C(x^k + α · A^T(b − A·x^k))
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32 CUDA sinogram, degrees, iterations (default 100).
+    step_size : float
+        Default 1.0.
+    euler_zyz_deg : Tensor ``[n_angles, 3]``, optional
+        Overrides ``angles_deg`` for the projectors.
+    support_mask : Tensor, optional
+        See Conventions (formerly ``support=``, still accepted with a
+        DeprecationWarning); mutually exclusive with ``mask=True`` (before,
+        ``support`` silently won).
+    Nz, positivity, mask, sparsity, warm_start, return_loss, loss_callback,
+    progress
+        See Conventions of :mod:`fasttomo.algorithms`.
 
-    where α = step_size / (n_angles · Nz).
-
-    Uses the Miao group voxel-driven scatter/gather kernels with 4-point
-    supersampling (forward_project_resire / back_project_resire).  For a
-    single-axis tilt series, angles_deg is wrapped as ZYZ triples (φ=0,
-    θ=angle, ψ=0) internally.  Pass euler_zyz_deg directly for dual-axis
-    tilt or general orientations.
-
-    support: explicit float mask [Ny, Nz, Nx] or [1, Nz, Nx] applied each
-    iteration.  If None and mask=True, uses the inscribed cylindrical mask.
-
-    return_loss: if True, returns (volume, loss_history) where loss_history
-    is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
-    ||b - A·x^k||² / numel at each iteration.
-
-    sparsity: L1 soft-threshold applied after each gradient step (proximal
-    operator of sparsity·‖x‖₁, as noted in Algorithm 1 of the RESIRE paper).
-    0.0 disables it.
-
-    fp32 only — the RESIRE FP/BP kernels (`csrc/cuda/projection_resire.cu`)
-    have no half-precision path. Cast your sinogram to ``torch.float32`` first.
-
-    Returns volume [Ny, Nz, Nx].
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     support_mask = _deprecated_kwarg(deprecated, "support", "support_mask",
                                      support_mask, "run_resire")
@@ -2715,8 +2822,7 @@ def run_resire(
         warm_start=warm_start, positivity=positivity, mask=mask,
         support_mask=support_mask, sparsity=sparsity,
     )
-    n_angles, Ny, N_det, Nz, Nx = (
-        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
+    n_angles, N_det, Nz = setup.n_angles, setup.N_det, setup.Nz
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
     # step size: matches RESIRE's dt = step_size / Num_pjs / dimz
@@ -2734,8 +2840,11 @@ def run_resire(
             f"match the sinogram, got {tuple(euler_zyz_deg.shape)}"
         )
 
-    _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
-    _bp = lambda s: back_project_resire(s, euler_zyz_deg, Nz=Nz)
+    def _fp(v):
+        return forward_project_resire(v, euler_zyz_deg, N_det=N_det)
+
+    def _bp(s):
+        return back_project_resire(s, euler_zyz_deg, Nz=Nz)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_resire")
 
@@ -2772,55 +2881,43 @@ def run_grad_descent(
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    Reference autograd-based reconstruction.
+    """Reference autograd reconstruction with a ``torch.optim`` optimiser. fp32.
 
-    Demonstrates the canonical pattern using FastTomo's differentiable
-    projectors: a torch.optim optimizer drives ``volume.requires_grad_(True)``
-    by calling ``loss.backward()`` each iteration. Equivalent to Landweber
-    iteration when ``optimizer_cls=torch.optim.SGD``; with ``Adam`` (default)
-    the adaptive step size loosely substitutes for SIRT's diagonal
-    preconditioners.
+    Minimises ``mean((A x - b)^2) + tv_weight * TV(x)`` over the volume with
+    ``optimizer_cls`` (Adam by default; SGD gives Landweber; LBFGS works, its
+    closure is re-evaluated as it needs). Constraints are applied in place
+    under ``torch.no_grad`` after each step, the autograd-safe way to project
+    a leaf tensor. Recorded loss: the total loss of each step (the first
+    closure evaluation for LBFGS), components ``fidelity`` and ``tv``.
 
-    This is *not* a SIRT/RESIRE replacement — those remain the
-    production-fast iterative entry points. Use this when you need a custom
-    differentiable loss, learnable prior, or any reconstruction that benefits
-    from being part of a larger autograd graph.
+    Not a replacement for SIRT/RESIRE: use it for a custom differentiable
+    loss or a learnable prior. Peak memory ~7 N^3 vs SIRT's ~5 N^3.
 
-    Args:
-        sinogram:       [n_angles, Ny, N_det] — measured tilt series
-        angles_deg:     [n_angles] — single-axis tilt angles, mutually
-                        exclusive with ``euler_zyz_deg``
-        n_iter:         number of optimizer steps
-        lr:             optimizer learning rate
-        Nz:             reconstruction depth; defaults to N_det
-        optimizer_cls:  any torch.optim class (Adam, SGD, LBFGS, …)
-        positivity:     project volume onto [0, ∞) after each step
-        mask:           apply inscribed-cylinder mask after each step
-        tv_weight:      3-D isotropic TV regularisation weight; the
-                        penalty is ``mean(sqrt(∂y² + ∂z² + ∂x² + tv_eps))``
-                        across the inner-corner grid of the volume.
-                        Dispatches to a fused CUDA kernel via
-                        ``fasttomo.tv_loss_3d`` (CPU falls back to pure
-                        PyTorch). 0.0 disables the regularizer.
-        euler_zyz_deg:  [n_angles, 3] — switches to the 3D rotmat projector
-                        (CUDA only). Mutually exclusive with ``angles_deg``.
-        use_resire_projector: with ``euler_zyz_deg``, use the RESIRE 4-pt
-                        scatter projector instead of the rotmat tex3D one.
-        return_loss:    if True, also return the per-iteration loss history.
-        tv_eps:         smoothing constant inside the TV sqrt (default
-                        1e-8); only used when ``tv_weight > 0``.
+    Parameters
+    ----------
+    sinogram : Tensor ``[n_angles, Ny, N_det]`` fp32
+    angles_deg : Tensor ``[n_angles]``, optional
+        Single-axis angles; exactly one of ``angles_deg`` and ``euler_zyz_deg``.
+    n_iter : int
+        Optimiser steps (default 200).
+    lr : float
+        Learning rate (default 1e-2).
+    optimizer_cls : type
+        Any ``torch.optim.Optimizer`` class.
+    tv_weight, tv_eps : float
+        3-D isotropic TV weight (0 disables it) and the smoothing constant
+        inside the square root (:func:`fasttomo.tv_loss_3d`).
+    euler_zyz_deg : Tensor ``[n_angles, 3]``, optional
+        Rotation-matrix projector.
+    use_resire_projector : bool
+        With ``euler_zyz_deg``: RESIRE's projector instead (CUDA only).
+    Nz, positivity, mask, support_mask, warm_start, num_threads, return_loss,
+    loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
 
-    Constraints (positivity, mask) are applied **inside torch.no_grad()** on
-    the leaf tensor — the autograd-correct way to project. Users hand-rolling
-    similar loops should mimic this; in-place ops on a graph-tracked tensor
-    raise "leaf Variable that requires grad ... in-place operation".
-
-    Memory note: peak ~7 N³ vs SIRT's ~5 N³ because the BP backward must
-    materialise both the sinogram (forward output) and the volume gradient.
-
-    LBFGS is supported — it calls the closure multiple times per ``step()``
-    and rebuilds the graph each call.
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
     """
     if (angles_deg is None) == (euler_zyz_deg is None):
         raise ValueError(
@@ -2832,20 +2929,18 @@ def run_grad_descent(
         "run_grad_descent", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
         warm_start=warm_start, positivity=positivity, mask=mask, support_mask=support_mask,
     )
-    n_angles, Ny, N_det, Nz, Nx = (
-        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
+    N_det = setup.N_det
     constraints, n_iter = setup.constraints, setup.n_iter
 
     volume = setup.volume0.requires_grad_(True)
     opt = optimizer_cls([volume], lr=lr)
 
-    if euler_zyz_deg is not None:
+    def _fp(v):
+        if euler_zyz_deg is None:
+            return forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
         if use_resire_projector:
-            _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
-        else:
-            _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
-    else:
-        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
+            return forward_project_resire(v, euler_zyz_deg, N_det=N_det)
+        return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_grad_descent")
@@ -3278,47 +3373,74 @@ def run_mbir(
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple:
-    """Classical MBIR (Model-Based Iterative Reconstruction) for single-axis
-    parallel-beam tomography.
+    """Classical MBIR (MBIR-AM-PE, Venkatakrishnan et al. 2015). fp32, CPU and CUDA.
 
-    Implements MBIR-AM-PE (Venkatakrishnan et al. 2015): joint MAP
-    reconstruction of the volume `f`, per-tilt offset `d_k`, and noise
-    variance `σ` under a generalized-Huber likelihood + qGGMRF prior.
+    Joint MAP estimate of the volume ``f``, a per-view offset ``d_k`` and
+    the noise level ``sigma`` under a generalised-Huber likelihood and a
+    qGGMRF prior, by Gauss-Seidel ICD sweeps (random voxel order per
+    Y-slice) with closed-form offset and variance updates between sweeps,
+    optionally coarse-to-fine. Recorded loss: the data MSE ``mean(e^2)`` of
+    the residual ``e = g - A f - d`` after each outer iteration; indices run
+    across multires levels. Stops a level early when the relative volume
+    change falls below ``convergence_tol``.
 
     Parameters
     ----------
-    sinogram : [n_angles, Ny, N_det] float32 tensor
-    angles_deg : [n_angles] float32 tensor, degrees
-    Nz : reconstruction depth (default = N_det)
-    sigma_f, qggmrf_p, qggmrf_q, qggmrf_c : qGGMRF prior parameters.
-        Defaults `p=1.2, q=2.0, c=1e-3` follow the paper. σ_f sets the
-        prior strength.
-    huber_T : threshold for the generalized Huber likelihood. `inf`
-        (default) recovers conventional MBIR (no anomaly modeling).
-        `T=3` is the paper's recommendation for BF-TEM with Bragg scatter.
-    huber_delta : slope of the Huber tail. `δ=0.5` is the recommendation.
-    estimate_offset, estimate_variance : enable closed-form updates of
-        `d_k` and `σ` between outer iterations (MBIR-AM → MBIR-AM-PE).
-    sigma_init : initial noise std. Defaults to the std of the sinogram.
-    sigma_min : lower clamp on σ to prevent collapse (default
-        `sigma_init * 1e-3`).
-    multires_levels : coarse-to-fine levels. 1 = single-scale (default).
-    outer_iters : maximum outer iterations per scale.
-    convergence_tol : stop when the relative L2 change in the volume
-        between iterations falls below this.
-    seed : RNG seed for the per-Y-slice voxel permutation.
-    lambdas : optional [n_angles, Ny, N_det] per-pixel data weights (Λ).
-        `None` → uniform 1 (standard Poisson approximation).
-    sigma_f_per_scale : optional list of σ_f overrides per multires level,
-        coarse → fine. If None, `σ_f * 2**level` is used (prior weight
-        scales with voxel size).
-    return_history : if True, also returns the per-iteration convergence
-        history (relative L2 change).
+    sinogram, angles_deg
+        ``[n_angles, Ny, N_det]`` fp32 and ``[n_angles]`` degrees. Other dtypes
+        raise TypeError (they used to be cast silently).
+    n_iter : int
+        Maximum outer iterations per level (default 100; formerly
+        ``outer_iters``, still accepted with a DeprecationWarning).
+    sigma_f, qggmrf_p, qggmrf_q, qggmrf_c : float
+        qGGMRF prior; ``p=1.2, q=2, c=1e-3`` follow the paper, ``sigma_f`` sets
+        its strength.
+    huber_T, huber_delta : float
+        Generalised-Huber threshold (``inf``, the default, is conventional
+        MBIR; 3 is the paper's choice for BF-TEM with Bragg scatter) and tail
+        slope (0.5).
+    estimate_offset, estimate_variance : bool
+        Closed-form ``d_k`` and ``sigma`` updates (MBIR-AM -> MBIR-AM-PE).
+    sigma_init, sigma_min : float, optional
+        Initial noise std (default: the sinogram std, 1.0 for a blank
+        sinogram) and its floor (default ``sigma_init * 1e-3``).
+    multires_levels : int
+        Coarse-to-fine levels (1 = single scale). Nz and N_det must be
+        divisible by ``2**(levels - 1)``.
+    convergence_tol : float
+        Per-level stop on the relative L2 volume change (default 1e-4).
+    seed : int
+        Seed of the voxel permutation.
+    lambdas : Tensor ``[n_angles, Ny, N_det]``, optional
+        Per-pixel data weights (default 1), the sinogram's dtype.
+    sigma_f_per_scale : list of float, optional
+        ``sigma_f`` per level, coarse to fine (default ``sigma_f * 2**level``).
+    config : MbirConfig, optional
+        The tuning keywords above as one object; mixing it with a non-default
+        keyword raises TypeError.
+    mask, support_mask : optional
+        Support (Conventions), applied to each level's initial volume and
+        after every outer ICD sweep, not inside the voxel update. The removed
+        part is forward-projected into the error sinogram, so
+        ``e = g - A f - d`` stays exact. Coarse levels use the support
+        max-pooled to their grid.
+    warm_start : Tensor, optional
+        Initial volume (resized to the coarsest level); offsets start at 0.
+    num_threads : int, optional
+        CPU threads (it was hardcoded to 4); see Conventions.
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
+    return_state : bool
+        Also return ``(d_offsets, sigma)``: the ``[n_angles]`` offsets and the
+        final noise std.
 
     Returns
     -------
-    volume : [Ny, Nz, Nx] float32 tensor.
-    If `return_history=True`, also returns (d_offsets, sigma, history).
+    ``volume``, plus ``loss_history`` with ``return_loss`` and
+    ``d_offsets, sigma`` with ``return_state``, in that order. The
+    deprecated ``return_history=True`` still returns the legacy
+    ``(volume, d_offsets, sigma, history)`` with per-level lists of relative
+    volume changes.
     """
     n_iter = _deprecated_kwarg(deprecated, "outer_iters", "n_iter", n_iter, "run_mbir",
                                default=100)

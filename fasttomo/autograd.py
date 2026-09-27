@@ -147,9 +147,9 @@ def euler_zyz_to_rotmat(euler_zyz_deg: torch.Tensor) -> torch.Tensor:
     ct, st = torch.cos(theta), torch.sin(theta)
     cu, su = torch.cos(psi),   torch.sin(psi)
 
-    r00 =  cu*ct*cp - su*sp;  r01 = -cu*ct*sp - su*cp;  r02 = cu*st
-    r10 =  su*ct*cp + cu*sp;  r11 = -su*ct*sp + cu*cp;  r12 = su*st
-    r20 = -st*cp;             r21 =  st*sp;              r22 = ct
+    r00, r01, r02 = cu*ct*cp - su*sp, -cu*ct*sp - su*cp, cu*st
+    r10, r11, r12 = su*ct*cp + cu*sp, -su*ct*sp + cu*cp, su*st
+    r20, r21, r22 = -st*cp, st*sp, ct
 
     row0 = torch.stack([r00, r01, r02], dim=1)
     row1 = torch.stack([r10, r11, r12], dim=1)
