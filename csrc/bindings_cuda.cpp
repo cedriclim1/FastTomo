@@ -633,13 +633,6 @@ void register_cuda(py::module_ &m) {
 
 namespace py = pybind11;
 
-static void py_mbir_permutation_cuda(
-    long out_ptr, int Ny, int nvox, unsigned long long perm_key, long stream_ptr
-) {
-    mbir_permutation_cuda(reinterpret_cast<int *>(out_ptr), Ny, nvox, perm_key,
-                          to_stream(stream_ptr));
-}
-
 void register_cuda(py::module_ &m) {
     m.attr("cuda_available") = false;
 }
