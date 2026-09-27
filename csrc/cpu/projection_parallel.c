@@ -339,9 +339,15 @@ int back_project_parallel_cpu(
  * with r(j) = sino[ia, iy, j] for 0 <= j < N_det and 0 outside, read from a
  * zero-padded copy of the sinogram rows so the inner loop has no branch
  * (the reference pads the same way and clamps the row index into the pad).
- * vol is overwritten. OpenMP over (Y, Z) rows: each (iy, iz) output row is
- * written by one thread, so there is no race and the result does not depend
- * on num_threads.
+ * vol is overwritten. Each output voxel is written by one thread, so there
+ * is no race and the result does not depend on num_threads.
+ *
+ * Ny >= 2 runs Y-batched (gather_ybatched): u, w and the stencil indices do
+ * not depend on the Y slice, so they are computed once per (iz, angle, ix)
+ * and applied to FT_YB slices with a SIMD loop over a Y-innermost copy of
+ * the padded sinogram block; per lane the fp32 operations and their order
+ * are the ones above, so the two paths give the same bits. Ny = 1 keeps the
+ * row loop (gather_rows), which is faster there.
  */
 #if defined(__clang__)
 #define FT_NO_FP_CONTRACT
@@ -352,7 +358,7 @@ int back_project_parallel_cpu(
 #endif
 
 FT_NO_FP_CONTRACT
-int back_project_gather_parallel_cpu(
+static int gather_rows(
     const float *sino,
     float       *vol,
     const float *cos_a,
@@ -424,6 +430,114 @@ int back_project_gather_parallel_cpu(
     free(pad);
     free(xc);
     return 0;
+}
+
+FT_NO_FP_CONTRACT
+static int gather_ybatched(
+    const float *sino,
+    float       *vol,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const int    Np     = N_det + 2;                 /* one zero on each side */
+    const float  half_x = (float)(0.5 * (Nx - 1));
+    const float  half_z = (float)(0.5 * (Nz - 1));
+    const float  half_d = (float)(0.5 * (N_det - 1));
+    const int    yb     = Ny < FT_YB ? Ny : FT_YB;
+    const size_t plane  = (size_t)Nz * Nx;
+
+    /* padded block [n_angles][Np][nl], x*cos [n_angles][Nx], and one output
+     * row [Nx][nl] per thread */
+    float *pad = (float *)malloc((size_t)n_angles * Np * yb * sizeof(float));
+    float *xc  = (float *)malloc((size_t)n_angles * Nx * sizeof(float));
+    float *row = (float *)malloc((size_t)num_threads * Nx * yb * sizeof(float));
+    if (!pad || !xc || !row) { free(pad); free(xc); free(row); return -1; }
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        float *o = row + (size_t)omp_get_thread_num() * Nx * yb;
+
+        #pragma omp for schedule(static)
+        for (int ia = 0; ia < n_angles; ia++)
+            for (int ix = 0; ix < Nx; ix++)
+                xc[(size_t)ia * Nx + ix] = ((float)ix - half_x) * cos_a[ia];
+
+        for (int y0 = 0; y0 < Ny; y0 += FT_YB) {
+            const int nl = Ny - y0 < FT_YB ? Ny - y0 : FT_YB;
+
+            #pragma omp for schedule(static)
+            for (int ia = 0; ia < n_angles; ia++) {
+                float *d = pad + (size_t)ia * Np * nl;
+                for (int l = 0; l < nl; l++) {
+                    d[l] = 0.0f;
+                    d[(size_t)(Np - 1) * nl + l] = 0.0f;
+                    const float *src = sino + ((size_t)ia * Ny + y0 + l) * N_det;
+                    for (int j = 0; j < N_det; j++) d[(size_t)(j + 1) * nl + l] = src[j];
+                }
+            }
+            /* implicit barrier (also after xc): the block is complete */
+
+            #pragma omp for schedule(static)
+            for (int iz = 0; iz < Nz; iz++) {
+                const float z = (float)iz - half_z;
+                memset(o, 0, (size_t)Nx * nl * sizeof(float));
+                for (int ia = 0; ia < n_angles; ia++) {
+                    const float *pa  = pad + (size_t)ia * Np * nl;
+                    const float *xca = xc + (size_t)ia * Nx;
+                    const float  zs  = z * sin_a[ia];
+                    for (int ix = 0; ix < Nx; ix++) {
+                        float u  = (xca[ix] + zs) + half_d;
+                        int   i0 = (int)u;                 /* floorf, see above */
+                        i0 -= ((float)i0 > u);
+                        float w  = u - (float)i0;
+                        int   j0 = i0 + 1;
+                        int   j1 = j0 + 1;
+                        j0 = j0 < 0 ? 0 : (j0 > Np - 1 ? Np - 1 : j0);
+                        j1 = j1 < 0 ? 0 : (j1 > Np - 1 ? Np - 1 : j1);
+                        const float  omw = 1.0f - w;
+                        const float *restrict r0 = pa + (size_t)j0 * nl;
+                        const float *restrict r1 = pa + (size_t)j1 * nl;
+                        float       *restrict ov = o + (size_t)ix * nl;
+                        #pragma omp simd
+                        for (int l = 0; l < nl; l++) {
+                            float t0 = omw * r0[l];
+                            float t1 = w * r1[l];
+                            ov[l] += t0 + t1;
+                        }
+                    }
+                }
+                for (int ix = 0; ix < Nx; ix++)
+                    for (int l = 0; l < nl; l++)
+                        vol[(size_t)(y0 + l) * plane + (size_t)iz * Nx + ix] = o[(size_t)ix * nl + l];
+            }
+            /* implicit barrier: pad is refilled for the next block */
+        }
+    }
+    free(pad);
+    free(xc);
+    free(row);
+    return 0;
+}
+
+int back_project_gather_parallel_cpu(
+    const float *sino,
+    float       *vol,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+) {
+    if (num_threads < 1) num_threads = 1;
+    if (Ny >= 2)
+        return gather_ybatched(sino, vol, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, num_threads);
+    return gather_rows(sino, vol, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, num_threads);
 }
 
 void grad_angle_cpu(

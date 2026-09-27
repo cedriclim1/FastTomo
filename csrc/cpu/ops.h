@@ -67,8 +67,10 @@ int back_project_parallel_cpu(
  * forward_project_parallel_cpu (that is back_project_parallel_cpu).
  *
  * sino : [n_angles, Ny, N_det] float32; vol : [Ny, Nz, Nx], overwritten.
- * Returns 0, or -1 if the scratch allocation (padded sinogram, x*cos table:
- * (n_angles*Ny*(N_det+2) + n_angles*Nx) floats) fails.
+ * Y-batched for Ny >= 2. Returns 0, or -1 if the scratch allocation fails
+ * (padded sinogram rows and an x*cos table: n_angles*(min(Ny, FT_YB)*(N_det+2)
+ * + Nx) floats plus Nx*min(Ny, FT_YB) per thread; Ny = 1:
+ * n_angles*(N_det+2+Nx) floats).
  */
 int back_project_gather_parallel_cpu(
     const float *sino,
