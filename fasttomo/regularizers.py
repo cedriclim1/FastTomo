@@ -102,6 +102,9 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     horizontal-band artefacts in axis-2 projections; this function avoids
     that by construction.
 
+    Also available as ``tv_loss_zx`` (the same function; the volume axes
+    are ``[Ny, Nz, Nx]``).
+
     Args:
         volume: [Ny, Nz, Nx] float32 tensor.
         eps:    smoothing constant inside the sqrt (default 1e-8).
@@ -116,6 +119,11 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     dz = volume[:, 1:, :]  - volume[:, :-1, :]   # [Ny, Nz-1, Nx]
     dx = volume[:, :, 1:]  - volume[:, :, :-1]    # [Ny, Nz, Nx-1]
     return (dz[:, :, :-1].pow(2) + dx[:, :-1, :].pow(2) + eps).sqrt().mean()
+
+
+# Same function object under the other axis order (not deprecated): the
+# volume axes are [Ny, Nz, Nx], so "zx" names the plane in storage order.
+tv_loss_zx = tv_loss_xz
 
 
 # ── Log-Sum L0-proxy sparsity ─────────────────────────────────────────────

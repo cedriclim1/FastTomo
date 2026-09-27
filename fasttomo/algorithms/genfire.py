@@ -60,7 +60,7 @@ def run_genfire(
     angles_deg: torch.Tensor,       # [n_angles] degrees
     *,
     n_iter: int = 100,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = True,
     mask: bool | None = None,
     support_mask: torch.Tensor | None = None,

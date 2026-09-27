@@ -336,7 +336,7 @@ def _prepare_recon(
     sinogram: torch.Tensor,
     angles_deg: torch.Tensor | None,
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     n_iter: int | None = None,
     allowed_dtypes: tuple[torch.dtype, ...] = (torch.float32,),
     require_cuda: bool = False,
@@ -352,7 +352,8 @@ def _prepare_recon(
     * sinogram / angles: `_check_inputs` (dtype in ``allowed_dtypes``, 3-D
       sinogram, 1-D angles of matching length, CUDA if ``require_cuda``).
     * ``n_iter`` and ``Nz``: integers (numpy and 0-d tensor integers
-      accepted), ``n_iter >= 0``; ``Nz < 0`` means ``N_det``. ``Nx = N_det``.
+      accepted), ``n_iter >= 0``; ``Nz=None`` (or any negative value, the
+      former ``-1`` default) means ``N_det``. ``Nx = N_det``.
     * ``warm_start``: a tensor of shape ``[Ny, Nz, Nx]`` and the sinogram's
       dtype, moved to the sinogram's device and cloned, so the caller's
       tensor is never modified. Without it ``volume0`` is zeros in the
@@ -369,7 +370,9 @@ def _prepare_recon(
             f"{op_name}: mask=True and support_mask are mutually exclusive — "
             "pass one support per reconstruction."
         )
-    Nz = _as_int(Nz, "Nz", op_name, minimum=None)
+    # None (the default) or any negative value: Nz = N_det. -1 is what the
+    # raw kernel layer uses for "from the input"; None is the Python API's.
+    Nz = -1 if Nz is None else _as_int(Nz, "Nz", op_name, minimum=None)
     if n_iter is not None:
         n_iter = _as_int(n_iter, "n_iter", op_name)
     sparsity = _as_float(sparsity, "sparsity", op_name, minimum=0.0)

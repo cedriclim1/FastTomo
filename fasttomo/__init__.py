@@ -78,6 +78,7 @@ from fasttomo.utilities import (
 from fasttomo.algorithms import (
     run_fbp,
     run_weighted_backprojection,
+    run_wbp,
     run_sirt,
     run_sart,
     run_wsirt,
@@ -91,7 +92,9 @@ from fasttomo.algorithms import (
     refine_angles,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
-from fasttomo.regularizers import tilt_ssim_loss, s3im_loss, logsum_sparsity, tv_loss_xz
+from fasttomo.regularizers import (
+    tilt_ssim_loss, s3im_loss, logsum_sparsity, tv_loss_xz, tv_loss_zx,
+)
 from fasttomo.configs import (
     AdReconConfig,
     ConstraintConfig,
@@ -117,6 +120,7 @@ __all__ = [
     "tv_loss_3d",
     "run_fbp",
     "run_weighted_backprojection",
+    "run_wbp",
     "run_sirt",
     "run_sart",
     "run_wsirt",
@@ -134,6 +138,7 @@ __all__ = [
     "s3im_loss",
     "logsum_sparsity",
     "tv_loss_xz",
+    "tv_loss_zx",
     "AdReconConfig",
     "ConstraintConfig",
     "MbirConfig",

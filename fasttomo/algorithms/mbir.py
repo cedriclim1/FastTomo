@@ -559,7 +559,7 @@ def run_mbir(
     angles_deg: torch.Tensor,         # [n_angles] degrees
     n_iter: int = 100,                # max outer iterations per scale
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     sigma_f: float = 1.0,
     qggmrf_p: float = 1.2,
     qggmrf_q: float = 2.0,

@@ -202,7 +202,7 @@ def run_fbp(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = False,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
@@ -282,14 +282,15 @@ def run_weighted_backprojection(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = False,
     threshold_scale: float = 1.0,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
     num_threads: int | None = None,
 ) -> torch.Tensor:
-    """Exact weighted back-projection (W-BP, Wolf et al. 2014).
+    """Exact weighted back-projection (W-BP, Wolf et al. 2014). Also
+    available as ``run_wbp`` (the same function).
 
     Back-projects, then deconvolves every XZ slice by the numerically
     computed exact weighting filter (the inverse transfer function of the
@@ -326,3 +327,8 @@ def run_weighted_backprojection(
                        num_threads)(sinogram)
 
     return setup.constraints.apply(volume)
+
+
+# Short name (same function object, not deprecated): ``run_wbp`` is what the
+# W-BP algorithm is usually called.
+run_wbp = run_weighted_backprojection

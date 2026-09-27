@@ -161,6 +161,14 @@ def apply_shifts_2d(
 
 # ── projection ops ─────────────────────────────────────────────────────────
 
+def _size(value: int | None) -> int:
+    """A size argument of the public API as the raw kernel layer takes it:
+    ``None`` (the default, "derive it from the input") becomes ``-1``, the
+    binding-level sentinel; negative values are accepted with the same
+    meaning (the former ``-1`` defaults)."""
+    return -1 if value is None else int(value)
+
+
 def _transient(kind, shape, N_det, device, num_threads, angles_deg=None, *, name):
     """The one-shot operator behind the public function ``name``: uncached,
     with the volume dims the call knows (``-1``: the raw kernels derive them
@@ -174,7 +182,7 @@ def _transient(kind, shape, N_det, device, num_threads, angles_deg=None, *, name
 def forward_project(
     volume: torch.Tensor,          # [Ny, Nz, Nx]
     angles_deg: torch.Tensor,      # [n_angles] degrees
-    N_det: int = -1,
+    N_det: int | None = None,
     num_threads: int | None = None,
 ) -> torch.Tensor:
     """
@@ -193,7 +201,7 @@ def forward_project(
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    op = _transient("parallel", volume.shape, N_det, volume.device, num_threads,
+    op = _transient("parallel", volume.shape, _size(N_det), volume.device, num_threads,
                     angles_deg=angles_deg, name="forward_project")
     return op.project(volume, angles_deg)
 
@@ -201,10 +209,10 @@ def forward_project(
 def back_project(
     sinogram: torch.Tensor,        # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,      # [n_angles] degrees
-    Nz: int = -1,
+    Nz: int | None = None,
     num_threads: int | None = None,
     *,
-    Nx: int = -1,
+    Nx: int | None = None,
 ) -> torch.Tensor:
     """
     Back-project sinogram → volume [Ny, Nz, Nx].
@@ -233,15 +241,15 @@ def back_project(
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    op = _transient("parallel", (-1, Nz, Nx), sinogram.shape[-1], sinogram.device,
-                    num_threads, angles_deg=angles_deg, name="back_project")
+    op = _transient("parallel", (-1, _size(Nz), _size(Nx)), sinogram.shape[-1],
+                    sinogram.device, num_threads, angles_deg=angles_deg, name="back_project")
     return op.backproject(sinogram, angles_deg)
 
 
 def forward_project_3d(
     volume: torch.Tensor,                       # [Ny, Nz, Nx]
     euler_zyz_deg: torch.Tensor,                # [n_angles, 3] — (φ, θ, ψ) degrees
-    N_det: int = -1,
+    N_det: int | None = None,
     shifts: torch.Tensor | None = None,         # [n_angles, 2] — optional per-tilt detector-plane shifts (px)
     num_threads: int | None = None,             # CPU only; resolution: kwarg → OMP_NUM_THREADS → 1
 ) -> torch.Tensor:
@@ -280,7 +288,7 @@ def forward_project_3d(
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
     mats = euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    op = _transient("rotmat", volume.shape, N_det, volume.device, num_threads,
+    op = _transient("rotmat", volume.shape, _size(N_det), volume.device, num_threads,
                     name="forward_project_3d")
     sino = op.project(volume, mats)
     if shifts is not None:
@@ -291,10 +299,10 @@ def forward_project_3d(
 def back_project_3d(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
-    Nz: int = -1,
+    Nz: int | None = None,
     num_threads: int | None = None,
     *,
-    Nx: int = -1,
+    Nx: int | None = None,
 ) -> torch.Tensor:
     """
     3D rotation-matrix back-projection (CPU + CUDA).
@@ -313,15 +321,15 @@ def back_project_3d(
         sinogram = sinogram.unsqueeze(1)
     # no gradient w.r.t. the angles through a back-projection
     mats = euler_zyz_to_rotmat(euler_zyz_deg.detach())
-    op = _transient("rotmat", (-1, Nz, Nx), sinogram.shape[-1], sinogram.device,
-                    num_threads, name="back_project_3d")
+    op = _transient("rotmat", (-1, _size(Nz), _size(Nx)), sinogram.shape[-1],
+                    sinogram.device, num_threads, name="back_project_3d")
     return op.backproject(sinogram, mats)
 
 
 def forward_project_resire(
     volume: torch.Tensor,           # [Ny, Nz, Nx]
     euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
-    N_det: int = -1,
+    N_det: int | None = None,
 ) -> torch.Tensor:
     """
     RESIRE voxel-driven forward projection (CUDA only).
@@ -344,15 +352,15 @@ def forward_project_resire(
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
-    return _FPResire.apply(volume, euler_zyz_deg, N_det)
+    return _FPResire.apply(volume, euler_zyz_deg, _size(N_det))
 
 
 def back_project_resire(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
-    Nz: int = -1,
+    Nz: int | None = None,
     *,
-    Nx: int = -1,
+    Nx: int | None = None,
 ) -> torch.Tensor:
     """
     RESIRE voxel-driven back-projection (CUDA only).
@@ -369,4 +377,4 @@ def back_project_resire(
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    return _BPResire.apply(sinogram, euler_zyz_deg, Nz, Nx)
+    return _BPResire.apply(sinogram, euler_zyz_deg, _size(Nz), _size(Nx))

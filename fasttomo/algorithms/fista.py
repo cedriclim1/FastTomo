@@ -218,7 +218,7 @@ def run_fista(
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 50,
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = False,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
@@ -299,7 +299,7 @@ def run_fista_tv(
     n_iter: int = 50,
     *,
     tv_weight: float,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = False,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,

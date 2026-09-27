@@ -11,7 +11,7 @@ All are exported from `fasttomo` (and `fasttomo.algorithms`).
 | Algorithm | Function | Backends | One line |
 |---|---|---|---|
 | FBP | `run_fbp` | CPU, CUDA | Ramp-filtered back-projection (fp32/fp16). |
-| Weighted back-projection | `run_weighted_backprojection` | CPU, CUDA | Exact W-BP (Wolf et al. 2014): back-projection deconvolved by the numerically computed weighting filter. |
+| Weighted back-projection | `run_weighted_backprojection` (alias `run_wbp`) | CPU, CUDA | Exact W-BP (Wolf et al. 2014): back-projection deconvolved by the numerically computed weighting filter. |
 | SIRT | `run_sirt` | CPU, CUDA | Simultaneous iterative reconstruction; the CUDA path replays the loop as a CUDA graph. |
 | wSIRT | `run_wsirt` | CPU, CUDA | Weighted SIRT (Wolf et al. 2014): SIRT with the W-BP as back-projector. |
 | SART / OS-SART | `run_sart` | CPU, CUDA | Ordered-subset SART; `subset_size=1` is plain SART. |
@@ -24,7 +24,7 @@ All are exported from `fasttomo` (and `fasttomo.algorithms`).
 | Gradient descent | `run_grad_descent` | CPU, CUDA | Reference autograd reconstruction with any `torch.optim` optimiser (Adam default, SGD gives Landweber, LBFGS works). |
 | Angular refinement | `refine_angles` | CPU, CUDA | Brute-force per-view search (single tilt axis or ZYZ Euler) against a volume. Not a reconstruction; returns refined angles. |
 
-Also exported: the functional projectors (`forward_project`, `back_project`, `forward_project_3d`, `back_project_3d`, `forward_project_resire`, `back_project_resire`), the cached projector classes `ParallelProjector` and `RotmatProjector`, the regularisers (`tv_loss_3d`, `tv_loss_xz`, `tilt_ssim_loss`, `s3im_loss`, `logsum_sparsity`), helpers (`ramp_filter`, `cylindrical_mask`, `apply_shifts`, `apply_shifts_2d`, `estimate_shifts_xcorr`, `euler_zyz_to_rotmat`) and the config dataclasses (`AdReconConfig`, `OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`, `MbirConfig`).
+Also exported: the functional projectors (`forward_project`, `back_project`, `forward_project_3d`, `back_project_3d`, `forward_project_resire`, `back_project_resire`), the cached projector classes `ParallelProjector` and `RotmatProjector`, the regularisers (`tv_loss_3d`, `tv_loss_xz` (alias `tv_loss_zx`), `tilt_ssim_loss`, `s3im_loss`, `logsum_sparsity`), helpers (`ramp_filter`, `cylindrical_mask`, `apply_shifts`, `apply_shifts_2d`, `estimate_shifts_xcorr`, `euler_zyz_to_rotmat`) and the config dataclasses (`AdReconConfig`, `OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`, `MbirConfig`).
 
 ### Call convention
 
