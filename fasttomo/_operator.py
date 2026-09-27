@@ -305,10 +305,7 @@ class CudaCachedOperator(ProjectionOperator):
             _dtype_to_tc_code(dtype)
         self._cos = self._sin = None
         if self._angles_deg is not None:
-            a_rad = (self._angles_deg.to(device=self.device, dtype=torch.float32)
-                     * (math.pi / 180.0))
-            self._cos = a_rad.cos().contiguous()
-            self._sin = a_rad.sin().contiguous()
+            self._cos, self._sin = self._default_trig(self._angles_deg)
         self._vol_handle: int | None = None
         self._sino_handles: dict[int, int] = {}
         # Bumped by every volume upload, so a backward can tell whether the
@@ -316,6 +313,25 @@ class CudaCachedOperator(ProjectionOperator):
         self._vol_cache_epoch = 0
         self._sirt_graph_cache = {}
         self._sirt_graph_bad_keys = set()
+
+    def _default_trig(self, angles_deg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        a_rad = angles_deg.to(device=self.device, dtype=torch.float32) * (math.pi / 180.0)
+        return a_rad.cos().contiguous(), a_rad.sin().contiguous()
+
+    def _set_default_angles(self, angles_deg: torch.Tensor) -> None:
+        """Replace the default tilt angles (same count) in place: the cos/sin
+        buffers keep their storage, so a CUDA graph captured with this
+        operator reads the new angles on its next replay. Used by run_sirt
+        when it reuses an internal operator (``algebraic._SirtOperatorCache``)."""
+        a = angles_deg.detach()
+        if self._cos is None or a.numel() != self.n_angles:
+            raise ValueError(f"{self._name}: expected {self.n_angles} default angles, "
+                             f"got {a.numel()}")
+        self._angles_deg = a
+        cos_a, sin_a = self._default_trig(a)
+        with torch.cuda.device(self.device):
+            self._cos.copy_(cos_a)
+            self._sin.copy_(sin_a)
 
     def _channels(self) -> int:
         # 4-channel packed-Y mode for fp16 parallel caches when Ny % 4 == 0

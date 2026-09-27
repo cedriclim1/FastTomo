@@ -453,6 +453,63 @@ class TestRunSirtCudaGraph:
                     f"positivity violated for kwargs={kwargs}"
                 )
 
+    def test_internal_graph_reused_across_calls(self):
+        """Without ``projector=``, a repeated call replays the previous call's
+        graph (kernel audit F8) and gives exactly what fresh calls give, with
+        new sinogram data, new angles and a new support mask of the same
+        shapes each time; the replaying call is faster than the capturing one."""
+        import time
+
+        from fasttomo.algorithms import algebraic
+
+        N, n_angles = 32, 20
+        angles_a = make_angles(n_angles, device=DEVICE)
+        angles_b = angles_a * 0.9 + 1.0
+        vol_a = phantom_2d(N, device=DEVICE).unsqueeze(0)
+        vol_b = torch.flip(vol_a, dims=[-1])
+        sino_a = ft.forward_project(vol_a, angles_a)
+        sino_b = ft.forward_project(vol_b, angles_b)
+        m_a = _half_support(N, left=True)
+        m_b = _half_support(N, left=False)
+        calls = [
+            dict(sinogram=sino_a, angles_deg=angles_a, support_mask=m_a),
+            dict(sinogram=sino_b, angles_deg=angles_b, support_mask=m_b),
+            dict(sinogram=sino_a.clone(), angles_deg=angles_a.cpu(), support_mask=m_a),
+        ]
+
+        fresh = []
+        for kw in calls:
+            algebraic._SIRT_OPERATORS.clear()
+            fresh.append(ft.run_sirt(n_iter=7, Nz=N, positivity=True, **kw))
+
+        algebraic._SIRT_OPERATORS.clear()
+        captures0 = algebraic._sirt_graph_captures
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        reused = [ft.run_sirt(n_iter=7, Nz=N, positivity=True, **calls[0])]
+        torch.cuda.synchronize()
+        t_capture = time.perf_counter() - t0
+        reused += [ft.run_sirt(n_iter=7, Nz=N, positivity=True, **kw) for kw in calls[1:]]
+        assert algebraic._sirt_graph_captures == captures0 + 1   # one capture, then replays
+        assert len(algebraic._SIRT_OPERATORS) == 1
+        for a, b in zip(fresh, reused):
+            assert torch.equal(a, b)
+
+        t_replay = []
+        for _ in range(3):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            ft.run_sirt(n_iter=7, Nz=N, positivity=True, **calls[0])
+            torch.cuda.synchronize()
+            t_replay.append(time.perf_counter() - t0)
+        assert min(t_replay) < t_capture
+
+        # another configuration evicts the kept one (one entry kept)
+        ft.run_sirt(sino_a, angles_a, n_iter=7, Nz=N, omega=0.5)
+        assert len(algebraic._SIRT_OPERATORS) == 1
+        assert algebraic._sirt_graph_captures == captures0 + 2
+        algebraic._SIRT_OPERATORS.clear()
+
     @pytest.mark.skipif(
         torch.cuda.device_count() < 2,
         reason="cross-device graph capture needs >=2 GPUs",

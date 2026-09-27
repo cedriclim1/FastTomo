@@ -5,11 +5,18 @@ weighted SIRT (wSIRT).
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from typing import Any, Callable
 
 import torch
 
-from fasttomo._operator import Geometry, _drain_deferred_handles, _make_operator
+from fasttomo._operator import (
+    CudaCachedOperator,
+    Geometry,
+    _drain_deferred_handles,
+    _make_operator,
+)
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
@@ -56,7 +63,10 @@ def run_sirt(
     On CUDA the projections go through a cached projector (built internally
     unless ``projector`` is given) and, when no loss is needed, ``n_iter > 1``
     and ``euler_zyz_deg`` is None, the iteration body runs as a captured
-    CUDA graph cached on the projector.
+    CUDA graph cached on the projector. Without ``projector`` the internal
+    projector and its graph are kept for the next call with the same
+    shapes, dtype, device and options (one configuration is kept; see
+    ``_SirtOperatorCache``), so repeated calls skip the capture.
 
     Parameters
     ----------
@@ -93,10 +103,60 @@ def run_sirt(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
-    _fp, _bp, op = _build_fp_bp(
-        sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
-        device, num_threads, projector, euler_zyz_deg,
-    )
+    # Gate of the CUDA-graph path: CUDA input, no per-iteration loss (which
+    # calls .item()), n_iter > 1, parallel geometry. Rotmat mode
+    # (euler_zyz_deg) stays on the eager path because the per-call matrix
+    # tensor can vary, while cached graphs assume fixed captured inputs.
+    wants_loss = bool(return_loss) or loss_callback is not None
+    use_graph = sinogram.is_cuda and not wants_loss and n_iter > 1 and euler_zyz_deg is None
+    graph_key = None
+    cache_key = None
+    if use_graph:
+        graph_key = (Ny, Nz, Nx, n_angles, N_det,
+                     sinogram.dtype,
+                     float(omega),
+                     constraints.positivity,
+                     float(constraints.soft_threshold),
+                     tuple(constraints.support_mask.shape)
+                     if constraints.support_mask is not None else None,
+                     euler_zyz_deg is not None)
+        if projector is None:
+            # Reuse the internal operator (and the graph captured on it) of
+            # the previous call with this configuration.
+            cache_key = (device, *graph_key)
+            op = _SIRT_OPERATORS.checkout(cache_key)
+            if op is not None:
+                op._set_default_angles(angles_deg)
+                _fp, _bp = _operator_closures(op)
+    if cache_key is None or op is None:
+        _fp, _bp, op = _build_fp_bp(
+            sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
+            device, num_threads, projector, euler_zyz_deg,
+        )
+    try:
+        return _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
+                              (Ny, Nz, Nx), n_angles, N_det, use_graph, graph_key,
+                              return_loss, loss_callback, progress)
+    finally:
+        if cache_key is not None and isinstance(op, CudaCachedOperator):
+            _SIRT_OPERATORS.checkin(cache_key, op)
+
+
+def _operator_closures(op):
+    """``(_fp, _bp)`` of a parallel operator, as `_build_fp_bp` builds them."""
+    def _fp(v):
+        return op.project(v, None)
+
+    def _bp(s):
+        return op.backproject(s, None)
+    return _fp, _bp
+
+
+def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
+                   vol_shape, n_angles, N_det, use_graph, graph_key,
+                   return_loss, loss_callback, progress):
+    """run_sirt after validation and operator selection."""
+    Ny, Nz, Nx = vol_shape
 
     # --- normalisation matrices (computed once with the chosen projector) ---
     ones_sino = torch.ones_like(sinogram)
@@ -112,11 +172,8 @@ def run_sirt(
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
 
     # --- CUDA Graph capture path ----------------------------------------
-    # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
-    # Rotmat mode (euler_zyz_deg) is kept on eager path because the per-call
-    # matrix tensor can vary, while cached graphs assume fixed captured inputs.
     # If capture fails, fall back to the eager loop below.
-    if sinogram.is_cuda and not rec.wants_loss and n_iter > 1 and euler_zyz_deg is None:
+    if use_graph:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
             sinogram=sinogram,
@@ -128,14 +185,7 @@ def run_sirt(
             _bp=_bp,
             constraints=constraints,
             projector=op,
-            key=(Ny, Nz, Nx, n_angles, N_det,
-                 sinogram.dtype,
-                 float(omega),
-                 constraints.positivity,
-                 float(constraints.soft_threshold),
-                 tuple(constraints.support_mask.shape)
-                 if constraints.support_mask is not None else None,
-                 euler_zyz_deg is not None),
+            key=graph_key,
             on_replay=rec.tick,
         )
         if graph_result is not None:
@@ -352,6 +402,62 @@ def run_wsirt(
 # CUDA Graph helper for run_sirt
 # ---------------------------------------------------------------------------
 
+class _SirtOperatorCache:
+    """The internal projection operators of run_sirt's CUDA-graph path, kept
+    between calls so a repeated call replays the graph captured by the
+    previous one instead of capturing again (kernel audit F8).
+
+    Keyed by device plus the graph key (volume and sinogram shapes, dtype,
+    omega, positivity, soft threshold, support-mask shape). Each operator
+    holds the one graph of its key and the graph's static buffers. The
+    per-call data never enters the key and is never stale: the sinogram,
+    the normalisations and the support mask are copied into the static
+    buffers before every replay sequence, and the tilt angles into the
+    operator's cos/sin buffers (``CudaCachedOperator._set_default_angles``).
+
+    An operator is taken out while a call uses it (``checkout``) and put
+    back afterwards (``checkin``), so concurrent calls from several threads
+    never share static buffers. At most ``maxsize`` operators are kept
+    (least recently used evicted); the kept one pins its textures, static
+    buffers and graph memory pool (about 5 volumes plus 5 sinograms) until
+    it is evicted or ``clear()`` runs.
+    """
+
+    def __init__(self, maxsize: int = 1) -> None:
+        self.maxsize = maxsize
+        self._ops: OrderedDict[tuple, CudaCachedOperator] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def checkout(self, key: tuple) -> CudaCachedOperator | None:
+        with self._lock:
+            return self._ops.pop(key, None)
+
+    def checkin(self, key: tuple, op: CudaCachedOperator) -> None:
+        with self._lock:
+            self._ops[key] = op
+            self._ops.move_to_end(key)
+            evicted = []
+            while len(self._ops) > self.maxsize:
+                evicted.append(self._ops.popitem(last=False)[1])
+        del evicted     # released outside the lock (texture frees sync the device)
+
+    def clear(self) -> None:
+        with self._lock:
+            ops = list(self._ops.values())
+            self._ops.clear()
+        del ops
+
+    def __len__(self) -> int:
+        return len(self._ops)
+
+
+_SIRT_OPERATORS = _SirtOperatorCache()
+
+# Number of CUDA graphs run_sirt has captured in this process (tests use it
+# to tell a replayed graph from a fresh capture).
+_sirt_graph_captures = 0
+
+
 def _run_sirt_cuda_graph(
     volume: torch.Tensor,
     sinogram: torch.Tensor,
@@ -413,14 +519,11 @@ def _run_sirt_cuda_graph(
                 soft_threshold=constraints.soft_threshold,
             )
 
-            # Warmup: one eager iteration with the static buffer.
-            # Populates cuFFT plans, allocator pool, projector texture caches.
-            with torch.no_grad():
-                _sirt_iter_inplace(
-                    vol_static, sino_static, C_static, R_static, omega,
-                    _fp, _bp, static_constraints,
-                )
-
+            # No eager warm-up iteration: run_sirt's normalisation
+            # projections already created both texture caches and locked the
+            # dtype, and the iteration body has no lazily initialised library
+            # state (no cuFFT/cuBLAS), so the capture can run first.
+            #
             # Capture the iteration body on the correct device. Use an
             # explicit Stream pinned to the target device so torch.cuda.graph
             # captures on the right device — the implicit side stream is
@@ -444,6 +547,8 @@ def _run_sirt_cuda_graph(
 
             cache[key] = (g, vol_static, sino_static, C_static, R_static,
                           mask_static)
+            global _sirt_graph_captures
+            _sirt_graph_captures += 1
 
         except Exception as exc:
             _log.warning(
@@ -457,11 +562,9 @@ def _run_sirt_cuda_graph(
 
     g, vol_static, sino_static, C_static, R_static, mask_static = cache[key]
 
-    # Reset the captured static buffer to the caller's starting volume so the
-    # warmup iteration that ran inside the cache-build branch above does not
-    # advance the reconstruction. After this copy each replay applies one
-    # SIRT iteration, yielding exactly n_iter updates for both first-call
-    # and cache-hit paths.
+    # Load the caller's starting volume into the captured static buffer
+    # (the capture itself does not execute, but a cache hit holds the
+    # previous call's result). Each replay then applies one SIRT iteration.
     vol_static.copy_(volume)
     # Keep graph inputs fresh on cache hits; captured CUDA graphs replay with
     # pointer-stable tensors, so dynamic call-time tensors must be copied into
