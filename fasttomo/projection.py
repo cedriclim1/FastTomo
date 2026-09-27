@@ -184,6 +184,8 @@ def back_project_resire(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
     Nz: int = -1,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     """
     RESIRE voxel-driven back-projection (CUDA only).
@@ -192,10 +194,12 @@ def back_project_resire(
     at its rotated detector position with 4-point supersampling. Output is
     normalised by the supersampling factor (÷4).
 
-    Returns volume [Ny, Nz, Nx].
+    Returns volume [Ny, Nz, Nx]; ``Nz`` and ``Nx`` default to N_det. Pass
+    ``Nx`` when the volume is not as wide as the detector (the backward of
+    ``forward_project_resire`` does this automatically).
 
     Differentiable w.r.t. ``sinogram``: backward calls forward_project_resire.
     """
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
-    return _BPResire.apply(sinogram, euler_zyz_deg, Nz)
+    return _BPResire.apply(sinogram, euler_zyz_deg, Nz, Nx)

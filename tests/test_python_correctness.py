@@ -548,7 +548,7 @@ def test_resire_outputs_identical_to_main():
     ("bp", dict(euler=(10, 3)), "9 views but euler_zyz_deg has 10"),
     ("bp", dict(euler=(9, 4)), r"\[n_angles, 3\]"),
     ("bp", dict(data=(9, 0, 6)), "zero-size"),
-    ("bp", dict(Nz=0), "Nz must be positive"),
+    ("bp", dict(Nz=0), "Nz and Nx must be positive"),
 ])
 def test_resire_raw_wrappers_reject_bad_shapes(which, kwargs, match):
     """Mismatched sizes raise ValueError before any kernel launch."""
@@ -571,3 +571,28 @@ def test_run_resire_rejects_mismatched_euler():
     ang = torch.linspace(-60, 60, 9, device="cuda")
     with pytest.raises(ValueError, match=r"euler_zyz_deg must have shape \(9, 3\)"):
         ft.run_resire(sino, ang, n_iter=1, euler_zyz_deg=torch.zeros(1, 3))
+
+
+@needs_cuda
+@pytest.mark.parametrize("Nx,N_det", [(22, 26), (26, 22)])
+def test_resire_autograd_nx_ne_ndet(Nx, N_det):
+    """Same fix as the texture pair: forward_project_resire with N_det != Nx
+    has a working backward (it raised 'invalid gradient' before), equal to
+    back_project_resire(Nx=Nx); back_project_resire(Nx=...) of the wider
+    volume centre-cropped equals the narrow one (gather, exact)."""
+    g = torch.Generator().manual_seed(12)
+    Ny, Nz, n = 4, 14, 7
+    eul = torch.stack([torch.zeros(n), torch.linspace(-60, 60, n), torch.zeros(n)], 1).cuda()
+    x = torch.rand(Ny, Nz, Nx, generator=g).cuda().requires_grad_(True)
+    w = torch.rand(n, Ny, N_det, generator=g).cuda()
+    (ft.forward_project_resire(x, eul, N_det=N_det) * w).sum().backward()
+    assert x.grad.shape == x.shape
+    assert torch.equal(x.grad, ft.back_project_resire(w, eul, Nz=Nz, Nx=Nx))
+    s = w.clone().requires_grad_(True)
+    (ft.back_project_resire(s, eul, Nz=Nz, Nx=Nx) * x.detach()).sum().backward()
+    assert s.grad.shape == w.shape
+    narrow, wide = min(Nx, N_det), max(Nx, N_det)
+    off = (wide - narrow) // 2
+    small = ft.back_project_resire(w, eul, Nz=Nz, Nx=narrow)
+    big = ft.back_project_resire(w, eul, Nz=Nz, Nx=wide)[:, :, off:off + narrow]
+    assert torch.equal(small, big)

@@ -514,6 +514,8 @@ def _back_project_resire_raw(
     sinogram: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     _assert_cuda(sinogram, "back_project_resire")
     if not _core.cuda_available:
@@ -521,11 +523,12 @@ def _back_project_resire_raw(
     _ensure_fp32(sinogram, "back_project_resire")
     _check_resire_shapes("back_project_resire", sinogram, "sinogram", euler_zyz_deg,
                          n_views=sinogram.shape[0] if sinogram.ndim == 3 else None)
-    if Nz == 0:
-        raise ValueError("back_project_resire: Nz must be positive")
+    if Nz == 0 or Nx == 0:
+        raise ValueError("back_project_resire: Nz and Nx must be positive")
 
     n_angles, Ny, N_det = sinogram.shape
-    Nx = N_det
+    if Nx < 0:
+        Nx = N_det
     if Nz < 0:
         Nz = N_det
 
@@ -685,12 +688,14 @@ class _FPResire(torch.autograd.Function):
     def forward(ctx, volume, euler_zyz_deg, N_det):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.Nz = volume.shape[-2]
+        ctx.Nx = volume.shape[-1]
         return _forward_project_resire_raw(volume, euler_zyz_deg, N_det)
 
     @staticmethod
     def backward(ctx, grad_sino):
         (euler_zyz_deg,) = ctx.saved_tensors
-        grad_vol = _back_project_resire_raw(grad_sino.contiguous(), euler_zyz_deg, Nz=ctx.Nz)
+        grad_vol = _back_project_resire_raw(grad_sino.contiguous(), euler_zyz_deg,
+                                            Nz=ctx.Nz, Nx=ctx.Nx)
         return grad_vol, None, None
 
 
@@ -842,15 +847,15 @@ class _BPRotmatCached(torch.autograd.Function):
 
 class _BPResire(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sinogram, euler_zyz_deg, Nz):
+    def forward(ctx, sinogram, euler_zyz_deg, Nz, Nx=-1):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.N_det = sinogram.shape[-1]
-        return _back_project_resire_raw(sinogram, euler_zyz_deg, Nz)
+        return _back_project_resire_raw(sinogram, euler_zyz_deg, Nz, Nx=Nx)
 
     @staticmethod
     def backward(ctx, grad_vol):
         (euler_zyz_deg,) = ctx.saved_tensors
         grad_sino = _forward_project_resire_raw(grad_vol.contiguous(), euler_zyz_deg, N_det=ctx.N_det)
-        return grad_sino, None, None
+        return grad_sino, None, None, None
 
 
