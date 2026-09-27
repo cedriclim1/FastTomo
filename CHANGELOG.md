@@ -31,13 +31,14 @@ ramp-filter keys of the algorithm golden were regenerated).
   180/140). Anisotropic objects still show an orientation-dependent bias at
   limited tilt (a 4:1 ellipse at +-70 reads 1.20 or 0.50 depending on its
   orientation; the missing wedge), which no angular scale removes.
-- fp16 `run_fbp` now applies `pi / n_angles` to the filtered sinogram in
-  fp32, before its cast to fp16, instead of to the fp16 back-projection.
-  The back-projection used to sum `n_angles` unscaled views and could
-  overflow (OverflowError) although the result fits (density 400 over 720
-  views); now it overflows only when the result itself does. fp16 results
-  differ in the last fp16 bit (`cpu/fbp_h` and `cuda/fbp_h` of the
-  algorithm golden regenerated); fp32 is unchanged.
+- fp16 `run_fbp`: the back-projection sums `n_angles` unscaled views
+  before the `pi / n_angles` scale and could overflow (OverflowError)
+  although the result fits (density 400 over 720 views). When it does,
+  `run_fbp` now applies `pi / n_angles` to the filtered sinogram in fp32,
+  before its cast to fp16, and back-projects again, so it raises only when
+  the result itself exceeds the fp16 range. Otherwise nothing changes
+  (bit-identical); pre-scaling always would lose small values to fp16
+  underflow (a density of 1e-4 at 720 views: 8 % error instead of 0.08 %).
 
 ### ⚠ `run_mbir(multires_levels > 1)`: coarse levels hand over the right values
 

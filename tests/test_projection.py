@@ -744,11 +744,12 @@ def test_fp16_overflow_in_iterative_algorithms_raises_once_at_the_end():
     assert torch.isfinite(ft.run_sirt(big.half(), ang, 3, return_loss=True)[0]).all()
 
 
-def test_fp16_fbp_scales_before_the_fp16_cast(backend):
-    """FBP's back-projection sums n_angles filtered views; run_fbp scales
-    them by pi / n_angles in fp32 *before* the fp16 cast, so a density of
-    400 over 720 views (the unscaled sum is ~9.2e4, beyond fp16) comes back
-    at ~400 instead of raising OverflowError (#95 review)."""
+def test_fp16_fbp_scales_before_the_fp16_cast_when_it_would_overflow(backend):
+    """FBP's back-projection sums n_angles filtered views before the pi /
+    n_angles scale. When that unscaled sum exceeds fp16 (density 400 over
+    720 views: ~9.2e4), run_fbp scales the filtered sinogram in fp32 before
+    the fp16 cast instead, and returns ~400 rather than raising
+    OverflowError (#95 review)."""
     ang = torch.linspace(-89.75, 89.75, 720, device=backend)
     vol = torch.zeros(2, 64, 64, device=backend)
     vol[:, 16:48, 16:48] = 400.0
@@ -763,6 +764,22 @@ def test_fp16_fbp_scales_before_the_fp16_cast(backend):
     assert out.dtype == torch.float16 and torch.isfinite(out).all()
     assert rel_err(out.float(), ref) < 1e-2
     assert abs(out[:, 24:40, 24:40].float().mean().item() - 400.0) < 4.0
+
+
+@pytest.mark.parametrize("density", [1e-4, 1e-5])
+def test_fp16_fbp_keeps_low_amplitudes(backend, density):
+    """Pre-scaling by pi / n_angles only happens when the unscaled
+    back-projection would overflow: always pre-scaling pushes small
+    filtered values into the fp16 subnormal range (720 views: 8 % error at
+    a density of 1e-4, everything lost at 1e-5). Unscaled first, as before,
+    keeps them (0.08 % and 0.4 %)."""
+    ang = torch.linspace(-89.75, 89.75, 720, device=backend)
+    vol = torch.zeros(2, 64, 64, device=backend)
+    vol[:, 16:48, 16:48] = density
+    sino = ft.forward_project(vol, ang)
+    ref = ft.run_fbp(sino, ang)
+    out = ft.run_fbp(sino.half(), ang)
+    assert rel_err(out.float(), ref) < 1e-2
 
 
 def test_fp16_nan_is_reported_separately_from_overflow(backend):

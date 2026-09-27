@@ -18,10 +18,7 @@ Exception: the ramp-filter and FBP keys (``_fft_ramp``, ``fbp``,
 ``ramp_filter`` became the zero-padded spatial-domain Ram-Lak filter (the
 unpadded ``|xi|`` filter reconstructed a unit-density cylinder at 0.57 to
 0.96 instead of 1). Only those 9 keys were replaced; every other tensor of
-the file is byte-identical to before. ``cpu/fbp_h`` and ``cuda/fbp_h`` were
-replaced once more when fp16 ``run_fbp`` began applying its ``pi /
-n_angles`` scale in fp32 before the fp16 cast of the filtered sinogram
-(instead of to the fp16 back-projection); nothing else changed.
+the file is byte-identical to before.
 
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
