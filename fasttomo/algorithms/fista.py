@@ -11,6 +11,7 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
+from fasttomo._backend import _fp16_overflow_checked
 from fasttomo.algorithms._common import (
     _LIPSCHITZ_SAFETY,
     _NORM_EPS,
@@ -211,12 +212,13 @@ def _fista_loop(
     return rec.finish(x_prev)
 
 
+@_fp16_overflow_checked
 def run_fista(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 50,
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = False,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
@@ -290,13 +292,14 @@ def run_fista(
     )
 
 
+@_fp16_overflow_checked
 def run_fista_tv(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 50,
     *,
     tv_weight: float,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = False,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,

@@ -48,9 +48,11 @@ def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     shape (Ny-1) × (Nz-1) × (Nx-1).
 
     Differentiable w.r.t. ``volume`` — drop into any autograd loop in
-    place of the pure-PyTorch expression. On CUDA, dispatches to a single
-    fused kernel (one read-pass over the volume, one atomic-reduction to
-    a scalar) and a voxel-driven gather kernel for the backward. On CPU,
+    place of the pure-PyTorch expression. On CUDA, dispatches to a fused
+    kernel (one read-pass over the volume and a deterministic fixed-order
+    two-pass reduction with fp64 partials, no atomics, so the value is
+    bit-reproducible run to run) and a voxel-driven gather kernel for the
+    backward. On CPU,
     falls back to the equivalent pure-PyTorch expression so the same
     public function works on either device.
 
@@ -100,6 +102,9 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     horizontal-band artefacts in axis-2 projections; this function avoids
     that by construction.
 
+    Also available as ``tv_loss_zx`` (the same function; the volume axes
+    are ``[Ny, Nz, Nx]``).
+
     Args:
         volume: [Ny, Nz, Nx] float32 tensor.
         eps:    smoothing constant inside the sqrt (default 1e-8).
@@ -114,6 +119,11 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     dz = volume[:, 1:, :]  - volume[:, :-1, :]   # [Ny, Nz-1, Nx]
     dx = volume[:, :, 1:]  - volume[:, :, :-1]    # [Ny, Nz, Nx-1]
     return (dz[:, :, :-1].pow(2) + dx[:, :-1, :].pow(2) + eps).sqrt().mean()
+
+
+# Same function object under the other axis order (not deprecated): the
+# volume axes are [Ny, Nz, Nx], so "zx" names the plane in storage order.
+tv_loss_zx = tv_loss_xz
 
 
 # ── Log-Sum L0-proxy sparsity ─────────────────────────────────────────────
@@ -150,6 +160,20 @@ def _gaussian_window(win_size: int, sigma: float,
     g = g / g.sum()
     w2 = g[:, None] * g[None, :]
     return w2[None, None, :, :]
+
+
+def _ssim_constants(target: torch.Tensor, data_range: float | None):
+    """SSIM's ``C1 = (0.01 L)^2`` and ``C2 = (0.03 L)^2``.
+
+    ``L = data_range``, or ``target.max() - target.min()`` when it is None,
+    computed on the device without a host sync: 0-d tensors with the values
+    the former ``float(target.max() - target.min())`` gave (fp64 arithmetic,
+    rounded to fp32 once, as the fp32 ops did with the Python float), so the
+    loss is unchanged bit for bit."""
+    if data_range is not None:
+        return (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    L = (target.max() - target.min()).detach().double()
+    return ((0.01 * L) ** 2).float(), ((0.03 * L) ** 2).float()
 
 
 def _ssim_map(x: torch.Tensor, y: torch.Tensor,
@@ -217,10 +241,7 @@ def tilt_ssim_loss(
         raise TypeError("tilt_ssim_loss is fp32-only "
                         f"(got pred={pred.dtype}, target={target.dtype}).")
 
-    if data_range is None:
-        data_range = float(target.max() - target.min())
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
+    C1, C2 = _ssim_constants(target, data_range)
 
     pad = win_size // 2
     window = _gaussian_window(win_size, sigma, pred.device, pred.dtype)
@@ -305,10 +326,7 @@ def s3im_loss(
         raise ValueError(f"patch_pixels ({patch_pixels}) exceeds total sinogram "
                          f"size ({n_total})")
 
-    if data_range is None:
-        data_range = float(target.max() - target.min())
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
+    C1, C2 = _ssim_constants(target, data_range)
 
     pred_flat = pred.reshape(-1)
     target_flat = target.reshape(-1)

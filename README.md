@@ -2,7 +2,7 @@
 
 Ground-up fast tomography implementations in C and CUDA with direct workflows in PyTorch.
 
-Every public function takes and returns `torch.Tensor`. Projection and back-projection kernels run on the CPU (C/OpenMP) and on CUDA (texture memory). Volumes are `[Ny, Nz, Nx]`, sinograms `[n_angles, Ny, N_det]` and angles a 1-D tensor in degrees; `Ny` runs along the tilt axis. fp32 is supported everywhere; the parallel and 3D projections (functional and the projector classes) and FBP, SIRT, SART, FISTA and FISTA-TV also accept fp16 (output in the input dtype). Other dtypes raise `TypeError`; nothing is cast silently.
+Every public function takes and returns `torch.Tensor`. Projection and back-projection kernels run on the CPU (C/OpenMP) and on CUDA (texture memory). Volumes are `[Ny, Nz, Nx]`, sinograms `[n_angles, Ny, N_det]` and angles a 1-D tensor in degrees; `Ny` runs along the tilt axis. fp32 is supported everywhere; the parallel and 3D projections (functional and the projector classes) and FBP, SIRT, SART, FISTA and FISTA-TV also accept fp16 (output in the input dtype). An fp16 result beyond the fp16 range (65504) raises `OverflowError` instead of returning `inf` (the kernels accumulate in fp32; scale unnormalised data into range or use fp32). Other dtypes raise `TypeError`; nothing is cast silently.
 
 ## Algorithms
 
@@ -11,7 +11,7 @@ All are exported from `fasttomo` (and `fasttomo.algorithms`).
 | Algorithm | Function | Backends | One line |
 |---|---|---|---|
 | FBP | `run_fbp` | CPU, CUDA | Ramp-filtered back-projection (fp32/fp16). |
-| Weighted back-projection | `run_weighted_backprojection` | CPU, CUDA | Exact W-BP (Wolf et al. 2014): back-projection deconvolved by the numerically computed weighting filter. |
+| Weighted back-projection | `run_weighted_backprojection` (alias `run_wbp`) | CPU, CUDA | Exact W-BP (Wolf et al. 2014): back-projection deconvolved by the numerically computed weighting filter. |
 | SIRT | `run_sirt` | CPU, CUDA | Simultaneous iterative reconstruction; the CUDA path replays the loop as a CUDA graph. |
 | wSIRT | `run_wsirt` | CPU, CUDA | Weighted SIRT (Wolf et al. 2014): SIRT with the W-BP as back-projector. |
 | SART / OS-SART | `run_sart` | CPU, CUDA | Ordered-subset SART; `subset_size=1` is plain SART. |
@@ -24,7 +24,7 @@ All are exported from `fasttomo` (and `fasttomo.algorithms`).
 | Gradient descent | `run_grad_descent` | CPU, CUDA | Reference autograd reconstruction with any `torch.optim` optimiser (Adam default, SGD gives Landweber, LBFGS works). |
 | Angular refinement | `refine_angles` | CPU, CUDA | Brute-force per-view search (single tilt axis or ZYZ Euler) against a volume. Not a reconstruction; returns refined angles. |
 
-Also exported: the functional projectors (`forward_project`, `back_project`, `forward_project_3d`, `back_project_3d`, `forward_project_resire`, `back_project_resire`), the cached projector classes `ParallelProjector` and `RotmatProjector`, the regularisers (`tv_loss_3d`, `tv_loss_xz`, `tilt_ssim_loss`, `s3im_loss`, `logsum_sparsity`), helpers (`ramp_filter`, `cylindrical_mask`, `apply_shifts`, `apply_shifts_2d`, `estimate_shifts_xcorr`, `euler_zyz_to_rotmat`) and the config dataclasses (`AdReconConfig`, `OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`, `MbirConfig`).
+Also exported: the functional projectors (`forward_project`, `back_project`, `forward_project_3d`, `back_project_3d`, `forward_project_resire`, `back_project_resire`), the cached projector classes `ParallelProjector` and `RotmatProjector`, the regularisers (`tv_loss_3d`, `tv_loss_xz` (alias `tv_loss_zx`), `tilt_ssim_loss`, `s3im_loss`, `logsum_sparsity`), helpers (`ramp_filter`, `cylindrical_mask`, `apply_shifts`, `apply_shifts_2d`, `estimate_shifts_xcorr`, `euler_zyz_to_rotmat`) and the config dataclasses (`AdReconConfig`, `OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`, `MbirConfig`).
 
 ### Call convention
 
@@ -186,8 +186,8 @@ Tests are grouped by topic (`tests/test_projection.py`, `test_algorithms_*.py`, 
 
 Wheels are built by `.github/workflows/wheels.yml`:
 
-- **CPU manylinux_2_28 wheels** for cp310-cp313, x86_64, built without `-march=native`.
-- **CUDA wheels** for cp310-cp313, built with the CUDA 13.0 toolkit for architectures `75;80;86;89;90;100;120`, for use with the `cu130` torch wheels. `libcudart` is excluded from the wheel (`auditwheel --exclude`) and resolved at import time against the `libcudart` that PyTorch loaded; the test step loads the wheel under `torch+cu130`. `import fasttomo` raises `ImportError` for torch < 2.11 and emits a `RuntimeWarning` when a CUDA build meets a torch whose CUDA version is not 13.0, since mixed runtimes can crash at the first kernel launch. Volta (sm_70, V100) is not included because CUDA 13 dropped it; V100 users must build from source with a CUDA 12.x toolkit.
+- **CPU manylinux_2_28 wheels** for cp310-cp314, x86_64, built without `-march=native`.
+- **CUDA wheels** for cp310-cp314, built with the CUDA 13.0 toolkit for architectures `75;80;86;89;90;100;120`, for use with the `cu130` torch wheels. `libcudart` is excluded from the wheel (`auditwheel --exclude`) and resolved at import time against the `libcudart` that PyTorch loaded; the test step loads the wheel under `torch+cu130`. `import fasttomo` raises `ImportError` for torch < 2.11 and emits a `RuntimeWarning` when a CUDA build meets a torch whose CUDA version is not 13.0, since mixed runtimes can crash at the first kernel launch. Volta (sm_70, V100) is not included because CUDA 13 dropped it; V100 users must build from source with a CUDA 12.x toolkit.
 - **Sdist** for source builds when no wheel matches.
 
 ### One-time setup

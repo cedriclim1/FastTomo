@@ -73,3 +73,12 @@ def test_tiny_fbp_roundtrip():
 
     assert rec.shape == vol.shape
     assert torch.isfinite(rec).all()
+
+
+def test_version_comes_from_the_distribution_metadata():
+    """``fasttomo.__version__`` is the installed distribution's version, i.e.
+    ``[project] version`` of pyproject.toml (the single source)."""
+    from importlib.metadata import version
+
+    assert isinstance(ft.__version__, str) and ft.__version__
+    assert ft.__version__ == version("fasttomo")

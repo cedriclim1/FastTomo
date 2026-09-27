@@ -11,7 +11,10 @@ for the rest.
 Shapes and units
     Volume ``[Ny, Nz, Nx]``, sinogram ``[n_angles, Ny, N_det]``, angles a
     1-D tensor in degrees. ``Ny`` runs along the tilt axis. ``Nz`` (keyword,
-    ``-1``) defaults to ``N_det``; ``Nx = N_det``.
+    default ``None``) defaults to ``N_det``; ``Nx = N_det``. ``None`` is the
+    "derive it" sentinel of the whole Python API (``Nz``, ``Nx``, ``N_det``
+    of the projection functions too); the former ``-1`` (any negative
+    value) is still accepted and means the same.
 
 Call signature
     ``run_x(sinogram, angles_deg, n_iter, *, ...)``: the sinogram, the
@@ -38,7 +41,10 @@ dtypes
     fp32 everywhere; fp16 also for FBP, SIRT, SART, FISTA and FISTA-TV
     (output in the input dtype). Anything else (fp64, bf16) raises
     TypeError; nothing is cast silently. A ``warm_start`` must have the
-    sinogram's dtype.
+    sinogram's dtype. fp16 values are limited to +-65504: an fp16 run whose
+    projections overflow (typically unnormalised data in FBP or FISTA)
+    raises OverflowError when it returns instead of returning inf; scale the
+    sinogram into range or use fp32 (`fasttomo._backend`, fp16 range).
 
 Support: ``mask`` and ``support_mask``
     ``mask=True`` restricts the volume to the inscribed cylinder of the XZ
@@ -121,7 +127,8 @@ module          contents
 ==============  ======================================================
 ``_common``     constants, `_prepare_recon`, `_LossRecorder`,
                 deprecated-keyword helpers, `_build_fp_bp`
-``analytic``    ``run_fbp``, ``run_weighted_backprojection`` (W-BP)
+``analytic``    ``run_fbp``, ``run_weighted_backprojection`` (W-BP; alias
+                ``run_wbp``)
 ``algebraic``   ``run_sirt`` (+ CUDA graph), ``run_sart``, ``run_wsirt``
 ``fista``       ``run_fista``, ``run_fista_tv``, TV prox, Lipschitz
 ``ad``          ``run_ad_recon``, ``run_grad_descent``
@@ -170,6 +177,7 @@ from fasttomo.algorithms._common import (
 )
 from fasttomo.algorithms.analytic import (
     run_fbp,
+    run_wbp,
     run_weighted_backprojection,
     _bp_gather,
     _compute_exact_wf,
@@ -275,6 +283,7 @@ from fasttomo.utilities import ramp_filter
 __all__ = [
     "run_fbp",
     "run_weighted_backprojection",
+    "run_wbp",
     "run_sirt",
     "run_sart",
     "run_wsirt",

@@ -112,7 +112,7 @@ On a shared multi-GPU machine (the development box has 4 cards used by several p
 ## CI
 
 - `.github/workflows/test-cpu.yml`: on every pull request and push to `main`, builds CPU-only on Python 3.10 and 3.12 and runs `pytest tests`. Superseded pull-request runs are cancelled; in-progress runs on `main` are not, but a queued run on `main` can be replaced by a newer one, so a commit in a burst of merges may go untested. `ruff check fasttomo tests` must pass (ruff version pinned in the workflow, rule set in `pyproject.toml`).
-- `.github/workflows/wheels.yml`: on `v*` tags and manual dispatch, builds CPU and CUDA 13.0 manylinux_2_28 wheels for cp310-cp313 (CUDA archs `75;80;86;89;90;100;120`, no `-march=native`).
+- `.github/workflows/wheels.yml`: on `v*` tags and manual dispatch, builds CPU and CUDA 13.0 manylinux_2_28 wheels for cp310-cp314 (CUDA archs `75;80;86;89;90;100;120`, no `-march=native`).
 
 ## Linting
 

@@ -225,8 +225,9 @@ void grad_angle_cuda(
  * tv_loss_iso_3d_workspace(Ny, Nz, Nx) elements (0 when a dimension is < 2).
  * The 1/N normalization is applied by the Python caller. Backward expects
  * `d_g_scaled[0]` to already contain `grad_out · 1/N` (single-element
- * device buffer). d_grad_vol must be zeroed by the caller (kernel writes
- * once per voxel).
+ * device buffer). The backward kernel writes every voxel of d_grad_vol
+ * exactly once when Ny, Nz and Nx are all >= 2; with a dimension < 2 it
+ * launches nothing, so only then must the caller zero d_grad_vol.
  */
 long long tv_loss_iso_3d_workspace(int Ny, int Nz, int Nx);
 
