@@ -11,7 +11,10 @@ keyword names), except the five run_ad_recon keys, regenerated for later
 deliberate AD changes by `tests/data/regenerate_golden_keys.py` (phase 1b:
 deterministic grad_rotmat, fused Adam, the antisymmetric_z total
 derivative). Here the same calls use the new names and pass every new
-option at its no-op value, and must reproduce the golden:
+option at its no-op value, and must reproduce the golden. The input
+sinogram is stored in the golden too (``_input/<device>/sino``, main
+7fdaac2's forward projection, tests/data/freeze_golden_inputs.py), so these
+keys keep pinning GENFIRE / RESIRE when the parallel-beam projector changes:
 
 * GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal,
   but only where the machine's arithmetic fingerprint (``tests/_golden.py``)
@@ -52,7 +55,12 @@ def _inputs(device):
     sm = torch.zeros(1, N, N)
     sm[:, 3:17, 3:17] = 1.0
     vol, ang, sm = vol.to(device), ang.to(device), sm.to(device)
-    return ft.forward_project(vol, ang), ang, eul, sm, N
+    # The sinogram is the stored ft.forward_project(vol, ang) of main 7fdaac2
+    # (tests/data/freeze_golden_inputs.py), not recomputed: the projector's
+    # sampling-boundary change would otherwise change the frozen GENFIRE /
+    # RESIRE outputs through their input although their code did not change.
+    sino = _golden()[f"_input/{torch.device(device).type}/sino"].to(device)
+    return sino, ang, eul, sm, N
 
 
 class _Calls:

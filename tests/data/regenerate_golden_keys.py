@@ -12,7 +12,8 @@ same definition the test uses); the GENFIRE / RESIRE keys are frozen.
 
 Keys naming GENFIRE or RESIRE outputs (``genfire*`` / ``resire*``, e.g.
 ``cuda/gd_resire``) are refused in any file unless ``--allow-frozen`` is
-passed. Every other key must stay byte-identical: the script checks that, prints the
+passed, and so are the stored test inputs (``_input/<device>/sino``, see
+``tests/data/freeze_golden_inputs.py``). Every other key must stay byte-identical: the script checks that, prints the
 max abs / rel change of each replaced key, then re-saves the file with its
 arithmetic fingerprints (tests/_golden.py) unchanged. It refuses to run
 unless this environment's fingerprint for the keys' device is already
@@ -97,6 +98,10 @@ def main(path: str, keys: list[str], allow_frozen: bool = False) -> None:
         raise SystemExit(f"{path}: no such keys {missing}")
     _check_fingerprints(raw, keys, path)
     print("fasttomo from", fasttomo.__file__, "torch", torch.__version__)
+    inputs = [k for k in keys if k.startswith("_")]
+    if inputs:
+        raise SystemExit(f"refusing {inputs}: metadata and frozen test inputs "
+                         "(tests/data/freeze_golden_inputs.py) are not regenerated")
     frozen = [k for k in keys if any(f in k.lower() for f in FROZEN)]
     if frozen and not allow_frozen:
         raise SystemExit(f"refusing frozen keys {frozen} (GENFIRE/RESIRE outputs are frozen; "

@@ -8,6 +8,11 @@ refactor: support=, ConstraintConfig(mask=, sparsity=)). Needs a CUDA GPU:
 Every case here is mirrored, with the new keyword names plus the new
 optional keywords at their no-op values, in test_frozen_identity.py.
 
+The input sinograms (``_input/<device>/sino``) were added later by
+``tests/data/freeze_golden_inputs.py`` (main 7fdaac2's forward projection):
+the test reads them instead of projecting, so the file now depends on
+them as well.
+
 ``_golden.stamp`` then records this environment's arithmetic fingerprints
 (tests/_golden.py) under ``_arith_fingerprint``: the exact comparisons are
 only made where the fingerprint matches.

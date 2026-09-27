@@ -48,6 +48,12 @@ ZeroDivisionError); the fp16 estimate of L moved in its last bits (max
 change 2.9e-3 CPU / 2.0e-3 CUDA, 2 fp16 ulps at the peak 1.6). fp32 FISTA
 is unchanged bit for bit.
 
+The input sinogram of the algorithm cases (``_input/<device>/sino``) is
+stored in the golden: main 7fdaac2's ``ft.forward_project`` of the input
+volume (tests/data/freeze_golden_inputs.py). Before that it was recomputed,
+so a change of the forward projector changed every algorithm key through its
+input.
+
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
 
@@ -141,7 +147,11 @@ def _inputs(device):
     t = dict(vol=vol, ang=ang, eul=eul, w_sino=w_sino, w_vol=w_vol, sm=sm,
              shifts=shifts, rect=rect, w_wide=w_wide)
     t = {k: v.to(device) for k, v in t.items()}
-    t["sino"] = ft.forward_project(t["vol"], t["ang"])
+    # The input sinogram is the stored ft.forward_project(vol, ang) of main
+    # 7fdaac2 (tests/data/freeze_golden_inputs.py), so an algorithm key
+    # changes only when the algorithm or the operators it calls change, not
+    # through its input (the "fp" key still pins the forward projection).
+    t["sino"] = torch.load(GOLDEN, weights_only=True)[f"_input/{device}/sino"].to(device)
     t["sino3d"] = ft.forward_project_3d(t["vol"], t["eul"])
     t["N"] = N
     return t
