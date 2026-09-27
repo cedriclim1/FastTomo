@@ -251,6 +251,124 @@ def test_ad_recon_constraint_sparsity_cuda():
     assert rel_l2(rec, vol) < 1.0
 
 
+_SOFT_DEVICES = ["cpu", pytest.param("cuda", marks=needs_cuda)]
+
+
+@pytest.mark.parametrize("device", _SOFT_DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
+@pytest.mark.parametrize("t", [1e-3, 3.3e-3, 0.25])
+def test_soft_threshold_matches_reference_expression(device, dtype, t):
+    """A6-7: the softshrink-based soft-threshold (out of place and in
+    place) equals ``sign(v) * max(|v| - t, 0)`` bit for bit (torch.equal:
+    a zero may come out +0 instead of -0), including values at +-t, zeros
+    and values just around the threshold; the in-place form keeps the
+    storage."""
+    from fasttomo.constraints import _soft_threshold, _soft_threshold_
+
+    g = torch.Generator().manual_seed(7)
+    v = torch.randn(4, 9, 37, generator=g) * (3 * t)
+    edge = torch.tensor([t, -t, 0.0, -0.0, t * (1 + 1e-7), -t * (1 - 1e-7), 1e4, -1e4])
+    v.view(-1)[:edge.numel()] = edge
+    v = v.to(device=device, dtype=dtype)
+    ref = v.sign() * (v.abs() - t).clamp(min=0.0)
+    assert torch.equal(_soft_threshold(v, t), ref)
+    w = v.clone()
+    ptr = w.data_ptr()
+    _soft_threshold_(w, t)
+    assert torch.equal(w, ref) and w.data_ptr() == ptr
+    w = v.clone()
+    ft.constraints.apply_constraints_(w, soft_threshold=t, positivity=True)
+    assert torch.equal(w, (v.clamp(min=0) - t).clamp(min=0))
+
+
+def _count_syncs(fn) -> int:
+    """Host syncs torch's sync debug mode reports while ``fn`` runs."""
+    import warnings
+
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fn()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    return sum("synchroniz" in str(w.message).lower() for w in caught)
+
+
+@needs_cuda
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode")
+@pytest.mark.parametrize("mode,per_iter", [
+    ("return_loss", 0), ("callback", 1), ("components", 1), ("both", 1), ("none", 0)])
+@pytest.mark.parametrize("algorithm", ["ad", "gd"])
+def test_loss_recording_host_syncs_per_iteration(mode, per_iter, algorithm):
+    """A6-8: ``return_loss`` alone keeps the losses on the device (no host
+    sync per iteration, one transfer at the end); a ``loss_callback``,
+    with or without components, costs one sync per iteration (the total
+    and every component in one transfer). Counted as the difference
+    between a 6- and a 2-iteration run, so setup and the final transfer
+    cancel."""
+    sino, angles = _small_cuda_problem()
+    kw = {}
+    if mode in ("return_loss", "both"):
+        kw["return_loss"] = True
+    if mode in ("callback", "both"):
+        kw["loss_callback"] = lambda i, loss: None
+    if mode == "components":
+        kw["loss_callback"] = lambda i, loss, components=None: None
+
+    def run(n):
+        if algorithm == "ad":
+            cfg = ft.AdReconConfig(
+                optim=ft.OptimConfig(n_iter=n, lr_volume=0.05),
+                reg=ft.RegularizerConfig(tv_weight=1e-3, sparsity=1e-3))
+            ft.run_ad_recon(sino, angles, config=cfg, **kw)
+        else:
+            ft.run_grad_descent(sino, angles, n, lr=0.05, tv_weight=1e-3, **kw)
+
+    run(2)                                        # warm-up (lazy inits)
+    assert (_count_syncs(lambda: run(6)) - _count_syncs(lambda: run(2))) == 4 * per_iter
+
+
+def _small_cuda_problem():
+    torch.manual_seed(0)
+    angles = torch.linspace(-60, 60, 15, device="cuda")
+    vol = torch.zeros(3, 24, 24, device="cuda")
+    vol[:, 6:18, 8:16] = 1.0
+    return ft.forward_project(vol, angles), angles
+
+
+@needs_cuda
+@pytest.mark.parametrize("algorithm", ["ad", "gd"])
+def test_device_loss_history_equals_callback_values(algorithm):
+    """A6-8: the deferred (device) loss history is the same float32 tensor
+    the per-iteration path gives, and every callback value is a Python float
+    equal to it, components included."""
+    sino, angles = _small_cuda_problem()
+    calls = []
+
+    def cb(i, loss, components=None):
+        calls.append((i, loss, components))
+
+    def run(**kw):
+        if algorithm == "ad":
+            cfg = ft.AdReconConfig(
+                optim=ft.OptimConfig(n_iter=5, lr_volume=0.05),
+                reg=ft.RegularizerConfig(tv_weight=1e-3, sparsity=1e-3))
+            return ft.run_ad_recon(sino, angles, config=cfg, **kw)
+        return ft.run_grad_descent(sino, angles, 5, lr=0.05, tv_weight=1e-3, **kw)
+
+    vol_a, hist_a = run(return_loss=True)
+    vol_b, hist_b = run(return_loss=True, loss_callback=cb)
+    assert hist_a.dtype == torch.float32 and hist_a.device.type == "cpu"
+    assert torch.equal(vol_a, vol_b) and torch.equal(hist_a, hist_b)
+    assert [c[0] for c in calls] == list(range(5))
+    assert [c[1] for c in calls] == hist_a.tolist()
+    for _, loss, comps in calls:
+        assert type(loss) is float and all(type(v) is float for v in comps.values())
+        assert set(comps) == {"fidelity", "tv", "sparsity"} if algorithm == "ad" else {"fidelity", "tv"}
+
+
 def test_ad_recon_shape_guard_runs_before_shift_correction(monkeypatch):
     """A projector built for the wrong number of views must give the
     projector-shape error even with refine_shifts=True; the shift correction

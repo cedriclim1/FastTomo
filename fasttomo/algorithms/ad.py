@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.projection import apply_shifts_2d
-from fasttomo.constraints import _soft_threshold
+from fasttomo.constraints import _soft_threshold_
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_3d, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.configs import (
@@ -29,9 +29,75 @@ from fasttomo.configs import (
 from fasttomo.algorithms._common import (
     _S3IM_SEED,
     _assert_projector_output_shape,
+    _emit_loss,
     _prepare_recon,
     _LossRecorder,
 )
+
+
+class _DeviceLossRecorder(_LossRecorder):
+    """`_LossRecorder` that keeps tensor losses on the device (A6-8).
+
+    Same values and callback contract, fewer host syncs per iteration:
+
+    * ``return_loss`` alone: each loss is copied into a device buffer (no
+      sync); `history` / `finish` move it to the host once, at the end.
+    * with a ``loss_callback``: the total and its components go to the host
+      in one transfer (one sync instead of one per value), and the callback
+      still gets plain floats for the true iteration index. The history is
+      then kept from those floats.
+
+    Values are the fp32 losses the base class records (``tolist`` and
+    ``item`` convert the same fp32 value to the same Python float). Non-tensor
+    values fall back to the base class.
+    """
+
+    def __init__(self, return_loss, loss_callback, progress, n_iter, *, desc=None) -> None:
+        super().__init__(return_loss, loss_callback, progress, n_iter, desc=desc)
+        self._n_iter = n_iter
+        self._buf: torch.Tensor | None = None
+        self._n = 0
+
+    def record(self, it, loss, components=None) -> None:
+        if not self.wants_loss:
+            return
+        values = [loss]
+        if self.send_components and components is not None:
+            values += list(components.values())
+        if not all(isinstance(v, torch.Tensor) and v.numel() == 1
+                   and v.dtype == torch.float32 for v in values):
+            super().record(it, loss, components)
+            return
+        if self.loss_callback is None:
+            if self._buf is None:
+                self._buf = torch.empty(self._n_iter, dtype=torch.float32,
+                                        device=loss.device)
+            self._buf[self._n].copy_(loss.detach().reshape(()))
+            self._n += 1
+            return
+        host = torch.stack([v.detach().reshape(()) for v in values]).tolist()
+        loss_val = host[0]
+        if self.return_loss:
+            self.losses.append(loss_val)
+        comps = None
+        if self.send_components:
+            comps = ({"fidelity": loss_val} if components is None
+                     else dict(zip(components.keys(), host[1:])))
+        _emit_loss(self.loss_callback, self.send_components, it, loss_val, comps)
+
+    def _flush(self) -> None:
+        if self._buf is not None:
+            self.losses.extend(self._buf[:self._n].tolist())
+            self._buf = None
+            self._n = 0
+
+    def history(self) -> torch.Tensor:
+        self._flush()
+        return super().history()
+
+    def finish(self, volume):
+        self._flush()
+        return super().finish(volume)
 
 
 def _ad_recon_step_schedule(
@@ -214,9 +280,6 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         if key != "fidelity":
             loss = loss + term
 
-    # .item() (a host sync) only when the loss is returned or streamed
-    if rec.wants_loss:
-        rec.record(it, loss, terms)
     loss.backward()
 
     if run.ref_idx is not None:
@@ -245,6 +308,11 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         for sched, should_step in zip(run.schedulers, step_flags):
             if should_step:
                 sched.step()
+    # The loss of the iterate entering this iteration (before its step),
+    # recorded after the step kernels are queued so that a callback's host
+    # sync does not sit between the forward and the backward pass.
+    if rec.wants_loss:
+        rec.record(it, loss, terms)
     return step_volume
 
 
@@ -266,7 +334,7 @@ def _ad_project_constraints(run: _AdRun, step_volume: bool) -> None:
             # order of fasttomo.constraints (mask -> positivity -> threshold).
             # Skipped in pose-only iterations: unlike positivity and the
             # mask it is not idempotent and would shrink a frozen volume.
-            volume.copy_(_soft_threshold(volume, constraints_cfg.soft_threshold))
+            _soft_threshold_(volume, constraints_cfg.soft_threshold)
         tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
         if tilt_bound_deg is not None and run.refine_pose and tilt is not None:
             tilt[:, 1].clamp_(
@@ -510,7 +578,8 @@ def run_ad_recon(
         pose_warmup_iters=pose_warmup_iters, alternating_period=alternating_period,
         pred_shape=(n_angles, Ny, N_det),
     )
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_ad_recon")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter,
+                              desc="run_ad_recon")
     for it in rec.iterate(n_iter):
         step_volume = _ad_step(run, it, rec)
         _ad_project_constraints(run, step_volume)
@@ -628,7 +697,8 @@ def run_grad_descent(
         return op.project(v, geom)
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_grad_descent")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter,
+                              desc="run_grad_descent")
 
     # Loss terms of the first closure evaluation of each step: the loss
     # LBFGS.step returns is that evaluation's (it may evaluate several times).

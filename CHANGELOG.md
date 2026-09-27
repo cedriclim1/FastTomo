@@ -11,6 +11,21 @@
   output. At 256^3, 61 views, pose + shifts: a volume-only (warm-up)
   iteration 5.4 -> 2.5 ms, `alternating_period=5` 6.3 -> 3.9 ms per
   iteration.
+- Soft-threshold constraint (`ConstraintConfig.soft_threshold`, the
+  `sparsity=` keyword of the classical `run_*` functions) is one
+  `softshrink` pass, in place, for fp32/fp64 volumes (fp16 keeps the old
+  expression, whose arithmetic differs). Bit-identical (a zero may now be
+  +0 instead of -0). `run_ad_recon` with positivity, cylinder and
+  soft-threshold at 256^3: 2.18 -> 1.85 ms per iteration, peak 448 ->
+  352 MiB.
+- Loss recording in `run_ad_recon` and `run_grad_descent`: with
+  `return_loss` alone the losses stay on the device and are copied to the
+  host once at the end (0 host syncs per iteration, was 1); with a
+  `loss_callback` the total and all components reach the host in one
+  transfer (1 sync per iteration, was 1 + number of components). The
+  `loss_callback(iter, loss)` contract is unchanged: plain floats, the
+  true iteration index, the same values. `run_ad_recon` 128^3 L2 with
+  `return_loss`: 0.42 -> 0.32 ms per iteration.
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
