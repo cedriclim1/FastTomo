@@ -51,6 +51,41 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
             print(f"ok n={n} Ny={Ny}", flush=True)
     mbir_sweep_variants(g)
     clip_and_tv_variants(g)
+    sirt_variants(g)
+
+
+def sirt_variants(g) -> None:
+    """run_sirt's fused kernels (csrc/cuda/sirt_update.cu) on the graph and
+    eager paths: residual and update into global memory (scalar and 16-byte
+    vectorised), into 1-channel and 4-channel packed fp16 textures through
+    their surfaces, the texture-resident graph volume (surface reads and
+    tc_download), rotmat (3-D surface), broadcast and full support masks."""
+    from fasttomo.algorithms import algebraic
+
+    dev = torch.device("cuda")
+    for (Ny, Nz, Nx), n_ang in (((1, 1, 2), 1), ((3, 5, 7), 4), ((4, 17, 33), 7),
+                                ((8, 16, 24), 9)):
+        angles = torch.linspace(-60, 60, n_ang, device=dev)
+        euler = torch.stack([angles * 0.1, angles, -angles * 0.1], dim=1)
+        vol = torch.rand(Ny, Nz, Nx, generator=g).to(dev)
+        sm = (torch.rand(Ny, Nz, Nx, generator=g) > 0.3).float().to(dev)
+        for dtype in (torch.float32, torch.float16):
+            sino = ft.forward_project(vol, angles, N_det=Nx).to(dtype)
+            sino3 = ft.forward_project_3d(vol, euler, N_det=Nx).to(dtype)
+            for kw in (dict(), dict(positivity=True, mask=True, sparsity=1e-3, omega=0.7),
+                       dict(support_mask=sm.to(dtype), return_loss=True)):
+                algebraic._SIRT_OPERATORS.clear()
+                ft.run_sirt(sino, angles, 3, Nz=Nz, **kw)
+                ft.run_sirt(sino, angles, 3, Nz=Nz, **kw)          # graph replay
+            ft.run_sirt(sino3, angles, 2, Nz=Nz, euler_zyz_deg=euler, positivity=True)
+            # the fused kernels into global memory (no texture target)
+            algebraic._fused_update(vol.to(dtype), vol.to(dtype), vol.to(dtype), 0.5,
+                                    algebraic.ConstraintConfig(positivity=True),
+                                    eager_order=True)
+            algebraic._fused_residual(sino, sino, sino, want_raw=True)
+        algebraic._SIRT_OPERATORS.clear()
+        torch.cuda.synchronize()
+        print(f"ok sirt shape={(Ny, Nz, Nx)} n_angles={n_ang}", flush=True)
 
 
 def clip_and_tv_variants(g) -> None:

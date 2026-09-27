@@ -304,6 +304,29 @@ def test_tv_loss_iso_3d_backward_matches_pytorch():
 
 
 @needs_cuda
+@pytest.mark.parametrize("shape", [(12, 14, 10), (2, 2, 2), (1, 6, 5), (6, 1, 5), (6, 5, 1)])
+def test_tv_loss_iso_3d_backward_ignores_dirty_output_memory(shape):
+    """The backward allocates its output without zeroing it (kernel audit
+    F10): the kernel writes every voxel when each dimension is >= 2, and a
+    degenerate volume still gets an exact zero gradient. Run on reused
+    allocator blocks filled with NaN and with zeros: same bits, finite."""
+    from fasttomo.autograd import _tv_loss_iso_3d_grad_raw
+
+    torch.manual_seed(2)
+    vol = torch.randn(*shape, device=DEVICE)
+    g = torch.ones((), device=DEVICE)
+    grads = []
+    for fill in (float("nan"), 0.0):
+        junk = torch.full(shape, fill, device=DEVICE)
+        del junk                      # the next same-size allocation reuses it
+        grads.append(_tv_loss_iso_3d_grad_raw(vol, g, 1e-7))
+    assert torch.equal(grads[0], grads[1])
+    assert torch.isfinite(grads[0]).all()
+    if min(shape) < 2:
+        assert torch.equal(grads[0], torch.zeros_like(vol))
+
+
+@needs_cuda
 def test_tv_loss_iso_3d_chained_backward_matches_pytorch():
     """Chained loss (data + λ·TV) should yield matching gradients."""
     torch.manual_seed(2)

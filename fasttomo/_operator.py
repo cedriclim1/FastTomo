@@ -55,6 +55,7 @@ from fasttomo._backend import (
     _TC_SINO_LAYERED,
     _TC_VOL_3D,
     _TC_VOL_LAYERED,
+    _check_fp16_range,
     _dtype_to_tc_code,
     _io_dtype_code,
     _stream_ptr,
@@ -292,6 +293,17 @@ class CudaCachedOperator(ProjectionOperator):
     Also owns ``run_sirt``'s CUDA-graph cache (the graphs capture these
     textures, so they must die with them).
 
+    Direct texture writes (kernel audit F6): the caches are created with a
+    surface, so run_sirt's fused kernels can write the updated volume and
+    the residual straight into the textures. ``_mark_vol_written(volume)``
+    records that the volume texture now holds ``volume``; the next ``fp`` of
+    that same tensor (same storage, same autograd version counter, no upload
+    since) skips its ``tc_upload``. ``_mark_sino_written(n)`` /
+    ``bp_from_texture`` do the same for the sinogram texture; ``bp`` of a
+    tensor always uploads. ``_forget_texture_writes()`` drops both records.
+    ``upload_counts`` counts performed and skipped uploads (a debug hook for
+    tests and measurements; CUDA-graph replays are not counted).
+
     Streams: every call uploads into the same texture arrays, so a call on
     one stream must not start before the calls already queued on another
     stream have finished reading them (it overwrote the array under them:
@@ -314,15 +326,16 @@ class CudaCachedOperator(ProjectionOperator):
             _dtype_to_tc_code(dtype)
         self._cos = self._sin = None
         if self._angles_deg is not None:
-            a_rad = (self._angles_deg.to(device=self.device, dtype=torch.float32)
-                     * (math.pi / 180.0))
-            self._cos = a_rad.cos().contiguous()
-            self._sin = a_rad.sin().contiguous()
+            self._cos, self._sin = self._default_trig(self._angles_deg)
         self._vol_handle: int | None = None
         self._sino_handles: dict[int, int] = {}
         # Bumped by every volume upload, so a backward can tell whether the
         # volume texture still holds its forward's volume.
         self._vol_cache_epoch = 0
+        # what a direct (surface) write left in the textures, see above
+        self._vol_tex_token: tuple | None = None
+        self._sino_tex_written: set[int] = set()
+        self.upload_counts = {"vol": 0, "vol_skipped": 0, "sino": 0, "sino_skipped": 0}
         self._sirt_graph_cache = {}
         self._sirt_graph_bad_keys = set()
         # the stream of the latest call that used the textures
@@ -342,6 +355,25 @@ class CudaCachedOperator(ProjectionOperator):
         cur.wait_stream(last)
         self._last_stream = cur
 
+    def _default_trig(self, angles_deg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        a_rad = angles_deg.to(device=self.device, dtype=torch.float32) * (math.pi / 180.0)
+        return a_rad.cos().contiguous(), a_rad.sin().contiguous()
+
+    def _set_default_angles(self, angles_deg: torch.Tensor) -> None:
+        """Replace the default tilt angles (same count) in place: the cos/sin
+        buffers keep their storage, so a CUDA graph captured with this
+        operator reads the new angles on its next replay. Used by run_sirt
+        when it reuses an internal operator (``algebraic._SirtOperatorCache``)."""
+        a = angles_deg.detach()
+        if self._cos is None or a.numel() != self.n_angles:
+            raise ValueError(f"{self._name}: expected {self.n_angles} default angles, "
+                             f"got {a.numel()}")
+        self._angles_deg = a
+        cos_a, sin_a = self._default_trig(a)
+        with torch.cuda.device(self.device):
+            self._cos.copy_(cos_a)
+            self._sin.copy_(sin_a)
+
     def _channels(self) -> int:
         # 4-channel packed-Y mode for fp16 parallel caches when Ny % 4 == 0
         # (TorchRadon's batch-channel-packing trick); rotmat needs continuous
@@ -355,7 +387,7 @@ class CudaCachedOperator(ProjectionOperator):
             kind = _TC_VOL_LAYERED if self.kind == "parallel" else _TC_VOL_3D
             self._vol_handle = int(_core.tc_create(
                 kind, _dtype_to_tc_code(self.dtype), self._channels(),
-                self.Ny, self.Nz, self.Nx))
+                self.Ny, self.Nz, self.Nx, surface=True))
         return self._vol_handle
 
     def _sino_cache(self, n: int) -> int:
@@ -363,8 +395,77 @@ class CudaCachedOperator(ProjectionOperator):
         if h is None:
             h = self._sino_handles[n] = int(_core.tc_create(
                 _TC_SINO_LAYERED, _dtype_to_tc_code(self.dtype), self._channels(),
-                n, self.Ny, self.N_det))
+                n, self.Ny, self.N_det, surface=True))
         return h
+
+    # ── direct texture writes (run_sirt's fused kernels) ────────────────
+    def _vol_write_target(self) -> int | None:
+        """The volume texture handle if kernels can write it directly (it
+        has a surface), else None. Needs the dtype locked. The caller writes
+        on the current stream, ordered after other streams' reads."""
+        if self.dtype is None:
+            return None
+        with torch.cuda.device(self.device):
+            self._order_after_other_streams()
+            h = self._vol_cache()
+        return h if _core.tc_has_surface(h) else None
+
+    def _sino_write_target(self, n: int) -> int | None:
+        """The sinogram texture handle for ``n`` views if kernels can write
+        it directly, else None. Needs the dtype locked. The caller writes on
+        the current stream, ordered after other streams' reads."""
+        if self.dtype is None:
+            return None
+        with torch.cuda.device(self.device):
+            self._order_after_other_streams()
+            h = self._sino_cache(n)
+        return h if _core.tc_has_surface(h) else None
+
+    def _mark_vol_written(self, volume: torch.Tensor) -> None:
+        """A kernel just wrote ``volume``'s values into the volume texture."""
+        self._vol_cache_epoch += 1
+        self._vol_tex_token = (volume.data_ptr(), volume._version, self._vol_cache_epoch)
+
+    def _mark_sino_written(self, n: int) -> None:
+        """A kernel just wrote a sinogram of ``n`` views into that texture."""
+        self._sino_tex_written.add(n)
+
+    def _forget_texture_writes(self) -> None:
+        """Drop the direct-write records (the next fp/bp uploads). The epoch
+        moves on too: a CUDA graph may have rewritten the volume texture
+        since the last recorded write."""
+        if self._vol_tex_token is not None or self._sino_tex_written:
+            self._vol_cache_epoch += 1
+        self._vol_tex_token = None
+        self._sino_tex_written.clear()
+
+    def _vol_texture_holds(self, volume: torch.Tensor) -> bool:
+        return self._vol_tex_token == (
+            volume.data_ptr(), volume._version, self._vol_cache_epoch)
+
+    def _upload_vol(self, volume: torch.Tensor) -> None:
+        """Upload ``volume`` (contiguous, the operator's shape and dtype) into
+        the volume texture and record it, as a skipped ``fp`` upload would
+        need (run_sirt's CUDA graph: once per call instead of per iteration)."""
+        self._lock_dtype(volume)
+        self._check_input(volume, "volume", self.vol_shape)
+        vol = volume.contiguous()
+        with torch.cuda.device(self.device):
+            self._order_after_other_streams()
+            _core.tc_upload(self._vol_cache(), vol.data_ptr(), _stream_ptr(self.device))
+        self.upload_counts["vol"] += 1
+        self._mark_vol_written(vol)
+
+    def _download_vol(self, out: torch.Tensor) -> None:
+        """Copy the volume texture's contents into ``out`` (contiguous, the
+        operator's shape and dtype): the volume a CUDA graph kept only in
+        the texture (run_sirt)."""
+        self._check_input(out, "volume", self.vol_shape)
+        if out.dtype != self.dtype or not out.is_contiguous():
+            raise ValueError(f"{self._name}: _download_vol needs a contiguous {self.dtype} tensor")
+        with torch.cuda.device(self.device):
+            self._order_after_other_streams()
+            _core.tc_download(self._vol_cache(), out.data_ptr(), _stream_ptr(self.device))
 
     def _trig(self, geom):
         if geom is None and self._cos is not None:
@@ -392,6 +493,8 @@ class CudaCachedOperator(ProjectionOperator):
             self._order_after_other_streams()
             h = self._vol_cache()
             vol = volume.contiguous()
+            # the texture already holds `vol` (a direct write, no upload since)
+            upload = not self._vol_texture_holds(vol)
             if self.kind == "parallel":
                 cos_a, sin_a = self._trig(geom)
                 n = cos_a.numel()
@@ -399,39 +502,76 @@ class CudaCachedOperator(ProjectionOperator):
                 _core.forward_project_parallel_cuda_cached(
                     io_dtype, h, vol.data_ptr(), sino.data_ptr(),
                     cos_a.data_ptr(), sin_a.data_ptr(),
-                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device))
+                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
+                    upload=upload)
             else:
                 mats = self._mats(geom)
                 n = mats.shape[0]
                 sino = torch.empty(n, self.Ny, self.N_det, dtype=self.dtype, device=self.device)
                 _core.forward_project_rotmat_cuda_cached(
                     io_dtype, h, vol.data_ptr(), sino.data_ptr(), mats.data_ptr(),
-                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device))
-        self._vol_cache_epoch += 1
+                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
+                    upload=upload)
+        if upload:
+            self._vol_cache_epoch += 1
+            self._vol_tex_token = None
+            self.upload_counts["vol"] += 1
+        else:
+            # unchanged epoch: fp_token() still names the texture's contents
+            self.upload_counts["vol_skipped"] += 1
         return sino
 
     def bp(self, sinogram, geom=None):
         io_dtype = self._lock_dtype(sinogram)
+        return self._bp(io_dtype, sinogram.contiguous(), geom)
+
+    def bp_from_texture(self, geom=None) -> torch.Tensor:
+        """Back-project the sinogram a kernel wrote into the texture for
+        this view count (``_mark_sino_written``), without an upload."""
+        if self.dtype is None:
+            raise RuntimeError(f"{self._name}: bp_from_texture before any upload")
+        vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom)
+        # the fp16 overflow check `backproject` runs (inside an fp16
+        # run_sirt: a device-side flag); the input sinogram is the texture,
+        # so the output stands in for it (an inf is then never blamed on
+        # the input, which the fused residual kernel produced finite)
+        _check_fp16_range(vol, vol.new_zeros(()), self._name)
+        return vol
+
+    def _bp(self, io_dtype, sino, geom):
+        """``bp`` of ``sino``, or (``sino`` None) of the texture's contents."""
         with torch.cuda.device(self.device):
             self._order_after_other_streams()
-            sino = sinogram.contiguous()
             vol = torch.empty(self.Ny, self.Nz, self.Nx, dtype=self.dtype, device=self.device)
             if self.kind == "parallel":
                 cos_a, sin_a = self._trig(geom)
                 n = cos_a.numel()
-                self._check_input(sinogram, "sinogram", (n, self.Ny, self.N_det))
-                _core.back_project_parallel_cuda_cached(
-                    io_dtype, self._sino_cache(n), sino.data_ptr(), vol.data_ptr(),
-                    cos_a.data_ptr(), sin_a.data_ptr(),
-                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device))
             else:
                 mats = self._mats(geom)
                 n = mats.shape[0]
-                self._check_input(sinogram, "sinogram", (n, self.Ny, self.N_det))
+            if sino is None:
+                if n not in self._sino_tex_written:
+                    raise RuntimeError(f"{self._name}: no sinogram of {n} views was "
+                                       "written into the texture")
+                self.upload_counts["sino_skipped"] += 1
+                sino_ptr, upload = 0, False
+            else:
+                self._check_input(sino, "sinogram", (n, self.Ny, self.N_det))
+                self._sino_tex_written.discard(n)
+                self.upload_counts["sino"] += 1
+                sino_ptr, upload = sino.data_ptr(), True
+            if self.kind == "parallel":
+                _core.back_project_parallel_cuda_cached(
+                    io_dtype, self._sino_cache(n), sino_ptr, vol.data_ptr(),
+                    cos_a.data_ptr(), sin_a.data_ptr(),
+                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
+                    upload=upload)
+            else:
                 _core.back_project_rotmat_cuda_cached(
-                    io_dtype, self._sino_cache(n), sino.data_ptr(), vol.data_ptr(),
+                    io_dtype, self._sino_cache(n), sino_ptr, vol.data_ptr(),
                     mats.data_ptr(),
-                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device))
+                    self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
+                    upload=upload)
         return vol
 
     def fp_token(self):

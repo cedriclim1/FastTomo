@@ -586,8 +586,10 @@ ALGORITHMS_NAMES_BEFORE_SPLIT = [
 ]
 
 
-# Added since: plain aliases (the same function objects).
-FASTTOMO_PUBLIC_ADDED = ["run_wbp", "tv_loss_zx"]
+# Public names added deliberately since the split: plain aliases (the same
+# function objects) and release_cached_projectors (run_sirt's kept
+# projector and CUDA graph, kernel audit F8).
+FASTTOMO_PUBLIC_ADDED = ["run_wbp", "tv_loss_zx", "release_cached_projectors"]
 
 
 def test_fasttomo_public_names_unchanged():
@@ -673,6 +675,7 @@ def test_algorithms_public_objects_live_in_submodules():
         "run_fista": fista, "run_fista_tv": fista, "run_genfire": genfire,
         "run_resire": resire, "run_grad_descent": ad, "run_ad_recon": ad,
         "run_mbir": mbir, "refine_angles": alignment,
+        "release_cached_projectors": algebraic,
     }
     assert sorted(owners) == sorted(algo.__all__)
     for name, mod in owners.items():

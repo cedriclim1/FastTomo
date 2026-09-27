@@ -31,7 +31,7 @@ Python package `fasttomo/`:
 | `utilities.py` | `ramp_filter`, `estimate_shifts_xcorr`; re-exports `cylindrical_mask`, `tv_loss_3d`, `apply_shifts*` from their current homes. |
 | `configs.py` | `AdReconConfig` (`OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`), `MbirConfig`. |
 
-Native code `csrc/`: `bindings.cpp` (module), `bindings_cpu.cpp`, `bindings_cuda.cpp` (the CUDA bindings compile to stubs in a CPU-only build); `cpu/` (`projection_parallel.c`, `projection_rotmat.c`, `genfire.c`, `mbir_icd.c`); `cuda/` (`projection_parallel.cu`, `projection_rotmat.cu`, `projection_resire.cu`, `genfire.cu`, `grad_angle.cu`, `tv_loss.cu`, `texture_cache.cu`, `mbir_icd.cu`).
+Native code `csrc/`: `bindings.cpp` (module), `bindings_cpu.cpp`, `bindings_cuda.cpp` (the CUDA bindings compile to stubs in a CPU-only build); `cpu/` (`projection_parallel.c`, `projection_rotmat.c`, `genfire.c`, `mbir_icd.c`); `cuda/` (`projection_parallel.cu`, `projection_rotmat.cu`, `projection_resire.cu`, `genfire.cu`, `grad_angle.cu`, `tv_loss.cu`, `sirt_update.cu` (run_sirt's fused elementwise kernels), `texture_cache.cu`, `mbir_icd.cu`).
 
 ## Frozen algorithms
 

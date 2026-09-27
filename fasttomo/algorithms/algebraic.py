@@ -5,12 +5,22 @@ weighted SIRT (wSIRT).
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from typing import Any, Callable
 
 import torch
 
-from fasttomo._operator import Geometry, _drain_deferred_handles, _make_operator
-from fasttomo._backend import _fp16_overflow_checked
+import fasttomo._core as _core
+from fasttomo._backend import _fp16_overflow_checked, _stream_ptr
+from fasttomo._operator import (
+    CudaCachedOperator,
+    Geometry,
+    _UserProjectorOperator,
+    _drain_deferred_handles,
+    _make_operator,
+)
+from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
@@ -46,6 +56,7 @@ def run_sirt(
     return_loss: bool = False,
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
     progress: bool = False,
+    reuse_graph: bool = True,                   # keep the internal CUDA graph for the next call
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Simultaneous Iterative Reconstruction Technique.
@@ -59,7 +70,11 @@ def run_sirt(
     On CUDA the projections go through a cached projector (built internally
     unless ``projector`` is given) and, when no loss is needed, ``n_iter > 1``
     and ``euler_zyz_deg`` is None, the iteration body runs as a captured
-    CUDA graph cached on the projector.
+    CUDA graph cached on the projector. Without ``projector`` (and with
+    ``reuse_graph=True``) the internal projector and its graph are kept for
+    the next call with the same shapes, dtype, device and options, so
+    repeated calls skip the capture; see :func:`release_cached_projectors`
+    for the memory this keeps and how to free it.
 
     Parameters
     ----------
@@ -80,6 +95,16 @@ def run_sirt(
         Reuse its texture cache (and, on CUDA, CUDA graphs) across calls. Must
         be sized for this volume and sinogram; its angles replace
         ``angles_deg``, and a RotmatProjector needs ``euler_zyz_deg``.
+    reuse_graph : bool
+        CUDA graph path without ``projector`` only (default True): keep the
+        internal projector and its captured graph after the call, so the
+        next call with the same configuration replays it (one configuration
+        is kept, about 4 volumes plus 4 sinograms of GPU memory; see
+        :func:`release_cached_projectors`). False neither uses nor keeps
+        that cache: the call builds its own projector and graph and frees
+        them on return, as before; a configuration kept by earlier calls
+        stays until released. With ``projector`` the graph lives on that
+        projector, whatever this flag says.
 
     Returns
     -------
@@ -96,10 +121,84 @@ def run_sirt(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
-    _fp, _bp, op = _build_fp_bp(
-        sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
-        device, num_threads, projector, euler_zyz_deg,
-    )
+    # Gate of the CUDA-graph path: CUDA input, no per-iteration loss (which
+    # calls .item()), n_iter > 1, parallel geometry. Rotmat mode
+    # (euler_zyz_deg) stays on the eager path because the per-call matrix
+    # tensor can vary, while cached graphs assume fixed captured inputs.
+    wants_loss = bool(return_loss) or loss_callback is not None
+    use_graph = sinogram.is_cuda and not wants_loss and n_iter > 1 and euler_zyz_deg is None
+    graph_key = None
+    cache_key = None
+    if use_graph:
+        graph_key = (Ny, Nz, Nx, n_angles, N_det,
+                     sinogram.dtype,
+                     float(omega),
+                     constraints.positivity,
+                     float(constraints.soft_threshold),
+                     tuple(constraints.support_mask.shape)
+                     if constraints.support_mask is not None else None,
+                     euler_zyz_deg is not None)
+        if projector is None and reuse_graph:
+            # Reuse the internal operator (and the graph captured on it) of
+            # the previous call with this configuration.
+            cache_key = (device, *graph_key)
+            op = _SIRT_OPERATORS.checkout(cache_key)
+            if op is not None:
+                op._set_default_angles(angles_deg)
+                _fp, _bp = _operator_closures(op)
+    if cache_key is None or op is None:
+        _fp, _bp, op = _build_fp_bp(
+            sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
+            device, num_threads, projector, euler_zyz_deg,
+        )
+    # The cached textures the fused kernels may write directly (kernel audit
+    # F6), and the geometry for back-projecting what they wrote.
+    tex_op = _texture_operator(op) if sinogram.is_cuda else None
+    tex_geom = None
+    if tex_op is not None and euler_zyz_deg is not None:
+        tex_geom = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+    try:
+        return _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
+                              (Ny, Nz, Nx), n_angles, N_det, use_graph, graph_key,
+                              return_loss, loss_callback, progress, tex_op, tex_geom)
+    finally:
+        if tex_op is not None:
+            # the textures' contents are not the caller's business any more
+            tex_op._forget_texture_writes()
+        if cache_key is not None and isinstance(op, CudaCachedOperator):
+            _SIRT_OPERATORS.checkin(cache_key, op)
+
+
+def _texture_operator(op) -> CudaCachedOperator | None:
+    """The cached CUDA operator behind ``op`` whose textures the fused SIRT
+    kernels may write: ``op`` itself, or the operator of a plain
+    ``ParallelProjector`` / ``RotmatProjector`` passed as ``projector=``
+    (whose ``forward`` / ``back`` only validate and call it). None for
+    anything else (CPU, a duck-typed or subclassed projector)."""
+    if isinstance(op, CudaCachedOperator):
+        return op
+    if isinstance(op, _UserProjectorOperator):
+        p = op._projector
+        if type(p) in (ParallelProjector, RotmatProjector) and isinstance(p._op, CudaCachedOperator):
+            return p._op
+    return None
+
+
+def _operator_closures(op):
+    """``(_fp, _bp)`` of a parallel operator, as `_build_fp_bp` builds them."""
+    def _fp(v):
+        return op.project(v, None)
+
+    def _bp(s):
+        return op.backproject(s, None)
+    return _fp, _bp
+
+
+def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
+                   vol_shape, n_angles, N_det, use_graph, graph_key,
+                   return_loss, loss_callback, progress, tex_op, tex_geom):
+    """run_sirt after validation and operator selection."""
+    Ny, Nz, Nx = vol_shape
 
     # --- normalisation matrices (computed once with the chosen projector) ---
     ones_sino = torch.ones_like(sinogram)
@@ -115,11 +214,8 @@ def run_sirt(
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
 
     # --- CUDA Graph capture path ----------------------------------------
-    # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
-    # Rotmat mode (euler_zyz_deg) is kept on eager path because the per-call
-    # matrix tensor can vary, while cached graphs assume fixed captured inputs.
     # If capture fails, fall back to the eager loop below.
-    if sinogram.is_cuda and not rec.wants_loss and n_iter > 1 and euler_zyz_deg is None:
+    if use_graph:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
             sinogram=sinogram,
@@ -131,15 +227,9 @@ def run_sirt(
             _bp=_bp,
             constraints=constraints,
             projector=op,
-            key=(Ny, Nz, Nx, n_angles, N_det,
-                 sinogram.dtype,
-                 float(omega),
-                 constraints.positivity,
-                 float(constraints.soft_threshold),
-                 tuple(constraints.support_mask.shape)
-                 if constraints.support_mask is not None else None,
-                 euler_zyz_deg is not None),
+            key=graph_key,
             on_replay=rec.tick,
+            tex_op=tex_op,
         )
         if graph_result is not None:
             return rec.finish(graph_result)
@@ -148,14 +238,137 @@ def run_sirt(
     # The loss is the data MSE before the update (SIRT's loss is pure
     # fidelity; sparsity acts as a proximal constraint, not a loss term).
     for it in rec.iterate(n_iter):
-        raw_res  = sinogram - _fp(volume)
+        fp = _fp(volume)
+        fused = _fused_residual(sinogram, fp, R_sino, want_raw=rec.wants_loss,
+                                tex_op=tex_op)
+        if fused is None:
+            raw_res  = sinogram - fp
+            residual = raw_res * R_sino
+        else:
+            raw_res, residual = fused
         if rec.wants_loss:
             rec.record(it, raw_res.pow(2).mean())
-        residual = raw_res * R_sino
-        volume   = volume + omega * C_vol * _bp(residual)
-        volume   = constraints.apply(volume)
+        # residual None: it went straight into the sinogram texture
+        update = _bp(residual) if residual is not None else tex_op.bp_from_texture(tex_geom)
+        new = _fused_update(volume, update, C_vol, omega, constraints, eager_order=True,
+                            tex_op=tex_op)
+        if new is None:
+            volume = volume + omega * C_vol * update
+            volume = constraints.apply(volume)
+        else:
+            volume = new
 
     return rec.finish(volume)
+
+
+# ---------------------------------------------------------------------------
+# Fused elementwise steps of the SIRT iteration (kernel audit F7)
+# ---------------------------------------------------------------------------
+#
+# One kernel for the residual (sub, mul) and one for the update and the
+# constraints (mul, add, support multiply, positivity clamp, soft
+# threshold), instead of 2 + 5 PyTorch kernels. They round every
+# intermediate exactly where the PyTorch chain materialises a tensor, so the
+# output is bit-identical (csrc/cuda/sirt_update.cu). Used for CUDA fp32 /
+# fp16 tensors of one dtype; anything else (CPU, a duck-typed projector
+# returning another dtype, an unexpected mask shape) returns None and the
+# caller runs the PyTorch chain.
+
+def _fusable(*tensors: torch.Tensor) -> bool:
+    t0 = tensors[0]
+    return (t0.is_cuda and t0.dtype in (torch.float32, torch.float16)
+            and hasattr(_core, "sirt_update_cuda")
+            and all(t.device == t0.device and t.dtype == t0.dtype for t in tensors[1:]))
+
+
+def _tex_target(tex_op, t: torch.Tensor, kind: str) -> int | None:
+    """``tex_op``'s volume / sinogram texture handle if a fused kernel can
+    write ``t`` into it directly, else None."""
+    if tex_op is None or tex_op.dtype != t.dtype or t.device != tex_op.device:
+        return None
+    if kind == "vol":
+        if tuple(t.shape) != tex_op.vol_shape:
+            return None
+        return tex_op._vol_write_target()
+    if t.ndim != 3 or tuple(t.shape[1:]) != (tex_op.Ny, tex_op.N_det):
+        return None
+    return tex_op._sino_write_target(int(t.shape[0]))
+
+
+def _fused_residual(sinogram, fp, R_sino, *, want_raw: bool, tex_op=None):
+    """``(sinogram - fp, (sinogram - fp) * R_sino)`` in one kernel (the first
+    is None unless ``want_raw``), or None if not fusable. With ``tex_op``
+    (a `CudaCachedOperator`) the residual goes straight into its sinogram
+    texture when possible: then it is returned as None and
+    ``tex_op.bp_from_texture`` back-projects it."""
+    if not _fusable(sinogram, fp, R_sino) or not (
+            sinogram.shape == fp.shape == R_sino.shape):
+        return None
+    sino, fp, R = sinogram.contiguous(), fp.contiguous(), R_sino.contiguous()
+    raw = torch.empty_like(sino) if want_raw else None
+    code = 0 if sino.dtype == torch.float32 else 1
+    handle = _tex_target(tex_op, sino, "sino")
+    with torch.cuda.device(sino.device):
+        if handle is not None:
+            n, Ny, N_det = sino.shape
+            _core.sirt_residual_tex_cuda(
+                code, sino.data_ptr(), fp.data_ptr(), R.data_ptr(),
+                0 if raw is None else raw.data_ptr(), handle,
+                n, Ny, N_det, _stream_ptr(sino.device))
+            tex_op._mark_sino_written(n)
+            return raw, None
+        res = torch.empty_like(sino)
+        _core.sirt_residual_cuda(
+            code, sino.data_ptr(), fp.data_ptr(), R.data_ptr(),
+            0 if raw is None else raw.data_ptr(), res.data_ptr(),
+            sino.numel(), _stream_ptr(sino.device))
+    return raw, res
+
+
+def _fused_update(volume, update, C_vol, omega, constraints, *, eager_order: bool,
+                  out: torch.Tensor | None = None, tex_op=None,
+                  texture_resident: bool = False):
+    """``constraints(volume + omega * C_vol * update)`` in one kernel, written
+    to ``out`` (may be ``volume``; default a new tensor) and returned, with
+    the rounding of run_sirt's eager loop (``eager_order``) or of
+    `_sirt_iter_inplace`. None if not fusable. With ``tex_op`` the result
+    also goes into its volume texture when possible, so the next ``fp`` of
+    ``out`` skips its upload. ``texture_resident`` (with ``out`` is
+    ``volume``): the volume lives in the texture, which is read and written
+    instead of ``volume`` (left stale until ``tex_op._download_vol``); None
+    if the texture cannot be written."""
+    if volume.ndim != 3 or not _fusable(volume, update, C_vol) or not (
+            volume.shape == update.shape == C_vol.shape):
+        return None
+    Ny, Nz, Nx = volume.shape
+    mask = constraints._support_for(volume)
+    if mask is not None and not (
+            _fusable(volume, mask) and mask.ndim == 3
+            and tuple(mask.shape[1:]) == (Nz, Nx) and mask.shape[0] in (1, Ny)):
+        return None
+    if out is None:
+        out = torch.empty_like(volume, memory_format=torch.contiguous_format)
+    elif not out.is_contiguous():
+        return None
+    vol, upd, C = volume.contiguous(), update.contiguous(), C_vol.contiguous()
+    if mask is not None:
+        mask = mask.contiguous()
+    handle = _tex_target(tex_op, out, "vol")
+    if texture_resident and (handle is None or out is not volume):
+        return None
+    in_ptr, out_ptr = (0, 0) if texture_resident else (vol.data_ptr(), out.data_ptr())
+    with torch.cuda.device(vol.device):
+        _core.sirt_update_cuda(
+            0 if vol.dtype == torch.float32 else 1, int(eager_order),
+            in_ptr, out_ptr, upd.data_ptr(), C.data_ptr(),
+            0 if mask is None else mask.data_ptr(),
+            int(mask is not None and mask.shape[0] == Ny and Ny > 1),
+            float(omega), int(bool(constraints.positivity)),
+            float(constraints.soft_threshold), Ny, Nz, Nx, _stream_ptr(vol.device),
+            vol_cache_ptr=0 if handle is None else handle)
+    if handle is not None:
+        tex_op._mark_vol_written(out)
+    return out
 
 
 @_fp16_overflow_checked
@@ -356,6 +569,108 @@ def run_wsirt(
 # CUDA Graph helper for run_sirt
 # ---------------------------------------------------------------------------
 
+class _SirtOperatorCache:
+    """The internal projection operator of run_sirt's CUDA-graph path, kept
+    between calls so a repeated call replays the graph captured by the
+    previous one instead of capturing again (kernel audit F8). Public
+    handle: :func:`release_cached_projectors`.
+
+    Keyed by device plus the graph key (volume and sinogram shapes, dtype,
+    omega, positivity, soft threshold, support-mask shape). Each operator
+    holds the one graph of its key and the graph's static buffers. The
+    per-call data never enters the key and is never stale: the sinogram,
+    the normalisations and the support mask are copied into the static
+    buffers before every replay sequence, and the tilt angles into the
+    operator's cos/sin buffers (``CudaCachedOperator._set_default_angles``).
+
+    An operator is taken out while a call uses it (``checkout``) and put
+    back afterwards (``checkin``), so concurrent calls from several threads
+    never share static buffers. One configuration is kept (``maxsize=1``):
+    a call with any other configuration (shape, dtype, device or option)
+    drops the kept operator *before* building its own, so two
+    configurations never coexist in memory; ``clear()`` drops it too.
+    """
+
+    def __init__(self, maxsize: int = 1) -> None:
+        self.maxsize = maxsize
+        self._ops: OrderedDict[tuple, CudaCachedOperator] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def checkout(self, key: tuple) -> CudaCachedOperator | None:
+        """Take the operator for ``key`` (None if not kept). Any operator
+        kept for another configuration is dropped first."""
+        with self._lock:
+            op = self._ops.pop(key, None)
+            stale = list(self._ops.values())
+            self._ops.clear()
+        del stale       # released outside the lock (texture frees sync the device)
+        return op
+
+    def checkin(self, key: tuple, op: CudaCachedOperator) -> None:
+        with self._lock:
+            self._ops[key] = op
+            self._ops.move_to_end(key)
+            evicted = []
+            while len(self._ops) > self.maxsize:
+                evicted.append(self._ops.popitem(last=False)[1])
+        del evicted     # released outside the lock (texture frees sync the device)
+
+    def clear(self) -> int:
+        with self._lock:
+            ops = list(self._ops.values())
+            self._ops.clear()
+        n = len(ops)
+        del ops
+        return n
+
+    def __len__(self) -> int:
+        return len(self._ops)
+
+
+_SIRT_OPERATORS = _SirtOperatorCache()
+
+
+def release_cached_projectors() -> int:
+    """Free the projector and CUDA graph that :func:`run_sirt` keeps between
+    calls.
+
+    Without ``projector=``, a CUDA ``run_sirt`` on the graph path keeps its
+    internal projector for the next call with the same configuration (shapes,
+    dtype, device, ``omega``, constraints), so that call replays the captured
+    CUDA graph instead of building a projector and capturing again. Only one
+    configuration is kept, and a call with a different one drops it before
+    allocating its own. What is kept: the projector's two texture arrays, the
+    graph's static copies of the volume, sinogram, both normalisations and
+    the support mask, and the graph's memory pool (the forward-projection
+    and back-projection outputs): about 4 volumes plus 4 sinograms of
+    device memory, measured 0.36 GiB at 256^3 x 61 views and 2.6 GiB at
+    512^3 x 61 views in fp32. Pass ``run_sirt(..., reuse_graph=False)`` to not keep it in
+    the first place.
+
+    This releases it. The texture arrays go straight back to the driver; the
+    tensors and the graph pool go back to PyTorch's caching allocator, which
+    reuses them for later tensors but still holds them as reserved memory
+    (``torch.cuda.memory_reserved``, visible in ``nvidia-smi``). Call
+    ``torch.cuda.empty_cache()`` afterwards to return that to the driver as
+    well, e.g. for another process or library. A call running concurrently
+    on another thread keeps its projector until it returns (and then keeps
+    it again).
+
+    Returns the number of configurations released (0 or 1). Safe to call at
+    any time, also without CUDA.
+    """
+    n = _SIRT_OPERATORS.clear()
+    if n and torch.cuda.is_available():
+        # the textures were freed by the operators' finalizers; release any
+        # handle whose free was deferred by a capture on this thread
+        _drain_deferred_handles()
+    return n
+
+# Number of CUDA graphs run_sirt has captured in this process (tests use it
+# to tell a replayed graph from a fresh capture).
+_sirt_graph_captures = 0
+
+
 def _run_sirt_cuda_graph(
     volume: torch.Tensor,
     sinogram: torch.Tensor,
@@ -369,6 +684,7 @@ def _run_sirt_cuda_graph(
     projector,
     key: tuple,
     on_replay: Callable[[], None] | None = None,
+    tex_op: CudaCachedOperator | None = None,
 ) -> torch.Tensor | None:
     """
     Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
@@ -417,14 +733,23 @@ def _run_sirt_cuda_graph(
                 soft_threshold=constraints.soft_threshold,
             )
 
-            # Warmup: one eager iteration with the static buffer.
-            # Populates cuFFT plans, allocator pool, projector texture caches.
-            with torch.no_grad():
-                _sirt_iter_inplace(
-                    vol_static, sino_static, C_static, R_static, omega,
-                    _fp, _bp, static_constraints,
-                )
+            # With direct texture writes the captured forward projection
+            # reads the volume texture the previous replay's update wrote,
+            # without an upload; the first replay needs vol_static in the
+            # texture beforehand (loaded below, once per call).
+            # The volume then lives in the texture for the whole replay
+            # sequence (read and written there by the fused update, fetched
+            # into vol_static afterwards), saving a global read and write of
+            # the volume per iteration.
+            resident = _fusable(vol_static) and _tex_target(tex_op, vol_static, "vol") is not None
+            if resident:
+                tex_op._upload_vol(vol_static)
 
+            # No eager warm-up iteration: run_sirt's normalisation
+            # projections already created both texture caches and locked the
+            # dtype, and the iteration body has no lazily initialised library
+            # state (no cuFFT/cuBLAS), so the capture can run first.
+            #
             # Capture the iteration body on the correct device. Use an
             # explicit Stream pinned to the target device so torch.cuda.graph
             # captures on the right device — the implicit side stream is
@@ -438,16 +763,23 @@ def _run_sirt_cuda_graph(
                     with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
                         _sirt_iter_inplace(
                             vol_static, sino_static, C_static, R_static, omega,
-                            _fp, _bp, static_constraints,
+                            _fp, _bp, static_constraints, tex_op=tex_op,
+                            texture_resident=resident,
                         )
                     torch.cuda.synchronize(target_device)
             finally:
                 # Free texture caches of projectors collected during the
                 # capture (their release was deferred, see projector.py).
                 _drain_deferred_handles()
+            if resident and not tex_op._vol_texture_holds(vol_static):
+                # the captured forward projection uploaded after all: the
+                # graph would read a stale vol_static
+                raise RuntimeError("texture-resident SIRT capture is inconsistent")
 
             cache[key] = (g, vol_static, sino_static, C_static, R_static,
-                          mask_static)
+                          mask_static, resident)
+            global _sirt_graph_captures
+            _sirt_graph_captures += 1
 
         except Exception as exc:
             _log.warning(
@@ -459,13 +791,11 @@ def _run_sirt_cuda_graph(
             bad_keys.add(key)
             return None
 
-    g, vol_static, sino_static, C_static, R_static, mask_static = cache[key]
+    g, vol_static, sino_static, C_static, R_static, mask_static, resident = cache[key]
 
-    # Reset the captured static buffer to the caller's starting volume so the
-    # warmup iteration that ran inside the cache-build branch above does not
-    # advance the reconstruction. After this copy each replay applies one
-    # SIRT iteration, yielding exactly n_iter updates for both first-call
-    # and cache-hit paths.
+    # Load the caller's starting volume into the captured static buffer
+    # (the capture itself does not execute, but a cache hit holds the
+    # previous call's result). Each replay then applies one SIRT iteration.
     vol_static.copy_(volume)
     # Keep graph inputs fresh on cache hits; captured CUDA graphs replay with
     # pointer-stable tensors, so dynamic call-time tensors must be copied into
@@ -475,12 +805,17 @@ def _run_sirt_cuda_graph(
     R_static.copy_(R_sino)
     if mask_static is not None:
         mask_static.copy_(constraints.support_mask)
+    if resident:
+        # the graph reads and writes the volume in the texture only
+        tex_op._upload_vol(vol_static)
 
     with torch.cuda.device(target_device):
         for _ in range(n_iter):
             g.replay()
             if on_replay is not None:
                 on_replay()
+        if resident:
+            tex_op._download_vol(vol_static)
         torch.cuda.synchronize(target_device)
 
     return vol_static.clone()
@@ -495,17 +830,35 @@ def _sirt_iter_inplace(
     _fp,
     _bp,
     constraints: ConstraintConfig,
+    tex_op: CudaCachedOperator | None = None,
+    texture_resident: bool = False,
 ) -> None:
     """
     One in-place SIRT iteration on ``vol_static``.
 
     All writes go through in-place ops (``add_``, ``mul_``, ``clamp_``,
-    ``copy_``) so that ``vol_static``'s memory address is stable —
-    a requirement for CUDA Graph capture to replay correctly.
+    ``copy_``) or the fused kernels writing into ``vol_static`` so that
+    ``vol_static``'s memory address is stable — a requirement for CUDA
+    Graph capture to replay correctly. With ``tex_op`` (parallel geometry)
+    the residual and the updated volume also go straight into its textures;
+    ``texture_resident``: the volume lives only in the texture (read and
+    written there; ``vol_static`` is left stale, see `_fused_update`).
     """
-    raw_res  = sinogram - _fp(vol_static)
-    residual = raw_res * R_sino
-    update   = _bp(residual)
+    fp = _fp(vol_static)
+    fused = _fused_residual(sinogram, fp, R_sino, want_raw=False, tex_op=tex_op)
+    if fused is None:
+        update = _bp((sinogram - fp) * R_sino)
+    elif fused[1] is None:
+        update = tex_op.bp_from_texture(None)
+    else:
+        update = _bp(fused[1])
+    if vol_static.is_contiguous() and _fused_update(
+            vol_static, update, C_vol, omega, constraints,
+            eager_order=False, out=vol_static, tex_op=tex_op,
+            texture_resident=texture_resident) is not None:
+        return
+    if texture_resident:
+        raise RuntimeError("texture-resident SIRT update not possible")
     # Avoid creating a temporary for `update * C_vol` to keep allocations
     # inside the graph's memory pool.
     update.mul_(C_vol)

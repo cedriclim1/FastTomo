@@ -169,19 +169,25 @@ static void py_grad_angle_cuda(
 /* ── texture cache (opaque pointer exposed as Python int) ──────────────── */
 
 static long py_tc_create(int kind, int dtype, int channels,
-                         int dim_a, int dim_b, int dim_c) {
+                         int dim_a, int dim_b, int dim_c, bool surface) {
     if (kind < 0 || kind > 2)
         throw std::invalid_argument("tc_create: kind must be 0..2");
     if (dtype < 0 || dtype > 1)
         throw std::invalid_argument("tc_create: dtype must be 0 (fp32) or 1 (fp16)");
     if (channels != 1 && channels != 4)
         throw std::invalid_argument("tc_create: channels must be 1 or 4");
-    TextureCache *tc = tc_create(
+    TextureCache *tc = tc_create_ex(
         static_cast<tc_kind_t>(kind),
         static_cast<tc_dtype_t>(dtype),
         channels,
-        dim_a, dim_b, dim_c);
+        dim_a, dim_b, dim_c, surface ? 1 : 0);
     return reinterpret_cast<long>(tc);
+}
+
+static bool py_tc_has_surface(long handle) {
+    const TextureCache *tc = reinterpret_cast<const TextureCache *>(handle);
+    if (!tc) throw std::invalid_argument("tc_has_surface: null handle");
+    return tc->surf != 0;
 }
 
 static void py_tc_destroy(long handle) {
@@ -203,7 +209,7 @@ static void py_forward_project_parallel_cuda_cached(
     long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, bool upload
 ) {
     forward_project_parallel_cuda_cached(
         io_dtype,
@@ -213,7 +219,7 @@ static void py_forward_project_parallel_cuda_cached(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr), upload ? 1 : 0
     );
 }
 
@@ -223,7 +229,7 @@ static void py_back_project_parallel_cuda_cached(
     long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, bool upload
 ) {
     back_project_parallel_cuda_cached(
         io_dtype,
@@ -233,7 +239,7 @@ static void py_back_project_parallel_cuda_cached(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr), upload ? 1 : 0
     );
 }
 
@@ -242,7 +248,7 @@ static void py_forward_project_rotmat_cuda_cached(
     long cache_ptr,
     long vol_ptr, long sino_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, bool upload
 ) {
     forward_project_rotmat_cuda_cached(
         io_dtype,
@@ -251,7 +257,7 @@ static void py_forward_project_rotmat_cuda_cached(
         reinterpret_cast<void *>(sino_ptr),
         reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr), upload ? 1 : 0
     );
 }
 
@@ -260,7 +266,7 @@ static void py_back_project_rotmat_cuda_cached(
     long cache_ptr,
     long sino_ptr, long vol_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, bool upload
 ) {
     back_project_rotmat_cuda_cached(
         io_dtype,
@@ -269,7 +275,7 @@ static void py_back_project_rotmat_cuda_cached(
         reinterpret_cast<void *>(vol_ptr),
         reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr), upload ? 1 : 0
     );
 }
 
@@ -301,6 +307,71 @@ static void py_tv_loss_iso_3d_grad_cuda(
         Ny, Nz, Nx, eps,
         to_stream(stream_ptr)
     );
+}
+
+static void py_sirt_residual_cuda(
+    int io_dtype,
+    long sino_ptr, long fp_ptr, long R_ptr,
+    long raw_out_ptr, long res_out_ptr,
+    long long n,
+    long stream_ptr
+) {
+    sirt_residual_cuda(
+        io_dtype,
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<const void *>(fp_ptr),
+        reinterpret_cast<const void *>(R_ptr),
+        reinterpret_cast<void *>(raw_out_ptr),
+        reinterpret_cast<void *>(res_out_ptr),
+        n, to_stream(stream_ptr));
+}
+
+static void py_sirt_update_cuda(
+    int io_dtype, int eager_order,
+    long vol_in_ptr, long vol_out_ptr,
+    long upd_ptr, long C_ptr,
+    long mask_ptr, int mask_full,
+    float omega, int positivity, float soft_thr,
+    int Ny, int Nz, int Nx,
+    long stream_ptr, long vol_cache_ptr
+) {
+    sirt_update_cuda(
+        io_dtype, eager_order,
+        reinterpret_cast<const void *>(vol_in_ptr),
+        reinterpret_cast<void *>(vol_out_ptr),
+        reinterpret_cast<const void *>(upd_ptr),
+        reinterpret_cast<const void *>(C_ptr),
+        reinterpret_cast<const void *>(mask_ptr), mask_full,
+        omega, positivity, soft_thr, Ny, Nz, Nx,
+        reinterpret_cast<TextureCache *>(vol_cache_ptr),
+        to_stream(stream_ptr));
+}
+
+static void py_sirt_residual_tex_cuda(
+    int io_dtype,
+    long sino_ptr, long fp_ptr, long R_ptr, long raw_out_ptr,
+    long cache_ptr,
+    int n_angles, int Ny, int N_det,
+    long stream_ptr
+) {
+    sirt_residual_tex_cuda(
+        io_dtype,
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<const void *>(fp_ptr),
+        reinterpret_cast<const void *>(R_ptr),
+        reinterpret_cast<void *>(raw_out_ptr),
+        reinterpret_cast<TextureCache *>(cache_ptr),
+        n_angles, Ny, N_det, to_stream(stream_ptr));
+}
+
+static void py_tc_upload(long handle, long src_ptr, long stream_ptr) {
+    tc_upload(reinterpret_cast<TextureCache *>(handle),
+              reinterpret_cast<const void *>(src_ptr), to_stream(stream_ptr));
+}
+
+static void py_tc_download(long handle, long dst_ptr, long stream_ptr) {
+    tc_download(reinterpret_cast<const TextureCache *>(handle),
+                reinterpret_cast<void *>(dst_ptr), to_stream(stream_ptr));
 }
 
 static void py_genfire_gridding_2d_cuda(
@@ -488,9 +559,18 @@ void register_cuda(py::module_ &m) {
           "Y-axis packing (4 Y-slices per texel) — fp16 only, packing-axis "
           "must be divisible by 4. dim_a/b/c match the source-tensor dims "
           "in C order: vol is (Ny,Nz,Nx); sino is (n_angles,Ny,N_det). "
-          "Returns an opaque integer handle — pass to tc_destroy when done.",
+          "Returns an opaque integer handle — pass to tc_destroy when done. "
+          "surface=True also creates a surface object on a 1-channel cache "
+          "(within the device's surface limits) so fused kernels can write "
+          "the array directly; see tc_has_surface.",
           py::arg("kind"), py::arg("dtype"), py::arg("channels"),
-          py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"));
+          py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"),
+          py::arg("surface") = false);
+
+    m.def("tc_has_surface", &py_tc_has_surface,
+          "True if the TextureCache handle has a surface object (writable "
+          "by the fused SIRT kernels).",
+          py::arg("handle"));
 
     m.def("tc_destroy", &py_tc_destroy,
           py::call_guard<py::gil_scoped_release>(),
@@ -511,7 +591,7 @@ void register_cuda(py::module_ &m) {
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
 
     m.def("back_project_parallel_cuda_cached", &py_back_project_parallel_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
@@ -523,7 +603,7 @@ void register_cuda(py::module_ &m) {
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
 
     m.def("forward_project_rotmat_cuda_cached", &py_forward_project_rotmat_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
@@ -534,7 +614,7 @@ void register_cuda(py::module_ &m) {
           py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
 
     m.def("back_project_rotmat_cuda_cached", &py_back_project_rotmat_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
@@ -545,7 +625,7 @@ void register_cuda(py::module_ &m) {
           py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
 
     m.def("tv_loss_iso_3d_cuda", &py_tv_loss_iso_3d_cuda,
           py::call_guard<py::gil_scoped_release>(),
@@ -575,6 +655,54 @@ void register_cuda(py::module_ &m) {
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("eps"),
           py::arg("stream_ptr") = 0L);
+
+    m.def("sirt_residual_cuda", &py_sirt_residual_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused SIRT residual: raw = sino - fp, res = raw * R (n elements, "
+          "io_dtype 0 = fp32, 1 = fp16). raw_out_ptr / res_out_ptr may be 0.",
+          py::arg("io_dtype"), py::arg("sino_ptr"), py::arg("fp_ptr"), py::arg("R_ptr"),
+          py::arg("raw_out_ptr"), py::arg("res_out_ptr"), py::arg("n"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("sirt_update_cuda", &py_sirt_update_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused SIRT update + constraints: vol_out = constraints(vol_in + "
+          "omega * C * upd), eager (1) or CUDA-graph (0) rounding order; "
+          "mask_ptr 0 = no support mask, mask_full = 1 for a [Ny, Nz, Nx] mask "
+          "(else [1, Nz, Nx]); soft_thr <= 0 disables the soft threshold. "
+          "vol_cache_ptr (0 = none): a volume texture cache with a surface "
+          "that also receives vol_out; with it, vol_in_ptr = 0 reads the "
+          "volume from the texture and vol_out_ptr = 0 skips the global write.",
+          py::arg("io_dtype"), py::arg("eager_order"),
+          py::arg("vol_in_ptr"), py::arg("vol_out_ptr"),
+          py::arg("upd_ptr"), py::arg("C_ptr"),
+          py::arg("mask_ptr"), py::arg("mask_full"),
+          py::arg("omega"), py::arg("positivity"), py::arg("soft_thr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L);
+
+    m.def("sirt_residual_tex_cuda", &py_sirt_residual_tex_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused SIRT residual (sino - fp) * R written into the sinogram "
+          "texture cache cache_ptr (surface required) for a cached "
+          "back-projection with upload=False; raw_out_ptr (sino - fp) may be 0.",
+          py::arg("io_dtype"), py::arg("sino_ptr"), py::arg("fp_ptr"), py::arg("R_ptr"),
+          py::arg("raw_out_ptr"), py::arg("cache_ptr"),
+          py::arg("n_angles"), py::arg("Ny"), py::arg("N_det"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("tc_upload", &py_tc_upload,
+          py::call_guard<py::gil_scoped_release>(),
+          "Copy a contiguous device tensor (the cache's shape and dtype) into "
+          "the TextureCache handle (cudaMemcpy3DAsync, or the 4-channel pack "
+          "kernel), on stream_ptr.",
+          py::arg("handle"), py::arg("src_ptr"), py::arg("stream_ptr") = 0L);
+
+    m.def("tc_download", &py_tc_download,
+          py::call_guard<py::gil_scoped_release>(),
+          "Copy the TextureCache's contents into a contiguous device tensor of "
+          "its source shape and dtype (inverse of tc_upload), on stream_ptr.",
+          py::arg("handle"), py::arg("dst_ptr"), py::arg("stream_ptr") = 0L);
 
     m.def("genfire_gridding_2d_cuda", &py_genfire_gridding_2d_cuda,
           py::call_guard<py::gil_scoped_release>(),

@@ -188,6 +188,7 @@ from fasttomo.algorithms.analytic import (
 )
 from fasttomo.algorithms.algebraic import (
     run_sart,
+    release_cached_projectors,
     run_sirt,
     run_wsirt,
     _run_sirt_cuda_graph,
@@ -285,6 +286,7 @@ __all__ = [
     "run_weighted_backprojection",
     "run_wbp",
     "run_sirt",
+    "release_cached_projectors",
     "run_sart",
     "run_wsirt",
     "run_fista",

@@ -69,7 +69,8 @@ typedef struct {
      * bit-exact corner reads can use it. grad_rotmat_kernel uses this field so that
      * the 8 trilinear corner reads are bit-exact equivalent to global-memory loads. */
     cudaTextureObject_t   tex_point;
-    cudaSurfaceObject_t   surf;     /* used by 4-channel half upload kernel */
+    cudaSurfaceObject_t   surf;     /* 4-channel half upload kernel; direct
+                                     * writes (tc_create_ex want_surface) */
     int                   dim_a;
     int                   dim_b;
     int                   dim_c;
@@ -91,11 +92,22 @@ typedef struct {
 TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
                         int dim_a, int dim_b, int dim_c);
 
+/* tc_create, plus (want_surface != 0) a surface object on 1-channel caches
+ * so kernels can write the array directly (`surf` stays 0 when the extent
+ * exceeds the device's surface limits; 4-channel caches always have one). */
+TextureCache *tc_create_ex(tc_kind_t kind, tc_dtype_t dtype, int channels,
+                           int dim_a, int dim_b, int dim_c, int want_surface);
+
 /* Copy `src` (device-side, contiguous, matching the cache's recorded shape
  * and dtype) into the existing cudaArray. For channels==1 this is a single
  * cudaMemcpy3DAsync; for channels==4 a small pack kernel reorganises 4
  * consecutive Y-slices into channel-packed texels via surf2DLayeredwrite. */
 void tc_upload(TextureCache *tc, const void *src, cudaStream_t stream);
+
+/* Inverse of tc_upload: copy the cache's contents into the contiguous device
+ * buffer `dst` of the cache's source shape and dtype (volume kinds, and
+ * 1-channel sinogram caches). Values are copied bit for bit. */
+void tc_download(const TextureCache *tc, void *dst, cudaStream_t stream);
 
 /* Best-effort teardown that never throws: destroys every handle that exists
  * (surface, both textures, array), frees `tc`, and returns the first error

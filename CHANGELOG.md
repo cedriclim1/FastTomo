@@ -72,6 +72,38 @@ never checked; a direct fp16 call on CUDA pays one flag read (0.06-0.07 ms measu
   (alias of `tv_loss_xz`).
 - cp314 wheels (CPU and CUDA); `wheels.yml` uses cibuildwheel v3.4.1.
 
+### Faster CUDA `run_sirt` (bit-identical results; new `release_cached_projectors`, `reuse_graph=`)
+
+- Repeated `run_sirt` calls without `projector=` reuse the previous call's
+  internal projector and CUDA graph when shapes, dtype, device and options
+  match, instead of building a projector, running an eager warm-up iteration
+  and capturing a new graph every call. New sinogram data, angles and
+  support masks of the same shapes are copied into the graph's buffers.
+- **Memory kept after `run_sirt` returns** (CUDA graph path, no
+  `projector=`): exactly one configuration is kept, i.e. its two texture
+  arrays, the graph's static volume, sinogram, normalisations and support
+  mask, and the graph's memory pool, about 4 volumes plus 4 sinograms.
+  Measured in fp32 at 61 views: **0.36 GiB at 256^3, 2.6 GiB at 512^3**. A
+  call with a different shape, dtype, device or option drops the kept one
+  before allocating its own. New public `fasttomo.release_cached_projectors()`
+  frees it (the texture arrays go back to the driver at once, the rest to
+  PyTorch's caching allocator; follow with `torch.cuda.empty_cache()` to
+  hand that back to the driver too). New keyword `run_sirt(...,
+  reuse_graph=False)` keeps nothing, for a single reconstruction that
+  needs the memory back.
+- The iteration's elementwise work runs in two fused CUDA kernels (residual;
+  update plus support, positivity and soft-threshold constraints) instead of
+  up to seven PyTorch kernels, rounding exactly like the PyTorch chain.
+- The residual and the updated volume are written straight into the
+  projector's textures, removing the two device-to-device texture uploads
+  per iteration (102 -> 3 per 50-iteration call); on the graph path the
+  volume stays in the texture for the whole call.
+- `run_sirt(n_iter=50)`, 61 views, RTX PRO 6000 Blackwell: 128^3 11.3 ->
+  9.5 ms (graph path), 12.1 -> 11.4 ms (eager path); 256^3 80.9 -> 76.7 ms
+  (graph), 86.6 -> ~80.8 ms (eager). Outputs are bit-identical to before.
+- The `tv_loss_3d` backward no longer zero-fills its output (the kernel
+  writes every voxel): 256^3 143 -> 95 us.
+
 ### ⚠ `run_mbir` is single-threaded on CPU by default
 
 `run_mbir` used to run its CPU ICD sweep on a hardcoded 4 OpenMP threads. It
