@@ -455,8 +455,12 @@ def test_fbp_window_keyword(backend):
         rec = ft.run_fbp(sino, ang, window=w)
         assert abs(rec[:, inner].mean().item() - 1.0) < 5e-3, w
         assert ft.run_fbp(noisy, ang, window=w)[:, inner].std() < 0.8 * std_none, w
-    from fasttomo.algorithms.analytic import _fbp_filter_fp32
-    want = ft.back_project(_fbp_filter_fp32(sino, "hann"), ang) * (math.pi / 180)
+    from fasttomo.algorithms.analytic import _fbp_filter_fp32, _fbp_gather_backproject
+    filtered = _fbp_filter_fp32(sino, "hann")
+    if backend.type == "cpu":        # run_fbp's CPU back-projection is the gather
+        want = _fbp_gather_backproject(filtered, ang, N, N, None) * (math.pi / 180)
+    else:
+        want = ft.back_project(filtered, ang) * (math.pi / 180)
     torch.testing.assert_close(ft.run_fbp(sino, ang, window="hann"), want,
                                rtol=1e-5, atol=1e-5)
     with pytest.raises(ValueError, match="window"):
