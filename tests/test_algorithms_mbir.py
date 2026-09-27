@@ -739,6 +739,47 @@ def test_mbir_cpu_parallel_order_is_the_group_order(monkeypatch):
         assert np.array_equal(orders[0].numpy(), want), kernel
 
 
+def test_mbir_group_support_check_runs_on_target_cuda_device(monkeypatch):
+    """_mbir_resolve_sweep must query group-sweep support under the same CUDA
+    device as the reconstruction tensors. Otherwise the check can read another
+    device's shared-memory limits and pick a sweep mode that then fails at
+    launch time on the real device."""
+    from fasttomo.algorithms import mbir as M
+
+    active_device = {"value": None}
+
+    class _DeviceCtx:
+        def __init__(self, dev):
+            self.dev = torch.device(dev)
+
+        def __enter__(self):
+            active_device["value"] = self.dev
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            active_device["value"] = None
+            return False
+
+    def fake_cuda_device(dev):
+        return _DeviceCtx(dev)
+
+    target = torch.device("cuda:3")
+    calls = []
+
+    def fake_supported(*, n_angles, N_det):
+        calls.append((n_angles, N_det, active_device["value"]))
+        return active_device["value"] == target
+
+    monkeypatch.setattr(M.torch.cuda, "device", fake_cuda_device)
+    monkeypatch.setattr(M._core, "mbir_group_sweep_supported", fake_supported, raising=False)
+
+    cos_a = torch.tensor([0.5, 0.9], dtype=torch.float32)
+    S = M._mbir_resolve_sweep("auto", target, cos_a, Nz=16, Nx=16, N_det=16)
+    assert S > 0
+    assert calls == [(2, 16, target)]
+    assert active_device["value"] is None
+
+
 @needs_cuda
 def test_mbir_cuda_sweep_requires_work_buffer():
     import fasttomo._core as _core

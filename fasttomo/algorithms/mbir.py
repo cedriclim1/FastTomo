@@ -255,8 +255,13 @@ def _mbir_resolve_sweep(sweep_kernel: str, device: torch.device, cos_a: torch.Te
         return 0
     n_angles = cos_a.numel()
     S = _mbir_group_spacing(cos_a, Nz, Nx, N_det)
-    fits = (device.type != "cuda"
-            or bool(_core.mbir_group_sweep_supported(n_angles=n_angles, N_det=N_det)))
+    if device.type != "cuda":
+        fits = True
+    else:
+        # Query support on the reconstruction tensor's device, not whichever
+        # CUDA device happens to be current in this thread.
+        with torch.cuda.device(device):
+            fits = bool(_core.mbir_group_sweep_supported(n_angles=n_angles, N_det=N_det))
     if S > 0 and fits:
         return S
     if sweep_kernel == "auto":
