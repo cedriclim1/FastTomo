@@ -429,6 +429,53 @@ def atom_red_loss(
     return 0.5 * ((volume - target) ** 2).mean()
 
 
+# ── Inter-atom repulsion loss ─────────────────────────────────────────────
+
+def atom_repulsion_loss(
+    volume: torch.Tensor,
+    *,
+    min_bond_vox: float,
+) -> torch.Tensor:
+    """Differentiable pairwise repulsion loss — penalizes density pairs closer
+    than the minimum physical bond distance.
+
+    Convolves the clamped-positive volume with a spherical forbidden-zone
+    kernel (radius = ``min_bond_vox``, center zeroed to exclude self) to
+    produce a *neighbour-density field*, then returns:
+
+        loss = mean( clamp(vol, 0) * neighbour_density )
+
+    High loss ↔ two blobs sitting within the forbidden zone. Gradients flow
+    through both ``volume`` terms, driving the optimizer to either reduce
+    one atom's amplitude or push the blobs apart.
+
+    Args:
+        volume:        ``[Ny, Nz, Nx]`` float32 tensor.
+        min_bond_vox:  Forbidden-zone radius in voxels. Convert from Å with
+                       ``min_bond_ang / pixel_angstrom``.
+
+    Returns:
+        Scalar tensor on the same device as ``volume``.
+    """
+    if volume.dtype != torch.float32:
+        raise TypeError(f"atom_repulsion_loss is fp32-only (got {volume.dtype}).")
+    if volume.ndim != 3:
+        raise ValueError(
+            f"atom_repulsion_loss expects [Ny, Nz, Nx], got {tuple(volume.shape)}"
+        )
+
+    R = max(1, int(math.ceil(min_bond_vox)))
+    coords = torch.arange(-R, R + 1, device=volume.device, dtype=torch.float32)
+    zz, yy, xx = torch.meshgrid(coords, coords, coords, indexing="ij")
+    r2 = zz ** 2 + yy ** 2 + xx ** 2
+    kernel = ((r2 > 0) & (r2 <= min_bond_vox ** 2)).float()[None, None]
+
+    vol_pos = volume.clamp(min=0)
+    x = F.pad(vol_pos[None, None], (R,) * 6, mode="constant", value=0.0)
+    neighbor_density = F.conv3d(x, kernel)[0, 0]
+    return (vol_pos * neighbor_density).mean()
+
+
 # ── In-line Gaussian-atom projection ──────────────────────────────────────
 
 @torch.no_grad()

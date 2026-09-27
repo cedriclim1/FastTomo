@@ -66,6 +66,7 @@ from fasttomo.regularizers import (
     logsum_sparsity,
     tilt_ssim_loss,
     atom_red_loss,
+    atom_repulsion_loss,
     gaussian_atom_project,
 )
 from fasttomo.algorithms import (
@@ -81,6 +82,7 @@ from fasttomo.algorithms import (
     refine_angles,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
+from fasttomo.atom_tracer import AtomList, trace_atoms
 
 __all__ = [
     "forward_project",
@@ -98,6 +100,7 @@ __all__ = [
     "logsum_sparsity",
     "tilt_ssim_loss",
     "atom_red_loss",
+    "atom_repulsion_loss",
     "gaussian_atom_project",
     "run_fbp",
     "run_weighted_backprojection",
@@ -111,4 +114,6 @@ __all__ = [
     "refine_angles",
     "ParallelProjector",
     "RotmatProjector",
+    "AtomList",
+    "trace_atoms",
 ]
