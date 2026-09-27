@@ -20,6 +20,14 @@ cmake.version = ">=3.18"
 cmake.build-type = "Release"
 wheel.packages = ["fasttomo"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA GPU (added automatically by tests/conftest.py)",
+    "multi_gpu: needs two CUDA GPUs (added automatically by tests/conftest.py)",
+    "op(name): the operation whose dtype capabilities (conftest.DTYPE_CAPS) the dtype fixture applies",
+]
+
 [tool.ruff.lint]
 # ruff's classic default rule set, pinned so newer ruff releases (which
 # widen the default) do not change what `ruff check fasttomo tests` reports.

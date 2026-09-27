@@ -12,11 +12,12 @@ cudart linkage actually works at runtime.
 """
 
 import os
+
+import fasttomo._core as _core
 import pytest
 import torch
 
 import fasttomo as ft
-import fasttomo._core as _core
 
 
 def test_package_imports():
@@ -24,13 +25,23 @@ def test_package_imports():
 
 
 def test_split_modules_import():
+    import fasttomo.algorithms as algorithms
     import fasttomo.projection as projection
     import fasttomo.utilities as utilities
-    import fasttomo.algorithms as algorithms
 
     assert hasattr(projection, "forward_project")
     assert hasattr(utilities, "ramp_filter")
     assert hasattr(algorithms, "run_sirt")
+
+
+def test_algorithm_subpackage_is_installed():
+    """fasttomo/algorithms/ is a package: the wheel must ship its modules."""
+    import importlib
+
+    for mod in ("_common", "analytic", "algebraic", "fista", "ad", "genfire",
+                "resire", "alignment", "mbir"):
+        importlib.import_module(f"fasttomo.algorithms.{mod}")
+    importlib.import_module("fasttomo._backend")
 
 
 def test_cuda_available_matches_env():
