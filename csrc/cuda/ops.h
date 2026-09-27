@@ -345,8 +345,8 @@ void mbir_forward_project_cuda(
  *                       order is generated on the device from perm_key
  *                       (see mbir_perm_* in mbir_icd.cu).
  *   perm_key          : 64-bit key of this outer iteration's order.
- *   d_work            : scratch of Ny*Nz*Nx float4 (16 bytes per voxel,
- *                       16-byte aligned), reusable across calls.
+ *   d_work            : scratch of Ny*Nz*Nx float2 (8 bytes per voxel,
+ *                       8-byte aligned), reusable across calls.
  *   sigma             : current noise std for the Huber surrogate.
  */
 void mbir_icd_sweep_cuda(

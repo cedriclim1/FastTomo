@@ -318,7 +318,7 @@ def _mbir_icd_sweep_cuda(
     e_sino: torch.Tensor,             # [n_angles, Ny, N_det] fp32, updated in place
     lambdas: torch.Tensor | None,     # [n_angles, Ny, N_det] fp32
     vol_snap: torch.Tensor,           # [Ny, Nz, Nx] fp32
-    work: torch.Tensor,               # [Ny * Nz * Nx * 4] fp32 scratch
+    work: torch.Tensor,               # [Ny * Nz * Nx * 2] fp32 scratch
     cos_a: torch.Tensor,
     sin_a: torch.Tensor,
     *,
@@ -352,7 +352,7 @@ def _mbir_icd_sweep_cuda(
         ("volume", volume, (Ny, Nz, Nx)),
         ("e_sino", e_sino, (n_angles, Ny, N_det)),
         ("volume_snapshot", vol_snap, (Ny, Nz, Nx)),
-        ("work", work, (Ny * Nz * Nx * 4,)),
+        ("work", work, (Ny * Nz * Nx * 2,)),
         ("lambdas", lambdas, (n_angles, Ny, N_det)),
         ("cos_a (angles)", cos_a, (n_angles,)),
         ("sin_a (angles)", sin_a, (n_angles,)),
@@ -442,9 +442,9 @@ def _run_mbir_single_scale(
         e_sino.sub_(d_offsets.view(n_angles, 1, 1))
 
     Nvox = Nz * Nx
-    # CUDA sweep scratch (per voxel: order index, pre-sweep value, prior
-    # sums; 16 bytes), allocated once per level and reused every iteration.
-    work = (torch.empty(Ny * Nvox * 4, dtype=torch.float32, device=device)
+    # CUDA sweep scratch (per voxel: its two prior sums; 8 bytes),
+    # allocated once per level and reused every iteration.
+    work = (torch.empty(Ny * Nvox * 2, dtype=torch.float32, device=device)
             if device.type == "cuda" else None)
     history: list[float] = []
     sigma_cur = float(sigma)
@@ -620,8 +620,8 @@ def run_mbir(
     the residual ``e = g - A f - d`` after each outer iteration; indices run
     across multires levels. Stops a level early when the relative volume
     change falls below ``convergence_tol``. On CUDA each level allocates a
-    sweep scratch buffer of 16 bytes per voxel of that level (256 MiB at
-    256^3, 2 GiB at 512^3), released when the level returns.
+    sweep scratch buffer of 8 bytes per voxel of that level (128 MiB at
+    256^3, 1 GiB at 512^3), released when the level returns.
 
     Parameters
     ----------

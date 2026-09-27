@@ -14,8 +14,7 @@
  *       (which is ray-marching detector-driven); this voxel-driven model is
  *       what the ICD column-A access pattern reproduces.
  *   mbir_sweep_prepare_kernel   - fully parallel part of an outer iteration:
- *       the per-slice voxel order (generated on the device) and, for every
- *       step, the voxel's pre-sweep value and qGGMRF prior sums.
+ *       every voxel's qGGMRF prior sums, in natural voxel order.
  *   icd_sweep_mbir_kernel       - the sequential part: one warp per Y-slice
  *       walks the order, reduces the data term over the angles with warp
  *       shuffles and applies the closed-form update; lanes write the
@@ -29,6 +28,7 @@
  */
 
 #include "common.cuh"
+#include <cuda_pipeline.h>
 #include <cfloat>
 #include <cmath>
 #include <stdexcept>
@@ -221,19 +221,24 @@ __global__ static void forward_project_mbir_kernel(
  * so the prior is Jacobi within a slice as well as across Y. The CPU sweep
  * does the same.
  *
- * 1. mbir_sweep_prepare_kernel, one thread per (slice, step), fully parallel:
- *    rec[iy][s] = (j, f_j, n1_j, n2_j) with j the voxel visited at step s,
- *    f_j its value before the sweep and n1_j, n2_j its prior sums. None of
- *    these depends on the sweep: a voxel is written only when it is
- *    visited (each order is a permutation), so f_j at its visit is its
- *    pre-sweep value, and the prior reads only the snapshot and f_j. The
- *    26 neighbour terms are summed in the order of the previous kernel's
- *    warp reduction, so the sums are bit-identical to computing them inside
- *    the sweep.
+ * 1. mbir_sweep_prepare_kernel, one thread per voxel in natural order,
+ *    fully parallel: prior[iy][j] = (n1_j, n2_j), the qGGMRF prior sums of
+ *    voxel j from the snapshot and j's value before the sweep. The 26
+ *    neighbour terms are summed in the order of the original 64-thread
+ *    kernel's warp reduction, so the sums are bit-identical to computing
+ *    them inside the sweep. (Until phase 1b this kernel ran in the visiting
+ *    order and also stored j and f_j per step, 16 bytes per voxel; the
+ *    stencil gathers were then uncoalesced: 3.2 ms instead of 1 ms at
+ *    256^3. Natural order gives the same sums, bit for bit.)
  * 2. icd_sweep_mbir_kernel: the sequential part. One warp owns one Y-slice
- *    (grid Ny x 32 threads) and walks rec[iy][*]; per voxel it computes the
- *    data-term sums over the angles, all-reduces them across the warp, and
- *    applies the closed-form update.
+ *    (grid Ny x 32 threads) and walks the slice's order: step s visits
+ *    voxel j = order(s) (the in-kernel Feistel order, or the explicit
+ *    array), reads its value f_j from the live volume and its prior sums
+ *    from prior[iy][j]; per voxel it computes the data-term sums over the
+ *    angles, all-reduces them across the warp, and applies the closed-form
+ *    update. f_j read from the live volume is still the pre-sweep value:
+ *    each order is a permutation, so a voxel is written only when it is
+ *    visited.
  *
  * Ownership, which makes the non-atomic error-sinogram writes safe without
  * any barrier:
@@ -300,14 +305,12 @@ __device__ __forceinline__ void mbir_prior_term(
     }
 }
 
-/* One thread per (slice, step). rec is [Ny, Nz*Nx] float4:
- * (voxel index as int bits, pre-sweep value, n1, n2). */
+/* One thread per voxel, natural order (coalesced stencil gathers).
+ * prior is [Ny, Nz*Nx] float2: (n1, n2) of that voxel. */
 __global__ static void mbir_sweep_prepare_kernel(
-    float4 *__restrict__       rec,
+    float2 *__restrict__       prior,
     const float *__restrict__  volume,
     const float *__restrict__  snap,
-    const int   *__restrict__  perm,
-    unsigned long long         perm_key,
     int Ny, int Nz, int Nx,
     const MbirHyper H
 ) {
@@ -315,17 +318,10 @@ __global__ static void mbir_sweep_prepare_kernel(
     const size_t total = (size_t)Ny * nvox;
     for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
          t += (size_t)gridDim.x * blockDim.x) {
-        const int iy = (int)(t / nvox);
-        const int s  = (int)(t - (size_t)iy * nvox);
-        int lin;
-        if (perm) {
-            lin = perm[t];
-        } else {
-            const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
-            lin = mbir_perm_index(P, s);
-        }
-        const float fj = volume[(size_t)iy * nvox + lin];
-        /* The previous kernel had lane nb compute neighbour nb (lanes 26..31
+        const int iy  = (int)(t / nvox);
+        const int lin = (int)(t - (size_t)iy * nvox);
+        const float fj = volume[t];
+        /* The original kernel had lane nb compute neighbour nb (lanes 26..31
          * and the second warp contributed 0) and reduced with a shfl tree:
          * v[i] += v[i + off] for off = 16, 8, 4, 2, 1, then + 0 for the
          * second warp. Same terms, same order. */
@@ -341,8 +337,47 @@ __global__ static void mbir_sweep_prepare_kernel(
                 v2[i] = v2[i] + v2[i + off];
             }
         }
-        rec[t] = make_float4(__int_as_float(lin), fj, v1[0] + 0.0f, v2[0] + 0.0f);
+        prior[t] = make_float2(v1[0] + 0.0f, v2[0] + 0.0f);
     }
+}
+
+/* The record of step s of a slice: (voxel index as int bits, its value
+ * before the sweep, n1, n2). The value comes from the live volume: the voxel
+ * has not been visited yet (see the semantics above). */
+__device__ __forceinline__ float4 mbir_fetch(
+    const int *perm_slice, const MbirPerm &P, int s,
+    const float *vol_slice, const float2 *__restrict__ prior_slice
+) {
+    const int lin = mbir_voxel(perm_slice, P, s);
+    const float2 pr = __ldg(prior_slice + lin);
+    return make_float4(__int_as_float(lin), vol_slice[lin], pr.x, pr.y);
+}
+
+/* The sequential kernel reads its records from a shared-memory ring of
+ * MBIR_RING steps, refilled MBIR_WARP steps at a time between blocks of 32
+ * steps: lane l computes the voxel index of step s0 + l in parallel with
+ * the other lanes and copies the voxel's value and prior sums into the ring
+ * with asynchronous global->shared copies (cp.async; synchronous below
+ * sm_80), waited for 32 steps later. Neither the order computation nor the
+ * two dependent loads sit on the per-voxel chain (computing them per step
+ * there made the sweep 25-35 % slower), and the per-step loop has no refill
+ * branch (one made it 10 % slower). A voxel's value read up to 96 steps
+ * early is still its pre-sweep value: it is written only when visited, and
+ * its copy has landed by then. */
+#define MBIR_RING 128
+__device__ __forceinline__ void mbir_ring_fill_async(
+    float4 *ring, int s0, int nvox, int lane, const int *perm_slice, const MbirPerm &P,
+    const float *vol_slice, const float2 *prior_slice
+) {
+    const int s = s0 + lane;
+    if (s < nvox) {
+        const int lin = mbir_voxel(perm_slice, P, s);
+        float4 *slot = ring + (s & (MBIR_RING - 1));
+        reinterpret_cast<int *>(slot)[0] = lin;
+        __pipeline_memcpy_async(reinterpret_cast<float *>(slot) + 1, vol_slice + lin, 4);
+        __pipeline_memcpy_async(reinterpret_cast<float2 *>(slot) + 1, prior_slice + lin, 8);
+    }
+    __pipeline_commit();
 }
 
 /* Per-pixel data-term contribution: w = b(r)·λ/σ², then
@@ -423,7 +458,9 @@ __device__ __forceinline__ void mbir_slot_partial(
 
 template <int K, bool LAM, bool HUB>
 __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
-    const float4 *__restrict__ rec,              /* [Ny, Nz*Nx] from the prepare kernel */
+    const float2 *__restrict__ prior,            /* [Ny, Nz*Nx] from the prepare kernel */
+    const int   *__restrict__  perm,             /* [Ny, Nz*Nx] explicit order, or null */
+    unsigned long long         perm_key,         /* in-kernel order when perm is null */
     float *__restrict__        volume,           /* [Ny, Nz, Nx] live (write only here) */
     float *__restrict__        e_sino,           /* [n_angles, Ny, N_det] live */
     const float *__restrict__  lambdas,          /* [n_angles, Ny, N_det] (LAM) */
@@ -439,7 +476,9 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
     if (iy >= Ny || nvox <= 0) return;                 /* block-uniform */
 
     float *vol_slice = volume + (size_t)iy * nvox;
-    const float4 *rec_slice = rec + (size_t)iy * nvox;
+    const float2 *prior_slice = prior + (size_t)iy * nvox;
+    const int *perm_slice = perm ? perm + (size_t)iy * nvox : nullptr;
+    const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
     /* Row (ia, iy) of e / lambdas starts at (ia * Ny + iy) * N_det. */
     const size_t row_stride = (size_t)Ny * N_det;
     float *e_base = e_sino + (size_t)iy * N_det;
@@ -454,9 +493,19 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
         sa[k] = (ia < n_angles) ? sin_a[ia] : 0.0f;
     }
 
-    /* Pipeline: rec two steps ahead, the next voxel's e values one ahead. */
-    float4 R_c = rec_slice[0];
-    float4 R_n = (nvox > 1) ? rec_slice[1] : R_c;
+    /* Pipeline: records from the ring two steps ahead, the next voxel's e
+     * values one ahead. The steps run in blocks of 32; before block s0 the
+     * warp waits for block s0 + 32 (copied during block s0 - 32) and starts
+     * copying block s0 + 64 into the slots of block s0 - 64, whose last
+     * read was at step s0 - 35. Block s0 reads steps up to s0 + 33. */
+    __shared__ float4 ring[MBIR_RING];
+    mbir_ring_fill_async(ring, 0, nvox, lane, perm_slice, P, vol_slice, prior_slice);
+    mbir_ring_fill_async(ring, MBIR_WARP, nvox, lane, perm_slice, P, vol_slice, prior_slice);
+    __pipeline_wait_prior(0);
+    mbir_ring_fill_async(ring, 2 * MBIR_WARP, nvox, lane, perm_slice, P, vol_slice, prior_slice);
+    __syncwarp();
+    float4 R_c = ring[0];
+    float4 R_n = (nvox > 1) ? ring[1] : R_c;
     MbirSlot C[K], N[K];
     mbir_load_slots<K, LAM>(C, ca, sa, __float_as_int(R_c.x), Nx, H, lane, n_angles, N_det,
                             e_base, lam_base, row_stride);
@@ -467,12 +516,20 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
     float pe0[K], pe1[K];
     bool  pending = false;                              /* warp-uniform */
 
-    for (int s = 0; s < nvox; s++) {
+    for (int s0 = 0; s0 < nvox; s0 += MBIR_WARP) {
+      if (s0 > 0) {
+        __pipeline_wait_prior(0);       /* this lane's copies of block s0 + 32 */
+        __syncwarp();                   /* visible to the warp; old slots all read */
+        mbir_ring_fill_async(ring, s0 + 2 * MBIR_WARP, nvox, lane, perm_slice, P, vol_slice,
+                             prior_slice);
+      }
+      const int s_end = min(s0 + MBIR_WARP, nvox);
+      for (int s = s0; s < s_end; s++) {
         const bool has_next = (s + 1 < nvox);           /* warp-uniform */
         if (has_next)
             mbir_load_slots<K, LAM>(N, ca, sa, __float_as_int(R_n.x), Nx, H, lane, n_angles,
                                     N_det, e_base, lam_base, row_stride);
-        const float4 R_nn = (s + 2 < nvox) ? rec_slice[s + 2] : R_n;
+        const float4 R_nn = (s + 2 < nvox) ? ring[(s + 2) & (MBIR_RING - 1)] : R_n;
 
         /* C was loaded before the previous voxel's stores: patch it. A pixel
          * the previous voxel wrote lies in a row this lane owns, so C then
@@ -542,6 +599,7 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
         for (int k = 0; k < K; k++) C[k] = N[k];
         R_c = R_n;
         R_n = R_nn;
+      }
     }
 
     /* The per-tilt offsets d_k enter only through `e_sino`: the host keeps
@@ -552,7 +610,9 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
  * l, l+32, ... directly in global memory (no register slots), with the
  * same ownership, order and arithmetic. */
 __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_generic_kernel(
-    const float4 *__restrict__ rec,
+    const float2 *__restrict__ prior,
+    const int   *__restrict__  perm,
+    unsigned long long         perm_key,
     float *__restrict__        volume,
     float *__restrict__        e_sino,
     const float *__restrict__  lambdas,
@@ -568,13 +628,15 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_generic_kerne
     if (iy >= Ny || nvox <= 0) return;
 
     float *vol_slice = volume + (size_t)iy * nvox;
-    const float4 *rec_slice = rec + (size_t)iy * nvox;
+    const float2 *prior_slice = prior + (size_t)iy * nvox;
+    const int *perm_slice = perm ? perm + (size_t)iy * nvox : nullptr;
+    const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
     const size_t row_stride = (size_t)Ny * N_det;
     float *e_base = e_sino + (size_t)iy * N_det;
     const float *lam_base = lambdas ? lambdas + (size_t)iy * N_det : nullptr;
 
     for (int s = 0; s < nvox; s++) {
-        const float4 R = rec_slice[s];
+        const float4 R = mbir_fetch(perm_slice, P, s, vol_slice, prior_slice);
         const int lin = __float_as_int(R.x);
         const float x = (lin % Nx) - H.half_x;
         const float z = (lin / Nx) - H.half_z;
@@ -671,7 +733,7 @@ void mbir_icd_sweep_cuda(
     const float *d_lambdas,        /* [n_angles, Ny, N_det] or nullptr */
     const int   *d_perm,           /* [Ny, Nz*Nx] int32, or nullptr */
     unsigned long long perm_key,   /* in-kernel order when d_perm is null */
-    float       *d_work,           /* [Ny, Nz*Nx, 4] fp32 scratch */
+    float       *d_work,           /* [Ny, Nz*Nx, 2] fp32 scratch */
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
@@ -694,10 +756,9 @@ void mbir_icd_sweep_cuda(
     H.huber_T = huber_T; H.huber_delta = huber_delta; H.sigma = sigma;
     H.half_x = g.half_x; H.half_z = g.half_z; H.half_det = g.half_det;
 
-    /* 1. Order, pre-sweep values and prior sums of every (slice, step):
-     *    a grid-stride loop over one full wave of resident 256-thread blocks
-     *    (3 per SM on sm_120 at 70 registers/thread: 24 of 48 warps). */
-    float4 *rec = reinterpret_cast<float4 *>(d_work);
+    /* 1. Prior sums of every voxel, natural order: a grid-stride loop over
+     *    one full wave of resident 256-thread blocks. */
+    float2 *prior = reinterpret_cast<float2 *>(d_work);
     int n_sm = 0, dev = 0, per_sm = 0;
     FASTTOMO_CUDA_CHECK(cudaGetDevice(&dev));
     FASTTOMO_CUDA_CHECK(cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev));
@@ -708,7 +769,7 @@ void mbir_icd_sweep_cuda(
     const size_t wave = (size_t)n_sm * (per_sm > 0 ? per_sm : 1);
     const int prep_blocks = (int)(want < wave ? want : wave);
     mbir_sweep_prepare_kernel<<<prep_blocks, 256, 0, stream>>>(
-        rec, d_volume, d_volume_snapshot, d_perm, perm_key, Ny, Nz, Nx, H);
+        prior, d_volume, d_volume_snapshot, Ny, Nz, Nx, H);
     CUDA_CHECK_KERNEL();
 
     /* 2. The sweep: one warp per Y-slice, all Ny blocks resident at once up
@@ -721,7 +782,7 @@ void mbir_icd_sweep_cuda(
     const bool lam = d_lambdas != nullptr;
     const bool hub = std::isfinite(huber_T);
 #define MBIR_SWEEP(KK, LL, HH) icd_sweep_mbir_kernel<KK, LL, HH><<<grid, block, 0, stream>>>( \
-        rec, d_volume, d_e_sino, d_lambdas, d_cos_a, d_sin_a, Ny, Nz, Nx, n_angles, N_det, H)
+        prior, d_perm, perm_key, d_volume, d_e_sino, d_lambdas, d_cos_a, d_sin_a, Ny, Nz, Nx, n_angles, N_det, H)
 #define MBIR_SWEEP_K(KK) \
     if (lam) { if (hub) MBIR_SWEEP(KK, true, true);  else MBIR_SWEEP(KK, true, false); } \
     else     { if (hub) MBIR_SWEEP(KK, false, true); else MBIR_SWEEP(KK, false, false); }
@@ -732,7 +793,7 @@ void mbir_icd_sweep_cuda(
     case 8: MBIR_SWEEP_K(8); break;
     default:
         icd_sweep_mbir_generic_kernel<<<grid, block, 0, stream>>>(
-            rec, d_volume, d_e_sino, d_lambdas, d_cos_a, d_sin_a,
+            prior, d_perm, perm_key, d_volume, d_e_sino, d_lambdas, d_cos_a, d_sin_a,
             Ny, Nz, Nx, n_angles, N_det, H);
         break;
     }
