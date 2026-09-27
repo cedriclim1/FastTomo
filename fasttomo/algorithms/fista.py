@@ -305,9 +305,11 @@ def _fista_loop(
     try:
         for it in rec.iterate(n_iter):
             fp_y = _fp(y)
+            res = fp_y - sinogram
             if rec.wants_loss:
-                rec.record(it, (sinogram - fp_y).pow(2).mean())
-            grad = _bp(fp_y - sinogram)
+                # mean((b - A y)^2): the same bits as squaring -res
+                rec.record(it, res.pow(2).mean())
+            grad = _bp(res)
             t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
             beta = (t - 1.0) / t_new
             if constraints is not None and _fista_update(
