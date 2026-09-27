@@ -22,7 +22,7 @@ Python package `fasttomo/`:
 | `algorithms/mbir.py` | `run_mbir` (ICD sweeps, offset/variance update, multi-resolution, Feistel voxel order). |
 | `algorithms/alignment.py` | `refine_angles`. |
 | `_operator.py` | The projection-operator seam: `Geometry`, `ProjectionOperator` (`fp` / `bp` / `grad_geom`, differentiable `project` / `backproject`), adapters `UncachedOperator`, `CudaCachedOperator`, `ResireOperator`, `_UserProjectorOperator`, chosen by `_make_operator`. Every projection goes through it (except MBIR's own model and GENFIRE's gridding). |
-| `_backend.py` | Device guard, stream pointer, dtype codes, input and shape guards, `_resolve_num_threads` (keyword, else `OMP_NUM_THREADS`, else 1). |
+| `_backend.py` | Device guard, stream pointer, dtype codes, input and shape guards (incl. `_check_finite_geometry`: NaN/Inf host angles raise), `_resolve_num_threads` (keyword, else the first entry of `OMP_NUM_THREADS`, else 1). |
 | `autograd.py` | Raw kernel layer (`_launch`, `*_raw`), the generic `_Project` / `_BackProject` autograd Functions, RESIRE and TV-loss Functions, `euler_zyz_to_rotmat`. |
 | `projection.py` | Functional projections (`forward_project`, `back_project`, `*_3d`, `*_resire`) as transient operators; `apply_shifts`, `apply_shifts_2d`. |
 | `projector.py` | `ParallelProjector`, `RotmatProjector`: own one operator (persistent CUDA texture cache, or CPU kernels with `device="cpu"`). |
@@ -83,6 +83,7 @@ Layout, by topic:
 | `test_contracts.py` | The uniform API over one `ALGOS` capability table and the frozen `loss_callback` / `support_mask` contracts the desktop app relies on. |
 | `test_regularizers.py` | Regularisers and the TV loss. |
 | `test_kernel_correctness.py` | Kernel-level correctness: finite-difference geometry gradients, strided inputs, size checks, leak-free failure paths of the scoped texture cache. |
+| `test_cpu_kernels.py` | CPU C/OpenMP kernels: NaN/Inf angles (raise; the raw kernels survive them), the Y-batched kernels bit for bit against fp32 NumPy ports of the scalar loops, thread invariance, `grad_angle` against an fp64 evaluation. |
 | `test_frozen_identity.py`, `test_algorithm_identity.py` | Bit-identity goldens (`tests/data/*.pt`). |
 | `test_wsirt.py` | wSIRT CPU/CUDA parity and convergence. |
 | `test_wheel_smoke.py` | Import and `_core` smoke test (run by the wheel workflow; strict CUDA check with `FASTTOMO_EXPECT_CUDA=1`). |
@@ -124,3 +125,5 @@ On a shared multi-GPU machine (the development box has 4 cards used by several p
 - `python3-dev` (apt) is required for the CMake build to find `Python Development.Module` when using the system Python.
 - On machines without a GPU, install the CPU-only PyTorch build (`--index-url https://download.pytorch.org/whl/cpu`) to avoid pulling ~2 GB of CUDA libraries.
 - The `support_mask` and `loss_callback` keyword names and semantics are frozen (a desktop app probes `inspect.signature` for them); `test_contracts.py` guards them.
+- CPU thread pools: the C kernels use `num_threads` (keyword, else `OMP_NUM_THREADS`, else **1**), while torch's element-wise ops between them use `torch.get_num_threads()` (every core by default), and both share one libgomp runtime. Mismatched counts oversubscribe the cores: CPU `run_sirt` at 8x128^2 x 61 views, 16 pinned cores, 1.7 ms/iter with both at 16 vs 20.8 ms/iter with torch at 128 (the phase-1b audit measured 7.3 vs 59.6 ms/iter before the Y-batched kernels). For CPU solver loops and CPU benchmarks set `torch.set_num_threads(n)`, `num_threads=n` (or `OMP_NUM_THREADS=n`) to the same `n`, pin with `taskset` and `OMP_PROC_BIND=close`, and record `n` and `FASTTOMO_MARCH_NATIVE`.
+- CPU kernel changes: the parallel-beam CPU kernels are Y-batched (`FT_YB` slices per SIMD loop, `csrc/cpu/common.h`) and must stay bit-identical to the per-slice scalar loops (same fp32 operations in the same order per lane; ray clipping only drops steps the in-loop test rejects). `tests/test_cpu_kernels.py` pins this against NumPy ports; a larger memcmp matrix against a previous build is in the phase-1b PR A report. Keep new C code free of FMA-contraction assumptions (`-ffp-contract=off`).

@@ -131,10 +131,12 @@ void forward_project_rotmat_cpu(
 /* ── 3D rotation-matrix back-projection (CPU) ──────────────────────────────
  * Voxel-driven gather (mirrors back_project_rotmat_cuda); each voxel reads
  * the bilinearly-interpolated sinogram value at its rotated detector position
- * and accumulates over angles. Approximate adjoint of forward_project_rotmat_cpu
- * — see CLAUDE.md note that CPU/CUDA BP outputs are not expected to match
- * numerically. Border-zero semantics: a voxel mapping to u_det == N_det-1
- * still contributes the last detector column.
+ * and accumulates over angles. Not the exact adjoint of
+ * forward_project_rotmat_cpu (7.5 % Frobenius apart on a dense 16^2 system;
+ * inner-product gap below 1e-6 on smooth data, 17-56 % on random data), and
+ * not bit-comparable with the CUDA BP (texture weights). Border-zero
+ * semantics: a voxel mapping to u_det == N_det-1 still contributes the last
+ * detector column.
  */
 void back_project_rotmat_cpu(
     const float *sino,   /* [n_angles, Ny, N_det] */

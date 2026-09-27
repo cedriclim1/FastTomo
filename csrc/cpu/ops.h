@@ -83,21 +83,6 @@ int back_project_gather_parallel_cpu(
 );
 
 /*
- * GENFIRE Fourier gridding (CPU).
- *
- * Scatters 1D Fourier slices (fftshifted, DC at index bigN/2) onto a 2D
- * Fourier grid using inverse-distance weighting.
- *
- * fk_real / fk_imag : [n_angles, Ny, bigN]  — fftshifted 1D FFTs, C-contiguous
- * cos_a / sin_a     : [n_angles]
- * grid_real / grid_imag / weight_grid : [Ny, bigN, bigN]  — zeroed by caller
- *
- * For frequency index ixi, the centered frequency is xi = ixi - bigN/2.
- * At angle ia the grid point is (xi*cos_a[ia], xi*sin_a[ia]).
- * Each point within cutoff_dist of a grid cell contributes value/distance.
- * Normalization by accumulated weights is left to the caller.
- */
-/*
  * Gradient of forward projection w.r.t. tilt angles (CPU).
  *
  * Computes ∂L/∂θ_ia for each angle, given the upstream gradient on the
@@ -166,6 +151,21 @@ void grad_rotmat_cpu(
     int num_threads
 );
 
+/*
+ * GENFIRE Fourier gridding (CPU).
+ *
+ * Scatters 1D Fourier slices (fftshifted, DC at index bigN/2) onto a 2D
+ * Fourier grid using inverse-distance weighting.
+ *
+ * fk_real / fk_imag : [n_angles, Ny, bigN]  — fftshifted 1D FFTs, C-contiguous
+ * cos_a / sin_a     : [n_angles]
+ * grid_real / grid_imag / weight_grid : [Ny, bigN, bigN]  — zeroed by caller
+ *
+ * For frequency index ixi, the centered frequency is xi = ixi - bigN/2.
+ * At angle ia the grid point is (xi*cos_a[ia], xi*sin_a[ia]).
+ * Each point within cutoff_dist of a grid cell contributes value/distance.
+ * Normalization by accumulated weights is left to the caller.
+ */
 void genfire_gridding_2d_cpu(
     const float *fk_real,
     const float *fk_imag,
