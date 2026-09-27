@@ -14,7 +14,8 @@ PYTHONPATH: drop its ``ScikitBuildRedirectingFinder`` from ``sys.meta_path``
 The ``_fft_*`` fingerprint keys were added later from the same export; the
 other keys are the first generation (the atomics ones differ run to run).
 The ``cpu/mbir`` and ``cuda/mbir`` keys were later regenerated on the
-branch that moved the MBIR voxel order into the CUDA kernel, and the
+branch that moved the MBIR voxel order into the CUDA kernel and again in
+phase 1b (``tests/data/regen_mbir_goldens.py``), and the
 ``_fft_ramp`` / ``fbp*`` keys on the branch that zero-pads the ramp filter
 (see test_algorithm_identity.py), and the geometry-gradient keys on the
 branch that made grad_rotmat / grad_angle deterministic
