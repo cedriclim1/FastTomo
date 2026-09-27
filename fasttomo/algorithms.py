@@ -315,14 +315,12 @@ def _ad_sparsity_term(volume: torch.Tensor, weight: float) -> torch.Tensor:
 #   ~40x (CPU W-BP: 83 % error vs 30 % on CUDA). W-BP therefore uses the
 #   voxel-driven gather back-projection on both backends: the CUDA
 #   `back_project` kernel already is one, and `_bp_gather` is the same
-#   operator on CPU, down to the texture unit's interpolation weights.
+#   operator on CPU with exact fp32 interpolation weights. The CUDA texture
+#   unit interpolates with 8-bit fractional weights, so the two differ by
+#   ~2e-4 (the same texture floor the forward projector has at ~1.3e-4);
+#   the CPU path is the exact reference.
 
 _WBP_PAD = 2
-# The CUDA texture unit interpolates with weights in 9-bit fixed point (8
-# fractional bits). `_bp_gather` rounds its weights to the same grid so the
-# CPU W-BP is the operator the GPU computes (1e-5 apart instead of 2e-4).
-# The rounding moves a weight by at most 1/512, far below the model error.
-_TEXTURE_WEIGHT_STEPS = 256
 _WBP_CHUNK_VOXELS = 1 << 26     # padded layergram elements per Y-chunk (256 MiB fp32)
 
 
@@ -339,8 +337,8 @@ def _bp_gather(
     linearly interpolated, with zero outside the detector. This is the
     operator of the CUDA ``back_project_parallel_kernel`` (texture fetch at
     u + 0.5 with linear filtering and border addressing), in plain PyTorch
-    so the CPU W-BP matches it; the interpolation weight is rounded to the
-    texture unit's 1/256 grid (`_TEXTURE_WEIGHT_STEPS`)."""
+    so the CPU W-BP is the same operator, with exact interpolation weights
+    (the texture unit's are 8-bit, ~2e-4 apart)."""
     n_angles, Ny, N_det = sinogram.shape
     device = sinogram.device
     a = angles_deg.detach().to(device=device, dtype=torch.float32).reshape(-1) * (math.pi / 180.0)
@@ -352,9 +350,8 @@ def _bp_gather(
     for k in range(n_angles):
         rows = F.pad(sinogram[k].float().t(), (0, 0, 1, 1))
         u = (x[None, :] * cos_a[k] + z[:, None] * sin_a[k] + 0.5 * (N_det - 1)).reshape(-1)
-        u = (u + 0.5) - 0.5           # the kernel's texel-centre offset, in fp32 like the hardware
         u0 = torch.floor(u)
-        w = (torch.round((u - u0) * _TEXTURE_WEIGHT_STEPS) / _TEXTURE_WEIGHT_STEPS).unsqueeze(1)
+        w = (u - u0).unsqueeze(1)
         i0 = (u0.long() + 1).clamp_(0, N_det + 1)       # +1: the zero row
         i1 = (u0.long() + 2).clamp_(0, N_det + 1)
         out += (1.0 - w) * rows[i0] + w * rows[i1]
@@ -2105,8 +2102,8 @@ def run_wsirt(
     `run_weighted_backprojection` (padded, voxel-driven on both backends).
     With it the data residual is non-increasing at the default ``omega=1``;
     before the padding fix it rose again after ~4 iterations. CPU and CUDA
-    results agree to ~1e-4 (the CUDA forward projector's texture filtering
-    is the remaining difference).
+    results agree to ~2e-4, the floor set by the CUDA texture unit's 8-bit
+    interpolation weights in the forward and back projectors.
 
     return_loss: if True, returns (volume, loss_history) where loss_history
     is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
