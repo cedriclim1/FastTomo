@@ -270,6 +270,48 @@ def test_rotmat_ray_clipping_is_bit_identical(shape, N_det, case):
             assert torch.equal(_with_clip(1, grad), _with_clip(0, grad)), (name, dtype)
 
 
+# ── CPU voxel-driven (gather) back-projection for W-BP / wSIRT ────────────
+
+@pytest.mark.parametrize("Ny,Nz,Nx,Nd,n_ang", [
+    (2, 12, 12, 12, 7), (3, 9, 14, 11, 7), (1, 16, 10, 20, 7), (4, 40, 40, 32, 61),
+    (5, 33, 40, 29, 13), (1, 1, 1, 1, 1), (2, 7, 5, 3, 4)])
+def test_cpu_gather_back_projection_is_bp_gather_bit_for_bit(Ny, Nz, Nx, Nd, n_ang):
+    """The C/OpenMP kernel the CPU W-BP uses is `_bp_gather` bit for bit
+    (same fp32 arithmetic and order, no FMA), for grids wider and narrower
+    than the detector and any thread count."""
+    from fasttomo.algorithms.analytic import _bp_gather
+    from fasttomo.autograd import _back_project_gather_parallel_raw
+    g = torch.Generator().manual_seed(Ny * 1000 + Nz * 10 + Nd)
+    ang = torch.linspace(-70.0, 70.0, n_ang) + 0.123
+    sino = torch.rand(n_ang, Ny, Nd, generator=g) - 0.25
+    ref = _bp_gather(sino, ang, Nz, Nx)
+    for nt in (1, 3, 8):
+        out = _back_project_gather_parallel_raw(sino, ang, Nz, Nx, nt)
+        assert out.shape == (Ny, Nz, Nx) and out.dtype == torch.float32
+        assert torch.equal(out, ref), nt
+
+
+def test_cpu_wbp_uses_the_c_gather_kernel(monkeypatch):
+    """run_weighted_backprojection / run_wsirt on CPU go through the C
+    kernel with the caller's num_threads; plain back_project stays the
+    ray-driven transpose."""
+    from fasttomo import _core
+    calls = []
+    real = _core.back_project_gather_parallel_cpu
+    monkeypatch.setattr(_core, "back_project_gather_parallel_cpu",
+                        lambda *a: (calls.append(a[-1]), real(*a))[1])
+    vol = torch.zeros(2, 16, 16)
+    vol[:, 4:12, 5:11] = 1.0
+    ang = torch.linspace(-60, 60, 9)
+    sino = ft.forward_project(vol, ang)
+    ft.run_weighted_backprojection(sino, ang, num_threads=3)
+    ft.run_wsirt(sino, ang, 2, num_threads=2)
+    assert calls == [3, 2, 2]
+    calls.clear()
+    ft.back_project(sino, ang)
+    assert calls == []
+
+
 # ── D5 / P1 / P4: texture-cache lifetime on the CUDA one-shot paths ─────────
 
 _MiB = 1 << 20

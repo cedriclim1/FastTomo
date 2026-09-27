@@ -317,7 +317,7 @@ def run_wsirt(
     Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
     return_loss, loss_callback, progress
         See Conventions of :mod:`fasttomo.algorithms` (``num_threads`` drives
-        the CPU forward projection; the CPU W-BP is PyTorch).
+        the CPU forward projection and the CPU W-BP back-projection).
 
     Returns
     -------
@@ -331,7 +331,7 @@ def run_wsirt(
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
     # exact W-BP operator, built once per tilt geometry
-    _wbp = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale)
+    _wbp = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale, num_threads)
     op = _make_operator(Geometry("parallel", (setup.Ny, Nz, Nx), N_det, setup.n_angles,
                                  angles_deg), device, sinogram.dtype, num_threads=num_threads)
 
