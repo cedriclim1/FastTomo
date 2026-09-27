@@ -17,7 +17,9 @@ degrees, N_det = N, CUDA events, median of 20 calls; per iteration =
 - **FISTA-TV: the TV proximal operator runs as two CUDA kernels per inner
   iteration** (`csrc/cuda/tv_prox.cu`; the PyTorch FGP / Chambolle code
   stays the CPU path and the reference). Bit-identical to the PyTorch prox
-  in fp32 and fp16 (goldens unchanged); no Triton dependency. Per outer
+  in fp32 and fp16 (goldens unchanged; the prox weight's reciprocal
+  `1 / lam` is rounded as CUDA ATen rounds a division by a Python float:
+  in double, then once to fp32); no Triton dependency. Per outer
   iteration with 20 inner iterations: 68.7 -> 18.3 ms at 256^3 (3.75x),
   4.45 -> 0.69 ms at 128^3 (6.5x); the prox alone 66.8 -> 16.8 ms and
   4.12 -> 0.56 ms, peak 1.74 GiB -> 448 MiB at 256^3. 100 inner iterations
@@ -35,7 +37,8 @@ degrees, N_det = N, CUDA events, median of 20 calls; per iteration =
   parallel geometry the per-subset normalisers are one sinogram plus one
   `[1, Nz, Nx]` plane per subset (they are the same in every Y-slice),
   computed on a one-slice operator. 256^3: 30.6 -> 16.4 ms per iteration,
-  setup 29 -> 4.5 ms, peak 4.3 GiB -> 223 MiB; 128^3: 6.1 -> 4.8 ms.
+  setup 29 -> 4.2 ms, peak 4.3 GiB -> 223 MiB; 128^3: 6.1 -> 4.3 ms,
+  setup 8.0 -> 4.2 ms.
   Bit-identical (`sart*` goldens).
 - New `run_sart(view_order="golden")`: visits the views in the
   golden-ratio order (view k at the rank of frac(k (sqrt(5) - 1) / 2)).
@@ -64,7 +67,9 @@ degrees, N_det = N, CUDA events, median of 20 calls; per iteration =
   weighting filter per geometry (bounded LRU of 8, keyed by the fp32 angle
   values, sizes, `threshold_scale` and device): `run_wbp` 6.0 -> 0.41 ms
   at 128^3 (14.8x), 7.2 -> 1.55 ms at 256^3; wSIRT setup 6 -> 0.4 ms.
-  Bit-identical.
+  Bit-identical. The filters stay on their device (up to 8 of
+  `[Pz, Px // 2 + 1]` fp32, Pz, Px ~ 1.125 N: ~85 MiB at 2048^2) until
+  `release_cached_projectors()`, which now also drops them.
 - New `run_fbp(window="none" | "hann" | "hamming")`: apodises the Ram-Lak
   ramp (Hann 0.5 + 0.5 cos(2 pi f), Hamming 0.54 + 0.46 cos(2 pi f), f in
   cycles per detector pixel on the zero-padded grid). Default `"none"`

@@ -205,10 +205,20 @@ def _compute_exact_wf(
 # volume size), 4-11x the cost of applying it, and a W-BP sweep or repeated
 # wSIRT calls use the same geometry. The filter depends only on the key
 # below (the angles enter `_bp_gather` as fp32 values), so a hit returns the
-# identical tensor. At most _WF_CACHE_SIZE entries of [Pz, Px // 2 + 1] fp32.
+# identical tensor. At most _WF_CACHE_SIZE entries of [Pz, Px // 2 + 1] fp32
+# on the filter's device (Pz, Px ~ 1.125 N: ~10.6 MiB per entry at 2048^2,
+# 85 MiB for 8), kept until `release_cached_projectors()` clears them.
 _WF_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 _WF_CACHE_SIZE = 8
 _WF_CACHE_LOCK = threading.Lock()
+
+
+def _clear_wf_cache() -> int:
+    """Drop every cached weighting filter; returns how many were kept."""
+    with _WF_CACHE_LOCK:
+        n = len(_WF_CACHE)
+        _WF_CACHE.clear()
+    return n
 
 
 def _cached_exact_wf(
@@ -466,7 +476,11 @@ def run_weighted_backprojection(
     each side of Z and X (the circular deconvolution otherwise destabilises
     the volume edge) and use the voxel-driven back-projection on both
     backends, so CPU and CUDA agree up to the CUDA texture interpolation;
-    see the notes above `_bp_gather`. Extra memory: one padded layergram and
+    see the notes above `_bp_gather`. The weighting filter is built once per
+    geometry (angles, sizes, ``threshold_scale``, device) and kept for later
+    calls (``run_wsirt`` too): up to 8 filters of ``[Pz, Px // 2 + 1]`` fp32
+    on their device (~10.6 MiB each at 2048^2), until
+    :func:`release_cached_projectors`. Extra memory: one padded layergram and
     its spectrum per Y-chunk (at most ~64 Mi elements). fp32 only.
 
     Parameters

@@ -34,7 +34,7 @@ from fasttomo.algorithms._common import (
     _build_fp_bp,
     _reciprocal_or_zero,
 )
-from fasttomo.algorithms.analytic import _make_wbp
+from fasttomo.algorithms.analytic import _clear_wf_cache, _make_wbp
 
 
 @_fp16_overflow_checked
@@ -807,6 +807,11 @@ def release_cached_projectors() -> int:
     capture on every call) until this is called or a call with another
     configuration replaces it; the next call then captures again.
 
+    It also drops the exact W-BP weighting filters that
+    :func:`run_weighted_backprojection` and :func:`run_wsirt` keep per
+    geometry (up to 8, ``[Pz, Px // 2 + 1]`` fp32 each on their device:
+    ~10.6 MiB at 2048^2, 85 MiB for 8; not counted in the return value).
+
     It does not free the scratch pool of the CUDA geometry-gradient kernels
     (``grad_rotmat`` / ``grad_angle``): that stream-ordered pool keeps up to
     64 MiB per device reserved for the life of the process, outside
@@ -815,6 +820,7 @@ def release_cached_projectors() -> int:
     Returns the number of configurations released (0 or 1). Safe to call at
     any time, also without CUDA.
     """
+    _clear_wf_cache()
     n = _SIRT_OPERATORS.clear()
     if n and torch.cuda.is_available():
         # the textures were freed by the operators' finalizers; release any

@@ -465,3 +465,17 @@ def test_fbp_window_keyword(backend):
                                rtol=1e-5, atol=1e-5)
     with pytest.raises(ValueError, match="window"):
         ft.run_fbp(sino, ang, window="shepp")
+
+
+def test_release_cached_projectors_drops_wbp_filters(backend):
+    """release_cached_projectors() also frees the cached W-BP weighting
+    filters (it still returns the number of run_sirt configurations)."""
+    from fasttomo.algorithms import analytic as an
+
+    ang = make_angles(9, device=backend)
+    sino = ft.forward_project(phantom_2d(16, device=backend).unsqueeze(0), ang)
+    ft.release_cached_projectors()
+    ft.run_wbp(sino, ang)
+    assert len(an._WF_CACHE) == 1
+    assert ft.release_cached_projectors() == 0
+    assert len(an._WF_CACHE) == 0

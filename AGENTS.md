@@ -13,7 +13,7 @@ Python package `fasttomo/`:
 | `__init__.py` | Public API re-exports (pinned by a `dir(fasttomo)` test); torch >= 2.11 check; warns when a CPU-only build meets a CUDA machine or torch's CUDA is not 13.0. |
 | `algorithms/__init__.py` | Re-exports every name of the former `algorithms.py`; its docstring holds the shared conventions (shapes, call signature, dtypes, support, constraints order, `loss_callback`, `warm_start`, `progress`, `num_threads`). |
 | `algorithms/_common.py` | Named constants, `_prepare_recon` (validation, warm start, support resolution, `ConstraintConfig`), `_LossRecorder` (loss history, `loss_callback`, tqdm) and `_DeviceLossRecorder` (losses kept on the device, no per-iteration sync without a callback; used by SIRT, SART, wSIRT, FISTA, AD), deprecated-keyword helpers, `_build_fp_bp`. |
-| `algorithms/analytic.py` | `run_fbp` (ramp filter, optional apodisation window), `run_weighted_backprojection` (W-BP, `_bp_gather`, weighting filter cached per geometry). |
+| `algorithms/analytic.py` | `run_fbp` (ramp filter, optional apodisation window), `run_weighted_backprojection` (W-BP, `_bp_gather`, weighting filter cached per geometry: up to 8 filters on their device, dropped by `release_cached_projectors()`). |
 | `algorithms/algebraic.py` | `run_sirt` (+ CUDA-graph path, also with a loss), `run_sart` (fused SIRT kernels, planar normalisers, `view_order`), `run_wsirt`. |
 | `algorithms/fista.py` | `run_fista`, `run_fista_tv` (TV prox: FGP / Chambolle, CUDA kernels with the PyTorch code as CPU path and reference), fused FISTA update, Lipschitz estimate (fp32 norms). |
 | `algorithms/ad.py` | `run_ad_recon` (setup, `_ad_step`, `_ad_project_constraints`), `run_grad_descent`. |
