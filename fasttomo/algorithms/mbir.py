@@ -789,7 +789,9 @@ def run_mbir(
         Seed of the voxel order (a keyed Feistel permutation per Y-slice and
         iteration, of the voxels for the serial sweep and of the voxel
         groups for the parallel one). A fixed ``seed`` is bit-reproducible
-        for a given backend and ``sweep_kernel``. Different sweeps visit the voxels in different
+        for a given backend and ``sweep_kernel``, except with a
+        ``support_mask`` on CUDA (see there). Different sweeps visit the
+        voxels in different
         orders, so their volumes differ slightly along the way and agree at
         convergence.
     lambdas : Tensor ``[n_angles, Ny, N_det]``, optional
@@ -828,7 +830,16 @@ def run_mbir(
         after every outer ICD sweep, not inside the voxel update. The removed
         part is forward-projected into the error sinogram, so
         ``e = g - A f - d`` stays exact. Coarse levels use the support
-        max-pooled to their grid.
+        max-pooled to their grid. On CUDA that forward projection
+        accumulates with fp32 atomics, so a run with a support mask is not
+        bit-reproducible for a fixed ``seed``: two identical runs differ in
+        the last bits of the error sinogram whenever the sweep put mass
+        outside the support, and the ICD iterations amplify that (measured
+        on a 4 x 32^2 cylinder, 8 runs of 20 iterations: max volume
+        difference 3e-6 with the quadratic prior, 1e-3 with the default
+        prior, 0.2 with ``huber_T=2``, where the anomaly classification
+        flips). CPU runs, and CUDA runs without a support mask, are
+        bit-reproducible.
     warm_start : Tensor, optional
         Initial volume on the full grid (resized to the coarsest level and
         scaled to its voxel size, see `_to_level`); offsets start at 0.
