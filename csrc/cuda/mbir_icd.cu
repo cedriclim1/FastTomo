@@ -13,12 +13,14 @@
  *       reference. Distinct from `forward_project_parallel_kernel` in projection_parallel.cu
  *       (which is ray-marching detector-driven); this voxel-driven model is
  *       what the ICD column-A access pattern reproduces.
- *   icd_sweep_mbir_kernel       - one outer iteration: per-Y-slice ICD walk
- *       through the slice's permutation, threads cooperate on the per-voxel
- *       data-term reduction over angles and qGGMRF-prior reduction over the
- *       26-neighbour stencil; thread 0 applies the closed-form update, all
- *       threads write the incremental error-sinogram delta non-atomically
- *       (correctness argument inline below).
+ *   mbir_sweep_prepare_kernel   - fully parallel part of an outer iteration:
+ *       the per-slice voxel order (generated on the device) and, for every
+ *       step, the voxel's pre-sweep value and qGGMRF prior sums.
+ *   icd_sweep_mbir_kernel       - the sequential part: one warp per Y-slice
+ *       walks the order, reduces the data term over the angles with warp
+ *       shuffles and applies the closed-form update; lanes write the
+ *       error-sinogram rows they own non-atomically (argument inline below).
+ *       icd_sweep_mbir_generic_kernel is the same for n_angles > 256.
  *
  * Host wrappers expose these as `mbir_forward_project_cuda` and
  * `mbir_icd_sweep_cuda`. The offset (d_k) and variance (σ) closed-form
@@ -27,21 +29,21 @@
  */
 
 #include "common.cuh"
-#include "texture_cache.h"
+#include <cmath>
+#include <stdexcept>
 #include "ops.h"
 #include "../include/proj_geom.h"
 
-/* ── Hyperparameters in __constant__ memory ──────────────────────────────────
- * Loaded once per outer iteration before the kernel launches. Threads
- * broadcast-read so this is hardware-cached and free vs. global memory. */
+/* ── Hyperparameters ─────────────────────────────────────────────────────────
+ * Passed by value as a kernel argument (the argument bank is constant memory,
+ * broadcast to every thread). A kernel argument instead of a module-global
+ * __constant__ symbol keeps two sweeps on two streams from racing on it. */
 struct MbirHyper {
     float p, q, c, sigma_f;        /* qGGMRF: p ∈ [1,2], q = 2, c, σ_f */
     float huber_T, huber_delta;    /* Huber: T (threshold), δ (tail slope) */
     float sigma;                   /* current noise std */
     float half_x, half_z, half_det;
 };
-
-static __constant__ MbirHyper mbir_H;
 
 /* 26-neighbour stencil constants — same as in csrc/cpu/mbir_icd.c.
  * Indexing order: (dy, dz, dx) sweep over {-1,0,+1}^3 with the self entry
@@ -68,10 +70,10 @@ __constant__ float d_NB_W[26] = {
 };
 
 /* qGGMRF surrogate a_jk = ρ'(Δ)/Δ; see csrc/cpu/mbir_icd.c for derivation. */
-__device__ __forceinline__ float qggmrf_a_jk_dev(float delta) {
+__device__ __forceinline__ float qggmrf_a_jk_dev(float delta, const MbirHyper &H) {
     float u = fabsf(delta);
     if (u < 1e-12f) u = 1e-12f;
-    float p = mbir_H.p, q = mbir_H.q, c = mbir_H.c, sf = mbir_H.sigma_f;
+    float p = H.p, q = H.q, c = H.c, sf = H.sigma_f;
     float sp = __powf(sf, p);
     float sq = __powf(sf, q);
     float u_pmq    = __powf(u, p - q);
@@ -84,10 +86,10 @@ __device__ __forceinline__ float qggmrf_a_jk_dev(float delta) {
 
 /* Huber surrogate weight b(r): 1 inside threshold, δ·T/|r| outside.
  * Reduces to all-ones when T = ∞ (conventional MBIR). */
-__device__ __forceinline__ float huber_surr_weight_dev(float r) {
+__device__ __forceinline__ float huber_surr_weight_dev(float r, const MbirHyper &H) {
     float ar = fabsf(r);
-    if (!isfinite(mbir_H.huber_T) || ar < mbir_H.huber_T) return 1.0f;
-    return mbir_H.huber_delta * mbir_H.huber_T / ar;
+    if (!isfinite(H.huber_T) || ar < H.huber_T) return 1.0f;
+    return H.huber_delta * H.huber_T / ar;
 }
 
 /* ── Per-slice voxel ordering, generated in the kernel ───────────────────────
@@ -154,28 +156,6 @@ __device__ __forceinline__ int mbir_perm_index(const MbirPerm &P, int s) {
     return (int)y;
 }
 
-/* Block reduction (64 threads = 2 warps) using warp shuffle + 1 shared slot.
- * `sh2` must point to a 2-element __shared__ scratch (one slot per warp). */
-__device__ __forceinline__ float block_reduce_sum_64(float v, float *sh2) {
-    unsigned mask = 0xFFFFFFFFu;
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        v += __shfl_down_sync(mask, v, off);
-    int tid  = threadIdx.x;
-    int warp = tid >> 5;
-    int lane = tid & 31;
-    if (lane == 0) sh2[warp] = v;
-    __syncthreads();
-    float total = (tid < 2) ? sh2[tid] : 0.0f;
-    if (warp == 0) {
-        total += __shfl_xor_sync(mask, total, 1);
-    }
-    /* broadcast back via shared */
-    if (tid == 0) sh2[0] = total;
-    __syncthreads();
-    return sh2[0];
-}
-
 /* ────────────────────────────────────────────────────────────────────────────
  * Voxel-driven bilinear forward projection (MBIR's column-A model).
  *
@@ -215,152 +195,418 @@ __global__ static void forward_project_mbir_kernel(
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * One outer iteration of MBIR-AM-PE (CUDA).
+ * One outer iteration of MBIR-AM-PE (CUDA): the ICD sweep, in two kernels.
  *
- * Block layout: gridDim = (Ny, 1, 1), blockDim = (64, 1, 1).
- *   - One block owns one Y-slice. Parallel-beam single-axis: Y-slices are
- *     fully independent for the data term, so blocks have no cross-block
- *     dependencies on `e` or `volume` within the data path.
- *   - All 26 qGGMRF neighbour reads, in-slice ones included, come from a
- *     tex3D snapshot of the start-of-outer-iter volume (read-only across
- *     the kernel). The prior term is therefore Jacobi within a slice as
- *     well as across Y; only the data term is Gauss-Seidel (through the
- *     live error sinogram). The CPU sweep does the same.
+ * Semantics (unchanged): each Y-slice's voxels are updated one at a time in
+ * the slice's order; every update sees all earlier updates of the slice
+ * through the live error sinogram e (Gauss-Seidel data term). All 26
+ * qGGMRF neighbour values come from the start-of-outer-iteration snapshot,
+ * so the prior is Jacobi within a slice as well as across Y. The CPU sweep
+ * does the same.
  *
- * Within the block, voxels are processed sequentially in the per-slice
- * permutation order; threads cooperate on the per-voxel reductions.
+ * 1. mbir_sweep_prepare_kernel, one thread per (slice, step), fully parallel:
+ *    rec[iy][s] = (j, f_j, n1_j, n2_j) with j the voxel visited at step s,
+ *    f_j its value before the sweep and n1_j, n2_j its prior sums. None of
+ *    these depends on the sweep: a voxel is written only when it is
+ *    visited (each order is a permutation), so f_j at its visit is its
+ *    pre-sweep value, and the prior reads only the snapshot and f_j. The
+ *    26 neighbour terms are summed in the order of the previous kernel's
+ *    warp reduction, so the sums are bit-identical to computing them inside
+ *    the sweep.
+ * 2. icd_sweep_mbir_kernel: the sequential part. One warp owns one Y-slice
+ *    (grid Ny x 32 threads) and walks rec[iy][*]; per voxel it computes the
+ *    data-term sums over the angles, all-reduces them across the warp, and
+ *    applies the closed-form update.
  *
- * Race-condition argument for the non-atomic error-sinogram delta write:
- * each block exclusively owns the strip e[*, iy, *] (different iy across
- * different blocks). Within a single block, the 64 threads partition the
- * angle loop strided (ia = tid, tid + blockDim, ...); for any single
- * (ia, iy) pair, exactly one thread writes both detector pixels (u0 and
- * u0+1) the voxel touches. No collision possible. */
-__global__ static void icd_sweep_mbir_kernel(
-    cudaTextureObject_t       vol_snapshot_tex, /* tex3D over [Ny, Nz, Nx] read-only */
-    float *__restrict__       volume,           /* [Ny, Nz, Nx] live (read+write) */
-    float *__restrict__       e_sino,           /* [n_angles, Ny, N_det] live */
-    const float *__restrict__ lambdas,          /* [n_angles, Ny, N_det] or nullptr */
-    const int   *__restrict__ perm,             /* [Ny, Nz*Nx] or nullptr: in-kernel order */
-    unsigned long long        perm_key,
-    const float *__restrict__ cos_a,
-    const float *__restrict__ sin_a,
-    int Ny, int Nz, int Nx, int n_angles, int N_det
+ * Ownership, which makes the non-atomic error-sinogram writes safe without
+ * any barrier:
+ *   - block iy is the only block that reads or writes e[*, iy, *] and
+ *     volume[iy, *, *];
+ *   - lane l is the only thread that reads or writes the rows e[ia, iy, *]
+ *     with ia ≡ l (mod 32), for every voxel of the sweep, including both
+ *     detector pixels (u0, u0+1) of such a row. A later voxel's read of a
+ *     row therefore follows the earlier voxel's write in the same thread's
+ *     program order; no other thread is involved;
+ *   - the per-voxel sums are a warp all-reduce (xor butterfly). Every lane
+ *     ends with bit-identical sums (each step adds the same two operands,
+ *     a + b == b + a), so every lane computes the same update df on its
+ *     own: no shared-memory broadcast. Lane 0 alone stores the voxel.
+ *
+ * Summation order equals the previous 64-thread kernel's (thread t summed
+ * angles t, t+64, ...; the two warps were tree-reduced and then added):
+ * lane l keeps a partial sum A over angles l, l+64, ... and B over l+32,
+ * l+96, ..., reduces both with the butterfly (lane 0 of an xor butterfly
+ * adds in the same order as a shfl_down tree) and adds A + B. Results are
+ * bit-identical to the previous kernel for the same order (verified on
+ * 9..300 angles, with and without lambdas and Huber).
+ *
+ * Latency: for n_angles <= 32 * MBIR_MAX_SLOTS the sweep keeps each lane's
+ * e values for the current voxel in registers (K = angle slots per lane):
+ *   - the update stores e - df·a from those registers (no reload);
+ *   - the next voxel's e values are loaded at the top of the iteration,
+ *     before this voxel's stores, and patched at the top of the next
+ *     iteration (when the loads have landed): a pixel this voxel wrote lies
+ *     in a row owned by the same lane, which replaces its prefetched copy
+ *     with the value it stored. The next voxel sees exactly what a reload
+ *     after the store would return.
+ * LAM / HUB select exact simplifications of the per-pixel weight for
+ * lambdas == nullptr (lam = 1: sqrtf(1) = 1 and x·1 = x exactly) and
+ * huber_T = ±inf or NaN (Huber weight 1). */
+#define MBIR_WARP 32
+#define MBIR_MAX_SLOTS 8
+
+/* s-th voxel of the slice: the explicit order if given, else the in-kernel one. */
+__device__ __forceinline__ int mbir_voxel(const int *perm_slice, const MbirPerm &P, int s) {
+    return perm_slice ? perm_slice[s] : mbir_perm_index(P, s);
+}
+
+/* qGGMRF term of neighbour `nb` (0..25; anything else gives zero) of voxel
+ * `lin` (value fj) of slice iy, from the snapshot. */
+__device__ __forceinline__ void mbir_prior_term(
+    const float *__restrict__ snap, const MbirHyper &H,
+    int lin, float fj, int iy, int Ny, int Nz, int Nx, int nb,
+    float &n1, float &n2
 ) {
-    int iy  = blockIdx.x;
-    int tid = threadIdx.x;
-    if (iy >= Ny) return;
+    n1 = 0.0f; n2 = 0.0f;
+    if (nb < 26) {
+        int ix = lin % Nx, iz = lin / Nx;
+        int jx = ix + d_NB_DX[nb];
+        int jy = iy + d_NB_DY[nb];
+        int jz = iz + d_NB_DZ[nb];
+        if (jx >= 0 && jx < Nx && jy >= 0 && jy < Ny && jz >= 0 && jz < Nz) {
+            float fk = __ldg(snap + ((size_t)jy * Nz + jz) * Nx + jx);
+            float a = qggmrf_a_jk_dev(fj - fk, H);
+            float w = d_NB_W[nb];
+            n1 = w * a * fk;
+            n2 = w * a;
+        }
+    }
+}
 
+/* One thread per (slice, step). rec is [Ny, Nz*Nx] float4:
+ * (voxel index as int bits, pre-sweep value, n1, n2). */
+__global__ static void mbir_sweep_prepare_kernel(
+    float4 *__restrict__       rec,
+    const float *__restrict__  volume,
+    const float *__restrict__  snap,
+    const int   *__restrict__  perm,
+    unsigned long long         perm_key,
+    int Ny, int Nz, int Nx,
+    const MbirHyper H
+) {
     const int nvox = Nz * Nx;
-    const int *perm_slice = perm ? perm + (size_t)iy * nvox : nullptr;
-    const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
-    float *vol_slice = volume + (size_t)iy * Nz * Nx;
+    const size_t total = (size_t)Ny * nvox;
+    for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (size_t)gridDim.x * blockDim.x) {
+        const int iy = (int)(t / nvox);
+        const int s  = (int)(t - (size_t)iy * nvox);
+        int lin;
+        if (perm) {
+            lin = perm[t];
+        } else {
+            const MbirPerm P = mbir_perm_setup(perm_key, iy, nvox);
+            lin = mbir_perm_index(P, s);
+        }
+        const float fj = volume[(size_t)iy * nvox + lin];
+        /* The previous kernel had lane nb compute neighbour nb (lanes 26..31
+         * and the second warp contributed 0) and reduced with a shfl tree:
+         * v[i] += v[i + off] for off = 16, 8, 4, 2, 1, then + 0 for the
+         * second warp. Same terms, same order. */
+        float v1[32], v2[32];
+        #pragma unroll
+        for (int nb = 0; nb < 32; nb++)
+            mbir_prior_term(snap, H, lin, fj, iy, Ny, Nz, Nx, nb, v1[nb], v2[nb]);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            #pragma unroll
+            for (int i = 0; i < off; i++) {
+                v1[i] = v1[i] + v1[i + off];
+                v2[i] = v2[i] + v2[i + off];
+            }
+        }
+        rec[t] = make_float4(__int_as_float(lin), fj, v1[0] + 0.0f, v2[0] + 0.0f);
+    }
+}
 
-    /* Shared: 2-element scratch for block reduction (one slot per warp);
-     * + 5 broadcast scalars: theta1, theta2, n1, n2 and the update df. */
-    __shared__ float sh_red[2];
-    __shared__ float sh_t1, sh_t2, sh_n1, sh_n2, sh_df;
+/* Per-pixel data-term contribution: w = b(r)·λ/σ², then
+ * θ1 += a·e·w, θ2 += a²·w (θ1's sign is applied after the reduction). */
+template <bool LAM, bool HUB>
+__device__ __forceinline__ void mbir_pixel_term(
+    float a_col, float ek, float lam, const MbirHyper &H, float w_const,
+    float &t1, float &t2
+) {
+    float w;
+    if (HUB) {
+        float r  = LAM ? ek * sqrtf(lam) / H.sigma : ek / H.sigma;
+        float bw = huber_surr_weight_dev(r, H);
+        w = LAM ? bw * lam / (H.sigma * H.sigma) : bw / (H.sigma * H.sigma);
+    } else {
+        w = LAM ? lam / (H.sigma * H.sigma) : w_const;
+    }
+    t1 += a_col * ek * w;
+    t2 += a_col * a_col * w;
+}
+
+/* What lane `lane` keeps per angle slot for one voxel. */
+struct MbirSlot {
+    int   u0;          /* left detector pixel; u0 + 1 is the right one */
+    float wu;          /* bilinear weight of u0 + 1 */
+    float e0, e1;      /* e at u0, u0 + 1 (0 when off the detector) */
+    float l0, l1;      /* lambdas at u0, u0 + 1 (1 without lambdas) */
+};
+
+template <int K, bool LAM>
+__device__ __forceinline__ void mbir_load_slots(
+    MbirSlot (&S)[K], const float (&ca)[K], const float (&sa)[K],
+    int lin, int Nx, const MbirHyper &H, int lane, int n_angles, int N_det,
+    const float *e_base, const float *__restrict__ lam_base, size_t row_stride
+) {
+    const int ix = lin % Nx, iz = lin / Nx;
+    const float x = ix - H.half_x;
+    const float z = iz - H.half_z;
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        const int ia = lane + k * MBIR_WARP;
+        if (ia >= n_angles) continue;
+        float u  = x * ca[k] + z * sa[k] + H.half_det;
+        int u0 = (int)floorf(u);
+        S[k].u0 = u0;
+        S[k].wu = u - u0;
+        const size_t row = (size_t)ia * row_stride;
+        const bool in0 = (u0 >= 0 && u0 < N_det);
+        const bool in1 = (u0 + 1 >= 0 && u0 + 1 < N_det);
+        S[k].e0 = in0 ? e_base[row + u0] : 0.0f;
+        S[k].e1 = in1 ? e_base[row + u0 + 1] : 0.0f;
+        if (LAM) {
+            S[k].l0 = in0 ? __ldg(lam_base + row + u0) : 1.0f;
+            S[k].l1 = in1 ? __ldg(lam_base + row + u0 + 1) : 1.0f;
+        } else {
+            S[k].l0 = S[k].l1 = 1.0f;
+        }
+    }
+}
+
+template <bool LAM, bool HUB>
+__device__ __forceinline__ void mbir_slot_partial(
+    const MbirSlot &S, int N_det, const MbirHyper &H, float w_const, float &t1, float &t2
+) {
+    if (S.u0 >= 0 && S.u0 < N_det)
+        mbir_pixel_term<LAM, HUB>(1.0f - S.wu, S.e0, S.l0, H, w_const, t1, t2);
+    if (S.u0 + 1 >= 0 && S.u0 + 1 < N_det)
+        mbir_pixel_term<LAM, HUB>(S.wu, S.e1, S.l1, H, w_const, t1, t2);
+}
+
+template <int K, bool LAM, bool HUB>
+__global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
+    const float4 *__restrict__ rec,              /* [Ny, Nz*Nx] from the prepare kernel */
+    float *__restrict__        volume,           /* [Ny, Nz, Nx] live (write only here) */
+    float *__restrict__        e_sino,           /* [n_angles, Ny, N_det] live */
+    const float *__restrict__  lambdas,          /* [n_angles, Ny, N_det] (LAM) */
+    const float *__restrict__  cos_a,
+    const float *__restrict__  sin_a,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    const MbirHyper H
+) {
+    const unsigned FULL = 0xffffffffu;
+    const int iy   = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nvox = Nz * Nx;
+    if (iy >= Ny || nvox <= 0) return;                 /* block-uniform */
+
+    float *vol_slice = volume + (size_t)iy * nvox;
+    const float4 *rec_slice = rec + (size_t)iy * nvox;
+    /* Row (ia, iy) of e / lambdas starts at (ia * Ny + iy) * N_det. */
+    const size_t row_stride = (size_t)Ny * N_det;
+    float *e_base = e_sino + (size_t)iy * N_det;
+    const float *lam_base = LAM ? lambdas + (size_t)iy * N_det : nullptr;
+    const float w_const = 1.0f / (H.sigma * H.sigma);   /* w for λ = 1, b = 1 */
+
+    float ca[K], sa[K];
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        const int ia = lane + k * MBIR_WARP;
+        ca[k] = (ia < n_angles) ? cos_a[ia] : 0.0f;
+        sa[k] = (ia < n_angles) ? sin_a[ia] : 0.0f;
+    }
+
+    /* Pipeline: rec two steps ahead, the next voxel's e values one ahead. */
+    float4 R_c = rec_slice[0];
+    float4 R_n = (nvox > 1) ? rec_slice[1] : R_c;
+    MbirSlot C[K], N[K];
+    mbir_load_slots<K, LAM>(C, ca, sa, __float_as_int(R_c.x), Nx, H, lane, n_angles, N_det,
+                            e_base, lam_base, row_stride);
+    /* Pending patch: the pixels the previous voxel stored (per slot: its u0
+     * and the two new values). Applied to C one iteration after C's loads
+     * were issued, so the warp never waits on those loads to overwrite them. */
+    int   pu0[K];
+    float pe0[K], pe1[K];
+    bool  pending = false;                              /* warp-uniform */
 
     for (int s = 0; s < nvox; s++) {
-        int lin = perm_slice ? perm_slice[s] : mbir_perm_index(P, s);
-        int ix  = lin % Nx;
-        int iz  = lin / Nx;
-        float fj_old = vol_slice[(size_t)iz * Nx + ix];
-        float x = ix - mbir_H.half_x;
-        float z = iz - mbir_H.half_z;
+        const bool has_next = (s + 1 < nvox);           /* warp-uniform */
+        if (has_next)
+            mbir_load_slots<K, LAM>(N, ca, sa, __float_as_int(R_n.x), Nx, H, lane, n_angles,
+                                    N_det, e_base, lam_base, row_stride);
+        const float4 R_nn = (s + 2 < nvox) ? rec_slice[s + 2] : R_n;
 
-        /* ── data term: θ1, θ2 reduction over angles ──────────────────────
-         * Each thread handles a stride of angles (tid, tid+64, tid+128, ...).
-         * Within each angle, the same thread writes both detector pixels
-         * (u0, u0+1) — preventing intra-block races on the later e-update. */
-        float t1 = 0.0f, t2 = 0.0f;
-        for (int ia = tid; ia < n_angles; ia += blockDim.x) {
-            float ca = cos_a[ia], sa = sin_a[ia];
-            float u  = x * ca + z * sa + mbir_H.half_det;
-            int u0 = (int)floorf(u);
-            int u1 = u0 + 1;
-            float wu = u - u0;
+        /* C was loaded before the previous voxel's stores: patch it. A pixel
+         * the previous voxel wrote lies in a row this lane owns, so C then
+         * holds exactly what a reload would return. Off-detector pixels are
+         * never stored or read (the same u has the same status), so patching
+         * them is harmless. */
+        if (pending) {
             #pragma unroll
-            for (int kk = 0; kk < 2; kk++) {
-                int uk = (kk == 0) ? u0 : u1;
-                if (uk < 0 || uk >= N_det) continue;
-                float a_col = (kk == 0) ? (1.0f - wu) : wu;
-                size_t off = ((size_t)ia * Ny + iy) * N_det + uk;
-                float ek  = e_sino[off];
-                float lam = lambdas ? lambdas[off] : 1.0f;
-                float r   = ek * sqrtf(lam) / mbir_H.sigma;
-                float bw  = huber_surr_weight_dev(r);
-                float w   = bw * lam / (mbir_H.sigma * mbir_H.sigma);
-                t1 += a_col * ek * w;
-                t2 += a_col * a_col * w;
+            for (int k = 0; k < K; k++) {
+                const int d = C[k].u0 - pu0[k];
+                if (d == 0)       { C[k].e0 = pe0[k]; C[k].e1 = pe1[k]; }
+                else if (d == 1)  { C[k].e0 = pe1[k]; }
+                else if (d == -1) { C[k].e1 = pe0[k]; }
             }
         }
-        float t1_red = block_reduce_sum_64(t1, sh_red);
-        if (tid == 0) sh_t1 = -t1_red;     /* paper sign convention */
-        float t2_red = block_reduce_sum_64(t2, sh_red);
-        if (tid == 0) sh_t2 = t2_red;
-        __syncthreads();
 
-        /* ── prior term: 26 neighbour qGGMRF surrogate reduction ──────────
-         * One thread per neighbour for tid < 26; others contribute 0. */
-        float n1 = 0.0f, n2 = 0.0f;
-        if (tid < 26) {
-            int jx = ix + d_NB_DX[tid];
-            int jy = iy + d_NB_DY[tid];
-            int jz = iz + d_NB_DZ[tid];
-            if (jx >= 0 && jx < Nx && jy >= 0 && jy < Ny && jz >= 0 && jz < Nz) {
-                /* tex3D extent matches volume layout: x = Nx, y = Nz, z = Ny
-                 * (see TC_VOL_3D in texture_cache.cu). +0.5 → texel centre. */
-                float fk = tex3D<float>(vol_snapshot_tex,
-                                        (float)jx + 0.5f,
-                                        (float)jz + 0.5f,
-                                        (float)jy + 0.5f);
-                float a = qggmrf_a_jk_dev(fj_old - fk);
-                float w = d_NB_W[tid];
-                n1 = w * a * fk;
-                n2 = w * a;
+        /* ── data term from registers: A over even slots, B over odd ─── */
+        float t1a = 0.0f, t2a = 0.0f, t1b = 0.0f, t2b = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < K; k++) {
+            if (lane + k * MBIR_WARP >= n_angles) continue;
+            if ((k & 1) == 0) mbir_slot_partial<LAM, HUB>(C[k], N_det, H, w_const, t1a, t2a);
+            else              mbir_slot_partial<LAM, HUB>(C[k], N_det, H, w_const, t1b, t2b);
+        }
+        /* ── one fused warp all-reduce for the four sums ───────────────── */
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            t1a += __shfl_xor_sync(FULL, t1a, off);
+            t1b += __shfl_xor_sync(FULL, t1b, off);
+            t2a += __shfl_xor_sync(FULL, t2a, off);
+            t2b += __shfl_xor_sync(FULL, t2b, off);
+        }
+        const float theta1 = -(t1a + t1b);      /* paper sign convention */
+        const float theta2 = t2a + t2b;
+
+        /* ── closed-form ICD update (every lane, identical values) ─────── */
+        const float fj = R_c.y, n1 = R_c.z, n2 = R_c.w;
+        float df;
+        float denom = n2 + theta2;
+        if (denom < 1e-30f) {
+            df = 0.0f;
+        } else {
+            float u_star = (n1 + theta2 * fj - theta1) / denom;
+            float fj_new = (u_star > 0.0f) ? u_star : 0.0f;
+            if (lane == 0) vol_slice[__float_as_int(R_c.x)] = fj_new;
+            df = fj_new - fj;
+        }
+
+        /* ── e -= df · A_*j from registers; remember it for the patch ──── */
+        pending = (df != 0.0f);                         /* warp-uniform */
+        if (pending) {
+            #pragma unroll
+            for (int k = 0; k < K; k++) {
+                const int ia = lane + k * MBIR_WARP;
+                const int u0 = C[k].u0;
+                pu0[k] = u0;
+                pe0[k] = C[k].e0 - df * (1.0f - C[k].wu);
+                pe1[k] = C[k].e1 - df * C[k].wu;
+                if (ia >= n_angles) continue;
+                float *e_row = e_base + (size_t)ia * row_stride;
+                if (u0 >= 0 && u0 < N_det)         e_row[u0]     = pe0[k];
+                if (u0 + 1 >= 0 && u0 + 1 < N_det) e_row[u0 + 1] = pe1[k];
             }
         }
-        float n1_red = block_reduce_sum_64(n1, sh_red);
-        if (tid == 0) sh_n1 = n1_red;
-        float n2_red = block_reduce_sum_64(n2, sh_red);
-        if (tid == 0) sh_n2 = n2_red;
-        __syncthreads();
 
-        /* ── closed-form ICD update (thread 0) ─────────────────────────── */
-        if (tid == 0) {
-            float denom = sh_n2 + sh_t2;
-            if (denom < 1e-30f) {
-                sh_df = 0.0f;
-            } else {
-                float u_star = (sh_n1 + sh_t2 * fj_old - sh_t1) / denom;
-                float fj_new = (u_star > 0.0f) ? u_star : 0.0f;
-                vol_slice[(size_t)iz * Nx + ix] = fj_new;
-                sh_df     = fj_new - fj_old;
-            }
-        }
-        __syncthreads();
-        float df = sh_df;
-        if (df == 0.0f) continue;
-
-        /* ── error-sinogram incremental update: e -= df · A_*j ──────────
-         * Same stride pattern over angles as the data-term reduction —
-         * guarantees no thread collision on detector pixels. */
-        for (int ia = tid; ia < n_angles; ia += blockDim.x) {
-            float ca = cos_a[ia], sa = sin_a[ia];
-            float u  = x * ca + z * sa + mbir_H.half_det;
-            int u0 = (int)floorf(u);
-            int u1 = u0 + 1;
-            float wu = u - u0;
-            size_t base = ((size_t)ia * Ny + iy) * N_det;
-            if (u0 >= 0 && u0 < N_det) e_sino[base + u0] -= df * (1.0f - wu);
-            if (u1 >= 0 && u1 < N_det) e_sino[base + u1] -= df * wu;
-        }
-        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < K; k++) C[k] = N[k];
+        R_c = R_n;
+        R_n = R_nn;
     }
 
     /* The per-tilt offsets d_k enter only through `e_sino`: the host keeps
      * the invariant e = g - Af - d, so the kernel never reads d_k. */
+}
+
+/* Same sweep for n_angles > 32 * MBIR_MAX_SLOTS: lane l walks its angles
+ * l, l+32, ... directly in global memory (no register slots), with the
+ * same ownership, order and arithmetic. */
+__global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_generic_kernel(
+    const float4 *__restrict__ rec,
+    float *__restrict__        volume,
+    float *__restrict__        e_sino,
+    const float *__restrict__  lambdas,
+    const float *__restrict__  cos_a,
+    const float *__restrict__  sin_a,
+    int Ny, int Nz, int Nx, int n_angles, int N_det,
+    const MbirHyper H
+) {
+    const unsigned FULL = 0xffffffffu;
+    const int iy   = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nvox = Nz * Nx;
+    if (iy >= Ny || nvox <= 0) return;
+
+    float *vol_slice = volume + (size_t)iy * nvox;
+    const float4 *rec_slice = rec + (size_t)iy * nvox;
+    const size_t row_stride = (size_t)Ny * N_det;
+    float *e_base = e_sino + (size_t)iy * N_det;
+    const float *lam_base = lambdas ? lambdas + (size_t)iy * N_det : nullptr;
+
+    for (int s = 0; s < nvox; s++) {
+        const float4 R = rec_slice[s];
+        const int lin = __float_as_int(R.x);
+        const float x = (lin % Nx) - H.half_x;
+        const float z = (lin / Nx) - H.half_z;
+
+        float t[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};   /* [A|B][θ1|θ2] */
+        for (int ia = lane; ia < n_angles; ia += MBIR_WARP) {
+            float u  = x * cos_a[ia] + z * sin_a[ia] + H.half_det;
+            int u0 = (int)floorf(u);
+            float wu = u - u0;
+            const size_t row = (size_t)ia * row_stride;
+            const int ab = (ia / MBIR_WARP) & 1;
+            #pragma unroll
+            for (int kk = 0; kk < 2; kk++) {
+                int uk = u0 + kk;
+                if (uk < 0 || uk >= N_det) continue;
+                float a_col = (kk == 0) ? (1.0f - wu) : wu;
+                float ek  = e_base[row + uk];
+                float lam = lam_base ? lam_base[row + uk] : 1.0f;
+                float r   = ek * sqrtf(lam) / H.sigma;
+                float bw  = huber_surr_weight_dev(r, H);
+                float w   = bw * lam / (H.sigma * H.sigma);
+                t[ab][0] += a_col * ek * w;
+                t[ab][1] += a_col * a_col * w;
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            t[0][0] += __shfl_xor_sync(FULL, t[0][0], off);
+            t[1][0] += __shfl_xor_sync(FULL, t[1][0], off);
+            t[0][1] += __shfl_xor_sync(FULL, t[0][1], off);
+            t[1][1] += __shfl_xor_sync(FULL, t[1][1], off);
+        }
+        const float theta1 = -(t[0][0] + t[1][0]);
+        const float theta2 = t[0][1] + t[1][1];
+
+        float df;
+        float denom = R.w + theta2;
+        if (denom < 1e-30f) {
+            df = 0.0f;
+        } else {
+            float u_star = (R.z + theta2 * R.y - theta1) / denom;
+            float fj_new = (u_star > 0.0f) ? u_star : 0.0f;
+            if (lane == 0) vol_slice[lin] = fj_new;
+            df = fj_new - R.y;
+        }
+        if (df != 0.0f) {
+            for (int ia = lane; ia < n_angles; ia += MBIR_WARP) {
+                float u  = x * cos_a[ia] + z * sin_a[ia] + H.half_det;
+                int u0 = (int)floorf(u);
+                int u1 = u0 + 1;
+                float wu = u - u0;
+                float *e_row = e_base + (size_t)ia * row_stride;
+                if (u0 >= 0 && u0 < N_det) e_row[u0] -= df * (1.0f - wu);
+                if (u1 >= 0 && u1 < N_det) e_row[u1] -= df * wu;
+            }
+        }
+    }
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -396,10 +642,11 @@ void mbir_forward_project_cuda(
 void mbir_icd_sweep_cuda(
     float       *d_volume,         /* [Ny, Nz, Nx] in-place */
     float       *d_e_sino,         /* [n_angles, Ny, N_det] in-place */
-    const float *d_volume_snapshot,/* host uploads its own snapshot tex3D */
+    const float *d_volume_snapshot,/* [Ny, Nz, Nx] start-of-outer-iter copy */
     const float *d_lambdas,        /* [n_angles, Ny, N_det] or nullptr */
     const int   *d_perm,           /* [Ny, Nz*Nx] int32, or nullptr */
     unsigned long long perm_key,   /* in-kernel order when d_perm is null */
+    float       *d_work,           /* [Ny, Nz*Nx, 4] fp32 scratch */
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
@@ -407,32 +654,61 @@ void mbir_icd_sweep_cuda(
     float huber_T, float huber_delta, float sigma,
     cudaStream_t stream
 ) {
+    if (d_work == nullptr)
+        throw std::invalid_argument("mbir_icd_sweep_cuda: work buffer is required");
+    if (Ny <= 0 || Nz <= 0 || Nx <= 0) return;
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     MbirHyper H{};
     H.p = qggmrf_p; H.q = qggmrf_q; H.c = qggmrf_c; H.sigma_f = sigma_f;
     H.huber_T = huber_T; H.huber_delta = huber_delta; H.sigma = sigma;
     H.half_x = g.half_x; H.half_z = g.half_z; H.half_det = g.half_det;
-    FASTTOMO_CUDA_CHECK(cudaMemcpyToSymbolAsync(
-        mbir_H, &H, sizeof(MbirHyper), 0, cudaMemcpyHostToDevice, stream));
 
-    /* tex3D snapshot of `volume` for qGGMRF reads: a one-shot TC_VOL_3D
-     * cache (dim_a=Ny, dim_b=Nz, dim_c=Nx) per outer iteration.
-     * ScopedTextureCache releases it on every path; finish() syncs the
-     * stream first, so the kernel is done before the texture goes away. */
-    ScopedTextureCache snap(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx, stream);
-    tc_upload(snap.get(), d_volume_snapshot, stream);
-
-    dim3 block(64, 1, 1);
-    dim3 grid(Ny, 1, 1);
-    icd_sweep_mbir_kernel<<<grid, block, 0, stream>>>(
-        snap.get()->tex,
-        d_volume, d_e_sino, d_lambdas, d_perm, perm_key,
-        d_cos_a, d_sin_a,
-        Ny, Nz, Nx, n_angles, N_det
-    );
+    /* 1. Order, pre-sweep values and prior sums of every (slice, step):
+     *    a grid-stride loop over one full wave of resident 256-thread blocks
+     *    (3 per SM on sm_120 at 70 registers/thread: 24 of 48 warps). */
+    float4 *rec = reinterpret_cast<float4 *>(d_work);
+    int n_sm = 0, dev = 0, per_sm = 0;
+    FASTTOMO_CUDA_CHECK(cudaGetDevice(&dev));
+    FASTTOMO_CUDA_CHECK(cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev));
+    FASTTOMO_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_sm, mbir_sweep_prepare_kernel, 256, 0));
+    const size_t total = (size_t)Ny * Nz * Nx;
+    const size_t want = (total + 255) / 256;
+    const size_t wave = (size_t)n_sm * (per_sm > 0 ? per_sm : 1);
+    const int prep_blocks = (int)(want < wave ? want : wave);
+    mbir_sweep_prepare_kernel<<<prep_blocks, 256, 0, stream>>>(
+        rec, d_volume, d_volume_snapshot, d_perm, perm_key, Ny, Nz, Nx, H);
     CUDA_CHECK_KERNEL();
-    snap.finish();
+
+    /* 2. The sweep: one warp per Y-slice, all Ny blocks resident at once up
+     *    to Ny = 24 * #SMs on sm_120 (24 blocks per SM is the block limit;
+     *    registers allow 9 or more per SM for every variant below). */
+    dim3 block(MBIR_WARP, 1, 1);
+    dim3 grid(Ny, 1, 1);
+    const int slots = (n_angles + MBIR_WARP - 1) / MBIR_WARP;
+    const int K = slots <= 1 ? 1 : slots <= 2 ? 2 : slots <= 4 ? 4 : slots <= 8 ? 8 : 0;
+    const bool lam = d_lambdas != nullptr;
+    const bool hub = std::isfinite(huber_T);
+#define MBIR_SWEEP(KK, LL, HH) icd_sweep_mbir_kernel<KK, LL, HH><<<grid, block, 0, stream>>>( \
+        rec, d_volume, d_e_sino, d_lambdas, d_cos_a, d_sin_a, Ny, Nz, Nx, n_angles, N_det, H)
+#define MBIR_SWEEP_K(KK) \
+    if (lam) { if (hub) MBIR_SWEEP(KK, true, true);  else MBIR_SWEEP(KK, true, false); } \
+    else     { if (hub) MBIR_SWEEP(KK, false, true); else MBIR_SWEEP(KK, false, false); }
+    switch (K) {
+    case 1: MBIR_SWEEP_K(1); break;
+    case 2: MBIR_SWEEP_K(2); break;
+    case 4: MBIR_SWEEP_K(4); break;
+    case 8: MBIR_SWEEP_K(8); break;
+    default:
+        icd_sweep_mbir_generic_kernel<<<grid, block, 0, stream>>>(
+            rec, d_volume, d_e_sino, d_lambdas, d_cos_a, d_sin_a,
+            Ny, Nz, Nx, n_angles, N_det, H);
+        break;
+    }
+#undef MBIR_SWEEP_K
+#undef MBIR_SWEEP
+    CUDA_CHECK_KERNEL();
 }
 
 /* Test hook: write the in-kernel voxel order of every slice, [Ny, nvox]. */

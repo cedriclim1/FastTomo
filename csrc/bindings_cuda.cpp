@@ -346,6 +346,7 @@ static void py_mbir_icd_sweep_cuda(
     long lambdas_ptr,          /* 0 → nullptr */
     long perm_ptr,             /* 0 → in-kernel order from perm_key */
     unsigned long long perm_key,
+    long work_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
@@ -359,6 +360,7 @@ static void py_mbir_icd_sweep_cuda(
         reinterpret_cast<const float *>(lambdas_ptr),
         reinterpret_cast<const int *>(perm_ptr),
         perm_key,
+        reinterpret_cast<float *>(work_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -592,13 +594,15 @@ void register_cuda(py::module_ &m) {
           "volume and e_sino. Pass lambdas_ptr=0 for uniform weights "
           "(treated as nullptr). The voxel order of each Y-slice is generated "
           "in the kernel from perm_key unless perm_ptr ([Ny, Nz*Nx] int32) "
-          "is non-zero. Per-tilt offset d_k and noise variance σ "
+          "is non-zero. work_ptr: fp32 scratch of Ny*Nz*Nx*4 elements "
+          "(16-byte aligned). Asynchronous on the stream. "
+          "Per-tilt offset d_k and noise variance σ "
           "are updated in PyTorch by the Python wrapper using the post-call "
           "e_sino (the kernel never reads d_k: e = g - Af - d).",
           py::arg("vol_ptr"), py::arg("e_sino_ptr"),
           py::arg("vol_snapshot_ptr"),
           py::arg("lambdas_ptr"),
-          py::arg("perm_ptr"), py::arg("perm_key"),
+          py::arg("perm_ptr"), py::arg("perm_key"), py::arg("work_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),

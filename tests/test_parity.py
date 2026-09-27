@@ -366,6 +366,32 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     assert sg == pytest.approx(sc, rel=1e-5)
 
 
+@needs_cuda
+@pytest.mark.parametrize("n_angles", [9, 61, 100, 200, 300])
+@pytest.mark.parametrize("use_lam,huber_T", [(False, float("inf")), (True, float("inf")),
+                                             (False, 3.0), (True, 3.0)])
+def test_mbir_cpu_cuda_consistency_every_sweep_variant(n_angles, use_lam, huber_T):
+    """The CUDA sweep has one kernel per angle-slot count (1, 2, 4, 8 slots
+    of 32 angles per lane, then a generic kernel) and per lambdas / Huber
+    combination; each must agree with the CPU sweep (same voxel order,
+    different summation order)."""
+    g = torch.Generator().manual_seed(n_angles)
+    Ny, N = 3, 10
+    ph = torch.zeros(Ny, N, N)
+    ph[:, 3:7, 2:8] = 1.0
+    ang = torch.linspace(-70, 70, n_angles)
+    sino = _mbir_sino_cpu(ph, ang) + 0.02 * torch.randn(n_angles, Ny, N, generator=g)
+    lam = torch.rand(n_angles, Ny, N, generator=g) + 0.5 if use_lam else None
+    kw = dict(sigma_f=0.2, n_iter=4, multires_levels=1, seed=2, huber_T=huber_T,
+              return_state=True)
+    vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
+    vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(),
+                             lambdas=lam.cuda() if use_lam else None, **kw)
+    torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
+    torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)
+    assert sg == pytest.approx(sc, rel=1e-5)
+
+
 # ── cached projector <-> functional API ───────────────────────────────────────
 
 

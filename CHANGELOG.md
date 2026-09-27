@@ -13,13 +13,24 @@ before starting Python. CUDA runs are not affected.
 
 ### ⚠ `run_mbir`: faster outer iterations, different voxel order per `seed`
 
-- The random per-slice voxel order of the ICD sweep is now generated inside
-  the CUDA kernel (a keyed Feistel permutation per Y-slice and outer
+- The random per-slice voxel order of the ICD sweep is now generated on the
+  GPU (a keyed Feistel permutation per Y-slice and outer
   iteration) instead of by NumPy on the host and copied to the GPU every
   outer iteration (`Ny*Nz*Nx*4` bytes: 67 MB at 256^3, 537 MB at 512^3).
-  One CUDA outer iteration at 256^3 x 61 views: 300 ms -> 174 ms. The CPU
-  sweep uses a bit-identical NumPy mirror of the same order, so CPU and
+  The CPU sweep uses a bit-identical NumPy mirror of the same order, so CPU and
   CUDA still visit the voxels in the same order.
+- The CUDA ICD sweep was restructured: a fully parallel prepare kernel
+  computes the voxel order, pre-sweep values and qGGMRF prior sums of every
+  step, and the sequential sweep runs one warp per Y-slice with a fused
+  warp-shuffle reduction and no block barriers (it had about 11 per voxel),
+  keeping each lane's error-sinogram values in registers. The sweep no
+  longer builds a texture or synchronises the stream. Same Gauss-Seidel
+  order and arithmetic: bit-identical to the previous kernel for the same
+  voxel order. One CUDA outer iteration at 61 views: 128^3 52 -> 9.6 ms,
+  256^3 300 -> 41 ms (default settings; 1.9-2.5x on the sweep with lambdas
+  and/or a finite `huber_T`). It needs a scratch buffer of 16 bytes per
+  voxel for the duration of `run_mbir` (the host permutation it replaces
+  was 4 bytes per voxel on the host plus 4 on the GPU).
 - **Results for a given `seed` differ from earlier versions** (a different,
   equally random order); a fixed `seed` is still bit-reproducible run to
   run. `_generate_permutation` is no longer used by `run_mbir`.

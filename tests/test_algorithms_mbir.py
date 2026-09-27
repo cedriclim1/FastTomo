@@ -8,6 +8,7 @@ CPU <-> CUDA agreement lives in test_parity.py.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -247,12 +248,14 @@ def test_mbir_cuda_in_kernel_order_matches_explicit_perm():
     lam = (torch.rand(n, Ny, Nx, generator=g) + 0.5).to(DEVICE)
     key = _mbir_perm_key(11, 2)
     perm = torch.from_numpy(_mbir_permutation(Ny, Nz * Nx, key)).to(DEVICE)
+    work = torch.empty(Ny * Nz * Nx * 4, device=DEVICE)
     outs = []
     for perm_ptr in (0, perm.data_ptr()):
         vol, e = vol0.clone(), e0.clone()
         _core.mbir_icd_sweep_cuda(
             vol_ptr=vol.data_ptr(), e_sino_ptr=e.data_ptr(), vol_snapshot_ptr=vol0.data_ptr(),
             lambdas_ptr=lam.data_ptr(), perm_ptr=perm_ptr, perm_key=key,
+            work_ptr=work.data_ptr(),
             cos_ptr=cos_a.data_ptr(), sin_ptr=sin_a.data_ptr(),
             Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n, N_det=Nx,
             qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.3,
@@ -262,6 +265,87 @@ def test_mbir_cuda_in_kernel_order_matches_explicit_perm():
         outs.append((vol, e))
     assert not torch.equal(outs[0][0], vol0)
     assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
+# ── CUDA sweep variants ───────────────────────────────────────────────────────
+
+# 9, 61, 100, 140 and 260 angles take the 1-, 2-, 4- and 8-slot register
+# kernels and the generic kernel (> 256 angles).
+_SWEEP_ANGLES = (9, 61, 100, 140, 260)
+_SWEEP_GOLDEN = Path(__file__).parent / "data" / "mbir_sweep_golden.pt"
+
+
+def _sweep_golden_cases(pre_restructure: bool = False) -> dict[str, torch.Tensor]:
+    """Volume and error sinogram after three CUDA sweeps for every sweep
+    variant (see tests/data/mbir_sweep_golden_gen.py). ``pre_restructure``
+    calls the binding without ``work_ptr`` (the older signature)."""
+    import fasttomo._core as _core
+    from fasttomo.algorithms.mbir import _mbir_perm_key
+    out = {}
+    g = torch.Generator().manual_seed(123)
+    Ny, Nz, Nx, Nd = 2, 9, 11, 11
+    for n in _SWEEP_ANGLES:
+        ang = torch.linspace(-75, 75, n) * math.pi / 180
+        cos_a, sin_a = torch.cos(ang).to(DEVICE), torch.sin(ang).to(DEVICE)
+        vol0 = torch.rand(Ny, Nz, Nx, generator=g)
+        vol0 = (vol0 * (torch.rand(Ny, Nz, Nx, generator=g) > 0.3)).to(DEVICE)
+        e0 = torch.randn(n, Ny, Nd, generator=g).to(DEVICE)
+        lam_t = (torch.rand(n, Ny, Nd, generator=g) + 0.2).to(DEVICE)
+        for use_lam in (False, True):
+            for T in (float("inf"), 1.5):
+                vol, e = vol0.clone(), e0.clone()
+                work = torch.empty(Ny * Nz * Nx * 4, device=DEVICE)
+                extra = {} if pre_restructure else {"work_ptr": work.data_ptr()}
+                for it in range(3):
+                    snap = vol.clone()
+                    _core.mbir_icd_sweep_cuda(
+                        vol_ptr=vol.data_ptr(), e_sino_ptr=e.data_ptr(),
+                        vol_snapshot_ptr=snap.data_ptr(),
+                        lambdas_ptr=lam_t.data_ptr() if use_lam else 0,
+                        perm_ptr=0, perm_key=_mbir_perm_key(9, it),
+                        cos_ptr=cos_a.data_ptr(), sin_ptr=sin_a.data_ptr(),
+                        Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n, N_det=Nd,
+                        qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.4,
+                        huber_T=T, huber_delta=0.5, sigma=0.8,
+                        stream_ptr=torch.cuda.current_stream().cuda_stream, **extra)
+                    torch.cuda.synchronize()
+                key = f"n{n}_lam{int(use_lam)}_T{T}"
+                out[key + "/vol"] = vol.cpu()
+                out[key + "/e"] = e.cpu()
+    return out
+
+
+@needs_cuda
+def test_mbir_cuda_sweep_matches_pre_restructure_golden():
+    """The one-warp-per-slice sweep (prepare kernel, register-resident e,
+    fused warp reduction) reproduces the previous 64-thread kernel bit for
+    bit on sm_120, for every variant: same order, same arithmetic, same
+    summation order. On other GPUs the compiler may contract differently,
+    so the comparison falls back to 1e-5."""
+    golden = torch.load(_SWEEP_GOLDEN, weights_only=True)
+    now = _sweep_golden_cases()
+    assert set(now) == set(golden)
+    exact = torch.cuda.get_device_capability() == (12, 0)
+    bad = [k for k in sorted(now)
+           if not (torch.equal(now[k], golden[k]) if exact
+                   else torch.allclose(now[k], golden[k], rtol=1e-5, atol=1e-5))]
+    assert not bad, f"differ from the pre-restructure sweep (exact={exact}): {bad}"
+
+
+@needs_cuda
+def test_mbir_cuda_sweep_requires_work_buffer():
+    import fasttomo._core as _core
+    v = torch.zeros(1, 2, 2, device=DEVICE)
+    e = torch.zeros(3, 1, 2, device=DEVICE)
+    c = torch.ones(3, device=DEVICE)
+    with pytest.raises(ValueError, match="work buffer"):
+        _core.mbir_icd_sweep_cuda(
+            vol_ptr=v.data_ptr(), e_sino_ptr=e.data_ptr(), vol_snapshot_ptr=v.data_ptr(),
+            lambdas_ptr=0, perm_ptr=0, perm_key=0, work_ptr=0,
+            cos_ptr=c.data_ptr(), sin_ptr=c.data_ptr(),
+            Ny=1, Nz=2, Nx=2, n_angles=3, N_det=2,
+            qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=1.0,
+            huber_T=float("inf"), huber_delta=0.5, sigma=1.0)
 
 
 @needs_cuda

@@ -49,6 +49,24 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
                 ft.run_mbir(sino, angles, n_iter=1, multires_levels=1)
             torch.cuda.synchronize()
             print(f"ok n={n} Ny={Ny}", flush=True)
+    mbir_sweep_variants(g)
+
+
+def mbir_sweep_variants(g) -> None:
+    """Every MBIR ICD sweep kernel: 1, 2, 4, 8 angle slots per lane and the
+    generic kernel (> 256 angles), with and without lambdas and the Huber
+    weight, on odd sizes whose rotated projections leave the detector."""
+    dev = torch.device("cuda")
+    for n_ang in (9, 61, 100, 140, 260):
+        for Ny, Nz, Nx in ((1, 5, 7), (3, 9, 11)):
+            angles = torch.linspace(-75, 75, n_ang, device=dev)
+            vol = torch.rand(Ny, Nz, Nx, generator=g).to(dev)
+            sino = ft.forward_project(vol, angles)
+            lam = (torch.rand(sino.shape, generator=g) + 0.5).to(dev)
+            for kw in ({}, {"lambdas": lam}, {"huber_T": 2.0}, {"lambdas": lam, "huber_T": 2.0}):
+                ft.run_mbir(sino, angles, n_iter=2, multires_levels=1, **kw)
+            torch.cuda.synchronize()
+            print(f"ok mbir n_angles={n_ang} shape={(Ny, Nz, Nx)}", flush=True)
 
 
 if __name__ == "__main__":

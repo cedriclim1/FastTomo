@@ -360,6 +360,10 @@ def _run_mbir_single_scale(
         e_sino.sub_(d_offsets.view(n_angles, 1, 1))
 
     Nvox = Nz * Nx
+    # CUDA sweep scratch (per voxel: order index, pre-sweep value, prior
+    # sums; 16 bytes), allocated once per level and reused every iteration.
+    work = (torch.empty(Ny * Nvox * 4, dtype=torch.float32, device=device)
+            if device.type == "cuda" else None)
     history: list[float] = []
     sigma_cur = float(sigma)
     n_done = 0
@@ -380,7 +384,7 @@ def _run_mbir_single_scale(
                     e_sino_ptr=e_sino.data_ptr(),
                     vol_snapshot_ptr=vol_snap.data_ptr(),
                     lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
-                    perm_ptr=0, perm_key=perm_key,
+                    perm_ptr=0, perm_key=perm_key, work_ptr=work.data_ptr(),
                     cos_ptr=cos_a.data_ptr(),
                     sin_ptr=sin_a.data_ptr(),
                     Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
