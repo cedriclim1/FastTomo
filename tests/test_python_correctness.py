@@ -596,3 +596,50 @@ def test_resire_autograd_nx_ne_ndet(Nx, N_det):
     small = ft.back_project_resire(w, eul, Nz=Nz, Nx=narrow)
     big = ft.back_project_resire(w, eul, Nz=Nz, Nx=wide)[:, :, off:off + narrow]
     assert torch.equal(small, big)
+
+
+# ── zero-size inputs: one ValueError on both backends ──────────────────────
+
+def _zero_size_cases(dev):
+    from fasttomo.autograd import _grad_angle_raw, _grad_rotmat_raw
+    a = torch.linspace(-30, 30, 5, device=dev)
+    e = torch.zeros(5, 3, device=dev)
+    mats = torch.eye(3, device=dev).expand(5, 3, 3)
+    v = torch.rand(2, 6, 6, device=dev)
+    s = torch.rand(5, 2, 6, device=dev)
+    return {
+        "fp N_det=0": lambda: ft.forward_project(v, a, N_det=0),
+        "fp no angles": lambda: ft.forward_project(v, a[:0]),
+        "fp Ny=0": lambda: ft.forward_project(v[:0], a),
+        "bp Nz=0": lambda: ft.back_project(s, a, Nz=0),
+        "bp Nx=0": lambda: ft.back_project(s, a, Nx=0),
+        "bp N_det=0": lambda: ft.back_project(s[:, :, :0], a),
+        "fp3d N_det=0": lambda: ft.forward_project_3d(v, e, N_det=0),
+        "fp3d no angles": lambda: ft.forward_project_3d(v, e[:0]),
+        "bp3d Nz=0": lambda: ft.back_project_3d(s, e, Nz=0),
+        "bp3d Ny=0": lambda: ft.back_project_3d(s[:, :0], e),
+        "grad_rotmat": lambda: _grad_rotmat_raw(v, s[:, :, :0], mats),
+        "grad_angle": lambda: _grad_angle_raw(v, s[:, :, :0], a),
+    }
+
+
+@pytest.mark.parametrize("case", list(_zero_size_cases("cpu")))
+def test_zero_size_raises_value_error(backend, case):
+    """Before: CPU returned empty tensors while CUDA raised a launch
+    RuntimeError or a tc_create ValueError. Now both raise the same
+    ValueError from the shared launch helper."""
+    with pytest.raises(ValueError, match="zero-size dimension"):
+        _zero_size_cases(backend)[case]()
+
+
+@needs_cuda
+@pytest.mark.parametrize("make", [
+    lambda: ft.ParallelProjector((2, 0, 6), torch.zeros(5, device="cuda")),
+    lambda: ft.ParallelProjector((2, 6, 6), torch.zeros(0, device="cuda")),
+    lambda: ft.ParallelProjector((2, 6, 6), torch.zeros(5, device="cuda"), N_det=0),
+    lambda: ft.RotmatProjector((0, 6, 6), n_angles=5, device="cuda"),
+    lambda: ft.RotmatProjector((2, 6, 6), n_angles=5, device="cuda", N_det=0),
+])
+def test_projectors_reject_zero_size_geometry(make):
+    with pytest.raises(ValueError, match="at least 1"):
+        make()

@@ -7,6 +7,9 @@ short-circuits and behaves identically to a direct kernel call. When a
 volume (or sinogram) has requires_grad=True, loss.backward() flows the
 adjoint partner kernel back into .grad.
 
+Every op raises ValueError, on CPU and CUDA alike, when a dimension of its
+input or output (n_angles, Ny, Nz, Nx, N_det) is zero.
+
 See fasttomo/autograd.py and fasttomo-wiki/wiki/concepts/autograd-projectors.md.
 """
 

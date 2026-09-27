@@ -282,12 +282,23 @@ def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = No
     ``io_dtype`` prepended (when given) and the current stream appended, and
     runs under the device guard; the CPU call gets the resolved
     ``num_threads`` appended. Returns ``out``.
+
+    Zero-size inputs or outputs (``n_angles``, ``Ny``, ``Nz``, ``Nx`` or
+    ``N_det`` of 0) raise ValueError on both backends. The CUDA kernels
+    cannot launch an empty grid or build an empty texture, and the CPU
+    kernels used to return empty tensors instead; one backend-independent
+    error is the chosen contract.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
     if len(shapes) != len(tensors):
         raise RuntimeError(f"fasttomo internal error: {op} declares "
                            f"{len(shapes)} shapes for {len(tensors)} tensors")
     _check_shapes(op, [(n, t, sh) for (n, sh), t in zip(shapes, tensors)])
+    for name, shape in shapes:
+        if 0 in tuple(shape):
+            raise ValueError(
+                f"{op}: {name} has a zero-size dimension {tuple(shape)}; every "
+                "dimension (n_angles, Ny, Nz, Nx, N_det) must be at least 1")
     names = iter(n for n, _ in shapes)
     ptrs = [_data_ptr(a, f"{op}: {next(names)}", out.device)
             if isinstance(a, torch.Tensor) else a
