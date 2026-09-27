@@ -104,9 +104,14 @@ int back_project_gather_parallel_cpu(
  * sinogram.  Uses the identity ∂x/∂θ = −z, ∂z/∂θ = x at each ray step,
  * combined with bilinear-weighted finite differences for ∂vol/∂x and ∂vol/∂z.
  *
- * grad_angles : [n_angles] — zeroed by caller; returned in radians
+ * grad_angles : [n_angles] — overwritten; per radian
+ *
+ * Y-batched; fp64 accumulation in an order fixed by the geometry, so the
+ * result does not depend on num_threads. Returns 0, or -1 if the scratch
+ * allocation (Nz*Nx*min(Ny, FT_YB) floats for Ny > 1, plus
+ * n_angles*(ceil(N_det/32)*16 + 1) doubles) fails.
  */
-void grad_angle_cpu(
+int grad_angle_cpu(
     const float *vol,
     const float *grad_sino,
     float       *grad_angles,

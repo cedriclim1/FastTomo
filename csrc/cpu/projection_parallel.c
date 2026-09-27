@@ -540,7 +540,84 @@ int back_project_gather_parallel_cpu(
     return gather_rows(sino, vol, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, num_threads);
 }
 
-void grad_angle_cpu(
+/* Detectors per grad_angle task: the work of an angle is split into fixed
+ * chunks of detector rays (independent of num_threads), so that every
+ * accumulation below has an order fixed by the geometry alone. */
+#define FT_GA_CHUNK 32
+
+/* dL/dtheta contribution of one chunk of detector rays of one angle on the
+ * nl Y lanes of a Y-innermost block vt[Nz][Nx][nl]. Per ray and lane, the
+ * derivative of the ray sum, sum over steps of dvol/dx*(-z) + dvol/dz*x
+ * (the fp32 terms of the scalar loop), is accumulated in fp32 like the
+ * forward's ray sum; it is then weighted by the upstream gradient and added
+ * to the lane's fp64 accumulator acc[l], in detector order. (Weighting per
+ * step and accumulating in fp64 per step made gcc spill the SSE2 loop.) */
+static inline __attribute__((always_inline))
+void ga_chunk_lanes(const float *restrict vt, const float *restrict grad_sino,
+                    double *restrict acc, const int nl, ProjGeomParallel g,
+                    int ia, int y0, int id0, int id1, float ca, float sa)
+{
+    const int Nx = g.Nx, Nz = g.Nz, Ny = g.Ny, N_det = g.N_det;
+    for (int l = 0; l < nl; l++) acc[l] = 0.0;
+    for (int id = id0; id < id1; id++) {
+        float gsv[FT_YB], dray[FT_YB];
+        int any = 0;
+        for (int l = 0; l < nl; l++) {
+            gsv[l] = grad_sino[((size_t)ia * Ny + y0 + l) * N_det + id];
+            any |= gsv[l] != 0.0f;
+            dray[l] = 0.0f;
+        }
+        if (!any) continue;          /* the scalar loop skipped these rays too */
+        float t = id - g.half_det;
+        int lo = -g.ray_len, hi = g.ray_len;
+        clip_ray_x(g, t, ca, sa, &lo, &hi);
+        clip_ray_z(g, t, ca, sa, 0.0, Nz - 1, &lo, &hi);
+        for (int step = lo; step <= hi; step++) {
+            float s  = (float)step;
+            float x  = t * ca - s * sa;
+            float z  = t * sa + s * ca;
+            float fx = x + g.half_x;
+            float fz = z + g.half_z;
+
+            /* negated conjunction: NaN samples are skipped (see the forward) */
+            if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+                  fz >= 0.0f && fz < (float)(Nz - 1)))
+                continue;
+
+            int ix0 = (int)fx, iz0 = (int)fz;
+            float wx = fx - ix0, wz = fz - iz0;
+            const float *restrict p00 = vt + ((size_t)iz0 * Nx + ix0) * nl;
+            const float *restrict p01 = p00 + nl;
+            const float *restrict p10 = p00 + (size_t)Nx * nl;
+            const float *restrict p11 = p10 + nl;
+            #pragma omp simd
+            for (int l = 0; l < nl; l++) {
+                float dvol_dx = (1.0f - wz) * (p01[l] - p00[l]) + wz * (p11[l] - p10[l]);
+                float dvol_dz = (1.0f - wx) * (p10[l] - p00[l]) + wx * (p11[l] - p01[l]);
+                dray[l] += dvol_dx * (-z) + dvol_dz * x;
+            }
+        }
+        for (int l = 0; l < nl; l++)
+            if (gsv[l] != 0.0f) acc[l] += (double)gsv[l] * (double)dray[l];
+    }
+}
+
+/*
+ * Gradient of the parallel forward projection w.r.t. the tilt angles:
+ * at each ray sample, d sino / d theta = dvol/dx * (-z) + dvol/dz * x, with
+ * the bilinear finite differences of the volume. Y-batched like the
+ * forward (FT_YB slices per SIMD loop on a Y-innermost copy of the block;
+ * Ny = 1 reads the volume in place). The work of a block is split into
+ * tasks of one angle and FT_GA_CHUNK detector rays; each ray's derivative
+ * is summed in fp32 (as the forward sums a ray), weighted by its upstream
+ * gradient and accumulated per Y lane in fp64, and the partial sums are
+ * added per angle in a fixed (block, chunk, lane) order. The result
+ * therefore does not depend on num_threads, and the error of the old
+ * kernel's single fp32 accumulator per angle and thread (1e-6 to 4e-5
+ * relative, growing with the problem size) is gone. Returns 0, or -1
+ * if the scratch allocation fails.
+ */
+int grad_angle_cpu(
     const float *vol,
     const float *grad_sino,
     float       *grad_angles,
@@ -552,59 +629,54 @@ void grad_angle_cpu(
 ) {
     if (num_threads < 1) num_threads = 1;
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
+    const size_t plane = (size_t)Nz * Nx;
+    const int    yb    = Ny < FT_YB ? Ny : FT_YB;
+    const int    nch   = (N_det + FT_GA_CHUNK - 1) / FT_GA_CHUNK;
+    float  *vt   = NULL;
+    double *part = (double *)malloc((size_t)n_angles * nch * FT_YB * sizeof(double));
+    double *tot  = (double *)calloc((size_t)n_angles, sizeof(double));
+    if (Ny > 1) vt = (float *)malloc(plane * yb * sizeof(float));
+    if (!part || !tot || (Ny > 1 && !vt)) { free(part); free(tot); free(vt); return -1; }
 
-    for (int ia = 0; ia < n_angles; ia++)
-        grad_angles[ia] = 0.0f;
-
-    /*
-     * One scalar accumulator per angle; the outer ia loop is small (≈ tilt
-     * series length) so we parallelize the inner (iy, id) work with a
-     * reduction. This scales for the typical case where Ny, N_det >> n_angles.
-     */
-    for (int ia = 0; ia < n_angles; ia++) {
-        float ca = cos_a[ia], sa = sin_a[ia];
-        float g_theta = 0.0f;
-
-        #pragma omp parallel for collapse(2) schedule(static) \
-                                 num_threads(num_threads) reduction(+:g_theta)
-        for (int iy = 0; iy < Ny; iy++) {
-            for (int id = 0; id < N_det; id++) {
-                const float *slice = vol + (size_t)iy * Nz * Nx;
-                float t  = id - g.half_det;
-                float gs = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
-                if (gs == 0.0f) continue;
-
-                for (int step = -g.ray_len; step <= g.ray_len; step++) {
-                    float s  = (float)step;
-                    float x  = t * ca - s * sa;
-                    float z  = t * sa + s * ca;
-                    float fx = x + g.half_x;
-                    float fz = z + g.half_z;
-
-                    /* negated conjunction: a NaN sample (NaN/Inf angle)
-                     * fails every comparison and is skipped, instead of
-                     * indexing with (int)NaN = INT_MIN */
-                    if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
-                          fz >= 0.0f && fz < (float)(Nz - 1)))
-                        continue;
-
-                    int ix0 = (int)fx, iz0 = (int)fz;
-                    int ix1 = ix0 + 1, iz1 = iz0 + 1;
-                    float wx = fx - ix0, wz = fz - iz0;
-
-                    float v00 = slice[(size_t)iz0 * Nx + ix0];
-                    float v01 = slice[(size_t)iz0 * Nx + ix1];
-                    float v10 = slice[(size_t)iz1 * Nx + ix0];
-                    float v11 = slice[(size_t)iz1 * Nx + ix1];
-
-                    float dvol_dx = (1.0f - wz) * (v01 - v00) + wz * (v11 - v10);
-                    float dvol_dz = (1.0f - wx) * (v10 - v00) + wx * (v11 - v01);
-
-                    g_theta += gs * (dvol_dx * (-z) + dvol_dz * x);
-                }
-            }
+    #pragma omp parallel num_threads(num_threads)
+    for (int y0 = 0; y0 < Ny; y0 += FT_YB) {
+        const int nl = Ny - y0 < FT_YB ? Ny - y0 : FT_YB;
+        const float *blk = vol;
+        if (Ny > 1) {
+            #pragma omp for schedule(static)
+            for (size_t p = 0; p < plane; p++)
+                for (int l = 0; l < nl; l++)
+                    vt[p * nl + l] = vol[(size_t)(y0 + l) * plane + p];
+            blk = vt;
         }
 
-        grad_angles[ia] = g_theta;
+        #pragma omp for collapse(2) schedule(dynamic, 1)
+        for (int ia = 0; ia < n_angles; ia++)
+            for (int c = 0; c < nch; c++) {
+                const int id0 = c * FT_GA_CHUNK;
+                const int id1 = id0 + FT_GA_CHUNK < N_det ? id0 + FT_GA_CHUNK : N_det;
+                double *acc = part + ((size_t)ia * nch + c) * FT_YB;
+                if (nl == FT_YB)
+                    ga_chunk_lanes(blk, grad_sino, acc, FT_YB, g, ia, y0, id0, id1, cos_a[ia], sin_a[ia]);
+                else if (nl == 1)
+                    ga_chunk_lanes(blk, grad_sino, acc, 1, g, ia, y0, id0, id1, cos_a[ia], sin_a[ia]);
+                else
+                    ga_chunk_lanes(blk, grad_sino, acc, nl, g, ia, y0, id0, id1, cos_a[ia], sin_a[ia]);
+            }
+        /* implicit barrier: every partial of the block is done */
+
+        #pragma omp for schedule(static)
+        for (int ia = 0; ia < n_angles; ia++)
+            for (int c = 0; c < nch; c++)
+                for (int l = 0; l < nl; l++)
+                    tot[ia] += part[((size_t)ia * nch + c) * FT_YB + l];
+        /* implicit barrier: vt and part are refilled for the next block */
     }
+
+    for (int ia = 0; ia < n_angles; ia++)
+        grad_angles[ia] = (float)tot[ia];
+    free(part);
+    free(tot);
+    free(vt);
+    return 0;
 }

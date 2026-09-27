@@ -352,3 +352,55 @@ def test_cpu_rotmat_kernels_are_thread_invariant():
     for k in (3, 16):
         assert torch.equal(_forward_project_rotmat_raw(vol, mats, 17, num_threads=k), fp1)
         assert torch.equal(_grad_rotmat_raw(vol, gs, mats, num_threads=k), gm1)
+
+
+# ── P4: grad_angle, fp64 accumulation, thread-invariant ───────────────────
+
+def _grad_angle_fp64(vol, gs, ang):
+    """grad_angle_cpu's formula with every sum in fp64, on the same fp32
+    sample geometry (so the same samples and stencils as the kernel)."""
+    v = vol.double().numpy()
+    g = gs.double().numpy()
+    Ny, Nz, Nx = v.shape
+    n, _, Nd = g.shape
+    R, hd, hx, hz = _geom32(Nz, Nx, Nd)
+    cs, sn = _trig32(ang)
+    t = np.arange(Nd).astype(_F) - hd
+    out = np.zeros(n)
+    for a in range(n):
+        for step in range(-R, R + 1):
+            ok, ix0, iz0, wx, wz, x, z = _samples32(t, cs[a], sn[a], step, hx, hz, Nz, Nx)
+            wx, wz = wx.astype(np.float64), wz.astype(np.float64)
+            v00, v01 = v[:, iz0, ix0], v[:, iz0, ix0 + 1]
+            v10, v11 = v[:, iz0 + 1, ix0], v[:, iz0 + 1, ix0 + 1]
+            dx = (1 - wz) * (v01 - v00) + wz * (v11 - v10)
+            dz = (1 - wx) * (v10 - v00) + wx * (v11 - v01)
+            term = g[a] * (dx * -z.astype(np.float64) + dz * x.astype(np.float64))
+            out[a] += np.where(ok[None], term, 0.0).sum()
+    return torch.from_numpy(out) * (math.pi / 180.0)
+
+
+def _grad_angle_case(Ny, N, n, seed):
+    g = torch.Generator().manual_seed(seed)
+    c = torch.arange(N, dtype=torch.float64) - 0.5 * (N - 1)
+    blob = torch.exp(-((c[None, :] / (0.25 * N)) ** 2 + (c[:, None] / (0.2 * N)) ** 2))
+    vol = (blob.float().expand(Ny, N, N) + 0.05 * torch.rand(Ny, N, N, generator=g)).contiguous()
+    gs = torch.randn(n, Ny, N, generator=g)
+    return vol, gs, torch.linspace(-61.3, 58.7, n)
+
+
+@pytest.mark.parametrize("Ny,N,n", [(17, 48, 13), (1, 40, 9), (6, 33, 11)])
+def test_cpu_grad_angle_is_fp64_accurate_and_thread_invariant(Ny, N, n):
+    """The per-angle sums are fp64 in an order fixed by the geometry: the
+    result matches the all-fp64 evaluation of the same formula to fp32
+    rounding of the ray sums (the old single fp32 accumulator per thread
+    was 1e-6 to 8e-6 off and changed with the thread count), and it is the
+    same bits for every thread count."""
+    from fasttomo.autograd import _grad_angle_raw
+
+    vol, gs, ang = _grad_angle_case(Ny, N, n, seed=N)
+    ref = _grad_angle_fp64(vol, gs, ang)
+    out = _grad_angle_raw(vol, gs, ang, num_threads=1)
+    assert float((out.double() - ref).norm() / ref.norm()) < 1e-6
+    for k in (3, 8, 16):
+        assert torch.equal(_grad_angle_raw(vol, gs, ang, num_threads=k), out), k
