@@ -16,10 +16,7 @@ other keys are the first generation (the atomics ones differ run to run).
 The ``cpu/mbir`` and ``cuda/mbir`` keys were later regenerated on the
 branch that moved the MBIR voxel order into the CUDA kernel, and the
 ``_fft_ramp`` / ``fbp*`` keys on the branch that zero-pads the ramp filter
-(see test_algorithm_identity.py), and the geometry-gradient keys on the
-branch that made grad_rotmat / grad_angle deterministic
-(tests/data/regenerate_golden_keys.py); those runs replaced only their own
-keys. The cases live in ``tests/test_algorithm_identity.py::_cases`` (public API
+(see test_algorithm_identity.py); those runs replaced only their own keys. The cases live in ``tests/test_algorithm_identity.py::_cases`` (public API
 only), so generator and test cannot drift apart.
 
 ``_golden.stamp`` then records this environment's arithmetic fingerprints
