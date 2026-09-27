@@ -1231,6 +1231,36 @@ def test_run_grad_descent_cpu_converges():
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+def test_run_grad_descent_sgd_default_step_is_landweber(device):
+    """Low item (A6-12): with optimizer_cls=SGD and no lr, the step is 1/L
+    of the data term (power iteration), so SGD converges; the old fixed
+    1e-2 was 54x too small on this tiny problem (3 400-13 400x at 64^3 to
+    256^3) and barely moved. Adam's default stays 1e-2 (bit-identical to
+    passing it)."""
+    from fasttomo._operator import Geometry, _make_operator
+    from fasttomo.algorithms.ad import _landweber_step
+
+    N = 32
+    angles = make_angles(30).to(device)
+    vol = phantom_2d(N).unsqueeze(0).to(device)
+    sino = ft.forward_project(vol, angles)
+    _, auto = ft.run_grad_descent(sino, angles, 30, optimizer_cls=torch.optim.SGD,
+                                  return_loss=True)
+    _, fixed = ft.run_grad_descent(sino, angles, 30, lr=1e-2,
+                                   optimizer_cls=torch.optim.SGD, return_loss=True)
+    assert torch.isfinite(auto).all()
+    assert auto[-1] < 0.01 * auto[0]           # 120 -> 0.08
+    assert fixed[-1] > 0.3 * fixed[0]          # 120 -> 52
+    op = _make_operator(Geometry("parallel", (1, N, N), N, 30, angles), vol.device,
+                        torch.float32)
+    step = _landweber_step(op, None, vol, sino.numel())
+    assert step > 10 * 1e-2      # 54x the old fixed 1e-2 on this small problem
+    a = ft.run_grad_descent(sino, angles, 5)
+    b = ft.run_grad_descent(sino, angles, 5, lr=1e-2)
+    assert torch.equal(a, b)
+
+
 def test_run_grad_descent_legacy_positional_call_raises_cpu():
     """Everything after (sinogram, angles_deg, n_iter) is keyword-only, so a
     call written for the old positional order raises TypeError instead of

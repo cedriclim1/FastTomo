@@ -91,7 +91,12 @@ Constraints order
 ``loss_callback`` (frozen, 2026-06-11 handoff)
     Called once per iteration as ``loss_callback(i, loss)``: ``i`` is the
     0-based iteration index, ``loss`` the plain CPU float also stored in
-    ``loss_history[i]`` (NaN/Inf passed through). A callback that declares
+    ``loss_history[i]`` (NaN/Inf passed through). The value is the loss
+    computed during iteration ``i``, which each algorithm's docstring
+    defines; for most (SIRT, wSIRT, RESIRE, AD, gradient descent) it is the
+    loss of the iterate entering iteration ``i``, before its update, so the
+    last entry is not the loss of the returned volume (the 2026-06-11
+    handoff's "after iteration ``iter``" means "reported at the end of"). A callback that declares
     a ``components`` keyword (or ``**kwargs``) also receives
     ``components={...}``: CPU floats keyed ``"fidelity"`` plus only the
     regularisers active in the run, summing to ``loss``. A raising callback

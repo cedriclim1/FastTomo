@@ -76,6 +76,15 @@
   angles and shifts: L2 iteration 1.81 -> 1.72 ms at 256^3 (0.30 -> 0.25
   ms at 128^3), peak 352 -> 304 MiB (no volume-sized temporary). Results move at the ulp level (all `ad_*` goldens were
   regenerated). `run_grad_descent` keeps the caller's optimiser as given.
+- `run_grad_descent(optimizer_cls=torch.optim.SGD)` without `lr` now uses
+  the Landweber step `1 / L` of the data term (`L = 2 ||B A|| / M`, 20
+  seeded power iterations) instead of 1e-2, which was 3 400 to 13 400
+  times smaller at 64^3 to 256^3. `lr` defaults to None; with Adam (the
+  default) or any other optimiser it still means 1e-2, bit-identical.
+- Docs: the loss recorded for iteration `i` (`loss_history[i]`, the
+  callback value) is the loss of the iterate entering iteration `i`,
+  before its update, for SIRT-type algorithms and AD; the `loss_callback`
+  contract (values, indices, types) is unchanged.
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 

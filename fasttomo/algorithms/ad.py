@@ -398,6 +398,12 @@ def run_ad_recon(
     loss: the total loss of each iteration, with components ``fidelity``
     plus the active regularisers (``tv``, ``tv_xz``, ``sparsity``,
     ``in_plane``, ``s3im``, ``tilt_ssim``), each already weighted.
+    ``loss_history[i]`` (and the callback's value for ``i``) is the loss of
+    the iterate *entering* iteration ``i``, the one whose gradient that
+    iteration steps with: before its optimiser step and constraints (like
+    SIRT's residual before the update). ``loss_history[-1]`` is therefore
+    not the loss of the returned volume (they differ by the last step, ~0
+    with the cosine schedule, whose last learning rate is ~0).
 
     Parameters
     ----------
@@ -639,12 +645,34 @@ def run_ad_recon(
 
 # ── autograd-based reference reconstruction ──────────────────────────────
 
+_LANDWEBER_POWER_ITERS = 20
+_LANDWEBER_SEED = 0x5EED
+
+
+def _landweber_step(op, geom, volume: torch.Tensor, n_meas: int) -> float:
+    """``1 / L`` for the gradient of ``mean((A x - b)^2)``: ``L = 2 ||B A||
+    / n_meas`` with ``||B A||`` from a seeded power iteration on the
+    operator's raw ``fp`` / ``bp`` (the global RNG is not touched), times a
+    1 % safety margin. One host sync per power step, at setup only."""
+    g = torch.Generator().manual_seed(_LANDWEBER_SEED)
+    v = torch.randn(volume.shape, generator=g, dtype=volume.dtype).to(volume.device)
+    v = v / v.norm()
+    norm = 0.0
+    with torch.no_grad():
+        for _ in range(_LANDWEBER_POWER_ITERS):
+            w = op.bp(op.fp(v, geom), geom)
+            norm = float(w.norm())
+            if not norm > 0.0:          # A v = 0 (or non-finite): keep 1e-2
+                return 1e-2
+            v = w / norm
+    return n_meas / (2.0 * norm * 1.01)
+
 def run_grad_descent(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor | None = None,     # [n_angles] — single-axis
     n_iter: int = 200,
     *,
-    lr: float = 1e-2,
+    lr: float | None = None,
     Nz: int | None = None,
     optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
     positivity: bool = False,
@@ -667,7 +695,9 @@ def run_grad_descent(
     closure is re-evaluated as it needs). Constraints are applied in place
     under ``torch.no_grad`` after each step, the autograd-safe way to project
     a leaf tensor. Recorded loss: the total loss of each step (the first
-    closure evaluation for LBFGS), components ``fidelity`` and ``tv``.
+    closure evaluation for LBFGS), components ``fidelity`` and ``tv``,
+    evaluated at the iterate entering the step (before the update and the
+    constraints).
 
     Not a replacement for SIRT/RESIRE: use it for a custom differentiable
     loss or a learnable prior. Peak memory ~7 N^3 vs SIRT's ~5 N^3.
@@ -679,8 +709,19 @@ def run_grad_descent(
         Single-axis angles; exactly one of ``angles_deg`` and ``euler_zyz_deg``.
     n_iter : int
         Optimiser steps (default 200).
-    lr : float
-        Learning rate (default 1e-2).
+    lr : float, optional
+        Learning rate. Default (None): 1e-2, except for
+        ``optimizer_cls=torch.optim.SGD`` (or a subclass), where it is
+        ``1 / L``, ``L = 2 ||B A|| / M`` the Lipschitz constant of the
+        gradient of the data term ``mean((A x - b)^2)`` (``M`` sinogram
+        entries, ``B`` the back-projection, ``||B A||`` from 20 power
+        iterations with a fixed seed): plain gradient descent at the
+        classic Landweber step. A fixed 1e-2 was 3 400 to 13 400 times
+        smaller than that at 64^3 to 256^3, so SGD barely moved. The TV
+        term is not included (its gradient is not Lipschitz for small
+        ``tv_eps``); lower ``lr`` if SGD with a large ``tv_weight``
+        oscillates. Adam's step does not depend on the gradient's scale, so
+        its default is unchanged.
     optimizer_cls : type
         Any ``torch.optim.Optimizer`` class.
     tv_weight, tv_eps : float
@@ -712,7 +753,6 @@ def run_grad_descent(
     constraints, n_iter = setup.constraints, setup.n_iter
 
     volume = setup.volume0.requires_grad_(True)
-    opt = optimizer_cls([volume], lr=lr)
 
     # parallel: the angles are the operator's; rotmat: matrices computed
     # once; RESIRE: its wrappers take the Euler angles themselves
@@ -729,6 +769,11 @@ def run_grad_descent(
 
     def _fp(v):
         return op.project(v, geom)
+
+    if lr is None:
+        lr = (_landweber_step(op, geom, volume, sinogram.numel())
+              if issubclass(optimizer_cls, torch.optim.SGD) else 1e-2)
+    opt = optimizer_cls([volume], lr=lr)
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
     rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter,
