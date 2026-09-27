@@ -41,29 +41,36 @@ __all__ = [
 #
 # Moved from fasttomo.utilities (ARCH P8), which re-exports them.
 
+def _shift_compute_dtype(sinogram: torch.Tensor) -> torch.dtype:
+    """fp32 arithmetic for fp16/fp32 sinograms, fp64 for fp64 ones."""
+    return torch.float64 if sinogram.dtype == torch.float64 else torch.float32
+
+
 def apply_shifts(
     sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
     shifts: torch.Tensor,     # [n_angles] detector-axis shifts in pixels
-) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
+) -> torch.Tensor:            # [n_angles, Ny, N_det], sinogram's device and dtype
     """
     Sub-pixel shift each projection row along the detector axis via Fourier
     phase multiplication.  Positive shift moves the signal to the right.
 
-    shifts may be on CPU even when sinogram is on CUDA.
+    Returns the sinogram's dtype (fp16 in, fp16 out); the FFT runs in fp32
+    (fp64 for fp64 input). shifts may be on CPU even when sinogram is on CUDA.
     """
+    dt = _shift_compute_dtype(sinogram)
     N_det = sinogram.shape[-1]
-    s = shifts.to(device=sinogram.device, dtype=torch.float32)
-    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device)          # [N_freq]
+    s = shifts.to(device=sinogram.device, dtype=dt)
+    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device, dtype=dt)  # [N_freq]
     phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s.view(-1, 1, 1)
     phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
-    F = torch.fft.rfft(sinogram.float(), n=N_det, dim=-1)
-    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
+    F = torch.fft.rfft(sinogram.to(dt), n=N_det, dim=-1)
+    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1).to(sinogram.dtype)
 
 
 def apply_shifts_2d(
     sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
     shifts: torch.Tensor,     # [n_angles, 2] — (det-axis, tilt-axis) pixel shifts
-) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
+) -> torch.Tensor:            # [n_angles, Ny, N_det], sinogram's device and dtype
     """
     Per-tilt sub-pixel translation of the sinogram in the detector plane via
     bilinear ``grid_sample``.  Differentiable w.r.t. both ``sinogram`` and
@@ -77,6 +84,9 @@ def apply_shifts_2d(
     Intended for joint optimization with the volume and pose: drop in after
     ``forward_project_3d`` (or pass ``shifts=`` to it directly) so per-tilt
     translational alignment becomes a learnable parameter.
+
+    Returns the sinogram's dtype (fp16 in, fp16 out); the sampling runs in
+    fp32 (fp64 for fp64 input).
     """
     if shifts.ndim != 2 or shifts.shape[-1] != 2:
         raise ValueError(f"shifts must have shape [n_angles, 2], got {tuple(shifts.shape)}")
@@ -86,10 +96,11 @@ def apply_shifts_2d(
             f"shifts has {shifts.shape[0]} entries but sinogram has {n_a} angles"
         )
 
-    s = shifts.to(device=sinogram.device, dtype=torch.float32)
+    dt = _shift_compute_dtype(sinogram)
+    s = shifts.to(device=sinogram.device, dtype=dt)
 
-    ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=torch.float32)
-    xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=torch.float32)
+    ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=dt)
+    xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=dt)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")                  # [Ny, Nd]
     base = torch.stack((gx, gy), dim=-1)                            # [Ny, Nd, 2]
     base = base.unsqueeze(0).expand(n_a, -1, -1, -1)                # [n_a, Ny, Nd, 2]
@@ -101,11 +112,11 @@ def apply_shifts_2d(
     off = torch.stack((s[:, 0] * norm_x, s[:, 1] * norm_y), dim=-1) # [n_a, 2]
     grid = base - off.view(n_a, 1, 1, 2)                            # [n_a, Ny, Nd, 2]
 
-    inp = sinogram.unsqueeze(1).float()                             # [n_a, 1, Ny, Nd]
+    inp = sinogram.unsqueeze(1).to(dt)                              # [n_a, 1, Ny, Nd]
     out = torch.nn.functional.grid_sample(
         inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
     )
-    return out.squeeze(1)
+    return out.squeeze(1).to(sinogram.dtype)
 
 
 # ── projection ops ─────────────────────────────────────────────────────────

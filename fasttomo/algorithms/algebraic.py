@@ -21,6 +21,7 @@ from fasttomo.algorithms._common import (
     _prepare_recon,
     _LossRecorder,
     _build_fp_bp,
+    _reciprocal_or_zero,
 )
 from fasttomo.algorithms.analytic import _make_wbp
 
@@ -102,12 +103,12 @@ def run_sirt(
     ones_sino = torch.ones_like(sinogram)
     C_vol     = _bp(ones_sino)
     _assert_projector_output_shape(C_vol, (Ny, Nz, Nx), "back-projection", "run_sirt")
-    C_vol     = torch.where(C_vol > 0, 1.0 / C_vol, torch.zeros_like(C_vol))
+    C_vol     = _reciprocal_or_zero(C_vol)
 
     ones_vol  = torch.ones_like(volume)
     R_sino    = _fp(ones_vol)
     _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
-    R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
+    R_sino    = _reciprocal_or_zero(R_sino)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
 
@@ -246,13 +247,13 @@ def run_sart(
     C_list: list[torch.Tensor] = []  # col normalisers [Ny, Nz, Nx]
     for idx, geom in zip(subsets, geoms):
         R_s = op.project(ones_vol, geom)
-        R_s = torch.where(R_s > 0, 1.0 / R_s, torch.zeros_like(R_s))
+        R_s = _reciprocal_or_zero(R_s)
         R_list.append(R_s)
 
         # ones_sino for this subset
         ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=compute_dtype, device=device)
         C_s = op.backproject(ones_sino_s, geom)
-        C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
+        C_s = _reciprocal_or_zero(C_s)
         C_list.append(C_s)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")

@@ -103,6 +103,22 @@ def _assert_warm_start_shape(
         )
 
 
+def _reciprocal_or_zero(x: torch.Tensor) -> torch.Tensor:
+    """``1 / x`` where ``x > 0``, else 0: the SIRT / SART normalisers
+    ``1 / BP(1)`` and ``1 / FP(1)``, in ``x``'s dtype.
+
+    fp16 also zeroes the entries whose reciprocal would overflow (``x`` below
+    ``1 / 65504``). Those are rays that graze the volume (a path length of
+    ~1e-5 voxels, which the CPU rotation-matrix projector produces with its
+    exact interpolation weights); fp32 gives them a finite weight of ~1e5, the
+    fp16 division gave ``inf``, and ``residual * inf`` is ``inf`` or NaN.
+    A zero weight drops those rays from the update; for consistent data their
+    residual is ~1e-5 of a voxel value anyway. fp32 is unchanged (``x > 0``).
+    """
+    floor = 1.0 / torch.finfo(torch.float16).max if x.dtype == torch.float16 else 0.0
+    return torch.where(x > floor, 1.0 / x, torch.zeros_like(x))
+
+
 def _assert_projector_output_shape(
     tensor: torch.Tensor,
     expected_shape: tuple[int, ...],

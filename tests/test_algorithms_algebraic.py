@@ -21,6 +21,54 @@ import fasttomo as ft
 # ── SIRT ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("kind", ["parallel", "rotmat"])
+def test_fp16_sirt_normalisers_match_fp32(backend, kind):
+    """The fp16 SIRT/SART normalisers 1/BP(1) and 1/FP(1) (scope report 2d
+    [S]): finite and within 2**-10 relative of the fp32 ones at 128^2 x 61
+    views (two fp16 roundings: measured 7.3e-4, the same at 1024^2)."""
+    from fasttomo.algorithms._common import _reciprocal_or_zero
+
+    N, Ny, n = 128, 4, 61
+    ang = make_angles(n, device=backend)
+    if kind == "parallel":
+        fp = lambda v: ft.forward_project(v, ang)          # noqa: E731
+        bp = lambda s: ft.back_project(s, ang)             # noqa: E731
+    else:
+        eul = torch.stack([torch.linspace(-3, 3, n), ang.cpu(), torch.linspace(2, -2, n)], 1)
+        eul = eul.to(backend)
+        fp = lambda v: ft.forward_project_3d(v, eul)       # noqa: E731
+        bp = lambda s: ft.back_project_3d(s, eul)          # noqa: E731
+    for f, x in ((bp, torch.ones(n, Ny, N, device=backend)),
+                 (fp, torch.ones(Ny, N, N, device=backend))):
+        r32 = _reciprocal_or_zero(f(x))
+        r16 = _reciprocal_or_zero(f(x.half()))
+        assert r16.dtype == torch.float16 and torch.isfinite(r16).all()
+        assert torch.equal(r16 > 0, r32 > 0)
+        m = r32 > 0
+        rel = ((r16.float() - r32).abs() / r32)[m].max().item()
+        assert rel < 2.0 ** -10, rel
+
+
+def test_fp16_normaliser_of_a_grazing_ray_is_zero_not_inf():
+    """The CPU rotation-matrix FP has exact interpolation weights, so a ray
+    that grazes a corner of the volume gets FP(1) ~ 1.3e-5 < 1/65504: its
+    fp16 reciprocal was inf (fp32: ~7.7e4), and residual * inf is inf/NaN.
+    Such rays now get weight 0 in fp16; fp32 keeps 1/x."""
+    from fasttomo.algorithms._common import _reciprocal_or_zero
+
+    eul = torch.tensor([[1.7248682975769043, -41.286312103271484, 1.3200063705444336]])
+    R = ft.forward_project_3d(torch.ones(8, 256, 256), eul)
+    grazing = (R > 0) & (R < 1.0 / 65504)
+    assert grazing.sum() == 2                         # the reproducer still reproduces
+    assert torch.isinf(torch.where(R.half() > 0, 1.0 / R.half(), 0.0)).sum() == 2
+    r16 = _reciprocal_or_zero(R.half())
+    assert torch.isfinite(r16).all() and (r16[grazing] == 0).all()
+    r32 = _reciprocal_or_zero(R)
+    assert torch.equal(r32, torch.where(R > 0, 1.0 / R, torch.zeros_like(R)))
+    ok = (R >= 1.0 / 65504)
+    assert torch.equal(r16[ok], (1.0 / R.half())[ok])
+
+
 def test_sirt_shape(backend):
     """Replaces test_cpu.py::test_sirt_shape and test_cuda.py::test_sirt_shape_cuda."""
     N      = 32

@@ -918,6 +918,36 @@ def test_apply_shifts_2d_zero_is_identity_and_grad(backend):
     assert rel_l2(sh.grad, fd) < 1e-3
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64], ids=["fp16", "fp64"])
+@pytest.mark.parametrize("fn", ["apply_shifts", "apply_shifts_2d"])
+def test_apply_shifts_return_the_input_dtype(backend, fn, dtype):
+    """Both shift ops return the sinogram's dtype, like every other op (they
+    returned fp32 for fp16 and fp64 input). fp16 is the fp32 computation
+    rounded once; fp64 runs in fp64."""
+    g = torch.Generator().manual_seed(8)
+    sino = torch.rand(3, 5, 12, generator=g, dtype=torch.float64).to(backend)
+    sh = torch.tensor([0.3, -1.6, 2.2], dtype=torch.float64)
+    if fn == "apply_shifts_2d":
+        sh = torch.stack((sh, torch.tensor([0.4, 0.0, -0.7], dtype=torch.float64)), 1)
+    op = getattr(ft, fn)
+    out = op(sino.to(dtype), sh)
+    assert out.dtype == dtype and out.device.type == backend.type
+    ref = op(sino.to(dtype).float(), sh.float())      # the fp32 computation
+    if dtype == torch.float16:
+        assert torch.equal(out, ref.half())
+    else:
+        # fp64 arithmetic: far closer to the exact shift than fp32 (1e-7)
+        torch.testing.assert_close(out, ref.double(), rtol=0, atol=1e-5)
+        assert not torch.equal(out.float(), ref)
+
+
+def test_apply_shifts_fp16_is_differentiable(backend):
+    sino = torch.rand(2, 4, 8).to(backend).half().requires_grad_(True)
+    sh = torch.tensor([[0.5, 0.25], [-0.5, 0.0]], device=backend, requires_grad=True)
+    ft.apply_shifts_2d(sino, sh).float().sum().backward()
+    assert sino.grad.dtype == torch.float16 and sh.grad is not None
+
+
 def test_apply_shifts_2d_rejects_bad_shapes():
     sino = torch.zeros(3, 4, 5)
     with pytest.raises(ValueError, match=r"\[n_angles, 2\]"):
