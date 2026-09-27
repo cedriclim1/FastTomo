@@ -21,7 +21,7 @@ serve the same modelling goal in two different optimisation regimes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -74,6 +74,13 @@ class PoseRefinementConfig:
     The ``refine_pose`` and ``refine_shifts`` flags inside this config are
     independent: either, neither, or both may be true. ``anchor_reference``
     requires at least one of them to be true (validated in ``__post_init__``).
+
+    ``pose_warmup_iters`` delays pose/shift optimiser steps while the volume
+    forms. After warmup, a positive ``alternating_period`` alternates
+    volume-only and pose-only blocks of that length; zero keeps the historical
+    joint update. The optional initialisers are engine-native Euler angles in
+    degrees with shape ``[n_views, 3]`` and XY shifts in pixels with shape
+    ``[n_views, 2]``.
     """
     refine_pose: bool = False
     refine_shifts: bool = False
@@ -83,6 +90,10 @@ class PoseRefinementConfig:
     tilt_bound_deg: float | None = 1.0
     antisymmetric_z: bool = True
     anchor_reference: bool = False
+    pose_warmup_iters: int = 0
+    alternating_period: int = 0
+    pose_init_euler_deg: Any | None = None
+    pose_init_shifts: Any | None = None
 
     def __post_init__(self) -> None:
         if self.anchor_reference and not (self.refine_pose or self.refine_shifts):
@@ -90,6 +101,23 @@ class PoseRefinementConfig:
                 "anchor_reference=True requires refine_pose=True or "
                 "refine_shifts=True; nothing to anchor otherwise."
             )
+        for name in ("pose_warmup_iters", "alternating_period"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"{name} must be a non-negative integer, got {value!r}"
+                )
+        if self.alternating_period > 0 and not (
+            self.refine_pose or self.refine_shifts
+        ):
+            raise ValueError(
+                "alternating_period > 0 requires refine_pose=True or "
+                "refine_shifts=True; there is no pose-only block otherwise."
+            )
+        if self.pose_init_euler_deg is not None and not self.refine_pose:
+            raise ValueError("pose_init_euler_deg requires refine_pose=True.")
+        if self.pose_init_shifts is not None and not self.refine_shifts:
+            raise ValueError("pose_init_shifts requires refine_shifts=True.")
 
 
 @dataclass
