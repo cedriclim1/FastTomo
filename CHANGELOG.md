@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
+
+`ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes
+the DC term and makes the convolution circular. `run_fbp` of a unit-density
+cylinder came out at 0.96, 0.83 and 0.57 (radius 20, 40, 60 in a 128 grid)
+instead of 1. The filter is now the spatial-domain Ram-Lak kernel
+(`h[0] = 1/4`, `h[odd n] = -1/(pi n)^2`) applied with zero padding to the
+next power of two `>= 2 N_det - 1`; the same cylinders reconstruct at
+1.000 +- 0.002, at 180 degrees and at +-70 degrees alike. **`run_fbp` and
+`ramp_filter` results differ from earlier versions** (only the FBP and
+ramp-filter keys of the algorithm golden were regenerated). The
+`pi / n_angles` scale is unchanged and is right for limited tilt ranges
+too: it is pi times the mean over the measured views, so a +-70 degree
+series gives the same level as a full one (checked; the scope report had
+suspected it was off by 180/140).
+
+### ⚠ `run_mbir(multires_levels > 1)`: coarse levels hand over the right values
+
+A multires level with factor `f` works on voxels `f` fine voxels wide, so
+its values are `f` times the fine-grid ones. The hand-over to the next
+finer level only resized the volume, so the fine level started at twice
+the object's level, and a `warm_start` reached the coarse level at half
+its values. Both are now rescaled (`x 0.5` per level, `x coarse_factor`
+for a warm start). Multires results differ slightly from earlier versions
+(they converge to the same solution; the fine level starts 8x closer, data
+MSE 6.8 -> 0.82 on a test cylinder). Single-level runs are unchanged.
+
+### fp16 overflow raises `OverflowError`
+
+fp16 projections accumulate in fp32 but store fp16, so a result above
+65504 (the back-projection of an unnormalised sinogram, the forward
+projection of a large volume with large values, FBP before its
+`pi / n_angles` scale, FISTA's first gradient) came back as `inf`. The
+projection functions, the projector classes, `run_fbp` and autograd
+backward now raise `OverflowError` with the remedy (scale the data into
+range, or use fp32) instead; an `inf` that came with the input is passed
+through. `run_sirt`, `run_sart`, `run_fista` and `run_fista_tv` check
+their projections on the device and raise once when they return. fp32 is
+never checked; a direct fp16 call on CUDA pays one flag read (0.06-0.07 ms measured).
+
+### Changed
+
+- `apply_shifts` and `apply_shifts_2d` return the sinogram's dtype (they
+  returned fp32 for fp16 and fp64 input) and share one contract: shifts
+  `[n_angles]` (detector axis) or `[n_angles, 2]` (detector axis, tilt
+  axis), positive shifts move the signal toward larger indices, the same
+  shape errors. `apply_shifts` gained the `[n_angles, 2]` form (Fourier
+  shift along both axes) and `apply_shifts_2d` the `[n_angles]` form. A
+  sinogram that is not 3-D raises `ValueError` (`apply_shifts` used to
+  broadcast it into a wrong result).
+- Size parameters default to `None` across the Python API (`Nz` of every
+  reconstruction; `N_det`, `Nz`, `Nx` of the projection functions);
+  `-1` is still accepted and means the same.
+- fp16 SIRT / SART: a ray that grazes the volume (FP(1) below 1/65504,
+  produced by the CPU rotation-matrix projector) gets a zero normaliser
+  instead of `inf`. fp32 is unchanged.
+- One CUDA projector used from two streams is safe: a call from another
+  stream than the previous one waits for that stream first (the shared
+  texture uploads used to race).
+- `tilt_ssim_loss` and `s3im_loss` with `data_range=None` no longer
+  synchronise the host (two syncs per `run_ad_recon` iteration with both
+  weights on); values are bit-identical.
+
+### Added
+
+- `fasttomo.__version__` (from the installed distribution's metadata).
+- `run_wbp` (alias of `run_weighted_backprojection`) and `tv_loss_zx`
+  (alias of `tv_loss_xz`).
+- cp314 wheels (CPU and CUDA); `wheels.yml` uses cibuildwheel v3.4.1.
+
 ### ⚠ `run_mbir` is single-threaded on CPU by default
 
 `run_mbir` used to run its CPU ICD sweep on a hardcoded 4 OpenMP threads. It
