@@ -63,9 +63,20 @@ def back_project(
 
     Nz and Nx default to N_det (square reconstruction). Pass ``Nx`` (and
     ``Nz``) to back-project onto a volume whose width differs from the
-    detector; this is the adjoint of ``forward_project(volume, angles, N_det)``
-    for a ``[Ny, Nz, Nx]`` volume, and the backward of ``forward_project``
-    uses it automatically.
+    detector; the backward of ``forward_project(volume, angles, N_det)``
+    uses it automatically for a ``[Ny, Nz, Nx]`` volume.
+
+    The two backends implement different back-projections:
+
+    * CPU: ray-driven scatter, the exact transpose of the CPU
+      ``forward_project`` (inner-product test to fp32 round-off). It is not
+      shift-invariant: a constant sinogram back-projects to a voxel pattern
+      of up to +-34 % in a single 45 degree view.
+    * CUDA: voxel-driven gather; every voxel linearly interpolates each
+      view's sinogram row at its detector position (texture unit, 8-bit
+      interpolation weights). Shift-invariant, but only an approximate
+      adjoint of the CUDA ``forward_project`` (~1 % inner-product error on
+      smooth data, more on noise).
 
     The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in (default
     serial; resolution order kwarg → ``OMP_NUM_THREADS`` env → 1).

@@ -296,6 +296,86 @@ def _ad_sparsity_term(volume: torch.Tensor, weight: float) -> torch.Tensor:
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
+#
+# W-BP = back-project, then deconvolve every XZ slice by the transfer
+# function of the back-projection of a centred point (a 1 at detector pixel
+# (N_det-1)//2 in every view; Wolf et al. 2014). Two details matter for this
+# to be (close to) an inverse of the projector, and both used to be wrong:
+#
+# * The deconvolution is an FFT, i.e. circular, and on the bare [Nz, Nx]
+#   grid wSIRT diverged at omega=1 on 32 of 45 test geometries. Two modes
+#   grew: one concentrated in the outermost ~3 voxels of the volume (the
+#   circular boundary sits on the volume edge, where the tight-bounds
+#   forward projector barely sees the voxels), and, with many views, a
+#   low-frequency one next to the missing-wedge edge. The layergram and the
+#   PSF are now back-projected onto a grid with a margin of
+#   `_wbp_margin(N)` = max(2, N // 16) voxels on each side of Z and X,
+#   filtered there and cropped at the margin (symmetric, so exact for odd N).
+#   Measured over 9 sizes x 5 tilt schemes: no divergence, and the one-step
+#   error is lower than without the margin on every geometry; larger margins
+#   (N/8, N/4, 2x) lose accuracy.
+# * The filter assumes a shift-invariant back-projection. The CPU
+#   `back_project` is ray-driven (the exact transpose of the ray-marching CPU
+#   forward projector) and is not: a constant sinogram back-projects to a
+#   +-34 % voxel pattern at 45 degrees, which the filter amplifies up to
+#   ~40x (CPU W-BP: 83 % error vs 30 % on CUDA). W-BP therefore uses the
+#   voxel-driven gather back-projection on both backends: the CUDA
+#   `back_project` kernel already is one, and `_bp_gather` is the same
+#   operator on CPU with exact fp32 interpolation weights. The CUDA texture
+#   unit interpolates with 8-bit fractional weights, so the two differ by
+#   ~2e-4 (the same texture floor the forward projector has at ~1.3e-4);
+#   the CPU path is the exact reference.
+
+_WBP_CHUNK_VOXELS = 1 << 24     # padded layergram elements per Y-chunk (64 MiB fp32)
+
+
+def _wbp_margin(n: int) -> int:
+    """Voxels of padding on each side of a W-BP axis of length ``n``."""
+    return max(2, n // 16)
+
+
+def _bp_gather(
+    sinogram: torch.Tensor,     # [n_angles, Ny, N_det] fp32
+    angles_deg: torch.Tensor,   # [n_angles] degrees
+    Nz: int,
+    Nx: int,
+) -> torch.Tensor:
+    """Voxel-driven (gather) single-axis back-projection -> [Ny, Nz, Nx].
+
+    Each voxel (x, z), centred coordinates, takes from every view the
+    sinogram row value at detector position u = x cos + z sin + (N_det-1)/2,
+    linearly interpolated, with zero outside the detector. This is the
+    operator of the CUDA ``back_project_parallel_kernel`` (texture fetch at
+    u + 0.5 with linear filtering and border addressing), in plain PyTorch
+    so the CPU W-BP is the same operator, with exact interpolation weights
+    (the texture unit's are 8-bit, ~2e-4 apart)."""
+    n_angles, Ny, N_det = sinogram.shape
+    device = sinogram.device
+    a = angles_deg.detach().to(device=device, dtype=torch.float32).reshape(-1) * (math.pi / 180.0)
+    cos_a, sin_a = torch.cos(a), torch.sin(a)
+    x = torch.arange(Nx, device=device, dtype=torch.float32) - 0.5 * (Nx - 1)
+    z = torch.arange(Nz, device=device, dtype=torch.float32) - 0.5 * (Nz - 1)
+    # [N_det + 2, Ny]: one zero row on each side stands for "outside".
+    out = torch.zeros(Nz * Nx, Ny, device=device, dtype=torch.float32)
+    for k in range(n_angles):
+        rows = F.pad(sinogram[k].float().t(), (0, 0, 1, 1))
+        u = (x[None, :] * cos_a[k] + z[:, None] * sin_a[k] + 0.5 * (N_det - 1)).reshape(-1)
+        u0 = torch.floor(u)
+        w = (u - u0).unsqueeze(1)
+        i0 = (u0.long() + 1).clamp_(0, N_det + 1)       # +1: the zero row
+        i1 = (u0.long() + 2).clamp_(0, N_det + 1)
+        out += (1.0 - w) * rows[i0] + w * rows[i1]
+    return out.t().reshape(Ny, Nz, Nx).contiguous()
+
+
+def _wbp_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor,
+                     Nz: int, Nx: int) -> torch.Tensor:
+    """The shift-invariant back-projection W-BP needs: the CUDA kernel, or
+    the same gather operator on CPU."""
+    if sinogram.is_cuda:
+        return back_project(sinogram, angles_deg, Nz=Nz, Nx=Nx)
+    return _bp_gather(sinogram, angles_deg, Nz, Nx)
+
 
 def _compute_exact_wf(
     angles_deg: torch.Tensor,   # [n_angles] degrees
@@ -305,38 +385,70 @@ def _compute_exact_wf(
     threshold_scale: float = 1.0,
 ) -> torch.Tensor:
     """
-    Numerically compute the exact weighting filter for W-BP.
+    Numerically compute the exact weighting filter for W-BP on the padded
+    grid ``[Pz, Px] = [Nz, Nx] + 2 * margin`` (`_wbp_margin`).
 
-    Construct PSF: back-project a sinogram with a 1 at t=0 for every angle
-    (i.e., the sinogram of a unit point at the volume centre).
-    WF = |g| / |TF|  (thresholded).
+    PSF: back-project the sinogram of a unit point at the rotation centre:
+    a 1 at detector pixel ``(N_det - 1) // 2`` in every view. For even N_det
+    that pixel is half a pixel off the centre; the filter uses |TF| only, and
+    splitting the point 0.5/0.5 over the two central pixels instead adds a
+    blur the data do not have (measured: worse error on every even size and
+    divergence without the margin). WF = 1 / |TF(PSF)|, zero where |TF| is
+    below ``threshold_scale * TF[0, 0] / n_angles`` (missing wedge).
 
-    Returns real 2D filter [Nz, Nx//2+1] Fourier amplitudes ready to
-    multiply against rfft2 of a volume slice.
+    Returns real Fourier amplitudes ``[Pz, Px//2+1]`` to multiply against
+    ``rfft2`` of a padded layergram slice.
     """
-    # sinogram of a unit point at the origin: each row has a 1 at t=0
     n_angles = len(angles_deg)
     point_sino = torch.zeros(n_angles, 1, N_det, device=device)
-    center_det = (N_det - 1) // 2
-    point_sino[:, 0, center_det] = 1.0
+    point_sino[:, 0, (N_det - 1) // 2] = 1.0
+    Pz, Px = Nz + 2 * _wbp_margin(Nz), Nx + 2 * _wbp_margin(Nx)
+    # The exact gather on both backends: the filter is a hard threshold on
+    # |TF|, so a frequency sitting near it would be kept on one backend and
+    # zeroed on the other if the PSF carried the CUDA texture's 8-bit
+    # weights (up to 5e-2 CPU/CUDA difference measured). One Ny=1 slice,
+    # built once per geometry.
+    psf = _bp_gather(point_sino, angles_deg.to(device), Pz, Px)[0]   # [Pz, Px]
 
-    # back-project to get PSF of the S-BP [1, Nz, Nx]
-    psf = back_project(point_sino, angles_deg, Nz=Nz).squeeze(0)  # [Nz, Nx]
-
-    # transfer function
-    TF  = torch.fft.rfft2(psf)
-    TF_amp = TF.abs()
-
+    TF_amp = torch.fft.rfft2(psf).abs()
     # threshold: avoid division by zero inside missing wedge
-    n_alpha = float(n_angles)
-    thresh  = threshold_scale * TF_amp[0, 0].item() / n_alpha
-    thresh  = max(thresh, 1e-6)
+    thresh = max(threshold_scale * TF_amp[0, 0].item() / float(n_angles), 1e-6)
+    return torch.where(TF_amp > thresh, 1.0 / TF_amp, torch.zeros_like(TF_amp))
 
-    # WF = 1 / TF  (thresholded)
-    WF_amp = torch.where(TF_amp > thresh, 1.0 / TF_amp, torch.zeros_like(TF_amp))
 
-    # return as real-valued Fourier amplitudes (apply via rfft2 multiply)
-    return WF_amp  # [Nz, Nx//2+1] complex magnitudes
+def _make_wbp(
+    angles_deg: torch.Tensor,
+    Nz: int, Nx: int, N_det: int,
+    device: torch.device,
+    threshold_scale: float = 1.0,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return ``wbp(sinogram) -> [Ny, Nz, Nx]``: the exact weighted
+    back-projection shared by `run_weighted_backprojection` and `run_wsirt`
+    (the filter is built once per geometry)."""
+    WF = _compute_exact_wf(angles_deg, Nz, Nx, N_det, device, threshold_scale)
+    oz, ox = _wbp_margin(Nz), _wbp_margin(Nx)
+    Pz, Px = Nz + 2 * oz, Nx + 2 * ox       # symmetric margin: the crop is centred for odd N too
+    angles_deg = angles_deg.to(device)
+
+    # Y-slices are independent; chunk them so the padded layergram and its
+    # spectrum stay around _WBP_CHUNK_VOXELS elements.
+    y_chunk = max(1, _WBP_CHUNK_VOXELS // (Pz * Px))
+
+    @torch.no_grad()
+    def wbp(sinogram: torch.Tensor) -> torch.Tensor:
+        Ny = sinogram.shape[1]
+        out = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sinogram.device)
+        for y0 in range(0, Ny, y_chunk):
+            sl = sinogram[:, y0:y0 + y_chunk]
+            spec = torch.fft.rfft2(_wbp_backproject(sl, angles_deg, Pz, Px))   # [ny, Pz, Px//2+1]
+            spec.mul_(WF)
+            filtered = torch.fft.irfft2(spec, s=(Pz, Px))
+            del spec
+            out[y0:y0 + sl.shape[1]] = filtered[:, oz:oz + Nz, ox:ox + Nx]
+            del filtered
+        return out
+
+    return wbp
 
 
 # ── public reconstruction functions ───────────────────────────────────────
@@ -434,34 +546,26 @@ def run_weighted_backprojection(
     Exact Weighted Back-Projection (Wolf et al. 2014).
 
     Computes the exact numerical weighting filter from the PSF of a
-    central point, then applies it slice-by-slice in Fourier space.
+    central point, then applies it slice-by-slice in Fourier space. The
+    back-projection and the filter run on a grid with a max(2, N // 16)
+    voxel margin on each side of Z and X (the circular deconvolution
+    otherwise destabilises the volume edge) and use the voxel-driven
+    back-projection on both backends, so CPU and CUDA give the same result
+    up to the CUDA texture interpolation; see the "exact weighting filter"
+    notes above `_bp_gather`. Extra memory: one padded layergram and its
+    spectrum per Y-chunk (at most ~64 Mi elements).
 
     Returns volume [Ny, Nz, Nx].
     mask=True zeros voxels outside the inscribed cylinder (common in ET).
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
+    _, _, N_det, Nz, device = _check_inputs(
         sinogram, angles_deg, Nz,
         allowed_dtypes=(torch.float32,),
         op_name="run_weighted_backprojection",
     )
     Nx = N_det
 
-    # compute WF once for this tilt geometry [Nz, Nx//2+1] (amplitudes)
-    WF_amp = _compute_exact_wf(
-        angles_deg, Nz, Nx, N_det, device, threshold_scale
-    )
-
-    # simple back-project first → [Ny, Nz, Nx]
-    layergram = back_project(sinogram, angles_deg, Nz=Nz)
-
-    # apply WF slice-by-slice via rfft2
-    volume = torch.empty_like(layergram)
-    for iy in range(Ny):
-        F_slice = torch.fft.rfft2(layergram[iy])     # [Nz, Nx//2+1]
-        # multiply by WF (phase-preserving, magnitude correction)
-        phase   = F_slice / (F_slice.abs() + 1e-12)
-        F_out   = phase * (F_slice.abs() * WF_amp)
-        volume[iy] = torch.fft.irfft2(F_out, s=(Nz, Nx))
+    volume = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale)(sinogram)
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     return ConstraintConfig(positivity=positivity, mask=_mask).apply(volume)
@@ -2014,6 +2118,13 @@ def run_wsirt(
 
     f^k = f^{k-1} + ω · W-BP(b - A·f^{k-1})
 
+    W-BP is the exact weighted back-projection of
+    `run_weighted_backprojection` (edge margin, voxel-driven on both
+    backends). With it wSIRT does not diverge at the default ``omega=1``;
+    without the margin it diverged on most geometries tested. CPU and CUDA
+    results agree to ~2e-4, the floor set by the CUDA texture unit's 8-bit
+    interpolation weights in the forward and back projectors.
+
     return_loss: if True, returns (volume, loss_history) where loss_history
     is a float32 CPU tensor of shape [n_iter] containing the sinogram MSE
     ||b - A·f^k||² / numel at each iteration.
@@ -2027,7 +2138,7 @@ def run_wsirt(
     which builds the PSF in fp32 and applies a 2-D rfft, both fp32-pinned.
     Cast your sinogram to ``torch.float32`` first.
     """
-    n_angles, Ny, N_det, Nz, device = _check_inputs(
+    _, Ny, N_det, Nz, device = _check_inputs(
         sinogram, angles_deg, Nz,
         allowed_dtypes=(torch.float32,),
         op_name="run_wsirt",
@@ -2035,20 +2146,8 @@ def run_wsirt(
     Nx = N_det
     volume = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=device)
 
-    # pre-compute exact WF (once per tilt geometry)
-    WF_amp = _compute_exact_wf(
-        angles_deg, Nz, Nx, N_det, device, threshold_scale
-    )
-
-    def _wbp(sino: torch.Tensor) -> torch.Tensor:
-        """W-BP: back-project then apply exact WF in Fourier space."""
-        lg = back_project(sino, angles_deg, Nz=Nz)  # [Ny, Nz, Nx]
-        out = torch.empty_like(lg)
-        for iy in range(Ny):
-            F  = torch.fft.rfft2(lg[iy])
-            ph = F / (F.abs() + 1e-12)
-            out[iy] = torch.fft.irfft2(ph * (F.abs() * WF_amp), s=(Nz, Nx))
-        return out
+    # exact W-BP operator, built once per tilt geometry
+    _wbp = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale)
 
     _mask = _maybe_cylindrical_mask(Nz, Nx, device, mask)
     constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
