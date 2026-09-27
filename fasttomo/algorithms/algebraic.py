@@ -684,6 +684,11 @@ def release_cached_projectors() -> int:
     capture on every call) until this is called or a call with another
     configuration replaces it; the next call then captures again.
 
+    It does not free the scratch pool of the CUDA geometry-gradient kernels
+    (``grad_rotmat`` / ``grad_angle``): that stream-ordered pool keeps up to
+    64 MiB per device reserved for the life of the process, outside
+    PyTorch's allocator (not counted by ``torch.cuda.memory_*``).
+
     Returns the number of configurations released (0 or 1). Safe to call at
     any time, also without CUDA.
     """

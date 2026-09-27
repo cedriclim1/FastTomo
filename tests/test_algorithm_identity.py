@@ -20,14 +20,25 @@ unpadded ``|xi|`` filter reconstructed a unit-density cylinder at 0.57 to
 0.96 instead of 1). Only those 9 keys were replaced; every other tensor of
 the file is byte-identical to before.
 
+Exception: the geometry-gradient keys (``cuda/fp_grad_angles``,
+``cuda/fp3d_grad_euler``, ``cuda/fp3d_shift_grad_euler``,
+``cuda/proj_rotmat_grad_mats``, ``cuda/proj_rotmat_grad_mats_stale``) were
+regenerated when ``grad_rotmat`` and ``grad_angle`` replaced their fp32
+atomics with fixed-order reductions (and ``grad_rotmat`` factored u, v and
+the sinogram gradient out of its ray loop): max change 1.3e-7 to 3.8e-7 of
+each key's largest value (``tests/data/regenerate_golden_keys.py``). They
+are deterministic now, so all but ``cuda/fp3d_shift_grad_euler`` (its
+detector shifts go through ``grid_sample``, whose CUDA backward uses
+atomics) left ``ATOMIC_KEYS`` for the exact comparison.
+
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
 
 Comparison:
 
-* Keys listed in ``ATOMIC_KEYS`` come from CUDA kernels that accumulate with
-  fp32 atomics (``grad_angle``, ``grad_rotmat``, the RESIRE forward
-  projection, MBIR's forward projection), so they are not bit-reproducible
+* Keys listed in ``ATOMIC_KEYS`` come from CUDA code that accumulates with
+  fp32 atomics (the RESIRE forward projection, MBIR's forward projection,
+  ``grid_sample``'s backward), so they are not bit-reproducible
   even main-vs-main; they are compared at 2e-6 relative / absolute (the
   observed main-vs-main spread is below 1e-6). The TV-loss value is no longer
   one of them: since PR #92 its CUDA forward is a fixed-order two-pass
@@ -80,13 +91,11 @@ FFT_KEYS = {"_fft_ramp", "_fft_rfft2", "fbp", "fbp_mask", "fbp_h", "fbp_proj", "
 
 # Outputs of fp32-atomics kernels (not reproducible run to run). cuda/gd_tv
 # and cuda/gd_tv_loss are not here: the TV forward is a fixed-order reduction
-# since PR #92, so they get the deterministic-key check.
+# since PR #92, so they get the deterministic-key check; neither are the
+# grad_angle / grad_rotmat keys, fixed-order since phase 1b (R1/R5), except
+# fp3d_shift_grad_euler, whose shifts go through grid_sample's backward.
 ATOMIC_KEYS = {
-    "cuda/fp_grad_angles",
-    "cuda/fp3d_grad_euler",
     "cuda/fp3d_shift_grad_euler",
-    "cuda/proj_rotmat_grad_mats",
-    "cuda/proj_rotmat_grad_mats_stale",
     "cuda/gd_resire",
     "cuda/gd_resire_loss",
     "cuda/mbir",

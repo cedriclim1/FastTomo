@@ -5,13 +5,14 @@
  *          grad_rotmat_kernel.
  * Host wrappers: forward_project_rotmat_cuda, forward_project_rotmat_cuda_cached,
  *                back_project_rotmat_cuda, back_project_rotmat_cuda_cached,
- *                grad_rotmat_cuda.
+ *                grad_rotmat_cuda, grad_rotmat_cuda_cached.
  */
 
 #include "common.cuh"
 #include "texture_cache.h"
 #include "../include/proj_geom.h"
 #include "ops.h"
+#include "scratch_pool.cuh"
 
 #include <climits>
 
@@ -36,10 +37,14 @@
  * cannot drop a contributing sample. Non-finite ray parameters (a NaN or
  * Inf matrix) fall back to the full range, which is what the loop did.
  *
- * grad_rotmat_kernel marches the same steps but is NOT clipped: its loose
- * bounds test already skips the 8 texture fetches of an outside sample, so
- * clipping only saves that test, and measured 0.97-0.98x (block- or
- * warp-uniform range) and ~0.8x (per-lane range) against the full loop.
+ * grad_rotmat_kernel uses the same block-uniform clipping. A dropped step
+ * is one its loose bounds test would skip (the slab [-2, N+1] contains the
+ * contributing band (-1, N)), so no accumulator changes and the gradient is
+ * bit-identical to the full loop (tests compare both via the hook below).
+ * The gain is small because an outside step costs ~20 instructions against
+ * ~86 for an inside one: 0.97-0.98x with the old 9 KB smem-tree kernel
+ * (PR #92), 1.00-1.07x after the fixed-order reduction and the instruction
+ * cut (phase1b audit R1/R2/R10; per-lane ranges ~0.8x, not used).
  */
 __device__ __forceinline__ bool rotmat_clip_axis(float o, float d, int N,
                                                  float &t0, float &t1) {
@@ -244,9 +249,17 @@ void forward_project_rotmat_cuda_cached(
  * back_project_rotmat_kernel
  * Grid: (⌈Nx/8⌉, ⌈Nz/8⌉, ⌈Ny/4⌉)   Block: (8, 8, 4)
  * Each thread owns one (ix, iz, iy) voxel and loops over all angles.
- * Rotation matrices loaded into shared memory (9 * n_angles floats).
+ * Rotation matrices are staged in shared memory ROTMAT_BP_CHUNK views at a
+ * time, rows 0 and 1 only (6 floats per view; row 2, the ray direction, is
+ * not needed): 1.5 KB of static shared memory whatever n_angles is. Staging
+ * all 9*n_angles floats (the former layout) cut occupancy from 6 to 3
+ * blocks/SM at 721 views and to 1 at >= 1441 (25.7 vs 14.9 ms at 256^3,
+ * phase1b audit R6). Per-view arithmetic and the order of the sum are
+ * unchanged, so the output is bit-identical to the unchunked kernel.
  * Sinogram sampled with tex2DLayered (n_angles layers of [Ny, N_det]).
  */
+#define ROTMAT_BP_CHUNK 64
+
 template <typename T>
 __global__ static void back_project_rotmat_kernel(
     cudaTextureObject_t  sino_tex,        /* n_angles layers of [Ny, N_det] */
@@ -257,40 +270,47 @@ __global__ static void back_project_rotmat_kernel(
     float half_det, float half_x, float half_z, float half_y
 ) {
     /* Rotation matrices stay fp32 in shared memory. */
-    extern __shared__ float sh_mats[];   /* 9 * n_angles floats */
+    __shared__ float sh_mats[ROTMAT_BP_CHUNK * 6];
 
-    int tid       = threadIdx.x + threadIdx.y * blockDim.x
-                  + threadIdx.z * blockDim.x * blockDim.y;
-    int block_sz  = blockDim.x * blockDim.y * blockDim.z;
-    for (int k = tid; k < n_angles * 9; k += block_sz)
-        sh_mats[k] = mats[k];
-    __syncthreads();
+    const int tid      = threadIdx.x + threadIdx.y * blockDim.x
+                       + threadIdx.z * blockDim.x * blockDim.y;
+    const int block_sz = blockDim.x * blockDim.y * blockDim.z;
 
-    int ix = blockIdx.x * blockDim.x + threadIdx.x;
-    int iz = blockIdx.y * blockDim.y + threadIdx.y;
-    int iy = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (ix >= Nx || iz >= Nz || iy >= Ny) return;
+    const int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    const int iz = blockIdx.y * blockDim.y + threadIdx.y;
+    const int iy = blockIdx.z * blockDim.z + threadIdx.z;
+    /* No early return: every thread takes part in the chunk barriers. */
+    const bool active = (ix < Nx && iz < Nz && iy < Ny);
 
     float x = ix - half_x;
     float y = iy - half_y;
     float z = iz - half_z;
     float val = 0.0f;
 
-    for (int ia = 0; ia < n_angles; ia++) {
-        const float *M = sh_mats + ia * 9;
-        /* u = R[0,:] · (x,y,z)   v = R[1,:] · (x,y,z) */
-        float u_det = M[0]*x + M[1]*y + M[2]*z;
-        float v_det = M[3]*x + M[4]*y + M[5]*z;
-        /* tex2DLayered: x→N_det, y→Ny, layer→ia. Always read as float
-         * — hardware promotes fp16 texels on filtered read. */
-        val += tex2DLayered<float>(sino_tex,
-                                   u_det + half_det + 0.5f,
-                                   v_det + half_y   + 0.5f,
-                                   ia);
+    for (int a0 = 0; a0 < n_angles; a0 += ROTMAT_BP_CHUNK) {
+        const int cn = min(ROTMAT_BP_CHUNK, n_angles - a0);
+        __syncthreads();                     /* previous chunk fully read */
+        for (int k = tid; k < cn * 6; k += block_sz)
+            sh_mats[k] = mats[(size_t)(a0 + k / 6) * 9 + k % 6];
+        __syncthreads();
+        if (active) {
+            for (int a = 0; a < cn; a++) {
+                const float *M = sh_mats + a * 6;
+                /* u = R[0,:] · (x,y,z)   v = R[1,:] · (x,y,z) */
+                float u_det = M[0]*x + M[1]*y + M[2]*z;
+                float v_det = M[3]*x + M[4]*y + M[5]*z;
+                /* tex2DLayered: x→N_det, y→Ny, layer→ia. Always read as
+                 * float — hardware promotes fp16 texels on filtered read. */
+                val += tex2DLayered<float>(sino_tex,
+                                           u_det + half_det + 0.5f,
+                                           v_det + half_y   + 0.5f,
+                                           a0 + a);
+            }
+        }
     }
 
-    vol[((size_t)iy * Nz + iz) * Nx + ix] = float_to_t<T>(val);
+    if (active)
+        vol[((size_t)iy * Nz + iz) * Nx + ix] = float_to_t<T>(val);
 }
 
 /* Upload `sino` into `sino_cache` (already validated) and launch the
@@ -308,20 +328,16 @@ static void back_project_rotmat_launch(
     dim3 grid((g.Nx + 7) / 8,
               (g.Nz + 7) / 8,
               (g.Ny + 3) / 4);
-    size_t smem = 9 * (size_t)n_angles * sizeof(float);
-    if (io_dtype == 0) {
-        enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel<float>, smem);
-        back_project_rotmat_kernel<float><<<grid, block, smem, stream>>>(
+    if (io_dtype == 0)
+        back_project_rotmat_kernel<float><<<grid, block, 0, stream>>>(
             sino_cache->tex, (float *)vol, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y);
-    } else {
-        enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel<__half>, smem);
-        back_project_rotmat_kernel<__half><<<grid, block, smem, stream>>>(
+    else
+        back_project_rotmat_kernel<__half><<<grid, block, 0, stream>>>(
             sino_cache->tex, (__half *)vol, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y);
-    }
     CUDA_CHECK_KERNEL();
 }
 
@@ -362,8 +378,11 @@ void back_project_rotmat_cuda_cached(
 
 /* ── gradient of 3D rotmat forward projection w.r.t. rotation matrix ─────────
  * Grid:  (⌈N_det/16⌉, ⌈Ny/16⌉, n_angles)   Block: (16, 16, 1)
- * Same detector-driven layout as forward_project_rotmat_kernel, with one
- * block per angle's matrix entries reduced via shared memory.
+ * Same detector-driven layout as forward_project_rotmat_kernel. Each block
+ * reduces its 256 rays' 9 matrix-entry sums to one partial per block
+ * (warp shuffles, fixed order); grad_rotmat_finish_kernel then sums the
+ * partials of each view in a fixed order and WRITES grad_mats. No atomics:
+ * the gradient is bit-reproducible run to run.
  *
  * Forward sample at ray step s, detector cell (iu, iv):
  *   u = iu - half_det,  v = iv - half_y,  s = step
@@ -386,35 +405,54 @@ __global__ static void grad_rotmat_kernel(
     cudaTextureObject_t  vol_tex,            /* TC_VOL_3D, point-filter view */
     const float *__restrict__ grad_sino,     /* [n_angles, Ny, N_det] */
     const float *__restrict__ mats,      /* [n_angles*9] row-major */
-    float       *__restrict__ grad_mats, /* [n_angles*9] (zeroed by caller) */
+    float       *__restrict__ partials,  /* [n_angles, nb, 9], nb = gridDim.x*gridDim.y */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     float half_det, float half_x, float half_y, float half_z,
-    int ray_len
+    int ray_len, int clip
 ) {
     int iu = blockIdx.x * blockDim.x + threadIdx.x;
     int iv = blockIdx.y * blockDim.y + threadIdx.y;
     int ia = blockIdx.z;
 
-    int tid       = threadIdx.y * blockDim.x + threadIdx.x;
-    int nthreads  = blockDim.x * blockDim.y;          /* 256 */
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;   /* block is 16x16 */
 
     float gM[9] = {0,0,0,0,0,0,0,0,0};
 
+    const float *M = mats + (size_t)ia * 9;
+    float u = (float)iu - half_det;
+    float v = (float)iv - half_y;
+    float ox = u * M[0] + v * M[3];
+    float oy = u * M[1] + v * M[4];
+    float oz = u * M[2] + v * M[5];
+    float dxs = M[6], dys = M[7], dzs = M[8];
+    float gs = 0.0f;
+    int step_lo = INT_MAX, step_hi = INT_MIN;
+
     if (iu < N_det && iv < Ny) {
-        const float *M = mats + (size_t)ia * 9;
-        float u = (float)iu - half_det;
-        float v = (float)iv - half_y;
-        float ox = u * M[0] + v * M[3];
-        float oy = u * M[1] + v * M[4];
-        float oz = u * M[2] + v * M[5];
-        float dxs = M[6], dys = M[7], dzs = M[8];
+        gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
+        /* Steps whose stencil can touch the volume (rotmat_ray_steps), for
+         * the rays that contribute at all (gs != 0). */
+        if (gs != 0.0f)
+            rotmat_ray_steps(ox + half_x, oy + half_y, oz + half_z, dxs, dys, dzs,
+                             Nx, Ny, Nz, ray_len, clip, &step_lo, &step_hi);
+    }
+    /* United over the block (every thread reaches the barriers; the empty
+     * range of an inactive thread is the identity). */
+    rotmat_block_union(&step_lo, &step_hi);
 
-        float gs = grad_sino[((size_t)ia * Ny + iv) * N_det + iu];
-
+    if (iu < N_det && iv < Ny) {
         if (gs != 0.0f) {
-            for (int step = -ray_len; step <= ray_len; step++) {
+            /* dL/dM[3r+c] = gs * sum_s d_c(s) * {u, v, s}[r] with d = grad of
+             * the trilinear sample: u, v and gs are per-ray constants, so the
+             * loop keeps S_c = sum d_c and T_c = sum d_c*s (6 accumulators)
+             * and they are applied once after it (phase1b audit R2). */
+            float Sx = 0.0f, Sy = 0.0f, Sz = 0.0f;
+            float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
+            for (int step = step_lo; step <= step_hi; step++) {
                 float s  = (float)step;
+                /* Same position arithmetic as before (and as grad_rotmat_cpu),
+                 * so samples fall on the same side of the trilinear kinks. */
                 float fx = ox + s * dxs + half_x;
                 float fy = oy + s * dys + half_y;
                 float fz = oz + s * dzs + half_z;
@@ -434,61 +472,102 @@ __global__ static void grad_rotmat_kernel(
                     fz <= -1.0f || fz >= (float)Nz)
                     continue;
 
-                int ix0 = (int)floorf(fx), iy0 = (int)floorf(fy), iz0 = (int)floorf(fz);
-                int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
-                float wx = fx - (float)ix0;
-                float wy = fy - (float)iy0;
-                float wz = fz - (float)iz0;
-                float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
+                /* Corner indices stay floats (exact: |x0| < 2^24), so the
+                 * texture coordinates need no float->int->float round trip. */
+                float x0 = floorf(fx), y0 = floorf(fy), z0 = floorf(fz);
+                float wx = fx - x0, wy = fy - y0, wz = fz - z0;
+                float cx0 = x0 + 0.5f, cx1 = x0 + 1.5f;
+                float cy0 = y0 + 0.5f, cy1 = y0 + 1.5f;
+                float cz0 = z0 + 0.5f, cz1 = z0 + 1.5f;
 
-                /* Point-filter tex3D reads: +0.5f offset maps integer index i
-                 * to the texel centre coordinate i+0.5, which with
-                 * cudaFilterModePoint rounds back to texel i.  The hardware
+                /* Point-filter tex3D reads: texel centre i+0.5 with
+                 * cudaFilterModePoint reads texel i exactly. The hardware
                  * promotes fp16 texels to fp32, so tex3D<float> is correct
                  * for both T=float and T=__half.
-                 * tex3D axis mapping: (x→Nx width, z→Nz height, y→Ny depth). */
-                float v000 = tex3D<float>(vol_tex, ix0+0.5f, iz0+0.5f, iy0+0.5f);
-                float v001 = tex3D<float>(vol_tex, ix1+0.5f, iz0+0.5f, iy0+0.5f);
-                float v010 = tex3D<float>(vol_tex, ix0+0.5f, iz1+0.5f, iy0+0.5f);
-                float v011 = tex3D<float>(vol_tex, ix1+0.5f, iz1+0.5f, iy0+0.5f);
-                float v100 = tex3D<float>(vol_tex, ix0+0.5f, iz0+0.5f, iy1+0.5f);
-                float v101 = tex3D<float>(vol_tex, ix1+0.5f, iz0+0.5f, iy1+0.5f);
-                float v110 = tex3D<float>(vol_tex, ix0+0.5f, iz1+0.5f, iy1+0.5f);
-                float v111 = tex3D<float>(vol_tex, ix1+0.5f, iz1+0.5f, iy1+0.5f);
+                 * tex3D axis mapping: (x→Nx width, z→Nz height, y→Ny depth).
+                 * Naming v<y><z><x>: v001 is the x+1 corner. */
+                float v000 = tex3D<float>(vol_tex, cx0, cz0, cy0);
+                float v001 = tex3D<float>(vol_tex, cx1, cz0, cy0);
+                float v010 = tex3D<float>(vol_tex, cx0, cz1, cy0);
+                float v011 = tex3D<float>(vol_tex, cx1, cz1, cy0);
+                float v100 = tex3D<float>(vol_tex, cx0, cz0, cy1);
+                float v101 = tex3D<float>(vol_tex, cx1, cz0, cy1);
+                float v110 = tex3D<float>(vol_tex, cx0, cz1, cy1);
+                float v111 = tex3D<float>(vol_tex, cx1, cz1, cy1);
 
-                /* analytic derivatives of trilinear interpolation */
-                float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
-                          + uy * wz * (v011 - v010) + wy * wz * (v111 - v110);
-                float dfy = ux * uz * (v100 - v000) + wx * uz * (v101 - v001)
-                          + ux * wz * (v110 - v010) + wx * wz * (v111 - v011);
-                float dfz = ux * uy * (v010 - v000) + wx * uy * (v011 - v001)
-                          + ux * wy * (v110 - v100) + wx * wy * (v111 - v101);
+                /* Analytic derivatives of the trilinear interpolant in lerp
+                 * form: d.. are the x-differences on the 4 (y,z) edges, e..
+                 * the x-lerped edge values. dfx = bilerp_yz(d);
+                 * dfy, dfz = d/dy, d/dz of bilerp_yz(e). */
+                float d00 = v001 - v000, d01 = v011 - v010;
+                float d10 = v101 - v100, d11 = v111 - v110;
+                float e00 = fmaf(wx, d00, v000), e01 = fmaf(wx, d01, v010);
+                float e10 = fmaf(wx, d10, v100), e11 = fmaf(wx, d11, v110);
+                float a0  = fmaf(wz, d01 - d00, d00), a1 = fmaf(wz, d11 - d10, d10);
+                float dfx = fmaf(wy, a1 - a0, a0);
+                float by0 = e10 - e00, by1 = e11 - e01;
+                float dfy = fmaf(wz, by1 - by0, by0);
+                float bz0 = e01 - e00, bz1 = e11 - e10;
+                float dfz = fmaf(wy, bz1 - bz0, bz0);
 
-                float gdfx = gs * dfx, gdfy = gs * dfy, gdfz = gs * dfz;
-                gM[0] += gdfx * u;  gM[1] += gdfy * u;  gM[2] += gdfz * u;
-                gM[3] += gdfx * v;  gM[4] += gdfy * v;  gM[5] += gdfz * v;
-                gM[6] += gdfx * s;  gM[7] += gdfy * s;  gM[8] += gdfz * s;
+                Sx += dfx;  Sy += dfy;  Sz += dfz;
+                Tx = fmaf(dfx, s, Tx);  Ty = fmaf(dfy, s, Ty);  Tz = fmaf(dfz, s, Tz);
             }
+            const float gu = gs * u, gv = gs * v;
+            gM[0] = gu * Sx;  gM[1] = gu * Sy;  gM[2] = gu * Sz;
+            gM[3] = gv * Sx;  gM[4] = gv * Sy;  gM[5] = gv * Sz;
+            gM[6] = gs * Tx;  gM[7] = gs * Ty;  gM[8] = gs * Tz;
         }
     }
 
-    /* Block-level reduction. smem layout: [9 * nthreads] flat. */
-    extern __shared__ float smem[];
+    /* Deterministic block reduction (no atomics, fixed order): xor-shuffle
+     * within each warp (the 16x16 block is 8 full warps, so the full mask is
+     * valid), lane 0 of warp w stores sw[w][k], then thread k < 9 sums the 8
+     * warps in order and writes this block's partial. grad_rotmat_finish_kernel
+     * sums the partials of each view in a fixed order. Only 288 B of static
+     * shared memory: the 3D-texture kernels are L1/texture-cache capacity
+     * sensitive, and the former 9 KB [9 x 256] tree moved the smem/L1
+     * carveout and cost 1.3-1.5x (phase1b audit R1). Every thread reaches the
+     * barrier (no early return above). */
+    __shared__ float sw[8][9];
+    const int lane = tid & 31, warp = tid >> 5;
     #pragma unroll
-    for (int k = 0; k < 9; k++) smem[k * nthreads + tid] = gM[k];
-    __syncthreads();
-
-    for (int stride = nthreads >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            #pragma unroll
-            for (int k = 0; k < 9; k++)
-                smem[k * nthreads + tid] += smem[k * nthreads + tid + stride];
-        }
-        __syncthreads();
+    for (int k = 0; k < 9; k++) {
+        float x = gM[k];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            x += __shfl_xor_sync(0xffffffffu, x, off);
+        if (lane == 0) sw[warp][k] = x;
     }
+    __syncthreads();
+    if (tid < 9) {
+        float a = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; w++) a += sw[w][tid];
+        const int nb = gridDim.x * gridDim.y;
+        const int b  = blockIdx.y * gridDim.x + blockIdx.x;
+        partials[((size_t)ia * nb + b) * 9 + tid] = a;
+    }
+}
 
-    if (tid < 9)
-        atomicAdd(&grad_mats[(size_t)ia * 9 + tid], smem[tid * nthreads]);
+/* Second pass of the grad_rotmat reduction.
+ * Grid: (n_angles)   Block: (32, 9) -- warp k sums matrix entry k.
+ * Lane l adds the partials of blocks l, l+32, l+64, ... in order, then a
+ * fixed xor butterfly combines the 32 lanes: the result depends only on the
+ * launch geometry, never on block scheduling, so it is bit-reproducible. */
+__global__ static void grad_rotmat_finish_kernel(
+    const float *__restrict__ partials,   /* [n_angles, nb, 9] */
+    float       *__restrict__ grad_mats,  /* [n_angles*9] (written) */
+    int nb
+) {
+    const int ia = blockIdx.x, k = threadIdx.y, lane = threadIdx.x;
+    const float *p = partials + (size_t)ia * nb * 9 + k;
+    float a = 0.0f;
+    for (int b = lane; b < nb; b += 32) a += p[(size_t)b * 9];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a += __shfl_xor_sync(0xffffffffu, a, off);
+    if (lane == 0) grad_mats[(size_t)ia * 9 + k] = a;
 }
 
 /* Launch grad_rotmat_kernel on a TC_VOL_3D cache that already holds the
@@ -509,23 +588,24 @@ static void grad_rotmat_launch(
     dim3 grid((g.N_det + 15) / 16,
               (g.Ny    + 15) / 16,
               g.n_angles);
-    size_t smem = 9 * (size_t)(block.x * block.y) * sizeof(float);
+    const int nb = (int)(grid.x * grid.y);
+    StreamScratch partials((size_t)g.n_angles * nb * 9 * sizeof(float), stream);
 
-    if (io_dtype == 0) {
-        enable_extended_smem_if_needed((const void *)grad_rotmat_kernel<float>, smem);
-        grad_rotmat_kernel<float><<<grid, block, smem, stream>>>(
-            vol_cache->tex_point, grad_sino, mats, grad_mats,
+    if (io_dtype == 0)
+        grad_rotmat_kernel<float><<<grid, block, 0, stream>>>(
+            vol_cache->tex_point, grad_sino, mats, partials.floats(),
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len, g_rotmat_ray_clip
         );
-    } else {
-        enable_extended_smem_if_needed((const void *)grad_rotmat_kernel<__half>, smem);
-        grad_rotmat_kernel<__half><<<grid, block, smem, stream>>>(
-            vol_cache->tex_point, grad_sino, mats, grad_mats,
+    else
+        grad_rotmat_kernel<__half><<<grid, block, 0, stream>>>(
+            vol_cache->tex_point, grad_sino, mats, partials.floats(),
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
+            g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len, g_rotmat_ray_clip
         );
-    }
+    CUDA_CHECK_KERNEL();
+    grad_rotmat_finish_kernel<<<g.n_angles, dim3(32, 9, 1), 0, stream>>>(
+        partials.floats(), grad_mats, nb);
     CUDA_CHECK_KERNEL();
 }
 

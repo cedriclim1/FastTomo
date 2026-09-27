@@ -164,8 +164,9 @@ void back_project_resire_cuda(
 
 /*
  * Gradient of 3D rotation-matrix forward projection w.r.t. the rotation
- * matrix entries. grad_mats is [n_angles*9] row-major, must be zeroed
- * by the caller. Used by _FPRotmat's autograd backward; the host chains the
+ * matrix entries. grad_mats is [n_angles*9] row-major and is overwritten
+ * (a fixed-order two-pass reduction, bit-reproducible; no zeroing needed).
+ * Used by _FPRotmat's autograd backward; the host chains the
  * result through _euler_zyz_to_rotmat (pure-PyTorch) to yield ∂L/∂euler.
  */
 void grad_rotmat_cuda(
@@ -183,7 +184,7 @@ void grad_rotmat_cuda(
  * already uploaded by a preceding forward_project_rotmat_cuda_cached call.
  * Uses vol_cache->tex_point (point-filter view) for bit-exact corner reads.
  * io_dtype: 0=fp32, 1=fp16 (controls which kernel template is instantiated).
- * grad_mats must be zeroed by the caller; result is accumulated via atomicAdd.
+ * grad_mats is overwritten (fixed-order two-pass reduction, no atomics).
  */
 void grad_rotmat_cuda_cached(
     int io_dtype,
@@ -205,8 +206,8 @@ void grad_rotmat_cuda_cached(
 int _debug_set_rotmat_ray_clip(int on);
 
 /*
- * Gradient of forward projection w.r.t. tilt angles.
- * grad_angles must be zeroed by the caller; result is in radians.
+ * Gradient of forward projection w.r.t. tilt angles, in radians.
+ * grad_angles is overwritten (fixed-order two-pass reduction, no atomics).
  */
 void grad_angle_cuda(
     const float *vol,

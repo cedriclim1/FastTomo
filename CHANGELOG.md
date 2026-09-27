@@ -106,6 +106,42 @@ never checked; a direct fp16 call on CUDA pays one flag read (0.06-0.07 ms measu
   (alias of `tv_loss_xz`).
 - cp314 wheels (CPU and CUDA); `wheels.yml` uses cibuildwheel v3.4.1.
 
+### Deterministic, faster geometry gradients; faster rotmat BP and `refine_angles`
+
+- **CUDA pose/angle gradients are now bit-reproducible.** `grad_rotmat`
+  (∂L/∂rotation matrix: `forward_project_3d` / `RotmatProjector` /
+  `run_ad_recon(refine_pose=True)`) and `grad_angle` (∂L/∂tilt angle of
+  `forward_project`) summed their per-block partials with fp32
+  `atomicAdd`, so repeated calls differed (20 of 20 runs distinct at
+  256^3 / 61 views, up to 4.7e-2 absolute on the matrix gradient). Both
+  now reduce in a fixed order (warp shuffles, one partial per block, a
+  second kernel per view): the same inputs give the same bits. The values
+  move by rounding only (rel-L2 5.7e-7 / 1.1e-6 vs before at 256^3; the
+  error against an fp64 reference is unchanged), so `run_ad_recon` with
+  pose refinement differs from earlier versions in the last bits.
+- **`grad_rotmat` 1.86x faster** (256^3 fp32, 61 views: 4.73 -> 2.55 ms;
+  fp16 volume 3.22 -> 2.42 ms; 128^3 0.62 -> 0.38 ms): the 9 KB
+  shared-memory reduction that shrank the texture cache is gone, u, v and
+  the sinogram gradient are factored out of the ray loop, and the ray
+  march is clipped like the forward's (bit-identical to unclipped).
+  It was 53 % of an AD pose iteration at 256^3.
+- **Rotmat back-projection no longer slows down with many views**: the
+  matrices are staged 64 views at a time instead of all at once, so the
+  time per view stays at ~10.5 us (256^3) instead of rising to 17 us at
+  1441 views (24.9-25.3 -> 15.2 ms, 1.64-1.66x); bit-identical. The 2730-view shared
+  memory cap is gone (the 2048-layer texture limit remains).
+- **`refine_angles` 2.0x / 4.1x faster** (single-axis / ZYZ, 128^3, 61
+  views; 1.55x / 1.6-1.8x at 256^3): every view's candidates are projected
+  in one batch (one per axis in ZYZ mode, chunks of at most 256 MB) under
+  `torch.no_grad()`, with one host transfer per batch instead of 2 (6 in
+  ZYZ mode) per view. Results are bit-identical. Its docstring now records
+  the measured convergence, including the slow ZYZ convergence near
+  phi/psi degeneracy.
+- Internal: the gradient kernels overwrite their output (callers no longer
+  need to zero it) and take their partial-sum scratch from a FastTomo
+  stream-ordered memory pool per device that keeps up to 64 MiB reserved
+  between calls (`csrc/cuda/scratch_pool.cuh`).
+
 ### Faster CUDA `run_sirt` (bit-identical results; new public `release_cached_projectors()` and `run_sirt(reuse_graph=)`)
 
 - **API additions** (the PR text said "no API change"; it adds two public
