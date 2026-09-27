@@ -132,6 +132,150 @@ def test_refine_angles_dtype_mismatch_raises():
         ft.refine_angles(vol, sino, angles_deg=angles)
 
 
+# ── R4: all views' candidates in one batch, bit-identical to the per-view loop ──
+
+
+def _refine_per_view(volume, sinogram, angles_deg=None, euler_zyz_deg=None,
+                     search_range_deg=3.0, n_steps=31):
+    """The former refine_angles loop (one projection batch and host syncs per
+    view, per axis in ZYZ mode), kept verbatim as the reference."""
+    from fasttomo._operator import Geometry, _make_operator
+    from fasttomo.algorithms._common import _REL_EPS
+    from fasttomo.autograd import euler_zyz_to_rotmat
+
+    def op(kind):
+        return _make_operator(Geometry(kind, tuple(volume.shape), sinogram.shape[-1], n_steps),
+                              volume.device, volume.dtype)
+    if angles_deg is not None:
+        refined = angles_deg.detach().cpu().clone()
+        p = op("parallel")
+        for j in range(sinogram.shape[0]):
+            t = refined[j].item()
+            c = torch.linspace(t - search_range_deg, t + search_range_deg, n_steps)
+            projs = p.project(volume, c.to(sinogram.device))
+            m = sinogram[j]
+            res = (projs - m.unsqueeze(0)).abs().sum(dim=(-2, -1))
+            refined[j] = c[(res / (m.abs().sum().clamp(min=_REL_EPS))).argmin()]
+        return refined
+    refined = euler_zyz_deg.detach().cpu().clone()
+    p = op("rotmat")
+    for j in range(sinogram.shape[0]):
+        m = sinogram[j]
+        norm = m.abs().sum().clamp(min=_REL_EPS)
+        for axis in range(3):
+            v = refined[j, axis].item()
+            c = torch.linspace(v - search_range_deg, v + search_range_deg, n_steps)
+            eb = refined[j].unsqueeze(0).expand(n_steps, -1).clone()
+            eb[:, axis] = c
+            projs = p.project(volume, euler_zyz_to_rotmat(eb.to(sinogram.device)))
+            res = (projs - m.unsqueeze(0)).abs().sum(dim=(-2, -1))
+            refined[j, axis] = c[res.div(norm).argmin()]
+    return refined
+
+
+def _refine_case(device, shape=(3, 21, 19), N_det=23, n=11, dtype=torch.float32):
+    g = torch.Generator().manual_seed(n)
+    Ny, Nz, Nx = shape
+    vol = torch.zeros(shape)
+    vol[:, Nz // 4:3 * Nz // 4, Nx // 3:2 * Nx // 3] = 1.0
+    vol += 0.2 * torch.rand(shape, generator=g)
+    true = torch.linspace(-62, 62, n) + 0.1 * torch.randn(n, generator=g)
+    e_true = torch.stack([3 * torch.rand(n, generator=g) - 1.5, true,
+                          3 * torch.rand(n, generator=g) - 1.5], 1)
+    vol = vol.to(device)
+    sino = ft.forward_project(vol, true.to(device), N_det=N_det).to(dtype)
+    s3 = ft.forward_project_3d(vol, e_true.to(device), N_det=N_det).to(dtype)
+    start = true + 0.8 * torch.randn(n, generator=g)
+    e0 = e_true + 0.6 * torch.randn(n, 3, generator=g)
+    return vol.to(dtype), sino, s3, start, e0
+
+
+@pytest.mark.parametrize("chunk_bytes", [None, 1])
+@pytest.mark.parametrize("mode", ["single", "zyz"])
+def test_refine_angles_batched_is_bit_identical_to_per_view(backend, mode, chunk_bytes,
+                                                            monkeypatch):
+    """R4: one projection per call (per axis in ZYZ mode) gives exactly the
+    per-view loop's result, also when the batch is split into chunks
+    (chunk_bytes=1: one view per chunk) and for fp16 on CUDA."""
+    import fasttomo.algorithms.alignment as al
+    if chunk_bytes is not None:
+        monkeypatch.setattr(al, "_REFINE_BATCH_BYTES", chunk_bytes)
+    dtypes = [torch.float32] + ([torch.float16] if backend.type == "cuda" else [])
+    for dtype in dtypes:
+        for shape, N_det, n, steps in [((3, 21, 19), 23, 11, 9), ((1, 17, 13), 15, 7, 1)]:
+            vol, sino, s3, start, e0 = _refine_case(backend, shape, N_det, n, dtype)
+            for rng in (2.0, 0.37):
+                if mode == "single":
+                    got = ft.refine_angles(vol, sino, start.clone(),
+                                           search_range_deg=rng, n_steps=steps)
+                    want = _refine_per_view(vol, sino, angles_deg=start.clone(),
+                                            search_range_deg=rng, n_steps=steps)
+                else:
+                    got = ft.refine_angles(vol, s3, euler_zyz_deg=e0.clone(),
+                                           search_range_deg=rng, n_steps=steps)
+                    want = _refine_per_view(vol, s3, euler_zyz_deg=e0.clone(),
+                                            search_range_deg=rng, n_steps=steps)
+                assert got.device.type == "cpu" and got.dtype == want.dtype
+                assert torch.equal(got, want), (dtype, shape, rng)
+
+
+@pytest.mark.parametrize("mode", ["single", "zyz"])
+def test_refine_angles_projects_once_per_axis_without_autograd(backend, mode, monkeypatch):
+    """One projection batch per call (single-axis) or per axis (ZYZ), made
+    with autograd disabled; the volume's requires_grad does not matter."""
+    import fasttomo.algorithms.alignment as al
+    calls = []
+    real = al._make_operator
+
+    def spy(*a, **k):
+        op = real(*a, **k)
+        project = op.project
+
+        def counted(volume, geom):
+            calls.append((geom.shape[0], torch.is_grad_enabled()))
+            return project(volume, geom)
+        op.project = counted
+        return op
+
+    monkeypatch.setattr(al, "_make_operator", spy)
+    vol, sino, s3, start, e0 = _refine_case(backend, n=13)
+    vol = vol.clone().requires_grad_(True)
+    if mode == "single":
+        out = ft.refine_angles(vol, sino, start, n_steps=5)
+        assert calls == [(13 * 5, False)]
+    else:
+        out = ft.refine_angles(vol, s3, euler_zyz_deg=e0, n_steps=5)
+        assert calls == [(13 * 5, False)] * 3
+    assert not out.requires_grad
+
+
+@needs_cuda
+@pytest.mark.parametrize("mode", ["single", "zyz"])
+def test_refine_angles_host_syncs_do_not_scale_with_views(mode):
+    """The former loop synchronised with the host 2 times per view (6 per
+    view in ZYZ mode); the batched search does it a fixed number of times."""
+    import warnings
+
+    def count(n):
+        vol, sino, s3, start, e0 = _refine_case(torch.device("cuda"), n=n)
+        run = ((lambda: ft.refine_angles(vol, sino, start, n_steps=5)) if mode == "single"
+               else (lambda: ft.refine_angles(vol, s3, euler_zyz_deg=e0, n_steps=5)))
+        run()
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                run()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+        return sum("synchroniz" in str(x.message) for x in w)
+
+    few, many = count(5), count(29)
+    assert few == many
+    assert many <= (2 if mode == "single" else 6)
+
+
 # ── estimate_shifts_xcorr ─────────────────────────────────────────────────────
 
 
