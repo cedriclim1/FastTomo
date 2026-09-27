@@ -166,10 +166,10 @@ void mbir_forward_project_cpu(
  *   2. (Optional) Update per-tilt offset d_k from the just-updated e.
  *   3. (Optional) Update noise variance σ from the just-updated e.
  *
- * The qGGMRF prior reads from `volume_snapshot` (start-of-outer-iter copy),
- * not the live volume — this is the Jacobi-loose semantics across Y-slices
- * that matches the paper and OpenMBIR-TEM. Within a Y-slice the data term
- * uses the live (in-iteration) error sinogram, preserving Gauss-Seidel ICD.
+ * The qGGMRF prior reads all 26 neighbours, in-slice ones included, from
+ * `volume_snapshot` (start-of-outer-iter copy), not the live volume: the
+ * prior is Jacobi within a slice as well as across Y-slices. The data term
+ * uses the live (in-iteration) error sinogram, so it stays Gauss-Seidel ICD.
  *
  * In-place mutated outputs: volume, e_sino, d_offsets, sigma_out.
  * Returns 0 on success. */
@@ -194,9 +194,10 @@ int mbir_icd_sweep_cpu(
     const float half_x = g.half_x, half_z = g.half_z, half_det = g.half_det;
 
     /* ── ICD sweep ─────────────────────────────────────────────────────────
-     * Cross-slice neighbour reads of qGGMRF come from the snapshot so
-     * slices are independent and parallelizable. Within a slice the
-     * sweep is sequential (Gauss-Seidel via the incremental error sino). */
+     * Every qGGMRF neighbour read (in-slice and cross-slice) comes from the
+     * snapshot, so slices are independent and parallelizable. Within a
+     * slice the sweep is sequential (Gauss-Seidel via the incremental
+     * error sino). */
     #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int iy = 0; iy < Ny; iy++) {
         const int nvox_slice = Nz * Nx;

@@ -168,9 +168,9 @@ void mbir_forward_project_cpu(
  *   perm[Ny, Nz*Nx]                      : per-Y-slice voxel permutation
  *   lambdas[n_angles, Ny, N_det]         : per-pixel Λ data weights; NULL → 1
  *
- * Y-slices are parallelized via OpenMP (cross-slice qGGMRF reads use
- * the snapshot, so slices are independent — "Jacobi-loose" semantics
- * matching the paper). Within a slice, the sweep is sequential
+ * Y-slices are parallelized via OpenMP. All 26 qGGMRF neighbour reads
+ * (in-slice ones included) use the snapshot, so slices are independent
+ * and the prior is Jacobi. Within a slice the data term is sequential
  * Gauss-Seidel ICD via the incremental error sinogram.
  *
  * Set estimate_offset=0 / estimate_variance=0 (and pass NULL for

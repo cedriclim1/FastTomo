@@ -676,8 +676,9 @@ class _TVLossIso3D(torch.autograd.Function):
 # / ._bp_raw, which call the *_cuda_cached entry points and reuse the
 # projector's persistent TextureCache. The angle-gradient path is intentionally
 # absent on the parallel cached pair (use the functional API for that); the
-# rotmat cached pair forwards mats grad through the existing grad_rotmat
-# kernel (no texture, so caching gives nothing there).
+# rotmat cached pair computes the mats gradient with grad_rotmat_cuda_cached,
+# which samples the volume texture the forward already uploaded (point-filter
+# view), and falls back to the one-shot kernel if a later forward overwrote it.
 
 
 class _FP2DCached(torch.autograd.Function):

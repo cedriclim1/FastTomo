@@ -5,10 +5,16 @@
 #include "texture_cache.h"
 
 /*
- * All CUDA entry points run on a caller-supplied stream so the kernels
- * compose cleanly with PyTorch's stream model. None of them call
- * cudaDeviceSynchronize — the caller (PyTorch) syncs implicitly when the
- * output tensor is read.
+ * All CUDA entry points launch on a caller-supplied stream. Synchronisation:
+ *   - The *_cached entry points and the texture-free kernels (grad_angle,
+ *     TV, GENFIRE, RESIRE, MBIR forward) never synchronize; PyTorch orders
+ *     the work through the stream.
+ *   - The one-shot entry points that build their own texture
+ *     (forward/back_project_parallel_cuda, forward/back_project_rotmat_cuda,
+ *     grad_rotmat_cuda, mbir_icd_sweep_cuda) call cudaStreamSynchronize on
+ *     their stream before releasing it (ScopedTextureCache,
+ *     texture_cache.h). cudaFreeArray would synchronize anyway.
+ *   - The Python-side `tc_destroy` binding synchronizes the device.
  *
  * Every host-callable function may throw std::runtime_error on a CUDA error.
  *

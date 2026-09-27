@@ -16,8 +16,9 @@ Two flavours, mirroring the two functional FP/BP pairs:
                        AD reconstruction without pose optimisation, FBP, SIRT.
   RotmatProjector    — full ZYZ rotation, ``[n_angles, 3, 3]`` rotation matrix
                        passed each call. Differentiable w.r.t. volume,
-                       sinogram, and matrices (the ∂/∂M kernel doesn't use a
-                       texture, so no caching needed there).
+                       sinogram, and matrices (the ∂/∂M kernel samples the
+                       volume texture, and reuses the one the forward
+                       uploaded).
 
 Both classes are CUDA-only — they wrap the ``*_cuda_cached`` entry points.
 On CPU you should use the functional API.
@@ -365,7 +366,9 @@ class RotmatProjector(_ProjectorBase):
     call (since pose optimisation makes them learnable). Only the texture
     caches are persistent; the matrix tensor is consumed via its ``.data_ptr()``
     on each FP/BP. Differentiable w.r.t. ``volume``, ``sinogram``, and
-    ``matrices`` (the ∂/∂M kernel doesn't use a texture so it stays uncached).
+    ``matrices``: the ∂/∂M kernel reads the volume through the point-filter
+    view of the forward's texture cache, falling back to a one-shot texture
+    if the cache has been overwritten by a later forward.
 
     ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
     configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used

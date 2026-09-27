@@ -157,9 +157,11 @@ __global__ static void mbir_forward_project_kernel(
  *   - One block owns one Y-slice. Parallel-beam single-axis: Y-slices are
  *     fully independent for the data term, so blocks have no cross-block
  *     dependencies on `e` or `volume` within the data path.
- *   - The 26-neighbour qGGMRF reads of `volume` use a tex3D snapshot
- *     (read-only across the kernel) — cross-Y neighbour reads come from
- *     the start-of-outer-iter state ("Jacobi-loose" across Y).
+ *   - All 26 qGGMRF neighbour reads, in-slice ones included, come from a
+ *     tex3D snapshot of the start-of-outer-iter volume (read-only across
+ *     the kernel). The prior term is therefore Jacobi within a slice as
+ *     well as across Y; only the data term is Gauss-Seidel (through the
+ *     live error sinogram). The CPU sweep does the same.
  *
  * Within the block, voxels are processed sequentially in the per-slice
  * permutation order; threads cooperate on the per-voxel reductions.
@@ -190,7 +192,7 @@ __global__ static void mbir_icd_sweep_kernel(
     float *vol_slice = volume + (size_t)iy * Nz * Nx;
 
     /* Shared: 2-element scratch for block reduction (one slot per warp);
-     * + 4 scalars for {theta1, theta2, n1, n2, fj_old, fj_new, df}. */
+     * + 5 broadcast scalars: theta1, theta2, n1, n2 and the update df. */
     __shared__ float sh_red[2];
     __shared__ float sh_t1, sh_t2, sh_n1, sh_n2, sh_df;
 
