@@ -249,8 +249,16 @@ endif()
 # --config-settings=cmake.define.FASTTOMO_MARCH_NATIVE=ON).
 option(FASTTOMO_MARCH_NATIVE "Compile C sources with -march=native (not portable)" OFF)
 
+# -ffp-contract=off: no fused multiply-add contraction in the C kernels. The
+# default x86-64 target has no FMA, so the default build's code does not
+# change; with -march=native (or any FMA-capable target) gcc would otherwise
+# fuse a*b + c and change the kernels' fp32 results (FP/BP/rotmat bits, up
+# to 3.4e-2 of max in grad_rotmat at trilinear kinks), which the goldens'
+# arithmetic fingerprint cannot see. With it, a FASTTOMO_MARCH_NATIVE build
+# gives the same bits as the portable one, only faster (AVX2/AVX-512 SIMD).
 target_compile_options(_core PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-O3>
+    $<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>
 )
 if(FASTTOMO_MARCH_NATIVE)
     target_compile_options(_core PRIVATE $<$<COMPILE_LANGUAGE:C>:-march=native>)
