@@ -168,8 +168,8 @@ back-projects with the voxel-driven gather kernel that the CPU W-BP
 already uses (the CUDA back-projection's operator, with exact fp32
 weights): 2.7-4.3e-7 RMS (1.6-6e-6 max) against the fp64 FBP, CPU vs CUDA
 1.1-1.6e-4 (the CUDA texture unit's 8-bit weights). **CPU `run_fbp`
-results differ from earlier versions**; CUDA `run_fbp` and a `run_fbp`
-with a user `projector` are unchanged. The CPU FBP stays differentiable
+results differ from earlier versions** (also with a CPU
+`ParallelProjector` as `projector=`); CUDA `run_fbp` is unchanged. The CPU FBP stays differentiable
 w.r.t. the sinogram (the backward is the CPU forward projection, the
 pairing CUDA's back-projection has). The back-projection step is also
 faster (5x at 8x128^2, 61 views, with the Y-batched gather below). Only
