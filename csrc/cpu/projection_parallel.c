@@ -585,18 +585,33 @@ int back_project_gather_parallel_cpu(
 #define FT_GA_CHUNK 32
 
 /* dL/dtheta contribution of one chunk of detector rays of one angle on the
- * nl Y lanes of a Y-innermost block vt[Nz][Nx][nl]. Per ray and lane, the
- * derivative of the ray sum, sum over steps of dvol/dx*(-z) + dvol/dz*x
- * (the fp32 terms of the scalar loop), is accumulated in fp32 like the
- * forward's ray sum; it is then weighted by the upstream gradient and added
- * to the lane's fp64 accumulator acc[l], in detector order. (Weighting per
- * step and accumulating in fp64 per step made gcc spill the SSE2 loop.) */
+ * nl Y lanes of a Y-innermost block vp[Nz+4][Nx+4][nl] (zero border 2 voxels
+ * wide). Per ray and lane, the derivative of the ray sum, sum over steps of
+ * dvol/dx*(-z) + dvol/dz*x (the fp32 terms of the scalar loop), is
+ * accumulated in fp32 like the forward's ray sum; it is then weighted by the
+ * upstream gradient and added to the lane's fp64 accumulator acc[l], in
+ * detector order. (Weighting per step and accumulating in fp64 per step
+ * made gcc spill the SSE2 loop.)
+ *
+ * Kinks. The forward's bilinear interpolant is only piecewise smooth: on a
+ * grid line (wx == 0 or wz == 0) the derivative across it has two one-sided
+ * values, and the floor stencil gives the forward one. There the kernel
+ * takes the average of the forward and the backward difference (the
+ * backward one from the column ix0-1 / row iz0-1), which is the derivative
+ * of the central finite difference: the ray sum's derivative in theta at a
+ * view with samples on grid lines (0 deg: every sample; +-90 deg) is then
+ * the central one, and symmetric under the x-flip and 180 deg. The bounds
+ * test is inclusive, [-1, N]: a sample exactly on the outer end of a tent
+ * (f = -1 or f = N) adds 0 to the forward but has a one-sided slope on one
+ * side. The branch is uniform over the lanes (the geometry does not depend
+ * on Y) and rare off the grid-aligned views. */
 static inline __attribute__((always_inline))
-void ga_chunk_lanes(const float *restrict vt, const float *restrict grad_sino,
+void ga_chunk_lanes(const float *restrict vp, const float *restrict grad_sino,
                     double *restrict acc, const int nl, ProjGeomParallel g,
                     int ia, int y0, int id0, int id1, float ca, float sa)
 {
-    const int Nx = g.Nx, Nz = g.Nz, Ny = g.Ny, N_det = g.N_det;
+    const int Nx = g.Nx, Nz = g.Nz, Ny = g.Ny, N_det = g.N_det, Px = Nx + 4;
+    const size_t rs = (size_t)Px * nl;                 /* one padded row */
     for (int l = 0; l < nl; l++) acc[l] = 0.0;
     for (int id = id0; id < id1; id++) {
         float gsv[FT_YB], dray[FT_YB];
@@ -610,7 +625,7 @@ void ga_chunk_lanes(const float *restrict vt, const float *restrict grad_sino,
         float t = id - g.half_det;
         int lo = -g.ray_len, hi = g.ray_len;
         clip_ray_x(g, t, ca, sa, &lo, &hi);
-        clip_ray_z(g, t, ca, sa, 0.0, Nz - 1, &lo, &hi);
+        clip_ray_z(g, t, ca, sa, -1.0, Nz, &lo, &hi);
         for (int step = lo; step <= hi; step++) {
             float s  = (float)step;
             float x  = t * ca - s * sa;
@@ -618,22 +633,43 @@ void ga_chunk_lanes(const float *restrict vt, const float *restrict grad_sino,
             float fx = x + g.half_x;
             float fz = z + g.half_z;
 
-            /* negated conjunction: NaN samples are skipped (see the forward) */
-            if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
-                  fz >= 0.0f && fz < (float)(Nz - 1)))
+            /* inclusive loose bounds; NaN samples are skipped (see the forward) */
+            if (!(fx >= -1.0f && fx <= (float)Nx &&
+                  fz >= -1.0f && fz <= (float)Nz))
                 continue;
 
-            int ix0 = (int)fx, iz0 = (int)fz;
-            float wx = fx - ix0, wz = fz - iz0;
-            const float *restrict p00 = vt + ((size_t)iz0 * Nx + ix0) * nl;
+            int ix0 = ft_floor_loose(fx), iz0 = ft_floor_loose(fz);
+            float wx = fx - (float)ix0, wz = fz - (float)iz0;
+            const float *restrict p00 = vp + ((size_t)(iz0 + 2) * Px + (ix0 + 2)) * nl;
             const float *restrict p01 = p00 + nl;
-            const float *restrict p10 = p00 + (size_t)Nx * nl;
+            const float *restrict p10 = p00 + rs;
             const float *restrict p11 = p10 + nl;
-            #pragma omp simd
-            for (int l = 0; l < nl; l++) {
-                float dvol_dx = (1.0f - wz) * (p01[l] - p00[l]) + wz * (p11[l] - p10[l]);
-                float dvol_dz = (1.0f - wx) * (p10[l] - p00[l]) + wx * (p11[l] - p01[l]);
-                dray[l] += dvol_dx * (-z) + dvol_dz * x;
+            if (wx != 0.0f && wz != 0.0f) {
+                #pragma omp simd
+                for (int l = 0; l < nl; l++) {
+                    float dvol_dx = (1.0f - wz) * (p01[l] - p00[l]) + wz * (p11[l] - p10[l]);
+                    float dvol_dz = (1.0f - wx) * (p10[l] - p00[l]) + wx * (p11[l] - p01[l]);
+                    dray[l] += dvol_dx * (-z) + dvol_dz * x;
+                }
+            } else {
+                /* on a grid line: average with the backward difference */
+                const int kx = wx == 0.0f, kz = wz == 0.0f;
+                const float *restrict pxm0 = p00 - nl;     /* (iz0,   ix0-1) */
+                const float *restrict pxm1 = p10 - nl;     /* (iz0+1, ix0-1) */
+                const float *restrict pzm0 = p00 - rs;     /* (iz0-1, ix0)   */
+                const float *restrict pzm1 = p01 - rs;     /* (iz0-1, ix0+1) */
+                #pragma omp simd
+                for (int l = 0; l < nl; l++) {
+                    float dvol_dx = (1.0f - wz) * (p01[l] - p00[l]) + wz * (p11[l] - p10[l]);
+                    float dvol_dz = (1.0f - wx) * (p10[l] - p00[l]) + wx * (p11[l] - p01[l]);
+                    if (kx)
+                        dvol_dx = 0.5f * (dvol_dx + ((1.0f - wz) * (p00[l] - pxm0[l])
+                                                     + wz * (p10[l] - pxm1[l])));
+                    if (kz)
+                        dvol_dz = 0.5f * (dvol_dz + ((1.0f - wx) * (p00[l] - pzm0[l])
+                                                     + wx * (p01[l] - pzm1[l])));
+                    dray[l] += dvol_dx * (-z) + dvol_dz * x;
+                }
             }
         }
         for (int l = 0; l < nl; l++)
@@ -644,9 +680,10 @@ void ga_chunk_lanes(const float *restrict vt, const float *restrict grad_sino,
 /*
  * Gradient of the parallel forward projection w.r.t. the tilt angles:
  * at each ray sample, d sino / d theta = dvol/dx * (-z) + dvol/dz * x, with
- * the bilinear finite differences of the volume. Y-batched like the
- * forward (FT_YB slices per SIMD loop on a Y-innermost copy of the block;
- * Ny = 1 reads the volume in place). The work of a block is split into
+ * the bilinear finite differences of the volume (loose sampling rule, zero
+ * outside, symmetric at grid-line kinks: ga_chunk_lanes). Y-batched like
+ * the forward (FT_YB slices per SIMD loop on a Y-innermost copy of the
+ * block with a zero border 2 voxels wide). The work of a block is split into
  * tasks of one angle and FT_GA_CHUNK detector rays; each ray's derivative
  * is summed in fp32 (as the forward sums a ray), weighted by its upstream
  * gradient and accumulated per Y lane in fp64, and the partial sums are
@@ -668,26 +705,18 @@ int grad_angle_cpu(
 ) {
     if (num_threads < 1) num_threads = 1;
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
-    const size_t plane = (size_t)Nz * Nx;
     const int    yb    = Ny < FT_YB ? Ny : FT_YB;
     const int    nch   = (N_det + FT_GA_CHUNK - 1) / FT_GA_CHUNK;
-    float  *vt   = NULL;
+    float  *vp   = (float *)malloc((size_t)(Nz + 4) * (Nx + 4) * yb * sizeof(float));
     double *part = (double *)malloc((size_t)n_angles * nch * FT_YB * sizeof(double));
     double *tot  = (double *)calloc((size_t)n_angles, sizeof(double));
-    if (Ny > 1) vt = (float *)malloc(plane * yb * sizeof(float));
-    if (!part || !tot || (Ny > 1 && !vt)) { free(part); free(tot); free(vt); return -1; }
+    if (!part || !tot || !vp) { free(part); free(tot); free(vp); return -1; }
 
     #pragma omp parallel num_threads(num_threads)
     for (int y0 = 0; y0 < Ny; y0 += FT_YB) {
         const int nl = Ny - y0 < FT_YB ? Ny - y0 : FT_YB;
-        const float *blk = vol;
-        if (Ny > 1) {
-            #pragma omp for schedule(static)
-            for (size_t p = 0; p < plane; p++)
-                for (int l = 0; l < nl; l++)
-                    vt[p * nl + l] = vol[(size_t)(y0 + l) * plane + p];
-            blk = vt;
-        }
+        const float *blk = vp;
+        ft_fill_padded(vp, vol, Nz, Nx, y0, nl, 2);     /* ends with a barrier */
 
         #pragma omp for collapse(2) schedule(dynamic, 1)
         for (int ia = 0; ia < n_angles; ia++)
@@ -709,13 +738,13 @@ int grad_angle_cpu(
             for (int c = 0; c < nch; c++)
                 for (int l = 0; l < nl; l++)
                     tot[ia] += part[((size_t)ia * nch + c) * FT_YB + l];
-        /* implicit barrier: vt and part are refilled for the next block */
+        /* implicit barrier: vp and part are refilled for the next block */
     }
 
     for (int ia = 0; ia < n_angles; ia++)
         grad_angles[ia] = (float)tot[ia];
     free(part);
     free(tot);
-    free(vt);
+    free(vp);
     return 0;
 }
