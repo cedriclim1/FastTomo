@@ -169,26 +169,65 @@ class _ProjectorBase:
         self._check_shape(sinogram, "sinogram", (self.n_angles, self.Ny, self.N_det))
 
     def __del__(self) -> None:
-        # Tear down explicitly.  tc_destroy is safe-on-null and frees both the
-        # cudaArray and the textureObject. GC may fire while a different CUDA
-        # device is current (e.g. the user has since switched to cuda:0), so
-        # pin the current device to the projector's construction device first.
+        # Tear down explicitly. ``_core.tc_destroy`` synchronizes the device
+        # before freeing, so an FP/BP still queued on any stream (the last
+        # call of run_sirt, say) finishes reading the texture first. GC may
+        # fire while a different CUDA device is current, so pin the
+        # projector's construction device.
         try:
-            has_handles = (
-                getattr(self, "_vol_handle", None) is not None
-                or getattr(self, "_sino_handle", None) is not None
-            )
-            if not has_handles:
-                return
-            with torch.cuda.device(self.device):
-                if getattr(self, "_vol_handle", None) is not None:
-                    _core.tc_destroy(self._vol_handle)
-                    self._vol_handle = None
-                if getattr(self, "_sino_handle", None) is not None:
-                    _core.tc_destroy(self._sino_handle)
-                    self._sino_handle = None
+            handles = [h for h in (getattr(self, "_vol_handle", None),
+                                   getattr(self, "_sino_handle", None))
+                       if h is not None]
+            self._vol_handle = None
+            self._sino_handle = None
+            if handles:
+                _release_handles(self.device, handles)
         except Exception:
             pass
+
+
+# Handles of projectors collected while this thread was capturing a CUDA
+# graph. Releasing then is illegal: in the default (global) capture mode
+# the device sync and cudaFreeArray are prohibited for the whole thread,
+# whatever device the capture runs on, and would invalidate the capture.
+# They wait here until _drain_deferred_handles() runs after the capture
+# (run_sirt calls it) or the next projector is released.
+_deferred_handles: list[tuple[torch.device, int]] = []
+
+
+def _capturing(device: torch.device) -> bool:
+    """True if this thread is capturing a CUDA graph on the current device
+    or on ``device`` (the projector's)."""
+    if torch.cuda.is_current_stream_capturing():
+        return True
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+def _destroy(device: torch.device, handle: int) -> None:
+    try:
+        with torch.cuda.device(device):
+            _core.tc_destroy(handle)
+    except Exception:
+        pass   # best effort: one failing handle must not strand the rest
+
+
+def _drain_deferred_handles() -> None:
+    """Release the handles deferred during a CUDA-graph capture. No-op while
+    a capture is still running on the current device."""
+    if not _deferred_handles or torch.cuda.is_current_stream_capturing():
+        return
+    while _deferred_handles:
+        _destroy(*_deferred_handles.pop())
+
+
+def _release_handles(device: torch.device, handles: list[int]) -> None:
+    if _capturing(device):
+        _deferred_handles.extend((device, h) for h in handles)
+        return
+    for h in handles:
+        _destroy(device, h)
+    _drain_deferred_handles()
 
 
 class ParallelProjector(_ProjectorBase):

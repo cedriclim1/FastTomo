@@ -16,19 +16,6 @@ static inline cudaStream_t to_stream(long stream_ptr) {
     return reinterpret_cast<cudaStream_t>(stream_ptr);
 }
 
-/* Validate a TextureCache pointer against expected kind, dtype, and shape.
- * Called by each cached FP/BP entry point before dispatching to the kernel. */
-static void validate_cache(const TextureCache *tc, tc_kind_t expected_kind,
-                           int io_dtype, int da, int db, int dc) {
-    if (!tc) throw std::invalid_argument("cache pointer is null");
-    if (tc->kind != expected_kind ||
-        tc->dim_a != da || tc->dim_b != db || tc->dim_c != dc)
-        throw std::invalid_argument("cache shape/kind mismatch");
-    int cache_dtype = (tc->dtype == TC_DTYPE_FP32) ? 0 : 1;
-    if (cache_dtype != io_dtype)
-        throw std::invalid_argument("cache dtype mismatch with io_dtype");
-}
-
 /* ── CUDA projection bindings ─────────────────────────────────────────── */
 
 static void py_forward_project_cuda(
@@ -150,8 +137,6 @@ static void py_grad_rotmat_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    validate_cache(reinterpret_cast<const TextureCache *>(cache_ptr),
-                   TC_VOL_3D, io_dtype, Ny, Nz, Nx);
     grad_rotmat_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
@@ -200,7 +185,14 @@ static long py_tc_create(int kind, int dtype, int channels,
 }
 
 static void py_tc_destroy(long handle) {
-    tc_destroy(reinterpret_cast<TextureCache *>(handle));
+    /* A persistent cache may have been read by kernels on any stream of the
+     * current device; wait for all of them before its textures and array are
+     * released (P1). cudaFreeArray would synchronize anyway. Release even if
+     * the sync reports an error, then surface the first error. */
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    cudaError_t rel_err  = tc_release(reinterpret_cast<TextureCache *>(handle));
+    FASTTOMO_CUDA_CHECK(sync_err);
+    FASTTOMO_CUDA_CHECK(rel_err);
 }
 
 /* ── cached FP/BP entry points ─────────────────────────────────────────── */
@@ -213,8 +205,6 @@ static void py_forward_project_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    validate_cache(reinterpret_cast<const TextureCache *>(cache_ptr),
-                   TC_VOL_LAYERED, io_dtype, Ny, Nz, Nx);
     forward_project_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
@@ -235,8 +225,6 @@ static void py_back_project_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    validate_cache(reinterpret_cast<const TextureCache *>(cache_ptr),
-                   TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det);
     back_project_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
@@ -256,8 +244,6 @@ static void py_forward_project_rotmat_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    validate_cache(reinterpret_cast<const TextureCache *>(cache_ptr),
-                   TC_VOL_3D, io_dtype, Ny, Nz, Nx);
     forward_project_rotmat_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
@@ -276,8 +262,6 @@ static void py_back_project_rotmat_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    validate_cache(reinterpret_cast<const TextureCache *>(cache_ptr),
-                   TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det);
     back_project_rotmat_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
@@ -386,6 +370,7 @@ static void py_mbir_icd_sweep_cuda(
 
 void register_cuda(py::module_ &m) {
     m.def("forward_project_cuda", &py_forward_project_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "Forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints. "
           "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream).",
@@ -397,6 +382,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_cuda", &py_back_project_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "Back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints.",
           py::arg("io_dtype"),
@@ -407,6 +393,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda", &py_forward_project_rotmat_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "3D rotation-matrix forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
           py::arg("io_dtype"),
@@ -416,6 +403,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_rotmat_cuda", &py_back_project_rotmat_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "3D rotation-matrix back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
           py::arg("io_dtype"),
@@ -425,6 +413,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_resire_cuda", &py_forward_project_resire_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "RESIRE voxel-driven forward projection (CUDA). "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
           "sino_ptr must point to a zeroed buffer.",
@@ -434,6 +423,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_resire_cuda", &py_back_project_resire_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "RESIRE voxel-driven back-projection (CUDA). "
           "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
           "vol_ptr must point to a zeroed buffer.",
@@ -443,6 +433,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("grad_rotmat_cuda", &py_grad_rotmat_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CUDA). "
           "All ptr args are device data_ptr() ints. "
           "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
@@ -453,6 +444,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("grad_rotmat_cuda_cached", &py_grad_rotmat_cuda_cached,
+          py::call_guard<py::gil_scoped_release>(),
           "Cached gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CUDA). "
           "cache_ptr: TC_VOL_3D handle already populated by forward_project_rotmat_cuda_cached. "
           "Uses the cache's point-filter tex_point for bit-exact corner reads. "
@@ -466,6 +458,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("grad_angle_cuda", &py_grad_angle_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "Gradient of forward projection w.r.t. tilt angles (CUDA). "
           "vol_ptr/grad_sino_ptr/cos_ptr/sin_ptr/grad_angles_ptr: device data_ptr() ints. "
           "Returns gradient in radians via grad_angles_ptr.",
@@ -477,6 +470,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("tc_create", &py_tc_create,
+          py::call_guard<py::gil_scoped_release>(),
           "Allocate a persistent cudaArray + cudaTextureObject. "
           "kind: 0=TC_VOL_LAYERED (FP scalar), 1=TC_SINO_LAYERED (BP scalar/rotmat), "
           "2=TC_VOL_3D (FP rotmat). dtype: 0=fp32, 1=fp16. "
@@ -489,10 +483,14 @@ void register_cuda(py::module_ &m) {
           py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"));
 
     m.def("tc_destroy", &py_tc_destroy,
-          "Release a TextureCache handle returned by tc_create.",
+          py::call_guard<py::gil_scoped_release>(),
+          "Release a TextureCache handle returned by tc_create. Synchronizes "
+          "the current device first, so kernels still reading the cache "
+          "finish before its textures and cudaArray are freed.",
           py::arg("handle"));
 
     m.def("forward_project_cuda_cached", &py_forward_project_cuda_cached,
+          py::call_guard<py::gil_scoped_release>(),
           "Forward projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
           "cache_ptr: TC_VOL_LAYERED handle sized to (Ny, Nz, Nx) with matching dtype. "
           "Uploads volume into the cache's cudaArray and launches the kernel — "
@@ -506,6 +504,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_cuda_cached", &py_back_project_cuda_cached,
+          py::call_guard<py::gil_scoped_release>(),
           "Back-projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
           "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
           py::arg("io_dtype"),
@@ -517,6 +516,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda_cached", &py_forward_project_rotmat_cuda_cached,
+          py::call_guard<py::gil_scoped_release>(),
           "3D rotmat forward projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
           "cache_ptr: TC_VOL_3D handle sized to (Ny, Nz, Nx) with matching dtype.",
           py::arg("io_dtype"),
@@ -527,6 +527,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("back_project_rotmat_cuda_cached", &py_back_project_rotmat_cuda_cached,
+          py::call_guard<py::gil_scoped_release>(),
           "3D rotmat back-projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
           "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
           py::arg("io_dtype"),
@@ -537,6 +538,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("tv_loss_iso_3d_cuda", &py_tv_loss_iso_3d_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "Fused 3-D isotropic TV loss (CUDA). Forward: atomicAdd Σ s into "
           "acc_ptr (single-element fp32 buffer, must be zeroed). Caller "
           "post-divides by N=(Ny-1)(Nz-1)(Nx-1) to obtain mean(s).",
@@ -546,6 +548,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("tv_loss_iso_3d_grad_cuda", &py_tv_loss_iso_3d_grad_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "Backward of tv_loss_iso_3d. g_scaled_ptr: single-element fp32 "
           "buffer holding grad_out · 1/N. grad_vol_ptr: [Ny, Nz, Nx] fp32 "
           "output (must be zeroed; kernel writes once per voxel).",
@@ -555,6 +558,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("genfire_gridding_2d_cuda", &py_genfire_gridding_2d_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "GENFIRE Fourier gridding (CUDA). All args are device data_ptr() ints "
           "except bigN/Ny/n_angles/cutoff_dist.",
           py::arg("fk_real_ptr"), py::arg("fk_imag_ptr"),
@@ -565,6 +569,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("mbir_forward_project_cuda", &py_mbir_forward_project_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "MBIR voxel-driven bilinear scatter forward projection (CUDA). "
           "Distinct from forward_project_cuda (ray-marching). sino_ptr is "
           "zeroed by the wrapper before launch.",
@@ -575,6 +580,7 @@ void register_cuda(py::module_ &m) {
           py::arg("stream_ptr") = 0L);
 
     m.def("mbir_icd_sweep_cuda", &py_mbir_icd_sweep_cuda,
+          py::call_guard<py::gil_scoped_release>(),
           "One outer iteration of MBIR-AM-PE (CUDA). In-place mutates "
           "volume and e_sino. Pass d_offsets_ptr=0 / lambdas_ptr=0 to "
           "disable those inputs (treated as nullptr). Per-tilt offset d_k "
@@ -592,6 +598,12 @@ void register_cuda(py::module_ &m) {
           py::arg("qggmrf_c"), py::arg("sigma_f"),
           py::arg("huber_T"), py::arg("huber_delta"), py::arg("sigma"),
           py::arg("stream_ptr") = 0L);
+
+    m.def("_tc_debug_fail_next_create", &tc_debug_fail_next_create,
+          "Test hook: make the next tc_create throw at `stage` "
+          "(1 = after cudaMalloc3DArray, 2 = after the texture object, "
+          "3 = after all handles exist, 0 = off).",
+          py::arg("stage"));
 
     m.attr("cuda_available") = true;
 }

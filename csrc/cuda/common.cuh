@@ -24,9 +24,11 @@ template <>           __device__ __forceinline__ __half float_to_t<__half>(float
 /* ── kernel launch error check ────────────────────────────────────────────────
  * Called immediately after a <<< >>> launch to surface launch-time errors
  * (invalid configuration, too much shared memory, etc.) without a host-device
- * sync. Stream-ordered errors are surfaced later when PyTorch syncs on read. */
+ * sync. Stream-ordered errors are surfaced later when PyTorch syncs on read.
+ * cudaGetLastError (not Peek) so a non-sticky launch error is consumed here
+ * and not re-reported against the next, unrelated kernel launch. */
 #define CUDA_CHECK_KERNEL() do {                                              \
-    cudaError_t _err = cudaPeekAtLastError();                                 \
+    cudaError_t _err = cudaGetLastError();                                    \
     if (_err != cudaSuccess) {                                                \
         throw std::runtime_error(std::string("CUDA kernel launch error at "   \
             __FILE__ ":") + std::to_string(__LINE__) + ": "                   \

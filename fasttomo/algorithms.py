@@ -33,7 +33,7 @@ from fasttomo.projection import (
 )
 from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
-from fasttomo.projector import ParallelProjector, RotmatProjector
+from fasttomo.projector import ParallelProjector, RotmatProjector, _drain_deferred_handles
 from fasttomo.configs import (
     AdReconConfig,
     ConstraintConfig,
@@ -1609,16 +1609,21 @@ def _run_sirt_cuda_graph(
             # captures on the right device — the implicit side stream is
             # created lazily on the first call's device and reused for later
             # calls, which corrupts cross-device captures.
-            with torch.cuda.device(target_device):
-                torch.cuda.synchronize(target_device)
-                capture_stream = torch.cuda.Stream(device=target_device)
-                g = torch.cuda.CUDAGraph()
-                with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
-                    _sirt_iter_inplace(
-                        vol_static, sino_static, C_static, R_static, omega,
-                        _fp, _bp, static_constraints,
-                    )
-                torch.cuda.synchronize(target_device)
+            try:
+                with torch.cuda.device(target_device):
+                    torch.cuda.synchronize(target_device)
+                    capture_stream = torch.cuda.Stream(device=target_device)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
+                        _sirt_iter_inplace(
+                            vol_static, sino_static, C_static, R_static, omega,
+                            _fp, _bp, static_constraints,
+                        )
+                    torch.cuda.synchronize(target_device)
+            finally:
+                # Free texture caches of projectors collected during the
+                # capture (their release was deferred, see projector.py).
+                _drain_deferred_handles()
 
             cache[key] = (g, vol_static, sino_static, C_static, R_static,
                           mask_static)

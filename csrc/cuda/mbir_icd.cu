@@ -353,26 +353,21 @@ void mbir_icd_sweep_cuda(
     FASTTOMO_CUDA_CHECK(cudaMemcpyToSymbolAsync(
         mbir_H, &H, sizeof(MbirHyper), 0, cudaMemcpyHostToDevice, stream));
 
-    /* tex3D snapshot of `volume` for qGGMRF reads. Allocate, upload, bind,
-     * launch, destroy — per outer iter. The cudaArray lifecycle uses the
-     * existing TextureCache helpers for 3D fp32 single-channel volumes
-     * (TC_VOL_3D dim_a=Ny, dim_b=Nz, dim_c=Nx). */
-    TextureCache *snap = tc_create(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx);
-    tc_upload(snap, d_volume_snapshot, stream);
+    /* tex3D snapshot of `volume` for qGGMRF reads: a one-shot TC_VOL_3D
+     * cache (dim_a=Ny, dim_b=Nz, dim_c=Nx) per outer iteration.
+     * ScopedTextureCache releases it on every path; finish() syncs the
+     * stream first, so the kernel is done before the texture goes away. */
+    ScopedTextureCache snap(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx, stream);
+    tc_upload(snap.get(), d_volume_snapshot, stream);
 
     dim3 block(64, 1, 1);
     dim3 grid(Ny, 1, 1);
     mbir_icd_sweep_kernel<<<grid, block, 0, stream>>>(
-        snap->tex,
+        snap.get()->tex,
         d_volume, d_e_sino, d_d_offsets, d_lambdas, d_perm,
         d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det
     );
     CUDA_CHECK_KERNEL();
-
-    /* The kernel reads the texture asynchronously on this stream; tc_destroy
-     * is stream-synchronous on the cudaArray free. Sync the stream first so
-     * the kernel completes before we tear down the texture. */
-    FASTTOMO_CUDA_CHECK(cudaStreamSynchronize(stream));
-    tc_destroy(snap);
+    snap.finish();
 }
