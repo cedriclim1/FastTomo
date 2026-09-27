@@ -8,7 +8,7 @@
  * Tomography", IEEE TCI 1(1).
  *
  * Provided entry points (mirroring `csrc/cpu/ops.h`):
- *   mbir_forward_project_mbir_cpu - voxel-driven bilinear FP (no super-
+ *   mbir_forward_project_cpu - voxel-driven bilinear FP (no super-
  *       sampling) used inside MBIR. Distinct from the existing ray-marching
  *       `forward_project_parallel_cpu` so the column-A model used in the ICD updates
  *       below matches the FP used to compute the initial e = g - Af.

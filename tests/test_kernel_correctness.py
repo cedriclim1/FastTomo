@@ -187,18 +187,29 @@ def _driver_free_bytes() -> int:
     return torch.cuda.mem_get_info()[0]
 
 
-def _assert_no_leak(fail_once, n_calls=200, tol=64 * _MiB):
-    """Call ``fail_once`` (which must raise) n_calls times and check the
-    driver-level free memory does not drop. Each call allocates a >= 8 MiB
-    cudaArray before throwing, so a leak shows up as >= 1.6 GB."""
+def _assert_no_leak(fail_once, array_bytes, n_calls=200, attempts=3):
+    """Call ``fail_once`` (which must raise) ``n_calls`` times and check the
+    driver-level free memory does not drop by a leak-sized amount.
+
+    A leak of the one-shot cudaArray would cost ``n_calls * array_bytes``; the
+    bound is a quarter of that (at least 32 MiB). The GPU may be shared, so
+    another process allocating during the loop could fake a drop: the loop
+    is retried up to ``attempts`` times and passes if any attempt stays under
+    the bound (a real leak shows up on every attempt)."""
     with pytest.raises((RuntimeError, ValueError)):
         fail_once()                      # warm-up: allocator pools, module init
-    before = _driver_free_bytes()
-    for _ in range(n_calls):
-        with pytest.raises((RuntimeError, ValueError)):
-            fail_once()
-    after = _driver_free_bytes()
-    assert before - after < tol, f"leaked {(before - after) / _MiB:.0f} MiB"
+    bound = max(n_calls * array_bytes // 4, 32 * _MiB)
+    drops = []
+    for _ in range(attempts):
+        before = _driver_free_bytes()
+        for _ in range(n_calls):
+            with pytest.raises((RuntimeError, ValueError)):
+                fail_once()
+        drops.append(before - _driver_free_bytes())
+        if drops[-1] < bound:
+            return
+    pytest.fail(f"leaked on every attempt: {[d // _MiB for d in drops]} MiB "
+                f"(bound {bound // _MiB} MiB)")
 
 
 # grid.z = n_angles (rotmat FP / grad) and grid.y = ceil(n_angles / 16)
@@ -213,7 +224,8 @@ _TOO_MANY_PARALLEL = 65535 * 16 + 1
 def test_forward_project_3d_launch_failure_does_not_leak(dtype):
     vol = torch.zeros(1, 2048, 2048, device="cuda", dtype=dtype)   # 8-16 MiB array
     euler = torch.zeros(_TOO_MANY_ROTMAT, 3, device="cuda")
-    _assert_no_leak(lambda: ft.forward_project_3d(vol, euler, N_det=2))
+    _assert_no_leak(lambda: ft.forward_project_3d(vol, euler, N_det=2),
+                    vol.numel() * vol.element_size())
 
 
 @needs_cuda
@@ -223,7 +235,8 @@ def test_forward_project_3d_launch_failure_does_not_leak(dtype):
 def test_forward_project_launch_failure_does_not_leak(dtype, Ny):
     vol = torch.zeros(Ny, 2048, 1024, device="cuda", dtype=dtype)
     angles = torch.zeros(_TOO_MANY_PARALLEL, device="cuda")
-    _assert_no_leak(lambda: ft.forward_project(vol, angles, N_det=1))
+    _assert_no_leak(lambda: ft.forward_project(vol, angles, N_det=1),
+                    vol.numel() * vol.element_size())
 
 
 @needs_cuda
@@ -231,7 +244,7 @@ def test_grad_rotmat_uncached_launch_failure_does_not_leak():
     vol = torch.zeros(1, 2048, 2048, device="cuda")
     gs = torch.zeros(_TOO_MANY_ROTMAT, 1, 2, device="cuda")
     mats = torch.zeros(_TOO_MANY_ROTMAT, 9, device="cuda")
-    _assert_no_leak(lambda: _grad_rotmat_raw(vol, gs, mats))
+    _assert_no_leak(lambda: _grad_rotmat_raw(vol, gs, mats), vol.numel() * 4)
 
 
 @needs_cuda
@@ -254,7 +267,7 @@ def test_tc_create_failure_does_not_leak(stage, kind, dtype, channels, dims):
             _core._tc_debug_fail_next_create(0)
         _core.tc_destroy(h)   # only reached if the hook did not fire
 
-    _assert_no_leak(fail_once)
+    _assert_no_leak(fail_once, dims[0] * dims[1] * dims[2] * (4 if dtype == 0 else 2))
 
 
 @needs_cuda
@@ -267,13 +280,14 @@ def test_texture_limits_raise_clear_error_without_leak():
     sino = torch.zeros(2049, 1, 8, device="cuda")
     with pytest.raises(ValueError, match="limit"):
         ft.back_project(sino, torch.zeros(2049, device="cuda"))
-    _assert_no_leak(lambda: ft.forward_project(vol, torch.zeros(4, device="cuda")))
+    _assert_no_leak(lambda: ft.forward_project(vol, torch.zeros(4, device="cuda")),
+                    vol.numel() * 4)
     # audit regression 6: BP with n_angles = 13000 (also past the 96 KB smem cap)
     big = torch.zeros(13000, 1, 8, device="cuda")
     angles = torch.zeros(13000, device="cuda")
-    _assert_no_leak(lambda: ft.back_project(big, angles), n_calls=10)
+    _assert_no_leak(lambda: ft.back_project(big, angles), big.numel() * 4, n_calls=10)
     _assert_no_leak(lambda: ft.back_project_3d(big, torch.zeros(13000, 3, device="cuda")),
-                    n_calls=10)
+                    big.numel() * 4, n_calls=10)
 
 
 def _read_on_side_stream(t: torch.Tensor) -> torch.Tensor:
@@ -368,10 +382,12 @@ def test_projector_collected_during_graph_capture_is_freed_after_capture():
     free0 = _driver_free_bytes()
     proj = ft.ParallelProjector((N, N, N), angles)
     sino = proj.forward(vol)
-    proj.back(sino)                        # both caches exist: ~8 + 16 MiB of arrays
+    proj.back(sino)                        # both caches exist
+    arrays = (N * N * N + 256 * N * N) * 4  # vol + sino cudaArrays: 24 MiB
     del sino
     held = free0 - _driver_free_bytes()
-    assert held > 16 * _MiB
+    # Relative bounds: the card may be shared, so allow 25 % noise.
+    assert held > 0.75 * arrays
 
     x = torch.zeros(16, device="cuda")
     g = torch.cuda.CUDAGraph()
@@ -380,10 +396,11 @@ def test_projector_collected_during_graph_capture_is_freed_after_capture():
         del proj
         gc.collect()
         assert len(projector_mod._deferred_handles) == 2
-    assert free0 - _driver_free_bytes() > 16 * _MiB   # still held after capture
+    still_held = free0 - _driver_free_bytes()
+    assert still_held > 0.75 * arrays               # not freed during capture
     projector_mod._drain_deferred_handles()
     assert not projector_mod._deferred_handles
-    assert free0 - _driver_free_bytes() < 8 * _MiB
+    assert still_held - (free0 - _driver_free_bytes()) > 0.75 * arrays   # freed now
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(x, torch.ones_like(x))
@@ -533,3 +550,181 @@ def test_genfire_gridding_cpu_bit_identical_to_numpy_binding():
     )
     for t, key in zip(grids, ("grid_real", "grid_imag", "weight_grid")):
         assert torch.equal(t, torch.from_numpy(d[key])), key
+
+
+# ── B1: size mismatches raise ValueError before any pointer is taken ───────
+#
+# The kernels get bare pointers plus dims, so an input smaller than the dims
+# claim is read out of bounds (NaN, garbage or a segfault). Every raw op
+# checks every tensor's shape in `_launch`.
+
+def _bad_calls(device):
+    from fasttomo import autograd as ag
+
+    d = device
+    vol = torch.rand(3, 8, 8, device=d)
+    sino = torch.rand(5, 3, 8, device=d)
+    ang5 = torch.linspace(-40, 40, 5, device=d)
+    mats5 = _euler_zyz_to_rotmat(torch.stack([ang5 * 0, ang5, ang5 * 0], 1)).reshape(5, 9)
+    return {
+        "bp_parallel: too few angles":
+            lambda: ag._back_project_parallel_raw(sino, ang5[:1]),
+        "bp_parallel: too many angles":
+            lambda: ag._back_project_parallel_raw(sino, torch.zeros(9, device=d)),
+        "bp_parallel: 2-D sinogram":
+            lambda: ag._back_project_parallel_raw(sino[0], ang5),
+        "fp_parallel: 4-D volume":
+            lambda: ag._forward_project_parallel_raw(vol[None], ang5),
+        "grad_angle: angles vs grad_sino":
+            lambda: ag._grad_angle_raw(vol, sino, ang5[:2]),
+        "grad_angle: grad_sino Ny":
+            lambda: ag._grad_angle_raw(vol, sino[:, :2], ang5),
+        "bp_rotmat: fewer matrices than views":
+            lambda: ag._back_project_rotmat_raw(sino, mats5[:1]),
+        "bp_rotmat: more matrices than views":
+            lambda: ag._back_project_rotmat_raw(sino[:2], mats5),
+        "fp_rotmat: matrices not [n, 9]":
+            lambda: ag._forward_project_rotmat_raw(vol, mats5.reshape(-1)[:40]),
+        "grad_rotmat: grad_sino views":
+            lambda: ag._grad_rotmat_raw(vol, sino[:2], mats5),
+        "grad_rotmat: grad_sino Ny":
+            lambda: ag._grad_rotmat_raw(vol, sino[:, :2], mats5),
+        "public back_project_3d (review repro)":
+            lambda: ft.back_project_3d(torch.ones(4000, 2, 8, device=d),
+                                       torch.zeros(1, 3, device=d)),
+        "public back_project (review repro)":
+            lambda: ft.back_project(torch.ones(4000, 2, 8, device=d),
+                                    torch.zeros(1, device=d)),
+    }
+
+
+_BAD_NAMES = list(_bad_calls("cpu"))
+
+
+@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("case", _BAD_NAMES)
+def test_raw_ops_reject_mismatched_sizes(device, case):
+    with pytest.raises(ValueError):
+        _bad_calls(device)[case]()
+
+
+def _sweep_args(Ny=2, Nz=4, Nx=4, n_angles=3):
+    from fasttomo.autograd import _trig_on_device
+    cos_a, sin_a = _trig_on_device(torch.linspace(-30, 30, n_angles), torch.device("cpu"))
+    return dict(
+        volume=torch.zeros(Ny, Nz, Nx), e_sino=torch.ones(n_angles, Ny, Nx),
+        d_offsets=torch.zeros(n_angles), lambdas=None,
+        vol_snap=torch.zeros(Ny, Nz, Nx),
+        perm=torch.arange(Nz * Nx, dtype=torch.int32).repeat(Ny, 1),
+        cos_a=cos_a, sin_a=sin_a)
+
+
+@pytest.mark.parametrize("bad", ["e_sino_Ny", "angles", "d_offsets", "perm", "snapshot"])
+def test_mbir_cpu_sweep_rejects_mismatched_sizes(bad):
+    """The #58 size checks (e_sino Ny, angles, d_offsets) and the others."""
+    from fasttomo.algorithms import _mbir_icd_sweep_cpu
+
+    kw = _sweep_args()
+    if bad == "e_sino_Ny":
+        kw["e_sino"] = torch.ones(3, 1, 4)
+    elif bad == "angles":
+        kw["cos_a"], kw["sin_a"] = kw["cos_a"][:2], kw["sin_a"][:2]
+    elif bad == "d_offsets":
+        kw["d_offsets"] = torch.zeros(2)
+    elif bad == "perm":
+        kw["perm"] = kw["perm"][:, :5].contiguous()
+    else:
+        kw["vol_snap"] = torch.zeros(2, 4, 3)
+    hyper = dict(qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=0.01, sigma_f=1.0,
+                 huber_T=float("inf"), huber_delta=1.0, sigma=1.0, sigma_min=1e-3,
+                 estimate_offset=True, estimate_variance=False, num_threads=1)
+    with pytest.raises(ValueError):
+        _mbir_icd_sweep_cpu(kw["volume"], kw["e_sino"], kw["d_offsets"], kw["lambdas"],
+                            kw["vol_snap"], kw["perm"], kw["cos_a"], kw["sin_a"], **hyper)
+    _mbir_icd_sweep_cpu(*(_sweep_args()[k] for k in
+                          ("volume", "e_sino", "d_offsets", "lambdas", "vol_snap",
+                           "perm", "cos_a", "sin_a")), **hyper)   # valid call runs
+
+
+# ── Parallel-beam path: tight bounds are consistent end to end ─────────────
+#
+# Unlike the rotmat path (D2), the single-axis operators use *tight* bounds
+# on every backend: a sample contributes only if its whole bilinear stencil
+# lies inside the slice, fx in [0, Nx-1), fz in [0, Nz-1). The CUDA forward
+# skips out-of-stencil samples explicitly before its (border-mode) texture
+# fetch, the CPU forward does the same, and grad_angle (CPU and CUDA) is the
+# derivative of exactly that forward. These tests pin that consistency on
+# volumes that touch every face, with the D2 methodology: an independent fp64
+# reference, central finite differences, generic angles.
+
+def _fp_parallel_ref(vol: np.ndarray, angles_deg: np.ndarray, N_det: int) -> np.ndarray:
+    """fp64 single-axis forward: unit steps, bilinear, tight stencil bounds."""
+    Ny, Nz, Nx = vol.shape
+    ray_len = int(math.ceil(0.5 * math.sqrt(Nx * Nx + Nz * Nz))) + 1
+    hd, hx, hz = 0.5 * (N_det - 1), 0.5 * (Nx - 1), 0.5 * (Nz - 1)
+    T, S = np.meshgrid(np.arange(N_det) - hd,
+                       np.arange(-ray_len, ray_len + 1, dtype=np.float64), indexing="ij")
+    out = np.zeros((len(angles_deg), Ny, N_det))
+    for a, th in enumerate(np.deg2rad(angles_deg)):
+        fx = T * math.cos(th) - S * math.sin(th) + hx
+        fz = T * math.sin(th) + S * math.cos(th) + hz
+        inside = (fx >= 0) & (fx < Nx - 1) & (fz >= 0) & (fz < Nz - 1)
+        fx = np.where(inside, fx, 0.0)
+        fz = np.where(inside, fz, 0.0)
+        x0 = np.floor(fx).astype(int)
+        z0 = np.floor(fz).astype(int)
+        wx, wz = fx - x0, fz - z0
+        x1 = np.minimum(x0 + 1, Nx - 1)
+        z1 = np.minimum(z0 + 1, Nz - 1)
+        val = ((1 - wz) * ((1 - wx) * vol[:, z0, x0] + wx * vol[:, z0, x1])
+               + wz * ((1 - wx) * vol[:, z1, x0] + wx * vol[:, z1, x1]))
+        out[a] = np.where(inside[None], val, 0.0).sum(-1)
+    return out
+
+
+_PAR_ANGLES = np.array([-47.3, -12.9, 8.1, 33.7, 61.2])
+
+
+def _parallel_case(seed=1, shape=(3, 11, 12)):
+    g = torch.Generator().manual_seed(seed)
+    vol = torch.rand(*shape, generator=g) + 0.5             # non-zero on every face
+    w = torch.randn(len(_PAR_ANGLES), shape[0], shape[2], generator=g)
+    eps = 1e-5
+    fd = np.zeros(len(_PAR_ANGLES))
+    for i in range(len(_PAR_ANGLES)):
+        e = eps * (np.arange(len(_PAR_ANGLES)) == i)
+        lp = (w.double().numpy() * _fp_parallel_ref(vol.double().numpy(), _PAR_ANGLES + e, shape[2])).sum()
+        lm = (w.double().numpy() * _fp_parallel_ref(vol.double().numpy(), _PAR_ANGLES - e, shape[2])).sum()
+        fd[i] = (lp - lm) / (2 * eps)
+    return vol, w, fd
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_grad_angle_matches_finite_difference(device):
+    from fasttomo.autograd import _grad_angle_raw
+
+    vol, w, fd = _parallel_case()
+    angles = torch.tensor(_PAR_ANGLES, dtype=torch.float32, device=device)
+    g = _grad_angle_raw(vol.to(device), w.to(device), angles)
+    assert g.shape == (len(_PAR_ANGLES),)
+    assert _rel(g, fd) < 1e-4
+
+
+@pytest.mark.parametrize("kind", ["ones", "rand"])
+def test_forward_project_parallel_cpu_matches_reference_on_box_filling_volume(kind):
+    vol = torch.ones(3, 11, 12) if kind == "ones" else _parallel_case()[0]
+    angles = torch.tensor(_PAR_ANGLES, dtype=torch.float32)
+    ref = _fp_parallel_ref(vol.double().numpy(), angles.double().numpy(), 12)
+    assert _rel(ft.forward_project(vol, angles), ref) < 1e-5
+
+
+@needs_cuda
+@pytest.mark.parametrize("kind", ["ones", "rand"])
+def test_forward_project_parallel_cpu_cuda_parity_on_box_filling_volume(kind):
+    """CPU and CUDA parallel forwards agree on a box-filling volume up to the
+    texture unit's 8-bit filter weights (~3e-4 relative)."""
+    vol = torch.ones(3, 11, 12) if kind == "ones" else _parallel_case()[0]
+    angles = torch.tensor(_PAR_ANGLES, dtype=torch.float32)
+    cpu = ft.forward_project(vol, angles)
+    gpu = ft.forward_project(vol.cuda(), angles.cuda()).cpu()
+    assert _rel(gpu, cpu) < 2e-3

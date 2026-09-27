@@ -16,7 +16,9 @@
  *     texture_cache.h). cudaFreeArray would synchronize anyway.
  *   - The Python-side `tc_destroy` binding synchronizes the device.
  *
- * Every host-callable function may throw std::runtime_error on a CUDA error.
+ * Every host-callable function may throw: std::runtime_error on a CUDA error,
+ * std::invalid_argument (Python ValueError) for a cache that does not match
+ * the call (tc_validate) or an extent beyond the device texture limits.
  *
  * Cos/sin tables (single-axis kernels) are passed as device pointers so the
  * trig precompute can stay on the GPU.
@@ -159,7 +161,7 @@ void back_project_resire_cuda(
 
 /*
  * Gradient of 3D rotation-matrix forward projection w.r.t. the rotation
- * matrix entries. d_grad_matrices is [n_angles*9] row-major, must be zeroed
+ * matrix entries. grad_mats is [n_angles*9] row-major, must be zeroed
  * by the caller. Used by _FPRotmat's autograd backward; the host chains the
  * result through _euler_zyz_to_rotmat (pure-PyTorch) to yield ∂L/∂euler.
  */
@@ -178,7 +180,7 @@ void grad_rotmat_cuda(
  * already uploaded by a preceding forward_project_rotmat_cuda_cached call.
  * Uses vol_cache->tex_point (point-filter view) for bit-exact corner reads.
  * io_dtype: 0=fp32, 1=fp16 (controls which kernel template is instantiated).
- * d_grad_matrices must be zeroed by the caller; result is accumulated via atomicAdd.
+ * grad_mats must be zeroed by the caller; result is accumulated via atomicAdd.
  */
 void grad_rotmat_cuda_cached(
     int io_dtype,
@@ -193,7 +195,7 @@ void grad_rotmat_cuda_cached(
 
 /*
  * Gradient of forward projection w.r.t. tilt angles.
- * d_grad_angles must be zeroed by the caller; result is in radians.
+ * grad_angles must be zeroed by the caller; result is in radians.
  */
 void grad_angle_cuda(
     const float *vol,

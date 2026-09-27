@@ -193,6 +193,10 @@ class _ProjectorBase:
 # whatever device the capture runs on, and would invalidate the capture.
 # They wait here until _drain_deferred_handles() runs after the capture
 # (run_sirt calls it) or the next projector is released.
+# Limitation (as on main, where cudaFreeArray had the same effect): only a
+# capture on the *calling* thread is detected. If GC finalizes a projector
+# on thread B while thread A captures in global mode, the free still breaks
+# A's capture; keep projectors alive across captures in threaded code.
 _deferred_handles: list[tuple[torch.device, int]] = []
 
 
