@@ -180,6 +180,7 @@ the exact transpose of the CPU forward (gap 5e-9). The back-projection step
 is also faster (5x at 8x128^2, 61 views, with the Y-batched gather above).
 Only
 the `cpu/fbp`, `cpu/fbp_h` and `cpu/fbp_mask` golden keys were regenerated.
+
 ### ⚠ `run_mbir`: the qGGMRF prior is now the paper's (all MBIR results change)
 
 The kernels computed the surrogate of `|D|^p / (c sigma_f^p + |D|^(p-q) sigma_f^q)`
