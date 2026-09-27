@@ -119,8 +119,10 @@ def test_forward_project_angle_grad_fd_nx_ne_ndet():
     h = 1e-2
     fd = []
     for i in range(n):
-        a_p = ang.detach().clone(); a_p[i] += h
-        a_m = ang.detach().clone(); a_m[i] -= h
+        a_p = ang.detach().clone()
+        a_p[i] += h
+        a_m = ang.detach().clone()
+        a_m[i] -= h
         lp = (ft.forward_project(x, a_p, N_det=N_det) * w).double().sum()
         lm = (ft.forward_project(x, a_m, N_det=N_det) * w).double().sum()
         fd.append(float((lp - lm) / (2 * h)))
@@ -414,8 +416,10 @@ def test_apply_shifts_2d_zero_is_identity_and_grad(backend):
     fd = torch.zeros(3, 2)
     for i in range(3):
         for j in range(2):
-            p = sh.detach().clone(); p[i, j] += h
-            m = sh.detach().clone(); m[i, j] -= h
+            p = sh.detach().clone()
+            p[i, j] += h
+            m = sh.detach().clone()
+            m[i, j] -= h
             fd[i, j] = ((ft.apply_shifts_2d(sino, p) - ft.apply_shifts_2d(sino, m)) * w).double().sum() / (2 * h)
     assert _rel(sh.grad, fd) < 1e-3
 
@@ -441,8 +445,10 @@ def _fd_grad(f, v: np.ndarray, h: float = 1e-6) -> np.ndarray:
     it = np.nditer(v, flags=["multi_index"])
     for _ in it:
         i = it.multi_index
-        vp = v.copy(); vp[i] += h
-        vm = v.copy(); vm[i] -= h
+        vp = v.copy()
+        vp[i] += h
+        vm = v.copy()
+        vm[i] -= h
         g[i] = (f(vp) - f(vm)) / (2 * h)
     return g
 
