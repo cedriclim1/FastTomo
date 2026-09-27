@@ -1422,14 +1422,17 @@ def run_ad_recon(
         else:
             pred = _proj.forward(volume)  # type: ignore[arg-type]
 
-        # optional shift correction
-        if refine_shifts and shifts is not None:
-            pred = apply_shifts_2d(pred, shifts)
         # A user-supplied projector built for another geometry would make
         # the loss broadcast silently (e.g. [1, Ny, N] against the sinogram).
+        # Checked before the shift correction, whose own error ("shifts has
+        # N entries but sinogram has M angles") would name the wrong culprit.
         _assert_projector_output_shape(
             pred, (n_angles, Ny, N_det), "forward-projection", "run_ad_recon",
         )
+
+        # optional shift correction
+        if refine_shifts and shifts is not None:
+            pred = apply_shifts_2d(pred, shifts)
 
         # data-fit + regularisation terms, keyed for the loss_callback
         # components contract. Insertion order matches the historical
@@ -2724,6 +2727,11 @@ def run_mbir(
     if Nz < 0:
         Nz = N_det
     Nx = N_det  # standard parallel-beam convention
+    # A NaN/inf pixel would otherwise surface as "sigma_init must be finite"
+    # (sinogram.std() is NaN) even though the caller never passed sigma_init,
+    # or poison every voxel if sigma_init is given.
+    if not torch.isfinite(sinogram).all():
+        raise ValueError("run_mbir: sinogram contains NaN or inf values")
 
     if lambdas is not None:
         if lambdas.dim() != 3 or tuple(lambdas.shape) != (n_angles, Ny, N_det):

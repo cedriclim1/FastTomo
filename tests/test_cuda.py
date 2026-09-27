@@ -2048,7 +2048,16 @@ def test_mbir_seed_reproducibility():
 
 def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
     """Regression (#58): the CUDA sweep reads lambdas through a raw pointer,
-    so an ``expand``ed view must give the same volume as its dense copy."""
+    so an ``expand``ed view must give the same volume as its dense copy.
+
+    The view is expanded along Ny from a [n_angles, 1, N_det] base with
+    different values per angle, and a filler tensor is allocated right after
+    the base storage. Without the fix the kernel reads the base linearly:
+    past its first rows it lands in the filler (1e3), not in a copy of the
+    right values. (The first version of this test expanded along the angle
+    axis and allocated the dense copy right after the base, so the stray
+    reads found exactly the right values and the test passed on the unfixed
+    code.)"""
     Ny = Nz = Nx = 16
     n_angles = 20
     angles = make_angles(n_angles, max_deg=60.0)
@@ -2057,7 +2066,9 @@ def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
     sino = _mbir_sino_self(phantom, angles)
 
     g = torch.Generator(device="cpu").manual_seed(0)
-    lam_expand = (torch.rand(1, Ny, Nx, generator=g) + 0.5).to(DEVICE).expand(n_angles, Ny, Nx)
+    lam_base = (torch.rand(n_angles, 1, Nx, generator=g) + 0.5).to(DEVICE)
+    filler = torch.full((1 << 16,), 1e3, device=DEVICE)   # noqa: F841 — keeps the memory after lam_base
+    lam_expand = lam_base.expand(n_angles, Ny, Nx)
     assert not lam_expand.is_contiguous()
     lam_contig = lam_expand.contiguous()
 

@@ -671,3 +671,36 @@ def test_zero_size_raises_value_error(backend, case):
 def test_projectors_reject_zero_size_geometry(make):
     with pytest.raises(ValueError, match="at least 1"):
         make()
+
+
+# ── #78 review follow-ups ──────────────────────────────────────────────────
+
+def test_ad_recon_shape_guard_runs_before_shift_correction(monkeypatch):
+    """A projector built for the wrong number of views must give the
+    projector-shape error even with refine_shifts=True; the shift correction
+    used to run first and raise 'shifts has 5 entries but sinogram has 1
+    angles', blaming the shifts."""
+
+    class OneViewProjector:
+        def forward(self, volume):
+            return volume.mean(dim=1).unsqueeze(0)          # [1, Ny, Nx]
+
+    proj = _cpu_ad_recon(monkeypatch, projector=OneViewProjector())
+    cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1),
+                           pose=ft.PoseRefinementConfig(refine_shifts=True))
+    with pytest.raises(ValueError, match="projector returned forward-projection"):
+        ft.run_ad_recon(torch.zeros(5, 2, 6), torch.linspace(-20, 20, 5), Nz=6,
+                        projector=proj, config=cfg)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("sigma_init", [None, 0.1])
+def test_mbir_rejects_non_finite_sinogram(backend, bad, sigma_init):
+    """A NaN/inf pixel raises a clear error. Without sigma_init it used to
+    say 'sigma_init must be finite' (the auto sigma is sinogram.std()); with
+    sigma_init it ran and returned NaN voxels."""
+    sino = torch.rand(6, 2, 8, device=backend)
+    sino[2, 1, 3] = bad
+    with pytest.raises(ValueError, match="sinogram contains NaN or inf"):
+        ft.run_mbir(sino, torch.linspace(-40, 40, 6, device=backend),
+                    outer_iters=1, multires_levels=1, sigma_init=sigma_init)
