@@ -125,9 +125,14 @@ class _GatherBackProject(torch.autograd.Function):
     """CPU FBP back-projection: the C gather kernel forward (shift-invariant,
     the CUDA back-projection's operator with exact weights), and the CPU
     forward projector as its backward, the same pairing as the CUDA
-    ``back_project`` (a gather whose backward is the ray-marching forward),
-    so ``run_fbp`` stays differentiable w.r.t. the sinogram on both
-    backends. Returns fp32."""
+    ``back_project`` (a gather whose backward is the ray-marching forward).
+    ``run_fbp`` stays differentiable w.r.t. the sinogram, but its gradient is
+    now approximate: the ray forward is not the exact adjoint of the gather
+    (inner-product gap 2.4e-2 at 64^2 x 61 views, 5.3e-2 at 32^2 x 31),
+    where the old ray-driven CPU back-projection was the exact transpose of
+    the CPU forward (gap 5e-9). CUDA has the same mismatched pairing. The
+    MBIR splat forward is the gather's exact adjoint, if an exact gradient
+    is ever needed. Returns fp32."""
 
     @staticmethod
     def forward(ctx, sinogram, angles_deg, Nz, Nx, num_threads):
