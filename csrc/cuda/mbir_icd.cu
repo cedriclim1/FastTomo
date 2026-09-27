@@ -23,7 +23,7 @@
  * Host wrappers expose these as `mbir_forward_project_cuda` and
  * `mbir_icd_sweep_cuda`. The offset (d_k) and variance (σ) closed-form
  * updates live in the Python wrapper using PyTorch ops — see
- * fasttomo/algorithms.py::_run_mbir_single_scale.
+ * fasttomo/algorithms/mbir.py::_run_mbir_single_scale.
  */
 
 #include "common.cuh"
