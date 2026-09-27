@@ -11,6 +11,27 @@ call is up to ~4x slower than before**. Results are unchanged. To restore
 the old speed pass `num_threads=4` (or more), or set `OMP_NUM_THREADS`
 before starting Python. CUDA runs are not affected.
 
+### Projection-operator seam (internal; outputs unchanged)
+
+- Every forward/back projection now goes through one internal interface,
+  `fasttomo._operator` (`ProjectionOperator` with `fp` / `bp` / `grad_geom`
+  and adapters for CPU, CUDA with cached textures, and the frozen RESIRE
+  kernels), chosen in one place (`_make_operator`). The functional API, the
+  projector classes and every algorithm use it; two generic autograd
+  Functions (`_Project`, `_BackProject`) replace the eight per-path ones in
+  `fasttomo.autograd` (`_FPParallel`, `_FPParallelCached`, ... were private).
+  No public API change, and every output is bit-identical to before
+  (`tests/test_algorithm_identity.py`, generated on the previous `main`).
+- New: `ParallelProjector` and `RotmatProjector` accept `device="cpu"` (and
+  a keyword-only `num_threads`); on CPU they give exactly the functional
+  API's results. Before, a CPU device raised `ValueError`.
+- Faster on CUDA: `run_sart`, `run_wsirt`, `run_grad_descent` and
+  `refine_angles` reuse texture caches instead of allocating a texture and
+  synchronising on every projection (e.g. `run_sart` 4-6x, `refine_angles`
+  2-3x faster on small problems).
+- `run_fbp` on CUDA without a projector uses the one-shot texture path
+  (numerically identical).
+
 ### Internal restructure (no behaviour change)
 
 - `fasttomo/algorithms.py` is now the package `fasttomo/algorithms/`

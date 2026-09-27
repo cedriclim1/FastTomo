@@ -130,6 +130,10 @@ module          contents
 ``alignment``   ``refine_angles``
 ``mbir``        ``run_mbir``
 ==============  ======================================================
+
+Every forward/back projection (except MBIR's own model and GENFIRE's
+gridding) goes through a projection operator from
+``fasttomo._operator._make_operator`` (ARCH P1).
 """
 
 from __future__ import annotations
