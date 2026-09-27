@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+### ⚠ Parallel-beam projector: loose sampling boundary; symmetric geometry gradients at grid alignments (phase 1b, PR G)
+
+**Every parallel-beam result changes slightly at the volume edges.** The
+single-axis operators (`forward_project`, `back_project` on CPU,
+`ParallelProjector`, and everything built on them: SIRT, SART, wSIRT, FISTA,
+FISTA-TV, gradient descent, AD reconstruction, `refine_angles`) now sample
+the volume with the rule the rotmat path, the CUDA border-mode textures and
+MBIR already used: every slice is a sum of bilinear tent functions, zero
+outside, so a ray sample contributes while any corner of its stencil is
+inside, x index in (-1, Nx), z in (-1, Nz). Before, a sample needed its
+whole stencil inside ([0, N-1)): at 0 degrees the last detector column was
+0 and the last z row was never sampled for odd Nz, Nz = 1 or Nx = 1 volumes
+projected to 0, and the result was not symmetric under an x-flip or a half
+turn. This reverses phase-1 decision 3 (tight bounds; its finite-difference
+argument holds for every rule).
+
+- `forward_project(v, a)` now equals `forward_project_3d(v, (0, a, 0))`
+  (bit for bit on CUDA, to 1e-7 on CPU). Volumes that are zero on the outer
+  voxel ring project to the same bits as before; the CPU back projection
+  (still the exact transpose, bit for bit) changes only on that ring; the
+  CUDA back projection (texture gather) is unchanged.
+- Consequences measured on analytic data (no inverse crime) of an ET slab
+  that fills the field of view, N = 128, 61 views over +-60 degrees, CUDA,
+  mean error of column 0 / column N-1: `run_sirt` 100 iterations
+  +0.07 / +0.50 -> +0.04 / +0.05, `run_sart` +-0.01 / +0.19 -> -0.02 / -0.01,
+  `run_fista` +0.01 / +5.97 (RMSE 0.61) -> -0.01 / -0.01 (RMSE 0.19),
+  `run_grad_descent` 300 iterations +0.26 / +1.06 -> +0.21 / +0.22.
+  `refine_angles` started at the true angles of that slab (64^2, 61 views)
+  ended 0.45 degrees rms (1.5 max) off on pure-tilt rotmat data and 1.17
+  rms (3.3 max) on analytic data; now 0.000 / 0.0004 and 0.35 (1.8).
+  The CUDA operator pair is closer to adjoint: `||B - A^T||_F / ||A||_F`
+  0.21 -> 0.077 at 32^2, 0.16 -> 0.077 at 64^2 (61 views); CUDA FISTA's
+  long-run growth (solver audit A2) is smaller but not gone (64^2 noise-free
+  after 3000 iterations: relative error 14.1 -> 0.77; see `run_fista`).
+- `grad_angle` (the angle gradient of `forward_project`) and `grad_rotmat`
+  (the pose gradient of `forward_project_3d`), CPU and CUDA: at a sample
+  exactly on a grid line or plane the kernels take the average of the two
+  one-sided differences (they took the forward one), with an inclusive
+  [-1, N] bound. The gradient now equals the central finite difference at
+  grid-aligned views too: 0 degrees (every sample on a grid line), +-90 /
+  180 degrees, the identity pose and pure tilts `(0, theta, 0)` (every
+  sample on a y plane: the pose-refinement start), 1e-8 to 1.2e-6 against an
+  fp64 central FD on both backends (was off by 20 % to several times there).
+  Off those views the gradients are unchanged. The design study measured
+  no convergence change from the kink rule (pose-only Adam and
+  `run_ad_recon` pose stages agree to 3-4 digits): it is a correctness and
+  testability fix. Note: torch's fp32 cos(90 deg) is -4.4e-8, so a +-90 / 180
+  degree view is 2.5e-6 / 5e-6 degrees past the alignment and its far
+  samples are just off the grid line, where the one-sided derivative is the
+  exact one.
+- CUDA `grad_angle` now walks only the clipped step range of each ray,
+  united over the warp (as the forward; bit-identical to the full loop).
+
+Cost (sm_120, interleaved A/B of the two builds in one process, N^3 volumes,
+angles linspace(-70, 70, n)): CUDA forward kernel +0.8 to +2.5 % (fp32 and
+fp16, 128^3 to 512^3, 61 and 181 views); CUDA `grad_angle` +18-23 % at
+128^3 and +13-17 % at 256^3 (61 views); CUDA `grad_rotmat` +1 % on generic
+poses and 1.9-2.1x on exact pure tilts (4 extra fetches per sample; only
+the first pose iteration of a tilt series is one). CPU (32 x 128^2 and
+16 x 256^2, 61 views): forward +3-5 %, ray-driven back projection +3-4 %
+(1 thread; within noise at 8), `grad_angle` +9-10 %, `grad_rotmat` +0.5-3 %
+generic and +24-30 % on a pure tilt; single slices (Ny = 1, 256^2 and
+512^2), which now copy the slice into a zero-bordered scratch, forward
++8-9 % (1 thread) and +17-31 % (8 threads), back projection +10-16 %,
+`grad_angle` +17-25 %.
+
+Goldens: the golden tests' input sinograms are now stored in the golden
+files (`_input/<device>/sino`, `tests/data/freeze_golden_inputs.py`), so
+GENFIRE / RESIRE (and FBP, W-BP, MBIR) keys stay byte-identical; the parallel
+projection keys, every parallel-derived algorithm key, the rotmat
+pose-gradient keys at the identity pose and the five `run_ad_recon` keys were
+regenerated (`tests/data/regen_boundary_goldens.py`).
+`tests/data/regenerate_golden_keys.py` now checks that every key it does not
+replace is still reproduced.
+
 ### Parallel-beam CUDA projections: packed textures, ray clipping, texture pool (phase 1b, PR B)
 
 Same results bit for bit (0 differing outputs over 3.7e8 values: FP/BP one-shot

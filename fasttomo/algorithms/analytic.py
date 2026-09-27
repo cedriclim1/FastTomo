@@ -39,7 +39,8 @@ from fasttomo.algorithms._common import (
 #   grid wSIRT diverged at omega=1 on 32 of 45 test geometries. Two modes
 #   grew: one concentrated in the outermost ~3 voxels of the volume (the
 #   circular boundary sits on the volume edge, where the tight-bounds
-#   forward projector barely sees the voxels), and, with many views, a
+#   forward projector of the time barely saw the voxels; since phase 1b
+#   PR G it samples the edge voxels fully), and, with many views, a
 #   low-frequency one next to the missing-wedge edge. The layergram and the
 #   PSF are now back-projected onto a grid with a margin of
 #   `_wbp_margin(N)` = max(2, N // 16) voxels on each side of Z and X,
