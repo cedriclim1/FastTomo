@@ -312,6 +312,16 @@ static f32arr py_mbir_forward_project_cpu(
     return sinogram;
 }
 
+/* The MBIR sweep indexes every buffer as a dense row-major array, and
+ * volume / e_sino / d_offsets are written in place. A strided numpy view
+ * would be read with the wrong layout, and a silent copy would drop the
+ * in-place writes, so reject non-C-contiguous inputs outright. */
+static void require_c_contiguous(const py::array &a, const char *name) {
+    if (!(a.flags() & py::array::c_style))
+        throw std::invalid_argument(
+            std::string("mbir_icd_sweep_cpu: ") + name + " must be C-contiguous");
+}
+
 static float py_mbir_icd_sweep_cpu(
     f32arr volume,              /* [Ny, Nz, Nx] in-place */
     f32arr e_sino,              /* [n_angles, Ny, N_det] in-place */
@@ -339,11 +349,17 @@ static float py_mbir_icd_sweep_cpu(
         throw std::invalid_argument("volume_snapshot size mismatch");
     if ((int)perm.size() != Ny * Nz * Nx)
         throw std::invalid_argument("perm size must be Ny*Nz*Nx");
+    require_c_contiguous(volume, "volume");
+    require_c_contiguous(e_sino, "e_sino");
+    require_c_contiguous(volume_snapshot, "volume_snapshot");
+    require_c_contiguous(perm, "perm");
+    require_c_contiguous(angles, "angles");
 
     float *d_ptr = nullptr;
     if (!d_offsets.is_none()) {
         f32arr d = py::cast<f32arr>(d_offsets);
         if ((int)d.size() != n_angles) throw std::invalid_argument("d_offsets length mismatch");
+        require_c_contiguous(d, "d_offsets");
         d_ptr = static_cast<float *>(d.request().ptr);
     } else if (estimate_offset) {
         throw std::invalid_argument("estimate_offset=True but d_offsets is None");
@@ -354,6 +370,7 @@ static float py_mbir_icd_sweep_cpu(
         f32arr l = py::cast<f32arr>(lambdas);
         if ((int)l.size() != n_angles * Ny * N_det)
             throw std::invalid_argument("lambdas size mismatch");
+        require_c_contiguous(l, "lambdas");
         lam_ptr = static_cast<const float *>(l.request().ptr);
     }
 

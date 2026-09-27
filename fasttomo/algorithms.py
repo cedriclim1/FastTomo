@@ -2407,7 +2407,7 @@ def _run_mbir_single_scale(
             e_np = e_sino.numpy()
             d_np = d_offsets.numpy() if estimate_offset else None
             vol_snap_np = vol_snap.numpy()
-            lam_np = lambdas.numpy() if lambdas is not None else None
+            lam_np = lambdas.contiguous().numpy() if lambdas is not None else None
             sigma_cur = float(_core.mbir_icd_sweep_cpu(
                 volume_np, e_np, d_np, lam_np,
                 vol_snap_np, perm,
@@ -2559,6 +2559,10 @@ def run_mbir(
             lambdas = lambdas.float()
         if lambdas.device != sinogram.device:
             lambdas = lambdas.to(sinogram.device)
+        # The MBIR sweeps read lambdas through a raw linear pointer (CUDA) or
+        # a numpy buffer (CPU), so a strided view such as one produced by
+        # ``expand`` would be indexed as if it were dense. Materialise it.
+        lambdas = lambdas.contiguous()
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())

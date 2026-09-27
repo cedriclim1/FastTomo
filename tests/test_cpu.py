@@ -1057,6 +1057,75 @@ def test_mbir_lambdas_shape_mismatch_raises():
         ft.run_mbir(sino, angles, lambdas=bad_lambdas)
 
 
+def test_mbir_noncontiguous_lambdas_matches_contiguous():
+    """Regression (#58): a strided lambdas view must behave like its dense copy.
+
+    The MBIR sweeps read lambdas through a raw linear buffer, so an
+    ``expand``ed view used to be indexed as if it were dense (reading past
+    the real storage) and gave a different reconstruction.
+    """
+    torch.manual_seed(0)
+    Ny = Nz = Nx = 8
+    n_angles = 5
+    angles = make_angles(n_angles, max_deg=40.0)
+    phantom = torch.rand(Ny, Nz, Nx)
+    sino = ft.forward_project(phantom, angles)
+
+    lam_expand = (torch.rand(1, Ny, Nx) + 0.5).expand(n_angles, Ny, Nx)
+    assert not lam_expand.is_contiguous()
+    lam_contig = lam_expand.contiguous()
+
+    kw = dict(
+        Nz=Nz,
+        sigma_f=0.1,
+        huber_T=float("inf"),
+        estimate_offset=False,
+        estimate_variance=False,
+        outer_iters=4,
+        multires_levels=1,
+        seed=11,
+    )
+    vol_contig = ft.run_mbir(sino, angles, lambdas=lam_contig, **kw)
+    vol_expand = ft.run_mbir(sino, angles, lambdas=lam_expand, **kw)
+
+    assert torch.allclose(vol_contig, vol_expand, atol=1e-6, rtol=1e-6)
+
+
+def test_mbir_cpu_binding_rejects_noncontiguous_buffers():
+    """The CPU MBIR binding must not silently ignore numpy strides (#58)."""
+    import numpy as np
+    from fasttomo import _core
+
+    Ny, Nz, Nx, n_angles = 2, 4, 4, 3
+    N_det = Nx
+    angles = np.linspace(-0.5, 0.5, n_angles).astype(np.float32)
+    perm = np.tile(np.arange(Nz * Nx, dtype=np.int32), (Ny, 1))
+
+    def call(volume, e_sino, lambdas):
+        return _core.mbir_icd_sweep_cpu(
+            volume, e_sino, None, lambdas,
+            np.zeros((Ny, Nz, Nx), np.float32), perm, angles,
+            1.2, 2.0, 0.01, 1.0,
+            float("inf"), 1.0,
+            1.0, 1e-3,
+            False, False,
+            num_threads=1,
+        )
+
+    vol = np.zeros((Ny, Nz, Nx), np.float32)
+    e = np.ones((n_angles, Ny, N_det), np.float32)
+    lam = np.ones((n_angles, Ny, N_det), np.float32)
+    call(vol, e.copy(), lam)  # dense buffers are accepted
+
+    lam_strided = np.broadcast_to(np.ones((1, Ny, N_det), np.float32), (n_angles, Ny, N_det))
+    with pytest.raises(ValueError, match="lambdas must be C-contiguous"):
+        call(vol, e.copy(), lam_strided)
+
+    vol_strided = np.zeros((Ny, Nx, Nz), np.float32).transpose(0, 2, 1)
+    with pytest.raises(ValueError, match="volume must be C-contiguous"):
+        call(vol_strided, e.copy(), lam)
+
+
 def test_mbir_multires_not_divisible_raises():
     # N_det=14 is not divisible by coarse_factor=4 (multires_levels=3).
     sino14 = torch.zeros(5, 2, 14)

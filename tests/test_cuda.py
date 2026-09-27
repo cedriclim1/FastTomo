@@ -1940,6 +1940,31 @@ def test_mbir_seed_reproducibility():
     assert torch.equal(v1, v2), "MBIR not reproducible with the same seed"
 
 
+def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
+    """Regression (#58): the CUDA sweep reads lambdas through a raw pointer,
+    so an ``expand``ed view must give the same volume as its dense copy."""
+    Ny = Nz = Nx = 16
+    n_angles = 20
+    angles = make_angles(n_angles, max_deg=60.0)
+    phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    phantom[4:12, 4:12, 4:12] = 1.0
+    sino = _mbir_sino_self(phantom, angles)
+
+    g = torch.Generator(device="cpu").manual_seed(0)
+    lam_expand = (torch.rand(1, Ny, Nx, generator=g) + 0.5).to(DEVICE).expand(n_angles, Ny, Nx)
+    assert not lam_expand.is_contiguous()
+    lam_contig = lam_expand.contiguous()
+
+    kw = dict(
+        sigma_f=0.1, huber_T=float("inf"),
+        estimate_offset=False, estimate_variance=False,
+        outer_iters=10, multires_levels=1, sigma_init=0.1, seed=3,
+    )
+    v_contig = ft.run_mbir(sino, angles, lambdas=lam_contig, **kw)
+    v_expand = ft.run_mbir(sino, angles, lambdas=lam_expand, **kw)
+    assert torch.allclose(v_contig, v_expand, atol=1e-6, rtol=1e-6)
+
+
 def test_mbir_estimate_offset_disabled_keeps_d_zero():
     """When estimate_offset=False, the per-tilt offset must remain at its
     initial value (zero). The kernel still receives the offset pointer but
