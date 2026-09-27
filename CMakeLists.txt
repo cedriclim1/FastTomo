@@ -230,8 +230,18 @@ if(FASTTOMO_CUDA)
     message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
+# -march=native bakes the build machine's ISA into the binary, which breaks
+# published wheels on older CPUs (illegal instruction). Off by default so
+# builds are portable; turn it on for a local source build with
+# -DFASTTOMO_MARCH_NATIVE=ON (pip/uv:
+# --config-settings=cmake.define.FASTTOMO_MARCH_NATIVE=ON).
+option(FASTTOMO_MARCH_NATIVE "Compile C sources with -march=native (not portable)" OFF)
+
 target_compile_options(_core PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:-O3 -march=native>
+    $<$<COMPILE_LANGUAGE:C>:-O3>
 )
+if(FASTTOMO_MARCH_NATIVE)
+    target_compile_options(_core PRIVATE $<$<COMPILE_LANGUAGE:C>:-march=native>)
+endif()
 
 install(TARGETS _core DESTINATION fasttomo)
