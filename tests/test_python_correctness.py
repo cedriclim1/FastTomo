@@ -524,6 +524,19 @@ def test_logsum_sparsity_value_and_grad(backend, dtype):
 RESIRE_GOLDEN = __import__("pathlib").Path(__file__).parent / "data" / "resire_golden_main.pt"
 RESIRE_EXACT = ("bp", "bp_nz", "bp_default", "fp_grad", "fp_exact", "fp_exact_ndet")
 RESIRE_NOISY = ("fp", "fp_ndet", "bp_grad_sq", "run", "run_loss", "run_euler")
+# The golden file was made on an RTX PRO 6000 Blackwell (sm_120) with torch
+# 2.12.1+cu130 and nvcc 13.0. Another GPU architecture, compiler or torch
+# version may round the rotation matrices or contract FMAs differently, so
+# the torch.equal comparison of the RESIRE_EXACT keys only holds in that
+# environment; elsewhere they are compared at the RESIRE_NOISY tolerance.
+# To regenerate: check out origin/main's fasttomo/ at 98fa473 and save
+# `_resire_cases()` with torch.save.
+RESIRE_GOLDEN_ENV = {"capability": (12, 0), "torch": "2.12."}
+
+
+def _resire_golden_env_matches() -> bool:
+    return (torch.cuda.get_device_capability() == RESIRE_GOLDEN_ENV["capability"]
+            and torch.__version__.startswith(RESIRE_GOLDEN_ENV["torch"]))
 
 
 def _resire_cases() -> dict[str, torch.Tensor]:
@@ -563,8 +576,12 @@ def test_resire_outputs_identical_to_main():
     golden = torch.load(RESIRE_GOLDEN)
     now = _resire_cases()
     assert set(golden) == set(RESIRE_EXACT) | set(RESIRE_NOISY) == set(now)
+    exact_env = _resire_golden_env_matches()
     for k in RESIRE_EXACT:
-        assert torch.equal(now[k], golden[k]), k
+        if exact_env:
+            assert torch.equal(now[k], golden[k]), k
+        else:
+            torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)
     for k in RESIRE_NOISY:
         assert now[k].shape == golden[k].shape
         torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)

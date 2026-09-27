@@ -176,7 +176,6 @@ __global__ static void icd_sweep_mbir_kernel(
     cudaTextureObject_t       vol_snapshot_tex, /* tex3D over [Ny, Nz, Nx] read-only */
     float *__restrict__       volume,           /* [Ny, Nz, Nx] live (read+write) */
     float *__restrict__       e_sino,           /* [n_angles, Ny, N_det] live */
-    const float *__restrict__ d_offsets,        /* [n_angles] for offset-aware residual */
     const float *__restrict__ lambdas,          /* [n_angles, Ny, N_det] or nullptr */
     const int   *__restrict__ perm,             /* [Ny, Nz*Nx] permutation */
     const float *__restrict__ cos_a,
@@ -294,12 +293,8 @@ __global__ static void icd_sweep_mbir_kernel(
         __syncthreads();
     }
 
-    /* `d_offsets` is read inside the residual computation only via `e_sino`
-     * because the host maintains the invariant e = g - Af - d. The kernel
-     * does not directly read `d_offsets` — kept in the signature so the
-     * Python wrapper can pass it through and future variants (e.g. an
-     * inline d_k closed-form update) can use it. */
-    (void)d_offsets;
+    /* The per-tilt offsets d_k enter only through `e_sino`: the host keeps
+     * the invariant e = g - Af - d, so the kernel never reads d_k. */
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -336,7 +331,6 @@ void mbir_icd_sweep_cuda(
     float       *d_volume,         /* [Ny, Nz, Nx] in-place */
     float       *d_e_sino,         /* [n_angles, Ny, N_det] in-place */
     const float *d_volume_snapshot,/* host uploads its own snapshot tex3D */
-    const float *d_d_offsets,      /* [n_angles] read-only, may be nullptr */
     const float *d_lambdas,        /* [n_angles, Ny, N_det] or nullptr */
     const int   *d_perm,           /* [Ny, Nz*Nx] int32 */
     const float *d_cos_a,
@@ -366,7 +360,7 @@ void mbir_icd_sweep_cuda(
     dim3 grid(Ny, 1, 1);
     icd_sweep_mbir_kernel<<<grid, block, 0, stream>>>(
         snap.get()->tex,
-        d_volume, d_e_sino, d_d_offsets, d_lambdas, d_perm,
+        d_volume, d_e_sino, d_lambdas, d_perm,
         d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det
     );

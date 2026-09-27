@@ -271,9 +271,6 @@ void mbir_forward_project_cuda(
  *   d_volume_snapshot : start-of-outer-iter copy of volume, bound to a
  *                       tex3D for the qGGMRF 26-neighbour reads. Caller
  *                       guarantees this is a valid snapshot.
- *   d_d_offsets       : [n_angles] read-only; passed through but the
- *                       kernel relies on the host's e = g - Af - d
- *                       invariant rather than re-reading d_k.
  *   d_lambdas         : per-pixel data weights or nullptr → uniform 1.
  *   d_perm            : [Ny, Nz*Nx] int32 host-generated permutation.
  *   sigma             : current noise std for the Huber surrogate.
@@ -282,7 +279,6 @@ void mbir_icd_sweep_cuda(
     float       *d_volume,
     float       *d_e_sino,
     const float *d_volume_snapshot,
-    const float *d_d_offsets,
     const float *d_lambdas,
     const int   *d_perm,
     const float *d_cos_a,

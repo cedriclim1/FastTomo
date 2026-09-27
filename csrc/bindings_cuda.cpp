@@ -343,7 +343,6 @@ static void py_mbir_forward_project_cuda(
 static void py_mbir_icd_sweep_cuda(
     long vol_ptr, long e_sino_ptr,
     long vol_snapshot_ptr,
-    long d_offsets_ptr,        /* 0 → nullptr */
     long lambdas_ptr,          /* 0 → nullptr */
     long perm_ptr,
     long cos_ptr, long sin_ptr,
@@ -356,7 +355,6 @@ static void py_mbir_icd_sweep_cuda(
         reinterpret_cast<float *>(vol_ptr),
         reinterpret_cast<float *>(e_sino_ptr),
         reinterpret_cast<const float *>(vol_snapshot_ptr),
-        reinterpret_cast<const float *>(d_offsets_ptr),
         reinterpret_cast<const float *>(lambdas_ptr),
         reinterpret_cast<const int *>(perm_ptr),
         reinterpret_cast<const float *>(cos_ptr),
@@ -582,13 +580,13 @@ void register_cuda(py::module_ &m) {
     m.def("mbir_icd_sweep_cuda", &py_mbir_icd_sweep_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "One outer iteration of MBIR-AM-PE (CUDA). In-place mutates "
-          "volume and e_sino. Pass d_offsets_ptr=0 / lambdas_ptr=0 to "
-          "disable those inputs (treated as nullptr). Per-tilt offset d_k "
-          "and noise variance σ are updated in PyTorch by the Python "
-          "wrapper using the post-call e_sino.",
+          "volume and e_sino. Pass lambdas_ptr=0 for uniform weights "
+          "(treated as nullptr). Per-tilt offset d_k and noise variance σ "
+          "are updated in PyTorch by the Python wrapper using the post-call "
+          "e_sino (the kernel never reads d_k: e = g - Af - d).",
           py::arg("vol_ptr"), py::arg("e_sino_ptr"),
           py::arg("vol_snapshot_ptr"),
-          py::arg("d_offsets_ptr"), py::arg("lambdas_ptr"),
+          py::arg("lambdas_ptr"),
           py::arg("perm_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),

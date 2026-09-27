@@ -2954,8 +2954,8 @@ def _mbir_update_offset_variance(
     lam = lambdas if lambdas is not None else torch.ones_like(e_sino)
 
     if estimate_offset:
-        num = (bw * lam * e_sino).double().sum(dim=(1, 2))
-        den = (bw * lam).double().sum(dim=(1, 2))
+        num = (bw * lam * e_sino).sum(dim=(1, 2), dtype=torch.float64)
+        den = (bw * lam).sum(dim=(1, 2), dtype=torch.float64)
         delta_d = torch.where(den >= _MBIR_WEIGHT_EPS, num / den.clamp(min=_MBIR_WEIGHT_EPS),
                               torch.zeros_like(num)).float()
         d_offsets = d_offsets + delta_d
@@ -2972,7 +2972,7 @@ def _mbir_update_offset_variance(
     sigma_new = sigma
     if estimate_variance:
         total = n_angles * Ny * N_det
-        s2 = (bw * lam * e_sino * e_sino).double().sum() / total
+        s2 = (bw * lam * e_sino * e_sino).sum(dtype=torch.float64) / total
         sigma_new = max(sigma_min, float(s2.clamp(min=0.0).sqrt().float().item()))
 
     return d_offsets, sigma_new
@@ -3162,7 +3162,6 @@ def _run_mbir_single_scale(
                     vol_ptr=volume.data_ptr(),
                     e_sino_ptr=e_sino.data_ptr(),
                     vol_snapshot_ptr=vol_snap.data_ptr(),
-                    d_offsets_ptr=d_offsets.data_ptr() if estimate_offset else 0,
                     lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
                     perm_ptr=perm_dev.data_ptr(),
                     cos_ptr=cos_a.data_ptr(),

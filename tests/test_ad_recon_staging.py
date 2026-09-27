@@ -295,13 +295,13 @@ def _staged_run(monkeypatch, n_iter, warmup, period):
                                      pose_warmup_iters=warmup, alternating_period=period),
     )
     calls = []
-    _, loss, euler, shifts = ft.run_ad_recon(
+    rec, loss, euler, shifts = ft.run_ad_recon(
         sino, angles, projector=proj, config=cfg, return_loss=True, return_pose=True,
         loss_callback=lambda i, v: calls.append(i))
     assert calls == list(range(n_iter))
     # state after the last step, appended so step k is (k -> k+1)
-    vols = proj.vols
-    mats = proj.mats + [ft.autograd._euler_zyz_to_rotmat(euler.to(dev))]
+    vols = proj.vols + [rec]
+    mats = proj.mats + [ft.euler_zyz_to_rotmat(euler.to(dev))]
     shift_log.append(shifts.to(dev))
     return loss, vols, mats, shift_log
 
@@ -317,7 +317,7 @@ def test_run_ad_recon_warmup_end_to_end(monkeypatch) -> None:
     moves on every iteration; the loss falls."""
     n_iter, warmup = 16, 6
     loss, vols, mats, shifts = _staged_run(monkeypatch, n_iter, warmup, 0)
-    for k in range(n_iter - 1):              # volume: last step is not observed
+    for k in range(n_iter):
         assert _moved(vols, k), k
     for k in range(n_iter):
         pose_active = k >= warmup
@@ -337,8 +337,7 @@ def test_run_ad_recon_alternating_end_to_end(monkeypatch) -> None:
     for k in range(n_iter):
         step_volume, step_pose = _ad_recon_step_schedule(
             k, pose_warmup_iters=warmup, alternating_period=period)
-        if k < n_iter - 1:
-            assert _moved(vols, k) == step_volume, k
+        assert _moved(vols, k) == step_volume, k
         assert _moved(mats, k) == step_pose, k
         assert _moved(shifts, k) == step_pose, k
     assert [k for k in range(n_iter) if _ad_recon_step_schedule(
@@ -346,3 +345,36 @@ def test_run_ad_recon_alternating_end_to_end(monkeypatch) -> None:
     assert (loss[1:] <= loss[:-1]).all()
     assert loss[8] < loss[5]            # the pose-only block alone lowers the loss
     assert loss[-1] < 0.5 * loss[0]
+
+
+def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:
+    """#82 review N2: ConstraintConfig.soft_threshold must not run in
+    pose-only iterations. It is not idempotent, so applying it there would
+    shrink the frozen volume on every pose-only step. Alternating period 2:
+    volume steps 0-1 and 4-5, pose-only steps 2-3."""
+    seen = []
+
+    class _Recording(_ZMeanProjector):
+        def forward(self, volume):
+            seen.append(volume.detach().clone())
+            return super().forward(volume)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kw):
+        n, ny, nd = sinogram.shape
+        return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", _Recording)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=6, lr_volume=0.2, cosine_schedule=False),
+        constraints=ft.ConstraintConfig(soft_threshold=0.01),
+        pose=ft.PoseRefinementConfig(refine_shifts=True, lr_shifts=0.1, alternating_period=2),
+    )
+    sino = torch.rand(5, 2, 6, generator=torch.Generator().manual_seed(0)) + 1.0
+    rec = ft.run_ad_recon(sino, torch.linspace(-30, 30, 5), Nz=6,
+                          projector=_Recording(), config=cfg)
+    vols = seen + [rec]                       # step k maps vols[k] -> vols[k + 1]
+    assert rec.abs().max() > 0.1              # far above the threshold: it would bite
+    for k in range(6):
+        step_volume, _ = _ad_recon_step_schedule(k, alternating_period=2)
+        assert (not torch.equal(vols[k], vols[k + 1])) == step_volume, k
