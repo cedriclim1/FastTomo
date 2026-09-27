@@ -297,7 +297,7 @@ def test_rotmat_projector_back_matches_functional(workload):
 
 @needs_cuda
 def test_grad_rotmat_cached_matches_uncached():
-    """grad_rotmat cached path (via RotmatProjector._grad_mats_raw) must match
+    """grad_rotmat cached path (the cached operator's _grad_mats_cached) must match
     the uncached path (_grad_rotmat_raw) to within 1e-5 relative error."""
     from fasttomo.autograd import _euler_zyz_to_rotmat, _grad_rotmat_raw
 
@@ -325,7 +325,7 @@ def test_grad_rotmat_cached_matches_uncached():
     proj = RotmatProjector((N, N, N), n_angles=n_angles, device=device)
     # Populate _vol_handle by running forward()
     _ = proj.forward(volume, mats_flat)
-    g_new = proj._grad_mats_raw(volume, grad_sino, mats_flat)  # [n_angles, 9]
+    g_new = proj._op._grad_mats_cached(volume, grad_sino, mats_flat)  # [n_angles, 9]
 
     assert g_old.shape == g_new.shape, f"shape mismatch: {g_old.shape} vs {g_new.shape}"
     denom = g_old.abs().max()

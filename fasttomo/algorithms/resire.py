@@ -1,7 +1,9 @@
 """
 RESIRE (Pham et al.). FROZEN: moved verbatim from the former
 ``fasttomo/algorithms.py``; no change to its math, normalisation, edge
-handling or numerical output (tests/test_frozen_identity.py).
+handling or numerical output (tests/test_frozen_identity.py). Its FP/BP go
+through the projection-operator seam's RESIRE adapter, which calls the same
+frozen wrappers with the same arguments.
 """
 
 from __future__ import annotations
@@ -10,10 +12,7 @@ from typing import Any, Callable
 
 import torch
 
-from fasttomo.projection import (
-    forward_project_resire,
-    back_project_resire,
-)
+from fasttomo._operator import Geometry, _make_operator
 from fasttomo.algorithms._common import (
     _deprecated_kwarg,
     _reject_unknown_kwargs,
@@ -98,11 +97,16 @@ def run_resire(
             f"match the sinogram, got {tuple(euler_zyz_deg.shape)}"
         )
 
+    # The RESIRE adapter calls the frozen FP/BP exactly as
+    # forward_project_resire / back_project_resire do.
+    op = _make_operator(Geometry("resire", (setup.Ny, Nz, setup.Nx), N_det, n_angles),
+                        sinogram.device)
+
     def _fp(v):
-        return forward_project_resire(v, euler_zyz_deg, N_det=N_det)
+        return op.project(v, euler_zyz_deg)
 
     def _bp(s):
-        return back_project_resire(s, euler_zyz_deg, Nz=Nz)
+        return op.backproject(s, euler_zyz_deg)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_resire")
 

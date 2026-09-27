@@ -9,13 +9,8 @@ from typing import Any, Callable
 
 import torch
 
-from fasttomo.projection import (
-    forward_project,
-    back_project,
-    forward_project_3d,
-    back_project_3d,
-)
-from fasttomo.projector import _drain_deferred_handles
+from fasttomo._operator import Geometry, _drain_deferred_handles, _make_operator
+from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
     _log,
@@ -79,7 +74,7 @@ def run_sirt(
         :func:`fasttomo.euler_zyz_to_rotmat`); switches to the rotation-matrix
         projector.
     projector : ParallelProjector or RotmatProjector, optional
-        CUDA only: reuse its texture cache (and CUDA graphs) across calls. Must
+        Reuse its texture cache (and, on CUDA, CUDA graphs) across calls. Must
         be sized for this volume and sinogram; its angles replace
         ``angles_deg``, and a RotmatProjector needs ``euler_zyz_deg``.
 
@@ -98,7 +93,7 @@ def run_sirt(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
 
-    _fp, _bp, _internal_proj = _build_fp_bp(
+    _fp, _bp, op = _build_fp_bp(
         sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
         device, num_threads, projector, euler_zyz_deg,
     )
@@ -121,7 +116,6 @@ def run_sirt(
     # Rotmat mode (euler_zyz_deg) is kept on eager path because the per-call
     # matrix tensor can vary, while cached graphs assume fixed captured inputs.
     # If capture fails, fall back to the eager loop below.
-    _active_proj = projector if projector is not None else _internal_proj
     if sinogram.is_cuda and not rec.wants_loss and n_iter > 1 and euler_zyz_deg is None:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
@@ -133,7 +127,7 @@ def run_sirt(
             _fp=_fp,
             _bp=_bp,
             constraints=constraints,
-            projector=_active_proj,
+            projector=op,
             key=(Ny, Nz, Nx, n_angles, N_det,
                  sinogram.dtype,
                  float(omega),
@@ -192,8 +186,8 @@ def run_sart(
     data MSE after the subset sweep, before the constraints (one extra
     forward projection per iteration, only when the loss is needed).
 
-    A reference implementation: functional projections, no projector cache,
-    no CUDA graph. Use :func:`run_sirt` when speed matters.
+    A reference implementation: no CUDA graph (on CUDA the projections do
+    reuse cached textures). Use :func:`run_sirt` when speed matters.
 
     Parameters
     ----------
@@ -226,63 +220,58 @@ def run_sart(
     volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
     constraints = setup.constraints
 
-    # Build functional closures that accept an index list so we can slice
-    # both the angles tensor and the sinogram for each subset.
-    if euler_zyz_deg is not None:
-        def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            return forward_project_3d(v, euler_zyz_deg[idx], N_det=N_det, num_threads=num_threads)
+    # One projection operator for every subset (CUDA: one cached volume
+    # texture plus one sinogram texture per subset size); each subset
+    # passes its own angles or rotation matrices, computed once here.
+    op = _make_operator(
+        Geometry("parallel" if euler_zyz_deg is None else "rotmat", (Ny, Nz, Nx), N_det,
+                 n_angles, angles_deg if euler_zyz_deg is None else None),
+        device, compute_dtype, num_threads=num_threads)
 
-        def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            return back_project_3d(s, euler_zyz_deg[idx], Nz=Nz, num_threads=num_threads)
-
-        def _fp_full(v: torch.Tensor) -> torch.Tensor:
-            return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
-    else:
-        def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            return forward_project(v, angles_deg[idx], N_det=N_det, num_threads=num_threads)
-
-        def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            return back_project(s, angles_deg[idx], Nz=Nz, num_threads=num_threads)
-
-        def _fp_full(v: torch.Tensor) -> torch.Tensor:
-            return forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
+    def _subset_geom(idx: torch.Tensor | None) -> torch.Tensor | None:
+        if euler_zyz_deg is None:
+            return None if idx is None else angles_deg[idx]
+        e = euler_zyz_deg if idx is None else euler_zyz_deg[idx]
+        return euler_zyz_to_rotmat(e).to(device=device)
 
     # Build subsets: list of index tensors
     clamp = max(1, min(subset_size, n_angles))
     all_idx = torch.arange(n_angles, dtype=torch.long)
     subsets = list(torch.split(all_idx, clamp))
+    geoms = [_subset_geom(idx) for idx in subsets]
 
     # Pre-compute per-subset normalisations (done once, outside the outer loop).
     ones_vol = torch.ones(Ny, Nz, Nx, dtype=compute_dtype, device=device)
     R_list: list[torch.Tensor] = []  # row normalisers [|S|, Ny, N_det]
     C_list: list[torch.Tensor] = []  # col normalisers [Ny, Nz, Nx]
-    for idx in subsets:
-        R_s = _fp_subset(ones_vol, idx)
+    for idx, geom in zip(subsets, geoms):
+        R_s = op.project(ones_vol, geom)
         R_s = torch.where(R_s > 0, 1.0 / R_s, torch.zeros_like(R_s))
         R_list.append(R_s)
 
         # ones_sino for this subset
         ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=compute_dtype, device=device)
-        C_s = _bp_subset(ones_sino_s, idx)
+        C_s = op.backproject(ones_sino_s, geom)
         C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
         C_list.append(C_s)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")
+    full_geom = _subset_geom(None) if rec.wants_loss else None
 
     # --- outer iteration loop ---
     for it in rec.iterate(n_iter):
         # --- inner subset loop ---
-        for idx, R_s, C_s in zip(subsets, R_list, C_list):
+        for idx, geom, R_s, C_s in zip(subsets, geoms, R_list, C_list):
             sino_s = sinogram[idx]                   # [|S|, Ny, N_det]
-            pred_s = _fp_subset(volume, idx)         # [|S|, Ny, N_det]
+            pred_s = op.project(volume, geom)        # [|S|, Ny, N_det]
             r_s    = sino_s - pred_s                 # [|S|, Ny, N_det]
-            volume = volume + omega * C_s * _bp_subset(r_s * R_s, idx)
+            volume = volume + omega * C_s * op.backproject(r_s * R_s, geom)
 
         # Loss over the full sinogram after the subset sweep, before the
         # constraints (costs one extra full forward projection).
         if rec.wants_loss:
             with torch.no_grad():
-                raw_res = sinogram - _fp_full(volume)
+                raw_res = sinogram - op.project(volume, full_geom)
                 rec.record(it, raw_res.pow(2).mean())
 
         volume = constraints.apply(volume)
@@ -343,11 +332,13 @@ def run_wsirt(
 
     # exact W-BP operator, built once per tilt geometry
     _wbp = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale)
+    op = _make_operator(Geometry("parallel", (setup.Ny, Nz, Nx), N_det, setup.n_angles,
+                                 angles_deg), device, sinogram.dtype, num_threads=num_threads)
 
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_wsirt")
 
     for it in rec.iterate(n_iter):
-        proj     = forward_project(volume, angles_deg, N_det=N_det, num_threads=num_threads)
+        proj     = op.project(volume)
         residual = sinogram - proj
         if rec.wants_loss:
             rec.record(it, residual.pow(2).mean())

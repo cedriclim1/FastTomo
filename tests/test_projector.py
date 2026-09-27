@@ -135,9 +135,10 @@ def test_rotmat_projector_strided_mats_forward_and_pose_grad():
 
 @needs_cuda
 def test_rotmat_grad_paths_accept_strided_mats():
-    """Both backward gradient kernels (cached _grad_mats_raw and uncached
-    _grad_rotmat_raw) must densify mats themselves: _FPRotmatCached.backward
-    passes the saved mats straight through."""
+    """Both backward gradient kernels (the cached operator's
+    _grad_mats_cached and the uncached _grad_rotmat_raw) must densify mats
+    themselves: the projection Function's backward passes the saved mats
+    straight through."""
     from fasttomo.autograd import _grad_rotmat_raw
 
     N, n_angles = 16, 8
@@ -153,8 +154,8 @@ def test_rotmat_grad_paths_accept_strided_mats():
     proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
     _ = proj.forward(volume, mats32)  # populates the cached volume texture
     torch.testing.assert_close(
-        proj._grad_mats_raw(volume, grad_sino, strided),
-        proj._grad_mats_raw(volume, grad_sino, mats32),
+        proj._op._grad_mats_cached(volume, grad_sino, strided),
+        proj._op._grad_mats_cached(volume, grad_sino, mats32),
         rtol=1e-5, atol=1e-5,
     )
 
@@ -162,49 +163,45 @@ def test_rotmat_grad_paths_accept_strided_mats():
 # ── geometry checks ───────────────────────────────────────────────────────────
 
 
-@needs_cuda
-def test_parallel_projector_volume_shape_mismatch_raises():
+def test_parallel_projector_volume_shape_mismatch_raises(backend):
     """ParallelProjector.forward must raise if volume shape != projector geometry."""
     N = 16
-    angles = make_angles(10, device=DEVICE)
-    proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
-    wrong_vol = torch.zeros(2, N, N, device=DEVICE)  # Ny mismatch
+    angles = make_angles(10, device=backend)
+    proj = ft.ParallelProjector((1, N, N), angles, device=backend)
+    wrong_vol = torch.zeros(2, N, N, device=backend)  # Ny mismatch
     with pytest.raises(ValueError, match="volume must have shape"):
         proj.forward(wrong_vol)
 
 
-@needs_cuda
-def test_parallel_projector_sinogram_shape_mismatch_raises():
+def test_parallel_projector_sinogram_shape_mismatch_raises(backend):
     """ParallelProjector.back must raise if sinogram shape != projector geometry."""
     N = 16
     n_angles = 10
-    angles = make_angles(n_angles, device=DEVICE)
-    proj = ft.ParallelProjector((1, N, N), angles, device=DEVICE)
-    wrong_sino = torch.zeros(n_angles, 2, N, device=DEVICE)  # Ny mismatch
+    angles = make_angles(n_angles, device=backend)
+    proj = ft.ParallelProjector((1, N, N), angles, device=backend)
+    wrong_sino = torch.zeros(n_angles, 2, N, device=backend)  # Ny mismatch
     with pytest.raises(ValueError, match="sinogram must have shape"):
         proj.back(wrong_sino)
 
 
-@needs_cuda
-def test_rotmat_projector_volume_shape_mismatch_raises():
+def test_rotmat_projector_volume_shape_mismatch_raises(backend):
     """RotmatProjector.forward must raise if volume shape != projector geometry."""
     N = 16
     n_angles = 10
-    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=DEVICE)
-    mats = torch.eye(3, device=DEVICE).unsqueeze(0).expand(n_angles, -1, -1).contiguous()
-    wrong_vol = torch.zeros(2, N, N, device=DEVICE)  # Ny mismatch
+    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=backend)
+    mats = torch.eye(3, device=backend).unsqueeze(0).expand(n_angles, -1, -1).contiguous()
+    wrong_vol = torch.zeros(2, N, N, device=backend)  # Ny mismatch
     with pytest.raises(ValueError, match="volume must have shape"):
         proj.forward(wrong_vol, mats)
 
 
-@needs_cuda
-def test_rotmat_projector_mats_shape_mismatch_raises():
+def test_rotmat_projector_mats_shape_mismatch_raises(backend):
     """RotmatProjector must raise on bad mats shape."""
     N = 16
     n_angles = 10
-    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=DEVICE)
-    vol = torch.zeros(1, N, N, device=DEVICE)
-    wrong_mats = torch.eye(3, device=DEVICE).unsqueeze(0).expand(5, -1, -1).contiguous()
+    proj = ft.RotmatProjector((1, N, N), n_angles=n_angles, device=backend)
+    vol = torch.zeros(1, N, N, device=backend)
+    wrong_mats = torch.eye(3, device=backend).unsqueeze(0).expand(5, -1, -1).contiguous()
     with pytest.raises(ValueError, match="mats must have shape"):
         proj.forward(vol, wrong_mats)
 
@@ -220,6 +217,95 @@ def test_rotmat_projector_mats_shape_mismatch_raises():
 def test_projectors_reject_zero_size_geometry(make):
     with pytest.raises(ValueError, match="at least 1"):
         make()
+
+
+# ── CPU projectors (additive since the operator seam) ─────────────────────────
+
+
+def _cpu_workload():
+    g = torch.Generator().manual_seed(3)
+    Ny, Nz, Nx, n = 3, 10, 13, 7
+    vol = torch.rand(Ny, Nz, Nx, generator=g)
+    sino = torch.rand(n, Ny, 15, generator=g)
+    ang = torch.linspace(-50, 50, n)
+    eul = torch.stack([torch.linspace(-5, 5, n), ang, torch.linspace(4, -4, n)], 1)
+    return vol, sino, ang, eul
+
+
+def test_cpu_parallel_projector_matches_functional():
+    """ParallelProjector(device="cpu") runs the CPU kernels: forward, back
+    and both gradients equal the functional API bit for bit (N_det != Nx,
+    Nz != Nx)."""
+    vol, sino, ang, _ = _cpu_workload()
+    proj = ft.ParallelProjector(tuple(vol.shape), ang, device="cpu", N_det=15, num_threads=2)
+    assert proj.device == torch.device("cpu") and proj.dtype is None
+    fp = proj.forward(vol)
+    assert fp.shape == (7, 3, 15) and fp.dtype == torch.float32 and proj.dtype == torch.float32
+    assert torch.equal(fp, ft.forward_project(vol, ang, N_det=15))
+    bp = proj.back(sino)
+    assert torch.equal(bp, ft.back_project(sino, ang, Nz=10, Nx=13))
+    v = vol.clone().requires_grad_(True)
+    (proj.forward(v) * sino).sum().backward()
+    assert torch.equal(v.grad, bp)
+    s = sino.clone().requires_grad_(True)
+    (proj.back(s) * vol).sum().backward()
+    assert torch.equal(s.grad, fp)
+    assert proj._sirt_graph_cache is None          # run_sirt never captures on CPU
+
+
+def test_cpu_rotmat_projector_matches_functional():
+    vol, sino, _, eul = _cpu_workload()
+    mats = ft.euler_zyz_to_rotmat(eul)
+    proj = ft.RotmatProjector(tuple(vol.shape), n_angles=7, device="cpu", N_det=15)
+    fp = proj.forward(vol, mats)
+    assert torch.equal(fp, ft.forward_project_3d(vol, eul, N_det=15))
+    assert torch.equal(proj.back(sino, mats), ft.back_project_3d(sino, eul, Nz=10, Nx=13))
+    v = vol.clone().requires_grad_(True)
+    m = mats.clone().requires_grad_(True)
+    (proj.forward(v, m) * sino).sum().backward()
+    v2 = vol.clone().requires_grad_(True)
+    (ft.forward_project_3d(v2, eul, N_det=15) * sino).sum().backward()
+    assert torch.equal(v.grad, v2.grad)
+    from fasttomo.autograd import _grad_rotmat_raw
+    assert m.grad.shape == (7, 3, 3)
+    assert torch.equal(m.grad.reshape(7, 9), _grad_rotmat_raw(vol, sino, mats))
+
+
+def test_cpu_projector_dtype_lock_and_fp16():
+    vol, sino, ang, _ = _cpu_workload()
+    proj = ft.ParallelProjector(tuple(vol.shape), ang, device="cpu", N_det=15)
+    out = proj.forward(vol.half())
+    assert out.dtype == torch.float16
+    assert torch.equal(out, ft.forward_project(vol.half(), ang, N_det=15))
+    with pytest.raises(TypeError, match="dtype lock-in"):
+        proj.forward(vol)
+    with pytest.raises(TypeError, match="bfloat16"):
+        ft.ParallelProjector(tuple(vol.shape), ang, device="cpu").forward(vol.bfloat16())
+
+
+@needs_cuda
+def test_cpu_projector_rejects_cuda_tensor():
+    vol, _, ang, _ = _cpu_workload()
+    proj = ft.ParallelProjector(tuple(vol.shape), ang, device="cpu")
+    with pytest.raises(ValueError, match="projector was built on cpu"):
+        proj.forward(vol.cuda())
+
+
+def test_algorithms_accept_cpu_projector():
+    """A CPU projector passed as ``projector=`` gives the same result as the
+    algorithm's own operator."""
+    N = 16
+    ang = make_angles(12)
+    vol = torch.zeros(2, N, N)
+    vol[:, 4:12, 5:11] = 1.0
+    sino = ft.forward_project(vol, ang)
+    proj = ft.ParallelProjector((2, N, N), ang, device="cpu")
+    assert torch.equal(ft.run_sirt(sino, ang, 4, projector=proj), ft.run_sirt(sino, ang, 4))
+    assert torch.equal(ft.run_fbp(sino, ang, projector=proj), ft.run_fbp(sino, ang))
+    torch.manual_seed(0)
+    a = ft.run_fista(sino, ang, 3, projector=proj)
+    torch.manual_seed(0)
+    assert torch.equal(a, ft.run_fista(sino, ang, 3))
 
 
 # ── gradients and dtypes ──────────────────────────────────────────────────────

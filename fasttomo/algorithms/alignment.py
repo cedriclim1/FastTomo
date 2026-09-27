@@ -9,10 +9,8 @@ from __future__ import annotations
 import torch
 
 from fasttomo._backend import _assert_dtype_match
-from fasttomo.projection import (
-    forward_project,
-    forward_project_3d,
-)
+from fasttomo._operator import Geometry, _make_operator
+from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.algorithms._common import _REL_EPS
 
 
@@ -68,11 +66,21 @@ def refine_angles(
             euler = ft.refine_angles(vol, sino, euler_zyz_deg=euler)
     """
     _assert_dtype_match(sinogram, volume, "sinogram", "volume", "refine_angles")
+    if volume.ndim == 2:
+        volume = volume.unsqueeze(0)
+
+    def _operator(kind):
+        # one operator for every candidate batch: on CUDA the volume texture
+        # is allocated once (it is still uploaded per batch)
+        return _make_operator(
+            Geometry(kind, tuple(volume.shape), sinogram.shape[-1], n_steps),
+            volume.device, volume.dtype, num_threads=num_threads)
 
     if angles_deg is not None and euler_zyz_deg is None:
         # ── single-axis mode ──────────────────────────────────────────────
         n_angles, Ny, N_det = sinogram.shape
         refined = angles_deg.detach().cpu().clone()
+        op = _operator("parallel")
 
         for j in range(n_angles):
             theta_j = refined[j].item()
@@ -81,8 +89,7 @@ def refine_angles(
                 theta_j + search_range_deg,
                 n_steps,
             )
-            projs = forward_project(volume, candidates.to(sinogram.device), N_det=N_det,
-                                    num_threads=num_threads)
+            projs = op.project(volume, candidates.to(sinogram.device))
             measured_j = sinogram[j]
             residuals  = (projs - measured_j.unsqueeze(0)).abs().sum(dim=(-2, -1))
             r_factors  = residuals / (measured_j.abs().sum().clamp(min=_REL_EPS))
@@ -94,6 +101,7 @@ def refine_angles(
         # ── ZYZ coordinate-descent mode ───────────────────────────────────
         n_angles, Ny, N_det = sinogram.shape
         refined = euler_zyz_deg.detach().cpu().clone()  # [n_angles, 3]
+        op = _operator("rotmat")
 
         for j in range(n_angles):
             measured_j  = sinogram[j]                              # [Ny, N_det]
@@ -112,10 +120,8 @@ def refine_angles(
                 euler_batch[:, axis] = candidates
 
                 # forward project at all n_steps orientations → [n_steps, Ny, N_det]
-                projs = forward_project_3d(
-                    volume, euler_batch.to(sinogram.device), N_det=N_det,
-                    num_threads=num_threads,
-                )
+                projs = op.project(
+                    volume, euler_zyz_to_rotmat(euler_batch.to(sinogram.device)))
                 residuals = (projs - measured_j.unsqueeze(0)).abs().sum(dim=(-2, -1))
                 refined[j, axis] = candidates[residuals.div(normalizer).argmin()]
 

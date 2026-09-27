@@ -568,6 +568,64 @@ class _FPResire(torch.autograd.Function):
         return grad_vol, None, None
 
 
+# ── generic projection Functions over a projection operator ────────────────
+#
+# ``op`` is a fasttomo._operator.ProjectionOperator: ``op.fp`` / ``op.bp`` are
+# its raw (non-autograd) forward and back projection, ``op.grad_geom`` the
+# gradient w.r.t. its per-call geometry ``geom`` (tilt angles or rotation
+# matrices; ``None`` = the operator's default). The adapter decides how the
+# kernels run (CPU, CUDA one-shot, CUDA cached); these two Functions only
+# wire the adjoint pairs: FP.backward = BP (+ grad_geom), BP.backward = FP.
+
+
+class _Project(torch.autograd.Function):
+    """``op.fp(volume, geom)``, differentiable w.r.t. ``volume`` (via
+    ``op.bp``) and ``geom`` (via ``op.grad_geom``)."""
+
+    @staticmethod
+    def forward(ctx, volume, geom, op):
+        ctx.op = op
+        ctx.geom_shape = None if geom is None else geom.shape
+        need_geom = ctx.needs_input_grad[1]
+        ctx.save_for_backward(volume.detach() if need_geom else None,
+                              None if geom is None else geom.detach())
+        sino = op.fp(volume, geom)
+        # e.g. which volume upload a cached texture holds right now; handed
+        # back to op.grad_geom, which alone knows what it means
+        ctx.token = op.fp_token()
+        return sino
+
+    @staticmethod
+    def backward(ctx, grad_sino):
+        volume, geom = ctx.saved_tensors
+        op = ctx.op
+        grad_sino = grad_sino.contiguous()
+        grad_vol = op.bp(grad_sino, geom) if ctx.needs_input_grad[0] else None
+        grad_geom = None
+        if ctx.needs_input_grad[1]:
+            grad_geom = op.grad_geom(volume, grad_sino, geom, token=ctx.token)
+            grad_geom = grad_geom.reshape(ctx.geom_shape)
+        return grad_vol, grad_geom, None
+
+
+class _BackProject(torch.autograd.Function):
+    """``op.bp(sinogram, geom)``, differentiable w.r.t. ``sinogram`` (via
+    ``op.fp``). No geometry gradient: it would need the volume that
+    produced the incoming gradient; use the forward projection as the
+    differentiable handle on the geometry."""
+
+    @staticmethod
+    def forward(ctx, sinogram, geom, op):
+        ctx.op = op
+        ctx.save_for_backward(None if geom is None else geom.detach())
+        return op.bp(sinogram, geom)
+
+    @staticmethod
+    def backward(ctx, grad_vol):
+        (geom,) = ctx.saved_tensors
+        return ctx.op.fp(grad_vol.contiguous(), geom), None, None
+
+
 # ── 3-D isotropic TV loss (fused CUDA kernel) ──────────────────────────────
 
 def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
