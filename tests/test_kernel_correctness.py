@@ -268,6 +268,12 @@ def test_texture_limits_raise_clear_error_without_leak():
     with pytest.raises(ValueError, match="limit"):
         ft.back_project(sino, torch.zeros(2049, device="cuda"))
     _assert_no_leak(lambda: ft.forward_project(vol, torch.zeros(4, device="cuda")))
+    # audit regression 6: BP with n_angles = 13000 (also past the 96 KB smem cap)
+    big = torch.zeros(13000, 1, 8, device="cuda")
+    angles = torch.zeros(13000, device="cuda")
+    _assert_no_leak(lambda: ft.back_project(big, angles), n_calls=10)
+    _assert_no_leak(lambda: ft.back_project_3d(big, torch.zeros(13000, 3, device="cuda")),
+                    n_calls=10)
 
 
 def _read_on_side_stream(t: torch.Tensor) -> torch.Tensor:
