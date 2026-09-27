@@ -61,6 +61,36 @@ def test_fbp_angular_scale_is_right_for_limited_tilt(backend, radius):
     assert abs(limited / full - 1.0) < 5e-3, (limited, full)
 
 
+@pytest.mark.parametrize("tilt", [90, 70])
+@pytest.mark.parametrize("radius", [20, 40, 60])
+def test_fbp_cylinder_absolute_value(backend, radius, tilt):
+    """A unit-density cylinder reconstructs at 1 (inner half-radius mean)
+    at 180 degrees and at +-70 degrees, from a small one to one filling the
+    field of view. The unpadded |xi| ramp gave 0.96 / 0.83 / 0.57."""
+    level = _cylinder_fbp_level(backend, radius, tilt)
+    assert abs(level - 1.0) < 5e-3, level
+
+
+def test_ramp_filter_is_the_linear_ram_lak_convolution():
+    """ramp_filter == the direct (linear, unpadded-wraparound-free)
+    convolution of each row with h[0] = 1/4, h[odd n] = -1/(pi n)^2."""
+    import math
+
+    g = torch.Generator().manual_seed(3)
+    for N_det in (7, 16, 33):
+        sino = torch.rand(2, 3, N_det, generator=g, dtype=torch.float64)
+        n = torch.arange(-(N_det - 1), N_det, dtype=torch.float64)
+        h = torch.where(n.abs() % 2 == 1, -1.0 / (math.pi * n) ** 2, torch.zeros_like(n))
+        h[N_det - 1] = 0.25
+        ref = torch.stack([torch.stack([
+            torch.tensor([(row * h.flip(0)[N_det - 1 - u: 2 * N_det - 1 - u]).sum().item()
+                          for u in range(N_det)], dtype=torch.float64)
+            for row in view]) for view in sino])
+        out = ft.ramp_filter(sino.float())
+        assert out.shape == sino.shape and out.dtype == torch.float32
+        torch.testing.assert_close(out.double(), ref, rtol=0, atol=1e-6)
+
+
 def test_fbp_better_than_plain_backproject(backend):
     """FBP reconstruction MSE should beat raw (unfiltered) back-projection.
 

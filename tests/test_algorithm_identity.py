@@ -13,6 +13,13 @@ Feistel permutation built in the CUDA kernel (and mirrored in NumPy for the
 CPU sweep). With the old order injected, the new code reproduced the old
 golden bit for bit on both backends; only the order changed.
 
+Exception: the ramp-filter and FBP keys (``_fft_ramp``, ``fbp``,
+``fbp_mask``, ``fbp_h`` and, on CUDA, ``fbp_proj``) were regenerated when
+``ramp_filter`` became the zero-padded spatial-domain Ram-Lak filter (the
+unpadded ``|xi|`` filter reconstructed a unit-density cylinder at 0.57 to
+0.96 instead of 1). Only those 9 keys were replaced; every other tensor of
+the file is byte-identical to before.
+
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
 

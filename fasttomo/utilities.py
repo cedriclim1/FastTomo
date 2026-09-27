@@ -11,6 +11,8 @@ operators next to the projectors is what lets this module import
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 # Moved to fasttomo.constraints (ARCH P10); re-exported here, its historical home.
@@ -35,29 +37,52 @@ __all__ = [
 
 
 # ── ramp filter (PyTorch, runs on same device as input) ───────────────────
+#
+# The discrete ramp filter is the band-limited ramp in the spatial domain
+# (Ram-Lak; Kak & Slaney, "Principles of Computerized Tomographic Imaging",
+# ch. 3, eq. 61): h[0] = 1/4, h[n] = -1/(pi n)^2 for odd n, 0 for even
+# n != 0, applied as a linear (not circular) convolution by zero-padding each
+# detector row to P >= 2 N_det - 1 (the next power of two). It used to be
+# |xi| sampled on the N_det-point FFT grid without padding: that zeroes the
+# DC term and wraps the convolution around, so FBP of a unit-density
+# cylinder came out at 0.96 (r = N/6), 0.83 (r = N/3) and 0.57 (r ~ N/2)
+# instead of 1; with this filter it is 1.000 at all three sizes.
+# Shape-only, so the frequency response is cached per (N_det, device, dtype).
+_RAMP_FILTER_CACHE: dict[tuple[int, torch.device, torch.dtype], tuple[int, torch.Tensor]] = {}
 
-# Ramp-filter |ξ| is shape-only; cache per (N_det, device, dtype) so tight
-# loops (FBP per slice, SIRT-style residual filtering) avoid the rfftfreq +
-# abs allocation each call.
-_RAMP_FILTER_CACHE: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
 
-
-def _ramp_filter_coeffs(N_det: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _ramp_filter_coeffs(N_det: int, device: torch.device,
+                        dtype: torch.dtype) -> tuple[int, torch.Tensor]:
+    """``(P, H)``: the padded length and the real frequency response
+    ``[P // 2 + 1]`` of the Ram-Lak kernel (built in fp64)."""
     key = (int(N_det), device, dtype)
-    coeffs = _RAMP_FILTER_CACHE.get(key)
-    if coeffs is None:
-        coeffs = torch.fft.rfftfreq(N_det, device=device, dtype=dtype).abs().contiguous()
-        _RAMP_FILTER_CACHE[key] = coeffs
-    return coeffs
+    hit = _RAMP_FILTER_CACHE.get(key)
+    if hit is None:
+        P = 1 << max(1, (2 * int(N_det) - 1).bit_length())
+        n = torch.arange(P, dtype=torch.float64)
+        n = torch.where(n < P // 2, n, n - P)          # signed lag, circularly
+        h = torch.zeros(P, dtype=torch.float64)
+        h[0] = 0.25
+        odd = (n.abs() % 2) == 1
+        h[odd] = -1.0 / (math.pi * n[odd]) ** 2
+        H = torch.fft.rfft(h).real.to(device=device, dtype=dtype).contiguous()
+        hit = _RAMP_FILTER_CACHE[key] = (P, H)
+    return hit
 
 
 def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
     """
-    Apply ramp filter |ξ| to each detector row of sinogram.
+    Apply the ramp filter to each detector row of sinogram.
 
     sinogram: [n_angles, Ny, N_det]
     Returns same shape, same device, same dtype. fp32 / fp16 supported; bf16
     raises.
+
+    The filter is the band-limited (Ram-Lak) ramp built in the spatial
+    domain and applied with zero padding to the next power of two
+    ``>= 2 N_det - 1``, so the convolution is linear and the DC term is
+    right: back-projected with ``pi / n_angles`` (``run_fbp``) a
+    unit-density object reconstructs at 1 (see the comment above).
 
     Implementation note on fp16: cuFFT only supports power-of-two signal
     lengths in half precision. Rather than restrict the user to power-of-two
@@ -72,9 +97,9 @@ def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
         )
     N_det = sinogram.shape[-1]
     sino_f = sinogram.float() if sinogram.dtype != torch.float32 else sinogram
-    f      = torch.fft.rfft(sino_f, n=N_det, dim=-1)
-    f      = f * _ramp_filter_coeffs(N_det, sino_f.device, torch.float32)
-    out    = torch.fft.irfft(f, n=N_det, dim=-1)
+    P, H   = _ramp_filter_coeffs(N_det, sino_f.device, torch.float32)
+    f      = torch.fft.rfft(sino_f, n=P, dim=-1) * H
+    out    = torch.fft.irfft(f, n=P, dim=-1)[..., :N_det].contiguous()
     return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
 
 
