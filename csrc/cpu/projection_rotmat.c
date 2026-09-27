@@ -10,7 +10,7 @@
  * Detector-driven; trilinear interpolation in 3D; one ray per (ia, iv, iu).
  * Mirrors forward_project_rotmat_cuda but with explicit interpolation.
  *
- * matrices: [n_angles*9] row-major. M = matrices + ia*9.
+ * mats: [n_angles*9] row-major. M = mats + ia*9.
  *   detector-u = M[0]*x + M[1]*y + M[2]*z   (R[0,:] · world)
  *   detector-v = M[3]*x + M[4]*y + M[5]*z   (R[1,:] · world)
  *   ray dir   = (M[6], M[7], M[8])          (R[2,:])
@@ -27,20 +27,20 @@
  * last slice entirely.
  */
 void forward_project_rotmat_cpu(
-    const float *volume,     /* [Ny, Nz, Nx] */
-    float       *sinogram,   /* [n_angles, Ny, N_det] */
-    const float *matrices,   /* [n_angles*9] row-major */
+    const float *vol,     /* [Ny, Nz, Nx] */
+    float       *sino,   /* [n_angles, Ny, N_det] */
+    const float *mats,   /* [n_angles*9] row-major */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
 ) {
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
 
     #pragma omp parallel for collapse(3) schedule(static) num_threads(num_threads)
     for (int ia = 0; ia < n_angles; ia++) {
         for (int iv = 0; iv < Ny; iv++) {
             for (int iu = 0; iu < N_det; iu++) {
-                const float *M = matrices + (size_t)ia * 9;
+                const float *M = mats + (size_t)ia * 9;
                 float dxs = M[6], dys = M[7], dzs = M[8];
                 float v  = iv - g.half_y;
                 float u  = iu - g.half_det;
@@ -86,7 +86,7 @@ void forward_project_rotmat_cpu(
                          + wy * wz * (ux * v110 + wx * v111);
                 }
 
-                sinogram[((size_t)ia * Ny + iv) * N_det + iu] = sum;
+                sino[((size_t)ia * Ny + iv) * N_det + iu] = sum;
             }
         }
     }
@@ -101,16 +101,16 @@ void forward_project_rotmat_cpu(
  * still contributes the last detector column.
  */
 void back_project_rotmat_cpu(
-    const float *sinogram,   /* [n_angles, Ny, N_det] */
-    float       *volume,     /* [Ny, Nz, Nx] */
-    const float *matrices,   /* [n_angles*9] row-major */
+    const float *sino,   /* [n_angles, Ny, N_det] */
+    float       *vol,     /* [Ny, Nz, Nx] */
+    const float *mats,   /* [n_angles*9] row-major */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
 ) {
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
 
-    memset(volume, 0, (size_t)Ny * Nz * Nx * sizeof(float));
+    memset(vol, 0, (size_t)Ny * Nz * Nx * sizeof(float));
 
     #pragma omp parallel for collapse(3) schedule(static) num_threads(num_threads)
     for (int iy = 0; iy < Ny; iy++) {
@@ -122,7 +122,7 @@ void back_project_rotmat_cpu(
                 float val = 0.0f;
 
                 for (int ia = 0; ia < n_angles; ia++) {
-                    const float *M = matrices + (size_t)ia * 9;
+                    const float *M = mats + (size_t)ia * 9;
                     float u_det = M[0]*x + M[1]*y + M[2]*z + g.half_det;
                     float v_det = M[3]*x + M[4]*y + M[5]*z + g.half_y;
 
@@ -135,7 +135,7 @@ void back_project_rotmat_cpu(
                     float wu = u_det - (float)iu0;
                     float wv = v_det - (float)iv0;
 
-                    const float *layer = sinogram + (size_t)ia * Ny * N_det;
+                    const float *layer = sino + (size_t)ia * Ny * N_det;
                     #define SSAMP(iu, iv) \
                         (((iu) >= 0 && (iu) < N_det && (iv) >= 0 && (iv) < Ny) \
                          ? layer[(size_t)(iv) * N_det + (iu)] : 0.0f)
@@ -146,7 +146,7 @@ void back_project_rotmat_cpu(
                     #undef SSAMP
                 }
 
-                volume[((size_t)iy * Nz + iz) * Nx + ix] = val;
+                vol[((size_t)iy * Nz + iz) * Nx + ix] = val;
             }
         }
     }
@@ -167,22 +167,22 @@ void back_project_rotmat_cpu(
  * with spatial derivatives ∂vol/∂{x,y,z} from analytic trilinear weights.
  */
 void grad_rotmat_cpu(
-    const float *volume,         /* [Ny, Nz, Nx] */
+    const float *vol,         /* [Ny, Nz, Nx] */
     const float *grad_sino,      /* [n_angles, Ny, N_det] */
-    const float *matrices,       /* [n_angles*9] */
-    float       *grad_matrices,  /* [n_angles*9] zeroed by this fn */
+    const float *mats,       /* [n_angles*9] */
+    float       *grad_mats,  /* [n_angles*9] zeroed by this fn */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
 ) {
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
 
-    for (int k = 0; k < n_angles * 9; k++) grad_matrices[k] = 0.0f;
+    for (int k = 0; k < n_angles * 9; k++) grad_mats[k] = 0.0f;
 
     #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int ia = 0; ia < n_angles; ia++) {
-        const float *M = matrices + (size_t)ia * 9;
-        float *gM = grad_matrices + (size_t)ia * 9;
+        const float *M = mats + (size_t)ia * 9;
+        float *gM = grad_mats + (size_t)ia * 9;
         float dxs = M[6], dys = M[7], dzs = M[8];
 
         for (int iv = 0; iv < Ny; iv++) {

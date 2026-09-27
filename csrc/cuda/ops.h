@@ -35,10 +35,10 @@
  * signatures. */
 void forward_project_parallel_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_cos_a,
-    const float *d_sin_a,
+    const void  *vol,
+    void        *sino,
+    const float *cos_a,
+    const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -46,10 +46,10 @@ void forward_project_parallel_cuda(
 
 void back_project_parallel_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_cos_a,
-    const float *d_sin_a,
+    const void  *sino,
+    void        *vol,
+    const float *cos_a,
+    const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -61,9 +61,9 @@ void back_project_parallel_cuda(
  */
 void forward_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_matrices,
+    const void  *vol,
+    void        *sino,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -71,9 +71,9 @@ void forward_project_rotmat_cuda(
 
 void back_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_matrices,
+    const void  *sino,
+    void        *vol,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -88,10 +88,10 @@ void back_project_rotmat_cuda(
 void forward_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_cos_a,
-    const float  *d_sin_a,
+    const void   *vol,
+    void         *sino,
+    const float  *cos_a,
+    const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -100,10 +100,10 @@ void forward_project_parallel_cuda_cached(
 void back_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_cos_a,
-    const float  *d_sin_a,
+    const void   *sino,
+    void         *vol,
+    const float  *cos_a,
+    const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -112,9 +112,9 @@ void back_project_parallel_cuda_cached(
 void forward_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_matrices,
+    const void   *vol,
+    void         *sino,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -123,9 +123,9 @@ void forward_project_rotmat_cuda_cached(
 void back_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_matrices,
+    const void   *sino,
+    void         *vol,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -160,14 +160,14 @@ void back_project_resire_cuda(
 /*
  * Gradient of 3D rotation-matrix forward projection w.r.t. the rotation
  * matrix entries. d_grad_matrices is [n_angles*9] row-major, must be zeroed
- * by the caller. Used by _FP3D's autograd backward; the host chains the
+ * by the caller. Used by _FPRotmat's autograd backward; the host chains the
  * result through _euler_zyz_to_rotmat (pure-PyTorch) to yield ∂L/∂euler.
  */
 void grad_rotmat_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *vol,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -183,9 +183,9 @@ void grad_rotmat_cuda(
 void grad_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -196,11 +196,11 @@ void grad_rotmat_cuda_cached(
  * d_grad_angles must be zeroed by the caller; result is in radians.
  */
 void grad_angle_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_cos_a,
-    const float *d_sin_a,
-    float       *d_grad_angles,
+    const float *vol,
+    const float *grad_sino,
+    const float *cos_a,
+    const float *sin_a,
+    float       *grad_angles,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream

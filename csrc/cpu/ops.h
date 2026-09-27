@@ -21,8 +21,8 @@ extern "C" {
  * Integration uses 1-pixel steps along the ray with bilinear interpolation.
  */
 void forward_project_parallel_cpu(
-    const float *volume,
-    float       *sinogram,
+    const float *vol,
+    float       *sino,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -40,8 +40,8 @@ void forward_project_parallel_cpu(
  * For each voxel, accumulates linearly-interpolated sinogram values over all angles.
  */
 void back_project_parallel_cpu(
-    const float *sinogram,
-    float       *volume,
+    const float *sino,
+    float       *vol,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -74,7 +74,7 @@ void back_project_parallel_cpu(
  * grad_angles : [n_angles] — zeroed by caller; returned in radians
  */
 void grad_angle_cpu(
-    const float *volume,
+    const float *vol,
     const float *grad_sino,
     float       *grad_angles,
     const float *cos_a,
@@ -95,18 +95,18 @@ void grad_angle_cpu(
  * a GPU and as a reference for the autograd backward.
  */
 void forward_project_rotmat_cpu(
-    const float *volume,
-    float       *sinogram,
-    const float *matrices,
+    const float *vol,
+    float       *sino,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
 );
 
 void back_project_rotmat_cpu(
-    const float *sinogram,
-    float       *volume,
-    const float *matrices,
+    const float *sino,
+    float       *vol,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
@@ -115,14 +115,14 @@ void back_project_rotmat_cpu(
 /*
  * Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries
  * (CPU). grad_matrices: [n_angles*9] zeroed by this function before
- * accumulating. Used by _FP3D's autograd backward on CPU; PyTorch chains
+ * accumulating. Used by _FPRotmat's autograd backward on CPU; PyTorch chains
  * the result through _euler_zyz_to_rotmat to yield ∂L/∂euler.
  */
 void grad_rotmat_cpu(
-    const float *volume,
+    const float *vol,
     const float *grad_sino,
-    const float *matrices,
-    float       *grad_matrices,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads

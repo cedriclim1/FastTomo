@@ -20,15 +20,15 @@ static inline cudaStream_t to_stream(long stream_ptr) {
 
 static void py_forward_project_parallel_cuda(
     int io_dtype,
-    long volume_ptr, long sinogram_ptr,
+    long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     forward_project_parallel_cuda(
         io_dtype,
-        reinterpret_cast<const void *>(volume_ptr),
-        reinterpret_cast<void *>(sinogram_ptr),
+        reinterpret_cast<const void *>(vol_ptr),
+        reinterpret_cast<void *>(sino_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -38,15 +38,15 @@ static void py_forward_project_parallel_cuda(
 
 static void py_back_project_parallel_cuda(
     int io_dtype,
-    long sinogram_ptr, long volume_ptr,
+    long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     back_project_parallel_cuda(
         io_dtype,
-        reinterpret_cast<const void *>(sinogram_ptr),
-        reinterpret_cast<void *>(volume_ptr),
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<void *>(vol_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -56,7 +56,7 @@ static void py_back_project_parallel_cuda(
 
 static void py_forward_project_rotmat_cuda(
     int io_dtype,
-    long vol_ptr, long sino_ptr, long matrices_ptr,
+    long vol_ptr, long sino_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
@@ -64,7 +64,7 @@ static void py_forward_project_rotmat_cuda(
         io_dtype,
         reinterpret_cast<const void *>(vol_ptr),
         reinterpret_cast<void *>(sino_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
@@ -72,7 +72,7 @@ static void py_forward_project_rotmat_cuda(
 
 static void py_back_project_rotmat_cuda(
     int io_dtype,
-    long sino_ptr, long vol_ptr, long matrices_ptr,
+    long sino_ptr, long vol_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
@@ -80,35 +80,35 @@ static void py_back_project_rotmat_cuda(
         io_dtype,
         reinterpret_cast<const void *>(sino_ptr),
         reinterpret_cast<void *>(vol_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
 }
 
 static void py_forward_project_resire_cuda(
-    long vol_ptr, long sino_ptr, long matrices_ptr,
+    long vol_ptr, long sino_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     forward_project_resire_cuda(
         reinterpret_cast<const float *>(vol_ptr),
         reinterpret_cast<float *>(sino_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
 }
 
 static void py_back_project_resire_cuda(
-    long sino_ptr, long vol_ptr, long matrices_ptr,
+    long sino_ptr, long vol_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     back_project_resire_cuda(
         reinterpret_cast<const float *>(sino_ptr),
         reinterpret_cast<float *>(vol_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
@@ -116,15 +116,15 @@ static void py_back_project_resire_cuda(
 
 static void py_grad_rotmat_cuda(
     long vol_ptr, long grad_sino_ptr,
-    long matrices_ptr, long grad_matrices_ptr,
+    long mats_ptr, long grad_mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
     grad_rotmat_cuda(
         reinterpret_cast<const float *>(vol_ptr),
         reinterpret_cast<const float *>(grad_sino_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
-        reinterpret_cast<float *>(grad_matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
+        reinterpret_cast<float *>(grad_mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
@@ -133,7 +133,7 @@ static void py_grad_rotmat_cuda(
 static void py_grad_rotmat_cuda_cached(
     int io_dtype,
     long cache_ptr,
-    long grad_sino_ptr, long matrices_ptr, long grad_matrices_ptr,
+    long grad_sino_ptr, long mats_ptr, long grad_mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
@@ -141,8 +141,8 @@ static void py_grad_rotmat_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
         reinterpret_cast<const float *>(grad_sino_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
-        reinterpret_cast<float *>(grad_matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
+        reinterpret_cast<float *>(grad_mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
@@ -200,7 +200,7 @@ static void py_tc_destroy(long handle) {
 static void py_forward_project_parallel_cuda_cached(
     int io_dtype,
     long cache_ptr,
-    long volume_ptr, long sinogram_ptr,
+    long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
@@ -208,8 +208,8 @@ static void py_forward_project_parallel_cuda_cached(
     forward_project_parallel_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
-        reinterpret_cast<const void *>(volume_ptr),
-        reinterpret_cast<void *>(sinogram_ptr),
+        reinterpret_cast<const void *>(vol_ptr),
+        reinterpret_cast<void *>(sino_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -220,7 +220,7 @@ static void py_forward_project_parallel_cuda_cached(
 static void py_back_project_parallel_cuda_cached(
     int io_dtype,
     long cache_ptr,
-    long sinogram_ptr, long volume_ptr,
+    long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
@@ -228,8 +228,8 @@ static void py_back_project_parallel_cuda_cached(
     back_project_parallel_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
-        reinterpret_cast<const void *>(sinogram_ptr),
-        reinterpret_cast<void *>(volume_ptr),
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<void *>(vol_ptr),
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
@@ -240,7 +240,7 @@ static void py_back_project_parallel_cuda_cached(
 static void py_forward_project_rotmat_cuda_cached(
     int io_dtype,
     long cache_ptr,
-    long vol_ptr, long sino_ptr, long matrices_ptr,
+    long vol_ptr, long sino_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
@@ -249,7 +249,7 @@ static void py_forward_project_rotmat_cuda_cached(
         reinterpret_cast<TextureCache *>(cache_ptr),
         reinterpret_cast<const void *>(vol_ptr),
         reinterpret_cast<void *>(sino_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
@@ -258,7 +258,7 @@ static void py_forward_project_rotmat_cuda_cached(
 static void py_back_project_rotmat_cuda_cached(
     int io_dtype,
     long cache_ptr,
-    long sino_ptr, long vol_ptr, long matrices_ptr,
+    long sino_ptr, long vol_ptr, long mats_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
@@ -267,7 +267,7 @@ static void py_back_project_rotmat_cuda_cached(
         reinterpret_cast<TextureCache *>(cache_ptr),
         reinterpret_cast<const void *>(sino_ptr),
         reinterpret_cast<void *>(vol_ptr),
-        reinterpret_cast<const float *>(matrices_ptr),
+        reinterpret_cast<const float *>(mats_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         to_stream(stream_ptr)
     );
@@ -375,7 +375,7 @@ void register_cuda(py::module_ &m) {
           "All ptr args are device data_ptr() ints. "
           "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream).",
           py::arg("io_dtype"),
-          py::arg("volume_ptr"), py::arg("sinogram_ptr"),
+          py::arg("vol_ptr"), py::arg("sino_ptr"),
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
@@ -386,7 +386,7 @@ void register_cuda(py::module_ &m) {
           "Back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints.",
           py::arg("io_dtype"),
-          py::arg("sinogram_ptr"), py::arg("volume_ptr"),
+          py::arg("sino_ptr"), py::arg("vol_ptr"),
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
@@ -395,9 +395,9 @@ void register_cuda(py::module_ &m) {
     m.def("forward_project_rotmat_cuda", &py_forward_project_rotmat_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "3D rotation-matrix forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
-          "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
+          "mats_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
           py::arg("io_dtype"),
-          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
+          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -405,9 +405,9 @@ void register_cuda(py::module_ &m) {
     m.def("back_project_rotmat_cuda", &py_back_project_rotmat_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "3D rotation-matrix back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
-          "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
+          "mats_ptr: device data_ptr() of [n_angles*9] row-major float32 rotation matrices.",
           py::arg("io_dtype"),
-          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
+          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -415,9 +415,9 @@ void register_cuda(py::module_ &m) {
     m.def("forward_project_resire_cuda", &py_forward_project_resire_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "RESIRE voxel-driven forward projection (CUDA). "
-          "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
+          "mats_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
           "sino_ptr must point to a zeroed buffer.",
-          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
+          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -425,9 +425,9 @@ void register_cuda(py::module_ &m) {
     m.def("back_project_resire_cuda", &py_back_project_resire_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "RESIRE voxel-driven back-projection (CUDA). "
-          "matrices_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
+          "mats_ptr: device data_ptr() of [n_angles*9] row-major float32 matrices. "
           "vol_ptr must point to a zeroed buffer.",
-          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
+          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -436,9 +436,9 @@ void register_cuda(py::module_ &m) {
           py::call_guard<py::gil_scoped_release>(),
           "Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries (CUDA). "
           "All ptr args are device data_ptr() ints. "
-          "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
+          "grad_mats_ptr must point to a zeroed [n_angles*9] buffer.",
           py::arg("vol_ptr"), py::arg("grad_sino_ptr"),
-          py::arg("matrices_ptr"), py::arg("grad_matrices_ptr"),
+          py::arg("mats_ptr"), py::arg("grad_mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -449,10 +449,10 @@ void register_cuda(py::module_ &m) {
           "cache_ptr: TC_VOL_3D handle already populated by forward_project_rotmat_cuda_cached. "
           "Uses the cache's point-filter tex_point for bit-exact corner reads. "
           "io_dtype: 0=fp32, 1=fp16. "
-          "grad_matrices_ptr must point to a zeroed [n_angles*9] buffer.",
+          "grad_mats_ptr must point to a zeroed [n_angles*9] buffer.",
           py::arg("io_dtype"),
           py::arg("cache_ptr"),
-          py::arg("grad_sino_ptr"), py::arg("matrices_ptr"), py::arg("grad_matrices_ptr"),
+          py::arg("grad_sino_ptr"), py::arg("mats_ptr"), py::arg("grad_mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -497,7 +497,7 @@ void register_cuda(py::module_ &m) {
           "no per-call cudaMalloc3DArray.",
           py::arg("io_dtype"),
           py::arg("cache_ptr"),
-          py::arg("volume_ptr"), py::arg("sinogram_ptr"),
+          py::arg("vol_ptr"), py::arg("sino_ptr"),
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
@@ -509,7 +509,7 @@ void register_cuda(py::module_ &m) {
           "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
           py::arg("io_dtype"),
           py::arg("cache_ptr"),
-          py::arg("sinogram_ptr"), py::arg("volume_ptr"),
+          py::arg("sino_ptr"), py::arg("vol_ptr"),
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
@@ -521,7 +521,7 @@ void register_cuda(py::module_ &m) {
           "cache_ptr: TC_VOL_3D handle sized to (Ny, Nz, Nx) with matching dtype.",
           py::arg("io_dtype"),
           py::arg("cache_ptr"),
-          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("matrices_ptr"),
+          py::arg("vol_ptr"), py::arg("sino_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
@@ -532,7 +532,7 @@ void register_cuda(py::module_ &m) {
           "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
           py::arg("io_dtype"),
           py::arg("cache_ptr"),
-          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("matrices_ptr"),
+          py::arg("sino_ptr"), py::arg("vol_ptr"), py::arg("mats_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);

@@ -123,7 +123,7 @@ void mbir_forward_project_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     /* Zero sinogram up-front; the voxel scatter only adds positive
      * contributions so memset suffices. */
@@ -190,7 +190,7 @@ int mbir_icd_sweep_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
     const float half_x = g.half_x, half_z = g.half_z, half_det = g.half_det;
 
     /* ── ICD sweep ─────────────────────────────────────────────────────────

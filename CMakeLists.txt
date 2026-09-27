@@ -192,16 +192,16 @@ set(CORE_SOURCES
     csrc/bindings.cpp
     csrc/bindings_cpu.cpp
     csrc/bindings_cuda.cpp
-    csrc/cpu/projection_2d.c
-    csrc/cpu/projection_3d.c
+    csrc/cpu/projection_parallel.c
+    csrc/cpu/projection_rotmat.c
     csrc/cpu/genfire.c
     csrc/cpu/mbir_icd.c
 )
 
 if(FASTTOMO_CUDA)
     list(APPEND CORE_SOURCES
-        csrc/cuda/projection_2d.cu
-        csrc/cuda/projection_3d.cu
+        csrc/cuda/projection_parallel.cu
+        csrc/cuda/projection_rotmat.cu
         csrc/cuda/projection_resire.cu
         csrc/cuda/genfire.cu
         csrc/cuda/grad_angle.cu

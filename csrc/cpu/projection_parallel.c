@@ -7,8 +7,8 @@
 #include <omp.h>
 
 void forward_project_parallel_cpu(
-    const float *volume,
-    float       *sinogram,
+    const float *vol,
+    float       *sino,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -16,7 +16,7 @@ void forward_project_parallel_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     /* Each (ia, iy, id) ray writes to a unique sinogram entry — collapse(2)
      * over the two outer loops parallelizes 29*200 = 5800 work units (more
@@ -25,7 +25,7 @@ void forward_project_parallel_cpu(
     for (int ia = 0; ia < n_angles; ia++) {
         for (int iy = 0; iy < Ny; iy++) {
             float ca = cos_a[ia], sa = sin_a[ia];
-            const float *slice = volume + (size_t)iy * Nz * Nx;
+            const float *slice = vol + (size_t)iy * Nz * Nx;
 
             for (int id = 0; id < N_det; id++) {
                 float t   = id - g.half_det;
@@ -52,15 +52,15 @@ void forward_project_parallel_cpu(
                          +          wz  *          wx  * slice[(size_t)iz1 * Nx + ix1];
                 }
 
-                sinogram[((size_t)ia * Ny + iy) * N_det + id] = sum;
+                sino[((size_t)ia * Ny + iy) * N_det + id] = sum;
             }
         }
     }
 }
 
 void back_project_parallel_cpu(
-    const float *sinogram,
-    float       *volume,
+    const float *sino,
+    float       *vol,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -68,9 +68,9 @@ void back_project_parallel_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
-    memset(volume, 0, (size_t)Ny * Nz * Nx * sizeof(float));
+    memset(vol, 0, (size_t)Ny * Nz * Nx * sizeof(float));
 
     /*
      * Ray-driven scatter — strict adjoint of the forward pass. Different Y
@@ -80,14 +80,14 @@ void back_project_parallel_cpu(
      */
     #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int iy = 0; iy < Ny; iy++) {
-        float *slice = volume + (size_t)iy * Nz * Nx;
+        float *slice = vol + (size_t)iy * Nz * Nx;
 
         for (int ia = 0; ia < n_angles; ia++) {
             float ca = cos_a[ia], sa = sin_a[ia];
 
             for (int id = 0; id < N_det; id++) {
                 float t    = id - g.half_det;
-                float sval = sinogram[((size_t)ia * Ny + iy) * N_det + id];
+                float sval = sino[((size_t)ia * Ny + iy) * N_det + id];
 
                 for (int step = -g.ray_len; step <= g.ray_len; step++) {
                     float s  = (float)step;
@@ -113,7 +113,7 @@ void back_project_parallel_cpu(
 }
 
 void grad_angle_cpu(
-    const float *volume,
+    const float *vol,
     const float *grad_sino,
     float       *grad_angles,
     const float *cos_a,
@@ -123,7 +123,7 @@ void grad_angle_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     for (int ia = 0; ia < n_angles; ia++)
         grad_angles[ia] = 0.0f;
@@ -141,7 +141,7 @@ void grad_angle_cpu(
                                  num_threads(num_threads) reduction(+:g_theta)
         for (int iy = 0; iy < Ny; iy++) {
             for (int id = 0; id < N_det; id++) {
-                const float *slice = volume + (size_t)iy * Nz * Nx;
+                const float *slice = vol + (size_t)iy * Nz * Nx;
                 float t  = id - g.half_det;
                 float gs = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
                 if (gs == 0.0f) continue;

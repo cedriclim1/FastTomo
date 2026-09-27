@@ -3,16 +3,16 @@ torch.autograd.Function wrappers for FastTomo's projection kernels.
 
 Each FP operator's backward calls its BP partner; each BP operator's backward
 calls its FP partner. This makes `forward_project`, `back_project`, and the
-3D / RESIRE variants first-class autograd ops — `loss.backward()` flows
+rotation-matrix / RESIRE variants first-class autograd ops — `loss.backward()` flows
 gradients into a `requires_grad=True` volume (or sinogram) tensor.
 
 Caveats:
 - The CUDA texture-based BPs are only approximate adjoints (~15-65 % relative
   error in the inner-product test). Sufficient as descent directions (SIRT and
   RESIRE rely on this), but `torch.autograd.gradcheck` will fail by design.
-- 2D tilt-angle gradient: `_FP2D` computes ∂L/∂θ via `_grad_angle_raw`
+- Single-axis tilt-angle gradient: `_FPParallel` computes ∂L/∂θ via `_grad_angle_raw`
   (CPU + CUDA).
-- 3D rotation-matrix gradient: `_FP3D` takes the [n_angles, 3, 3] rotation
+- 3D rotation-matrix gradient: `_FPRotmat` takes the [n_angles, 3, 3] rotation
   matrix tensor directly so PyTorch can trace through `_euler_zyz_to_rotmat`
   outside the Function boundary. Backward calls `_grad_rotmat_raw` for ∂L/∂M
   and lets autograd chain to ∂L/∂euler_zyz_deg automatically (CPU + CUDA).
@@ -275,7 +275,7 @@ def _launch(op: str, out: torch.Tensor, *args, io_dtype: int | None = None,
     return out
 
 
-def _forward_project_raw(
+def _forward_project_parallel_raw(
     volume: torch.Tensor,
     angles_deg: torch.Tensor,
     N_det: int = -1,
@@ -294,7 +294,7 @@ def _forward_project_raw(
     return sino.to(volume.dtype)
 
 
-def _back_project_raw(
+def _back_project_parallel_raw(
     sinogram: torch.Tensor,
     angles_deg: torch.Tensor,
     Nz: int = -1,
@@ -313,34 +313,34 @@ def _back_project_raw(
     return vol.to(sinogram.dtype)
 
 
-def _forward_project_3d_raw(
+def _forward_project_euler_raw(
     volume: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
     N_det: int = -1,
     num_threads: int | None = None,
 ) -> torch.Tensor:
     mats = _euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
-    return _forward_project_3d_mats_raw(volume, mats, N_det, num_threads)
+    return _forward_project_rotmat_raw(volume, mats, N_det, num_threads)
 
 
-def _back_project_3d_raw(
+def _back_project_euler_raw(
     sinogram: torch.Tensor,
     euler_zyz_deg: torch.Tensor,
     Nz: int = -1,
     num_threads: int | None = None,
 ) -> torch.Tensor:
     mats = _euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
-    return _back_project_3d_mats_raw(sinogram, mats, Nz, num_threads)
+    return _back_project_rotmat_raw(sinogram, mats, Nz, num_threads)
 
 
-def _forward_project_3d_mats_raw(
+def _forward_project_rotmat_raw(
     volume: torch.Tensor,
     mats_flat: torch.Tensor,   # [n_angles, 9]
     N_det: int = -1,
     num_threads: int | None = None,
 ) -> torch.Tensor:
     """Rotmat FP that bypasses the euler→rotmat step (mats already given).
-    Used by _FP3D's autograd Function so the conversion lives in PyTorch.
+    Used by _FPRotmat's autograd Function so the conversion lives in PyTorch.
     ``num_threads`` only applies to the CPU path. Output dtype = volume
     dtype; the matrices are always read as float32."""
     vol = _kernel_input(volume)
@@ -355,14 +355,14 @@ def _forward_project_3d_mats_raw(
     return sino.to(volume.dtype)
 
 
-def _back_project_3d_mats_raw(
+def _back_project_rotmat_raw(
     sinogram: torch.Tensor,
     mats_flat: torch.Tensor,   # [n_angles, 9]
     Nz: int = -1,
     num_threads: int | None = None,
 ) -> torch.Tensor:
-    """Adjoint partner of _forward_project_3d_mats_raw (used inside
-    _FP3D.backward). Output dtype = sinogram dtype."""
+    """Adjoint partner of _forward_project_rotmat_raw (used inside
+    _FPRotmat.backward). Output dtype = sinogram dtype."""
     sino = _kernel_input(sinogram)
     n_angles, Ny, N_det = sino.shape
     Nx = N_det
@@ -496,19 +496,19 @@ def _grad_angle_raw(
     return grad_a * (math.pi / 180.0)
 
 
-class _FP2D(torch.autograd.Function):
+class _FPParallel(torch.autograd.Function):
     @staticmethod
     def forward(ctx, volume, angles_deg, N_det, num_threads):
         ctx.save_for_backward(volume.detach(), angles_deg)
         ctx.Nz = volume.shape[-2]
         ctx.num_threads = num_threads
-        return _forward_project_raw(volume, angles_deg, N_det, num_threads)
+        return _forward_project_parallel_raw(volume, angles_deg, N_det, num_threads)
 
     @staticmethod
     def backward(ctx, grad_sino):
         volume, angles_deg = ctx.saved_tensors
         grad_sino = grad_sino.contiguous()
-        grad_vol = _back_project_raw(grad_sino, angles_deg, Nz=ctx.Nz,
+        grad_vol = _back_project_parallel_raw(grad_sino, angles_deg, Nz=ctx.Nz,
                                      num_threads=ctx.num_threads)
         grad_angles = None
         if ctx.needs_input_grad[1]:
@@ -517,24 +517,24 @@ class _FP2D(torch.autograd.Function):
         return grad_vol, grad_angles, None, None
 
 
-class _BP2D(torch.autograd.Function):
+class _BPParallel(torch.autograd.Function):
     @staticmethod
     def forward(ctx, sinogram, angles_deg, Nz, num_threads):
         ctx.save_for_backward(angles_deg)
         ctx.N_det = sinogram.shape[-1]
         ctx.num_threads = num_threads
-        return _back_project_raw(sinogram, angles_deg, Nz, num_threads)
+        return _back_project_parallel_raw(sinogram, angles_deg, Nz, num_threads)
 
     @staticmethod
     def backward(ctx, grad_vol):
         (angles_deg,) = ctx.saved_tensors
-        grad_sino = _forward_project_raw(grad_vol.contiguous(), angles_deg,
+        grad_sino = _forward_project_parallel_raw(grad_vol.contiguous(), angles_deg,
                                          N_det=ctx.N_det,
                                          num_threads=ctx.num_threads)
         return grad_sino, None, None, None
 
 
-class _FP3D(torch.autograd.Function):
+class _FPRotmat(torch.autograd.Function):
     """
     Texture-based 3D rotmat forward projection, differentiable w.r.t. both
     `volume` and the rotation matrix `mats` ([n_angles, 3, 3]). The Euler →
@@ -554,7 +554,7 @@ class _FP3D(torch.autograd.Function):
         ctx.save_for_backward(volume.detach(), mats_flat)
         ctx.Nz = volume.shape[-2]
         ctx.num_threads = num_threads
-        return _forward_project_3d_mats_raw(
+        return _forward_project_rotmat_raw(
             volume.detach(), mats_flat, N_det, num_threads
         )
 
@@ -564,7 +564,7 @@ class _FP3D(torch.autograd.Function):
         grad_sino = grad_sino.contiguous()
         grad_vol = None
         if ctx.needs_input_grad[0]:
-            grad_vol = _back_project_3d_mats_raw(
+            grad_vol = _back_project_rotmat_raw(
                 grad_sino, mats_flat, Nz=ctx.Nz, num_threads=ctx.num_threads
             )
         grad_mats = None
@@ -575,18 +575,18 @@ class _FP3D(torch.autograd.Function):
         return grad_vol, grad_mats, None, None
 
 
-class _BP3D(torch.autograd.Function):
+class _BPRotmat(torch.autograd.Function):
     @staticmethod
     def forward(ctx, sinogram, euler_zyz_deg, Nz, num_threads):
         ctx.save_for_backward(euler_zyz_deg)
         ctx.N_det = sinogram.shape[-1]
         ctx.num_threads = num_threads
-        return _back_project_3d_raw(sinogram, euler_zyz_deg, Nz, num_threads)
+        return _back_project_euler_raw(sinogram, euler_zyz_deg, Nz, num_threads)
 
     @staticmethod
     def backward(ctx, grad_vol):
         (euler_zyz_deg,) = ctx.saved_tensors
-        grad_sino = _forward_project_3d_raw(
+        grad_sino = _forward_project_euler_raw(
             grad_vol.contiguous(), euler_zyz_deg,
             N_det=ctx.N_det, num_threads=ctx.num_threads,
         )
@@ -681,7 +681,7 @@ class _TVLossIso3D(torch.autograd.Function):
 # view), and falls back to the one-shot kernel if a later forward overwrote it.
 
 
-class _FP2DCached(torch.autograd.Function):
+class _FPParallelCached(torch.autograd.Function):
     @staticmethod
     def forward(ctx, volume, projector):
         ctx.projector = projector
@@ -693,7 +693,7 @@ class _FP2DCached(torch.autograd.Function):
         return grad_vol, None
 
 
-class _BP2DCached(torch.autograd.Function):
+class _BPParallelCached(torch.autograd.Function):
     @staticmethod
     def forward(ctx, sinogram, projector):
         ctx.projector = projector
@@ -705,7 +705,7 @@ class _BP2DCached(torch.autograd.Function):
         return grad_sino, None
 
 
-class _FP3DCached(torch.autograd.Function):
+class _FPRotmatCached(torch.autograd.Function):
     @staticmethod
     def forward(ctx, volume, mats_flat, projector):
         ctx.projector = projector
@@ -735,7 +735,7 @@ class _FP3DCached(torch.autograd.Function):
         return grad_vol, grad_mats, None
 
 
-class _BP3DCached(torch.autograd.Function):
+class _BPRotmatCached(torch.autograd.Function):
     @staticmethod
     def forward(ctx, sinogram, mats_flat, projector):
         ctx.projector = projector

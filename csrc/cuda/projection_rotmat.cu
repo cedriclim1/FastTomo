@@ -1,5 +1,6 @@
-/* ── fasttomo/csrc/cuda/projection_3d.cu ─────────────────────────────────────
- * Rotation-matrix (3D) forward and back projection, plus grad_rotmat.
+/* ── fasttomo/csrc/cuda/projection_rotmat.cu ────────────────────────────────
+ * Arbitrary-rotation ("rotmat": one 3x3 matrix per view) forward and back
+ * projection, plus the gradient w.r.t. the matrices (grad_rotmat).
  * Kernels: forward_project_rotmat_kernel, back_project_rotmat_kernel,
  *          grad_rotmat_kernel.
  * Host wrappers: forward_project_rotmat_cuda, forward_project_rotmat_cuda_cached,
@@ -28,8 +29,8 @@
 template <typename T>
 __global__ static void forward_project_rotmat_kernel(
     cudaTextureObject_t  vol_tex,
-    T *__restrict__      sinogram,         /* [n_angles, Ny, N_det] */
-    const float *__restrict__ matrices,    /* [n_angles * 9] row-major */
+    T *__restrict__      sino,         /* [n_angles, Ny, N_det] */
+    const float *__restrict__ mats,    /* [n_angles * 9] row-major */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     float half_det, float half_x, float half_z, float half_y,
@@ -41,7 +42,7 @@ __global__ static void forward_project_rotmat_kernel(
 
     if (iu >= N_det || iv >= Ny) return;
 
-    const float *M = matrices + ia * 9;
+    const float *M = mats + ia * 9;
     float u = iu - half_det;
     float v = iv - half_y;
 
@@ -61,23 +62,23 @@ __global__ static void forward_project_rotmat_kernel(
          * float — hardware promotes fp16 texels on filtered read. */
         sum += tex3D<float>(vol_tex, tx, tz, ty);
     }
-    sinogram[((size_t)ia * Ny + iv) * N_det + iu] = float_to_t<T>(sum);
+    sino[((size_t)ia * Ny + iv) * N_det + iu] = float_to_t<T>(sum);
 }
 
 static tc_dtype_t tc_dtype_of(int io_dtype) {
     return io_dtype == 0 ? TC_DTYPE_FP32 : TC_DTYPE_FP16;
 }
 
-/* Upload `d_volume` into `vol_cache` (already validated) and launch the FP
+/* Upload `vol` into `vol_cache` (already validated) and launch the FP
  * kernel. Shared by the cached and the one-shot entry point. */
 static void forward_project_rotmat_launch(
     int io_dtype, TextureCache *vol_cache,
-    const void *d_volume, void *d_sinogram, const float *d_matrices,
+    const void *vol, void *sino, const float *mats,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
-    tc_upload(vol_cache, d_volume, stream);
+    ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
+    tc_upload(vol_cache, vol, stream);
 
     dim3 block(16, 16, 1);
     dim3 grid((g.N_det + 15) / 16,
@@ -85,12 +86,12 @@ static void forward_project_rotmat_launch(
               g.n_angles);
     if (io_dtype == 0)
         forward_project_rotmat_kernel<float><<<grid, block, 0, stream>>>(
-            vol_cache->tex, (float *)d_sinogram, d_matrices,
+            vol_cache->tex, (float *)sino, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y, g.ray_len);
     else
         forward_project_rotmat_kernel<__half><<<grid, block, 0, stream>>>(
-            vol_cache->tex, (__half *)d_sinogram, d_matrices,
+            vol_cache->tex, (__half *)sino, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y, g.ray_len);
     CUDA_CHECK_KERNEL();
@@ -98,9 +99,9 @@ static void forward_project_rotmat_launch(
 
 void forward_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_matrices,
+    const void  *vol,
+    void        *sino,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -108,17 +109,17 @@ void forward_project_rotmat_cuda(
     check_io_dtype(io_dtype, "forward_project_rotmat_cuda");
     /* Rotmat samples continuously in Y, so no 4-channel Y packing. */
     ScopedTextureCache tc(TC_VOL_3D, tc_dtype_of(io_dtype), 1, Ny, Nz, Nx, stream);
-    forward_project_rotmat_launch(io_dtype, tc.get(), d_volume, d_sinogram,
-                                  d_matrices, Ny, Nz, Nx, n_angles, N_det, stream);
+    forward_project_rotmat_launch(io_dtype, tc.get(), vol, sino,
+                                  mats, Ny, Nz, Nx, n_angles, N_det, stream);
     tc.finish();
 }
 
 void forward_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_matrices,
+    const void   *vol,
+    void         *sino,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -126,8 +127,8 @@ void forward_project_rotmat_cuda_cached(
     check_io_dtype(io_dtype, "forward_project_rotmat_cuda_cached");
     tc_validate(vol_cache, TC_VOL_3D, io_dtype, Ny, Nz, Nx,
                 "forward_project_rotmat_cuda_cached");
-    forward_project_rotmat_launch(io_dtype, vol_cache, d_volume, d_sinogram,
-                                  d_matrices, Ny, Nz, Nx, n_angles, N_det, stream);
+    forward_project_rotmat_launch(io_dtype, vol_cache, vol, sino,
+                                  mats, Ny, Nz, Nx, n_angles, N_det, stream);
 }
 
 /* ── 3D rotation-matrix back-projection ──────────────────────────────────────
@@ -140,8 +141,8 @@ void forward_project_rotmat_cuda_cached(
 template <typename T>
 __global__ static void back_project_rotmat_kernel(
     cudaTextureObject_t  sino_tex,        /* n_angles layers of [Ny, N_det] */
-    T *__restrict__      volume,          /* [Ny, Nz, Nx] */
-    const float *__restrict__ matrices,   /* [n_angles * 9] row-major */
+    T *__restrict__      vol,          /* [Ny, Nz, Nx] */
+    const float *__restrict__ mats,   /* [n_angles * 9] row-major */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     float half_det, float half_x, float half_z, float half_y
@@ -153,7 +154,7 @@ __global__ static void back_project_rotmat_kernel(
                   + threadIdx.z * blockDim.x * blockDim.y;
     int block_sz  = blockDim.x * blockDim.y * blockDim.z;
     for (int k = tid; k < n_angles * 9; k += block_sz)
-        sh_mats[k] = matrices[k];
+        sh_mats[k] = mats[k];
     __syncthreads();
 
     int ix = blockIdx.x * blockDim.x + threadIdx.x;
@@ -180,19 +181,19 @@ __global__ static void back_project_rotmat_kernel(
                                    ia);
     }
 
-    volume[((size_t)iy * Nz + iz) * Nx + ix] = float_to_t<T>(val);
+    vol[((size_t)iy * Nz + iz) * Nx + ix] = float_to_t<T>(val);
 }
 
-/* Upload `d_sinogram` into `sino_cache` (already validated) and launch the
+/* Upload `sino` into `sino_cache` (already validated) and launch the
  * BP kernel. Shared by the cached and the one-shot entry point. */
 static void back_project_rotmat_launch(
     int io_dtype, TextureCache *sino_cache,
-    const void *d_sinogram, void *d_volume, const float *d_matrices,
+    const void *sino, void *vol, const float *mats,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
-    tc_upload(sino_cache, d_sinogram, stream);
+    ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
+    tc_upload(sino_cache, sino, stream);
 
     dim3 block(8, 8, 4);
     dim3 grid((g.Nx + 7) / 8,
@@ -202,13 +203,13 @@ static void back_project_rotmat_launch(
     if (io_dtype == 0) {
         enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel<float>, smem);
         back_project_rotmat_kernel<float><<<grid, block, smem, stream>>>(
-            sino_cache->tex, (float *)d_volume, d_matrices,
+            sino_cache->tex, (float *)vol, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y);
     } else {
         enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel<__half>, smem);
         back_project_rotmat_kernel<__half><<<grid, block, smem, stream>>>(
-            sino_cache->tex, (__half *)d_volume, d_matrices,
+            sino_cache->tex, (__half *)vol, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y);
     }
@@ -217,9 +218,9 @@ static void back_project_rotmat_launch(
 
 void back_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_matrices,
+    const void  *sino,
+    void        *vol,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -227,17 +228,17 @@ void back_project_rotmat_cuda(
     check_io_dtype(io_dtype, "back_project_rotmat_cuda");
     ScopedTextureCache tc(TC_SINO_LAYERED, tc_dtype_of(io_dtype), 1,
                           n_angles, Ny, N_det, stream);
-    back_project_rotmat_launch(io_dtype, tc.get(), d_sinogram, d_volume,
-                               d_matrices, Ny, Nz, Nx, n_angles, N_det, stream);
+    back_project_rotmat_launch(io_dtype, tc.get(), sino, vol,
+                               mats, Ny, Nz, Nx, n_angles, N_det, stream);
     tc.finish();
 }
 
 void back_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_matrices,
+    const void   *sino,
+    void         *vol,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -245,8 +246,8 @@ void back_project_rotmat_cuda_cached(
     check_io_dtype(io_dtype, "back_project_rotmat_cuda_cached");
     tc_validate(sino_cache, TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det,
                 "back_project_rotmat_cuda_cached");
-    back_project_rotmat_launch(io_dtype, sino_cache, d_sinogram, d_volume,
-                               d_matrices, Ny, Nz, Nx, n_angles, N_det, stream);
+    back_project_rotmat_launch(io_dtype, sino_cache, sino, vol,
+                               mats, Ny, Nz, Nx, n_angles, N_det, stream);
 }
 
 /* ── gradient of 3D rotmat forward projection w.r.t. rotation matrix ─────────
@@ -268,14 +269,14 @@ void back_project_rotmat_cuda_cached(
  * T is the volume dtype (float or __half). The 8 corner reads are done with
  * tex3D<float> and cudaFilterModePoint so the result is bit-exact equivalent
  * to a global-memory load (hardware promotes fp16 texels to fp32 on read).
- * The output grad_matrices always accumulates in fp32 regardless of T.
+ * The output grad_mats always accumulates in fp32 regardless of T.
  */
 template <typename T>
 __global__ static void grad_rotmat_kernel(
     cudaTextureObject_t  vol_tex,            /* TC_VOL_3D, point-filter view */
     const float *__restrict__ grad_sino,     /* [n_angles, Ny, N_det] */
-    const float *__restrict__ matrices,      /* [n_angles*9] row-major */
-    float       *__restrict__ grad_matrices, /* [n_angles*9] (zeroed by caller) */
+    const float *__restrict__ mats,      /* [n_angles*9] row-major */
+    float       *__restrict__ grad_mats, /* [n_angles*9] (zeroed by caller) */
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     float half_det, float half_x, float half_y, float half_z,
@@ -291,7 +292,7 @@ __global__ static void grad_rotmat_kernel(
     float gM[9] = {0,0,0,0,0,0,0,0,0};
 
     if (iu < N_det && iv < Ny) {
-        const float *M = matrices + (size_t)ia * 9;
+        const float *M = mats + (size_t)ia * 9;
         float u = (float)iu - half_det;
         float v = (float)iv - half_y;
         float ox = u * M[0] + v * M[3];
@@ -377,14 +378,14 @@ __global__ static void grad_rotmat_kernel(
     }
 
     if (tid < 9)
-        atomicAdd(&grad_matrices[(size_t)ia * 9 + tid], smem[tid * nthreads]);
+        atomicAdd(&grad_mats[(size_t)ia * 9 + tid], smem[tid * nthreads]);
 }
 
 /* Launch grad_rotmat_kernel on a TC_VOL_3D cache that already holds the
  * volume (no upload: the cached path reuses the forward's upload). */
 static void grad_rotmat_launch(
     int io_dtype, TextureCache *vol_cache,
-    const float *d_grad_sino, const float *d_matrices, float *d_grad_matrices,
+    const float *grad_sino, const float *mats, float *grad_mats,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     cudaStream_t stream
 ) {
@@ -392,7 +393,7 @@ static void grad_rotmat_launch(
         throw std::invalid_argument("grad_rotmat: tex_point not initialised "
                                     "(cache was not created as TC_VOL_3D with channels==1)");
 
-    ProjGeom3D g = proj_geom_3d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
 
     dim3 block(16, 16, 1);
     dim3 grid((g.N_det + 15) / 16,
@@ -403,14 +404,14 @@ static void grad_rotmat_launch(
     if (io_dtype == 0) {
         enable_extended_smem_if_needed((const void *)grad_rotmat_kernel<float>, smem);
         grad_rotmat_kernel<float><<<grid, block, smem, stream>>>(
-            vol_cache->tex_point, d_grad_sino, d_matrices, d_grad_matrices,
+            vol_cache->tex_point, grad_sino, mats, grad_mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
         );
     } else {
         enable_extended_smem_if_needed((const void *)grad_rotmat_kernel<__half>, smem);
         grad_rotmat_kernel<__half><<<grid, block, smem, stream>>>(
-            vol_cache->tex_point, d_grad_sino, d_matrices, d_grad_matrices,
+            vol_cache->tex_point, grad_sino, mats, grad_mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_y, g.half_z, g.ray_len
         );
@@ -421,31 +422,31 @@ static void grad_rotmat_launch(
 void grad_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
     check_io_dtype(io_dtype, "grad_rotmat_cuda_cached");
     tc_validate(vol_cache, TC_VOL_3D, io_dtype, Ny, Nz, Nx, "grad_rotmat_cuda_cached");
-    grad_rotmat_launch(io_dtype, vol_cache, d_grad_sino, d_matrices, d_grad_matrices,
+    grad_rotmat_launch(io_dtype, vol_cache, grad_sino, mats, grad_mats,
                        Ny, Nz, Nx, n_angles, N_det, stream);
 }
 
 void grad_rotmat_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *vol,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
     ScopedTextureCache tc(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx, stream);
-    tc_upload(tc.get(), d_volume, stream);
-    grad_rotmat_launch(0, tc.get(), d_grad_sino, d_matrices, d_grad_matrices,
+    tc_upload(tc.get(), vol, stream);
+    grad_rotmat_launch(0, tc.get(), grad_sino, mats, grad_mats,
                        Ny, Nz, Nx, n_angles, N_det, stream);
     tc.finish();
 }

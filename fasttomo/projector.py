@@ -52,7 +52,7 @@ import torch
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _FP2DCached, _BP2DCached, _FP3DCached, _BP3DCached, _io_dtype_code,
+    _FPParallelCached, _BPParallelCached, _FPRotmatCached, _BPRotmatCached, _io_dtype_code,
     _on_device,
 )
 
@@ -351,12 +351,12 @@ class ParallelProjector(_ProjectorBase):
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
         self._check_device(volume, "volume")
         self._check_volume_shape(volume)
-        return _FP2DCached.apply(volume, self)
+        return _FPParallelCached.apply(volume, self)
 
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
-        return _BP2DCached.apply(sinogram, self)
+        return _BPParallelCached.apply(sinogram, self)
 
 
 class RotmatProjector(_ProjectorBase):
@@ -522,11 +522,11 @@ class RotmatProjector(_ProjectorBase):
         self._check_volume_shape(volume)
         self._check_device(mats, "mats")
         mats_flat = self._normalize_and_validate_mats(mats)
-        return _FP3DCached.apply(volume, mats_flat, self)
+        return _FPRotmatCached.apply(volume, mats_flat, self)
 
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
         self._check_device(mats, "mats")
         mats_flat = self._normalize_and_validate_mats(mats)
-        return _BP3DCached.apply(sinogram, mats_flat, self)
+        return _BPRotmatCached.apply(sinogram, mats_flat, self)

@@ -201,12 +201,12 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
  * with float2 = 8 bytes = 4 halves matches the 4-channel half texture format
  * (TorchRadon's pattern in src/texture.cu:105-118).
  *
- * write_half4_vol:  src is [Ny, Nz, Nx] fp16 → vol_layered or vol_3d cudaArray
+ * write_half4_vol_kernel:  src is [Ny, Nz, Nx] fp16 → vol_layered or vol_3d cudaArray
  *                   with extent (Nx, Nz, Ny/4), packing along Ny.
- * write_half4_sino: src is [n_angles, Ny, N_det] fp16 → sino_layered cudaArray
+ * write_half4_sino_kernel: src is [n_angles, Ny, N_det] fp16 → sino_layered cudaArray
  *                   with extent (N_det, Ny/4, n_angles), packing along Ny.
  */
-__global__ static void write_half4_vol(
+__global__ static void write_half4_vol_kernel(
     const __half *src,                   /* [Ny, Nz, Nx] */
     cudaSurfaceObject_t surf,
     int Nz, int Nx
@@ -227,7 +227,7 @@ __global__ static void write_half4_vol(
     surf2DLayeredwrite<float2>(tmp.f, surf, ix * (int)sizeof(float2), iz, iy_pack);
 }
 
-__global__ static void write_half4_sino(
+__global__ static void write_half4_sino_kernel(
     const __half *src,                   /* [n_angles, Ny, N_det] */
     cudaSurfaceObject_t surf,
     int Ny, int N_det
@@ -281,13 +281,13 @@ void tc_upload(TextureCache *tc, const void *src, cudaStream_t stream) {
         int Ny = tc->dim_a, Nz = tc->dim_b, Nx = tc->dim_c;
         dim3 block(16, 16, 1);
         dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny / 4);
-        write_half4_vol<<<grid, block, 0, stream>>>(
+        write_half4_vol_kernel<<<grid, block, 0, stream>>>(
             (const __half *)src, tc->surf, Nz, Nx);
     } else if (tc->kind == TC_SINO_LAYERED) {
         int n_angles = tc->dim_a, Ny = tc->dim_b, N_det = tc->dim_c;
         dim3 block(16, 16, 1);
         dim3 grid((N_det + 15) / 16, ((Ny / 4) + 15) / 16, n_angles);
-        write_half4_sino<<<grid, block, 0, stream>>>(
+        write_half4_sino_kernel<<<grid, block, 0, stream>>>(
             (const __half *)src, tc->surf, Ny, N_det);
     } else {
         throw std::runtime_error("tc_upload: unknown kind");
