@@ -517,7 +517,7 @@ def test_mbir_cpu_strided_sinogram_matches_contiguous():
     vol[:, 3:9, 3:9] = 1.0
     sino = ft.forward_project(vol, angles)
     strided = _variants(sino)["transposed"]
-    kw = dict(outer_iters=2, multires_levels=1, seed=3)
+    kw = dict(n_iter=2, multires_levels=1, seed=3)
     assert torch.equal(ft.run_mbir(strided, angles, **kw),
                        ft.run_mbir(strided.contiguous(), angles, **kw))
 

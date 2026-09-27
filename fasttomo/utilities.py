@@ -199,10 +199,10 @@ def estimate_shifts_xcorr(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     *,
-    upsample_factor: int = 10,                  # reserved; parabolic fit used today
     max_shift: float | None = None,
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — CUDA only
-    num_threads: int | None = None,             # CPU 3D path only
+    num_threads: int | None = None,             # CPU paths
+    **removed: object,
 ) -> torch.Tensor:                              # [n_angles] float32, CPU
     """
     Estimate the translational shift of each projection (along the detector
@@ -217,8 +217,8 @@ def estimate_shifts_xcorr(
     call site).
 
     Sub-pixel precision is achieved via 3-point parabolic interpolation around
-    the cross-correlation peak.  upsample_factor is accepted for API
-    compatibility but currently unused.
+    the cross-correlation peak. (The former ``upsample_factor`` argument never
+    had an effect and was removed; passing it raises TypeError.)
 
     Typical outer-loop usage::
 
@@ -231,12 +231,24 @@ def estimate_shifts_xcorr(
     # so utilities must not import from projection at module level.
     from fasttomo.projection import forward_project, forward_project_3d
 
+    if "upsample_factor" in removed:
+        raise TypeError(
+            "estimate_shifts_xcorr: upsample_factor was removed. It never had an "
+            "effect: the sub-pixel shift comes from a 3-point parabolic fit of "
+            "the correlation peak, and no upsampled-DFT refinement exists. "
+            "Drop the argument; the result is unchanged."
+        )
+    if removed:
+        raise TypeError(
+            "estimate_shifts_xcorr() got an unexpected keyword argument "
+            f"'{next(iter(removed))}'"
+        )
     N_det = sinogram.shape[-1]
 
     if euler_zyz_deg is not None:
         pred = forward_project_3d(volume, euler_zyz_deg, num_threads=num_threads)
     else:
-        pred = forward_project(volume, angles_deg)
+        pred = forward_project(volume, angles_deg, num_threads=num_threads)
 
     F_pred = torch.fft.rfft(pred.float(),      n=N_det, dim=-1)  # [n_a, Ny, N_freq]
     F_meas = torch.fft.rfft(sinogram.float(),  n=N_det, dim=-1)

@@ -46,7 +46,7 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
             if min(Ny, Nz, Nx) >= 2:
                 ft.tv_loss_3d(vol.clone().requires_grad_(True)).backward()
                 sino = ft.forward_project(vol, angles)
-                ft.run_mbir(sino, angles, outer_iters=1, multires_levels=1)
+                ft.run_mbir(sino, angles, n_iter=1, multires_levels=1)
             torch.cuda.synchronize()
             print(f"ok n={n} Ny={Ny}", flush=True)
 

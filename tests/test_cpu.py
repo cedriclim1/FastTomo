@@ -268,7 +268,7 @@ def test_sirt_warm_start_shape_mismatch_raises():
     angles = make_angles(n_angles)
     warm = torch.zeros(1, N, N, dtype=torch.float32)  # Ny mismatch
     with pytest.raises(ValueError, match="volume must have shape"):
-        ft.run_sirt(sino, angles, n_iter=1, Nz=N, volume=warm)
+        ft.run_sirt(sino, angles, n_iter=1, Nz=N, warm_start=warm)
 
 
 def test_sirt_projector_shape_mismatch_raises():
@@ -418,7 +418,7 @@ def test_fista_warm_start_shape_mismatch_raises():
     angles = make_angles(n_angles)
     warm = torch.zeros(1, N, N, dtype=torch.float32)  # Ny mismatch
     with pytest.raises(ValueError, match="volume must have shape"):
-        ft.run_fista(sino, angles, n_iter=1, Nz=N, volume=warm)
+        ft.run_fista(sino, angles, n_iter=1, Nz=N, warm_start=warm)
 
 
 def test_fista_user_L_skips_power_iteration():
@@ -842,26 +842,22 @@ def test_run_grad_descent_cpu_converges():
     )
 
 
-def test_run_grad_descent_positional_kwargs_backward_compat_cpu():
-    """Legacy positional optional args should still map correctly."""
+def test_run_grad_descent_legacy_positional_call_raises_cpu():
+    """Everything after (sinogram, angles_deg, n_iter) is keyword-only, so a
+    call written for the old positional order raises TypeError instead of
+    binding to the wrong parameters; the keyword spelling runs."""
     N      = 24
     angles = make_angles(12)
     vol    = phantom_2d(N).unsqueeze(0)
     sino   = ft.forward_project(vol, angles)
 
+    with pytest.raises(TypeError):
+        ft.run_grad_descent(sino, angles, 5, 5e-2, -1, torch.optim.Adam)
+
     rec, losses = ft.run_grad_descent(
-        sino,                       # sinogram
-        angles,                     # angles_deg
-        5,                          # n_iter
-        5e-2,                       # lr
-        -1,                         # Nz
-        torch.optim.Adam,           # optimizer_cls
-        False,                      # positivity
-        False,                      # mask
-        0.0,                        # tv_weight
-        None,                       # euler_zyz_deg
-        False,                      # use_resire_projector
-        True,                       # return_loss
+        sino, angles, 5, lr=5e-2, Nz=-1, optimizer_cls=torch.optim.Adam,
+        positivity=False, mask=False, tv_weight=0.0, euler_zyz_deg=None,
+        use_resire_projector=False, return_loss=True,
     )
 
     assert rec.shape == vol.shape
@@ -1041,7 +1037,7 @@ class TestRunSart:
         angles = make_angles(n_angles)
         warm = torch.zeros(1, N, N, dtype=torch.float32)  # Ny mismatch
         with pytest.raises(ValueError, match="volume must have shape"):
-            ft.run_sart(sino, angles, n_iter=1, Nz=N, volume=warm)
+            ft.run_sart(sino, angles, n_iter=1, Nz=N, warm_start=warm)
 
 
 # ── MBIR CPU reference + CPU/CUDA cross-consistency ──────────────────────
@@ -1083,7 +1079,7 @@ def test_mbir_cpu_runs():
         sino, angles,
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=True,
-        outer_iters=30, multires_levels=1,
+        n_iter=30, multires_levels=1,
     )
     rel = (vol - phantom).norm().item() / phantom.norm().item()
     assert rel < 0.30, f"CPU MBIR rel error {rel:.4f} > 0.30"
@@ -1108,7 +1104,7 @@ def test_mbir_cpu_cuda_consistency():
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=False,
         sigma_init=0.1,
-        outer_iters=20, multires_levels=1, seed=7,
+        n_iter=20, multires_levels=1, seed=7,
     )
     v_cpu = ft.run_mbir(sino_cpu, angles, **kw)
     v_cu  = ft.run_mbir(sino_cuda, angles.cuda(), **kw).cpu()
@@ -1169,7 +1165,7 @@ def test_mbir_reconstruction_from_standard_fp_sinogram_cpu():
         sino, angles,
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=True,
-        outer_iters=50, multires_levels=1,
+        n_iter=50, multires_levels=1,
     )
     rel_err = (vol - phantom).norm().item() / phantom.norm().item()
     assert rel_err < 0.35, (
@@ -1245,7 +1241,7 @@ def test_mbir_zero_lambdas_accepted():
     angles = torch.linspace(-70, 70, 5)
     lam = torch.ones_like(sino)
     lam[:, :, :4] = 0.0
-    vol = ft.run_mbir(sino, angles, lambdas=lam, outer_iters=2, multires_levels=1)
+    vol = ft.run_mbir(sino, angles, lambdas=lam, n_iter=2, multires_levels=1)
     assert torch.isfinite(vol).all()
 
 
@@ -1273,7 +1269,7 @@ def test_mbir_noncontiguous_lambdas_matches_contiguous():
         huber_T=float("inf"),
         estimate_offset=False,
         estimate_variance=False,
-        outer_iters=4,
+        n_iter=4,
         multires_levels=1,
         seed=11,
     )
@@ -1328,7 +1324,7 @@ def test_mbir_multires_even_runs():
     """Baseline: 2-level multires with power-of-2 detector width should run."""
     sino = torch.randn(5, 2, 16)
     angles = torch.linspace(-70, 70, 5)
-    vol = ft.run_mbir(sino, angles, multires_levels=2, outer_iters=2)
+    vol = ft.run_mbir(sino, angles, multires_levels=2, n_iter=2)
     assert vol.shape == (2, 16, 16)
 
 

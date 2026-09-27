@@ -709,7 +709,7 @@ def test_mbir_rejects_non_finite_sinogram(backend, bad, sigma_init):
     sino[2, 1, 3] = bad
     with pytest.raises(ValueError, match="sinogram contains NaN or inf"):
         ft.run_mbir(sino, torch.linspace(-40, 40, 6, device=backend),
-                    outer_iters=1, multires_levels=1, sigma_init=sigma_init)
+                    n_iter=1, multires_levels=1, sigma_init=sigma_init)
 
 
 # ── ARCH P12: one MBIR offset/variance implementation ──────────────────────
@@ -783,7 +783,7 @@ def test_mbir_cpu_uses_the_python_offset_variance_update(monkeypatch):
 
     monkeypatch.setattr(algo, "_mbir_update_offset_variance", counting)
     sino = torch.rand(6, 2, 8, generator=torch.Generator().manual_seed(14))
-    ft.run_mbir(sino, torch.linspace(-40, 40, 6), outer_iters=3, multires_levels=1,
+    ft.run_mbir(sino, torch.linspace(-40, 40, 6), n_iter=3, multires_levels=1,
                 convergence_tol=0.0, estimate_offset=True, estimate_variance=True)
     assert calls == [(True, True)] * 3
 
@@ -805,10 +805,10 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     sino = sino + 0.3 * torch.linspace(-1, 1, n).view(n, 1, 1) + 0.05 * torch.randn(n, Ny, N, generator=g)
     sino[3, 2, 5] += 8.0
     lam = torch.rand(n, Ny, N, generator=g) + 0.5
-    kw = dict(sigma_f=0.1, outer_iters=8, multires_levels=1, seed=5, return_history=True,
+    kw = dict(sigma_f=0.1, n_iter=8, multires_levels=1, seed=5, return_state=True,
               estimate_offset=True, estimate_variance=True, huber_T=3.0)
-    vc, dc, sc, _ = ft.run_mbir(sino, ang, lambdas=lam, **kw)
-    vg, dg, sg, _ = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
+    vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
+    vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
     assert (dc.abs() > 0.1).any()                        # offsets were estimated
     torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
     torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)

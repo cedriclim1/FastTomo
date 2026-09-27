@@ -37,7 +37,7 @@ Usage (AD loop, with pose):
     proj = RotmatProjector((Ny, Nz, Nx), N_det=Nx, device=vol.device,
                            n_angles=n_angles)
     for _ in range(n_iter):
-        mats = _euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous()
+        mats = euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous()
         pred = proj.forward(vol, mats)
         ...
 

@@ -17,7 +17,7 @@ import numbers
 import operator
 import warnings
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -26,7 +26,8 @@ from tqdm.auto import tqdm
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _assert_dtype_match, _check_shapes, _data_ptr, _euler_zyz_to_rotmat, _launch,
+    _assert_dtype_match, _check_shapes, _data_ptr, euler_zyz_to_rotmat, _launch,
+    _resolve_num_threads,
 )
 from fasttomo.projection import (
     forward_project,
@@ -226,6 +227,63 @@ def _finish_iters(
     if return_loss:
         return volume, torch.tensor(losses, dtype=torch.float32)
     return volume
+
+
+# ── deprecated keyword aliases ─────────────────────────────────────────────
+#
+# Renamed keywords keep working for one release: the old name is accepted
+# through ``**deprecated`` and emits a DeprecationWarning. Everything after
+# the core positionals is keyword-only, so a call written for an old
+# positional order raises TypeError instead of binding to the wrong
+# parameter. CHANGELOG.md lists every rename.
+
+
+def _is_default(value: object, default: object) -> bool:
+    if value is default:
+        return True
+    if isinstance(value, torch.Tensor) or isinstance(default, torch.Tensor):
+        return False
+    return type(value) is type(default) and value == default
+
+
+def _deprecated_kwarg(
+    kwargs: dict[str, Any],
+    old: str,
+    new: str,
+    value: object,
+    op_name: str,
+    *,
+    default: object = None,
+) -> Any:
+    """Resolve keyword ``new`` given its deprecated alias ``old``.
+
+    Pops ``old`` from ``kwargs``. If it was passed, warns (DeprecationWarning
+    pointing at the caller) and returns its value; passing both names
+    raises TypeError. Otherwise returns ``value`` (the new keyword's).
+    """
+    if old not in kwargs:
+        return value
+    old_value = kwargs.pop(old)
+    if not _is_default(value, default):
+        raise TypeError(
+            f"{op_name}: got both '{new}' and its deprecated alias '{old}'; "
+            f"pass '{new}' only."
+        )
+    warnings.warn(
+        f"{op_name}: '{old}' is deprecated, use '{new}' instead; the old name "
+        "will be removed in the next release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return old_value
+
+
+def _reject_unknown_kwargs(kwargs: dict[str, Any], op_name: str) -> None:
+    """Raise TypeError for keywords left after the deprecated aliases were
+    popped (what Python raises for an unknown keyword)."""
+    if kwargs:
+        name = next(iter(kwargs))
+        raise TypeError(f"{op_name}() got an unexpected keyword argument '{name}'")
 
 
 # ── shared reconstruction setup (ARCH P5) ──────────────────────────────────
@@ -639,11 +697,13 @@ def _compute_exact_wf(
 def run_fbp(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
+    *,
     Nz: int = -1,
     positivity: bool = False,
     mask: bool = False,
-    projector: object | None = None,
     support_mask: torch.Tensor | None = None,
+    projector: object | None = None,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Filtered Back-Projection.
@@ -698,7 +758,7 @@ def run_fbp(
         )
         volume = _proj.back(filtered)
     else:
-        volume = back_project(filtered, angles_deg, Nz=Nz)
+        volume = back_project(filtered, angles_deg, Nz=Nz, num_threads=num_threads)
     # angular sampling normalisation: π / n_angles
     volume = volume * (math.pi / n_angles)
     if support_mask is not None:
@@ -723,10 +783,13 @@ def run_fbp(
 def run_weighted_backprojection(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
+    *,
     Nz: int = -1,
     positivity: bool = False,
     threshold_scale: float = 1.0,
     mask: bool = False,
+    support_mask: torch.Tensor | None = None,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Exact Weighted Back-Projection (Wolf et al. 2014).
@@ -739,7 +802,7 @@ def run_weighted_backprojection(
     """
     setup = _prepare_recon(
         "run_weighted_backprojection", sinogram, angles_deg, Nz=Nz,
-        init_volume=False, positivity=positivity, mask=mask,
+        init_volume=False, positivity=positivity, mask=mask, support_mask=support_mask,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -750,7 +813,7 @@ def run_weighted_backprojection(
     )
 
     # simple back-project first → [Ny, Nz, Nx]
-    layergram = back_project(sinogram, angles_deg, Nz=Nz)
+    layergram = back_project(sinogram, angles_deg, Nz=Nz, num_threads=num_threads)
 
     # apply WF slice-by-slice via rfft2
     volume = torch.empty_like(layergram)
@@ -768,19 +831,21 @@ def run_sirt(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 50,
+    *,
     omega: float = 1.0,
     Nz: int = -1,
     positivity: bool = False,
     mask: bool = False,
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
-    return_loss: bool = False,
-    sparsity: float = 0.0,
-    num_threads: int | None = None,             # CPU 3D path only
-    projector: object | None = None,            # ParallelProjector / RotmatProjector for cached FP/BP
-    volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
     support_mask: torch.Tensor | None = None,   # precomputed support, enforced each iteration
+    sparsity: float = 0.0,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
+    projector: object | None = None,            # ParallelProjector / RotmatProjector for cached FP/BP
+    warm_start: torch.Tensor | None = None,     # [Ny, Nz, Nx]; its dtype must match the sinogram
+    num_threads: int | None = None,             # CPU paths
+    return_loss: bool = False,
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
     progress: bool = False,
+    **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
@@ -838,9 +903,11 @@ def run_sirt(
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
     """
+    warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sirt")
+    _reject_unknown_kwargs(deprecated, "run_sirt")
     setup = _prepare_recon(
         "run_sirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
         positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
@@ -1120,7 +1187,7 @@ def _build_fp_bp(
     _internal_proj = None
     if projector is not None:
         if euler_zyz_deg is not None:
-            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+            mats = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
             _fp = lambda v: projector.forward(v, mats)
             _bp = lambda s: projector.back(s, mats)
         else:
@@ -1128,7 +1195,7 @@ def _build_fp_bp(
             _bp = lambda s: projector.back(s)
     elif sinogram.is_cuda:
         if euler_zyz_deg is not None:
-            mats = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+            mats = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
             _internal_proj = RotmatProjector(
                 (Ny, Nz, Nx), n_angles=n_angles, device=device, N_det=N_det,
             )
@@ -1144,8 +1211,8 @@ def _build_fp_bp(
         _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
         _bp = lambda s: back_project_3d(s, euler_zyz_deg, Nz=Nz, num_threads=num_threads)
     else:
-        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
-        _bp = lambda s: back_project(s, angles_deg, Nz=Nz)
+        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
+        _bp = lambda s: back_project(s, angles_deg, Nz=Nz, num_threads=num_threads)
     return _fp, _bp, _internal_proj
 
 
@@ -1153,18 +1220,21 @@ def run_fista(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 50,
+    *,
     Nz: int = -1,
     positivity: bool = False,
     mask: bool = False,
+    support_mask: torch.Tensor | None = None,
     euler_zyz_deg: torch.Tensor | None = None,
-    return_loss: bool = False,
     n_power_iter: int = 10,
     L: float | None = None,
-    num_threads: int | None = None,
     projector: object | None = None,
-    volume: torch.Tensor | None = None,
+    warm_start: torch.Tensor | None = None,
+    num_threads: int | None = None,
+    return_loss: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
+    **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA (Beck & Teboulle 2009) on the smooth least-squares problem
@@ -1206,10 +1276,12 @@ def run_fista(
     ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
     ``t_k`` changes every iteration.
     """
+    warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_fista")
+    _reject_unknown_kwargs(deprecated, "run_fista")
     setup = _prepare_recon(
         "run_fista", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
-        positivity=positivity, mask=mask,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -1234,22 +1306,25 @@ def run_fista(
 def run_fista_tv(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
-    tv_weight: float,
     n_iter: int = 50,
+    *,
+    tv_weight: float,
     Nz: int = -1,
     positivity: bool = False,
     mask: bool = False,
+    support_mask: torch.Tensor | None = None,
     euler_zyz_deg: torch.Tensor | None = None,
-    return_loss: bool = False,
     n_power_iter: int = 10,
     L: float | None = None,
     tv_inner_iter: int = 20,
     tv_inner: str = "fgp",
-    num_threads: int | None = None,
     projector: object | None = None,
-    volume: torch.Tensor | None = None,
+    warm_start: torch.Tensor | None = None,
+    num_threads: int | None = None,
+    return_loss: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
+    **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA-TV (Beck & Teboulle 2009 + 2009b) on the composite problem
@@ -1276,6 +1351,8 @@ def run_fista_tv(
     Returns same shape/format as :func:`run_fista`. Loss history records
     ``||b − A·y_k||²``, *not* the composite objective.
     """
+    warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_fista_tv")
+    _reject_unknown_kwargs(deprecated, "run_fista_tv")
     if tv_weight <= 0.0:
         raise ValueError(
             f"run_fista_tv requires tv_weight > 0 (got {tv_weight}). "
@@ -1284,8 +1361,8 @@ def run_fista_tv(
 
     setup = _prepare_recon(
         "run_fista_tv", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
-        positivity=positivity, mask=mask,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -1313,18 +1390,21 @@ def run_sart(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 5,
+    *,
     subset_size: int = 1,
     omega: float = 1.0,
     Nz: int = -1,
     positivity: bool = False,
     mask: bool = False,
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
-    return_loss: bool = False,
+    support_mask: torch.Tensor | None = None,
     sparsity: float = 0.0,
-    num_threads: int | None = None,             # CPU 3D path only
-    volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
+    warm_start: torch.Tensor | None = None,     # [Ny, Nz, Nx]; its dtype must match the sinogram
+    num_threads: int | None = None,             # CPU paths
+    return_loss: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
+    **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
@@ -1369,11 +1449,14 @@ def run_sart(
 
     Returns volume [Ny, Nz, Nx].
     """
+    warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sart")
+    _reject_unknown_kwargs(deprecated, "run_sart")
     setup = _prepare_recon(
         "run_sart", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        allowed_dtypes=(torch.float32, torch.float16), warm_start=volume,
-        positivity=positivity, mask=mask, sparsity=sparsity,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
     )
+    subset_size = _as_int(subset_size, "subset_size", "run_sart", minimum=None)
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
@@ -1392,13 +1475,13 @@ def run_sart(
             return forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
     else:
         def _fp_subset(v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            return forward_project(v, angles_deg[idx], N_det=N_det)
+            return forward_project(v, angles_deg[idx], N_det=N_det, num_threads=num_threads)
 
         def _bp_subset(s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            return back_project(s, angles_deg[idx], Nz=Nz)
+            return back_project(s, angles_deg[idx], Nz=Nz, num_threads=num_threads)
 
         def _fp_full(v: torch.Tensor) -> torch.Tensor:
-            return forward_project(v, angles_deg, N_det=N_det)
+            return forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
 
     # Build subsets: list of index tensors
     clamp = max(1, min(subset_size, n_angles))
@@ -1446,11 +1529,13 @@ def run_sart(
 def run_ad_recon(
     sinogram: torch.Tensor,            # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,          # [n_angles] degrees
+    n_iter: int | None = None,         # None: config.optim.n_iter
     *,
     Nz: int = -1,
-    projector: object | None = None,
     config: AdReconConfig | None = None,
     support_mask: torch.Tensor | None = None,
+    projector: object | None = None,
+    warm_start: torch.Tensor | None = None,
     return_loss: bool = False,
     return_pose: bool = False,
     loss_callback: Callable | None = None,
@@ -1581,8 +1666,10 @@ def run_ad_recon(
         support_mask = _mask_cfg
 
     setup = _prepare_recon(
-        "run_ad_recon", sinogram, angles_deg, Nz=Nz, n_iter=optim_cfg.n_iter,
-        require_cuda=True, mask=_mask_cfg is True, support_mask=support_mask,
+        "run_ad_recon", sinogram, angles_deg, Nz=Nz,
+        n_iter=optim_cfg.n_iter if n_iter is None else n_iter,
+        require_cuda=True, warm_start=warm_start,
+        mask=_mask_cfg is True, support_mask=support_mask,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -1703,7 +1790,7 @@ def run_ad_recon(
 
         # forward project
         if refine_pose and tilt_angle_opt is not None:
-            mats = _euler_zyz_to_rotmat(tilt_angle_opt)
+            mats = euler_zyz_to_rotmat(tilt_angle_opt)
             pred = _proj.forward(volume, mats)  # type: ignore[arg-type]
         else:
             pred = _proj.forward(volume)  # type: ignore[arg-type]
@@ -2033,15 +2120,18 @@ def _genfire_hermitian_sym(
 def run_genfire(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
-    Nz: int = -1,
+    *,
     n_iter: int = 100,
+    Nz: int = -1,
+    positivity: bool = True,
+    mask: bool | None = None,
+    support_mask: torch.Tensor | None = None,
+    sparsity: float = 0.0,
     oversampling_ratio: float = 2.0,
     cutoff_dist: float = 0.5,
-    positivity: bool = True,
-    mask: bool = True,
     resolution_extension: bool = True,
+    warm_start: torch.Tensor | None = None,
     return_loss: bool = False,
-    sparsity: float = 0.0,
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2068,11 +2158,16 @@ def run_genfire(
     fp32 only — the GENFIRE gridding kernel (`csrc/cuda/genfire.cu`) has no
     half-precision path. Cast your sinogram to ``torch.float32`` first.
     """
+    # mask=None: the cylinder unless a support_mask is given (the default
+    # stays the historical mask=True for calls without support_mask).
+    if mask is None:
+        mask = support_mask is None
     # Validation only (frozen algorithm): GENFIRE builds its support and
     # constraints on the oversampled grid below.
     setup = _prepare_recon(
         "run_genfire", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        init_volume=False, sparsity=sparsity,
+        init_volume=False, warm_start=warm_start, mask=mask,
+        support_mask=support_mask, sparsity=sparsity,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -2152,13 +2247,20 @@ def run_genfire(
     ).bool()                                         # [bigN, bigN]
 
     # ── real-space support mask ─────────────────────────────────────────────
-    support = sinogram.new_zeros(bigN, bigN)
     z0 = (bigN - Nz) // 2;  z1 = z0 + Nz
     x0 = (bigN - Nx) // 2;  x1 = x0 + Nx
-    support[z0:z1, x0:x1] = (
-        cylindrical_mask(Nz, Nx, device=device) if mask
-        else sinogram.new_ones(Nz, Nx)
-    )
+    if support_mask is not None:
+        # [1|Ny, Nz, Nx] support, zero on the oversampling margin
+        user_support = setup.constraints.mask
+        support = sinogram.new_zeros(user_support.shape[0], bigN, bigN)
+        support[:, z0:z1, x0:x1] = user_support
+    else:
+        support = sinogram.new_zeros(bigN, bigN)
+        support[z0:z1, x0:x1] = (
+            cylindrical_mask(Nz, Nx, device=device) if mask
+            else sinogram.new_ones(Nz, Nx)
+        )
+        support = support.unsqueeze(0)
 
     # ── resolution extension/suppression schedule ───────────────────────────
     cutoffs: np.ndarray = np.zeros(n_iter, dtype=np.float32)
@@ -2182,9 +2284,18 @@ def run_genfire(
 
     # ── iteration ───────────────────────────────────────────────────────────
     _inner_constraints = ConstraintConfig(
-        positivity=positivity, mask=support.unsqueeze(0), sparsity=sparsity,
+        positivity=positivity, mask=support, sparsity=sparsity,
     )
     current_F = measured_K.clone()
+    if setup.volume0 is not None:
+        # Warm start: the Fourier transform of the given volume (embedded in
+        # the oversampled grid) with the measured values on the known grid
+        # points, so the first real-space iterate is the data-consistent
+        # version of warm_start instead of the zero-filled data.
+        v0 = sinogram.new_zeros(Ny, bigN, bigN)
+        v0[:, z0:z1, x0:x1] = setup.volume0
+        current_F = torch.fft.fftn(torch.fft.ifftshift(v0, dim=(-2, -1)), dim=(-2, -1))
+        current_F[:, known_us] = measured_K[:, known_us]
     best_F = current_F
     best_err = float("inf")
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_genfire")
@@ -2236,13 +2347,17 @@ def run_wsirt(
     sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,       # [n_angles] degrees
     n_iter: int = 50,
+    *,
     omega: float = 1.0,
     Nz: int = -1,
     positivity: bool = False,
-    threshold_scale: float = 1.0,
     mask: bool = False,
-    return_loss: bool = False,
+    support_mask: torch.Tensor | None = None,
     sparsity: float = 0.0,
+    threshold_scale: float = 1.0,
+    warm_start: torch.Tensor | None = None,
+    num_threads: int | None = None,
+    return_loss: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2269,8 +2384,8 @@ def run_wsirt(
     Cast your sinogram to ``torch.float32`` first.
     """
     setup = _prepare_recon(
-        "run_wsirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        positivity=positivity, mask=mask, sparsity=sparsity,
+        "run_wsirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter, warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -2283,7 +2398,7 @@ def run_wsirt(
 
     def _wbp(sino: torch.Tensor) -> torch.Tensor:
         """W-BP: back-project then apply exact WF in Fourier space."""
-        lg = back_project(sino, angles_deg, Nz=Nz)  # [Ny, Nz, Nx]
+        lg = back_project(sino, angles_deg, Nz=Nz, num_threads=num_threads)  # [Ny, Nz, Nx]
         out = torch.empty_like(lg)
         for iy in range(Ny):
             F  = torch.fft.rfft2(lg[iy])
@@ -2294,7 +2409,7 @@ def run_wsirt(
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_wsirt")
 
     for it in rec.iterate(n_iter):
-        proj     = forward_project(volume, angles_deg, N_det=N_det)
+        proj     = forward_project(volume, angles_deg, N_det=N_det, num_threads=num_threads)
         residual = sinogram - proj
         if rec.wants_loss:
             rec.record(it, residual.pow(2).mean())
@@ -2308,10 +2423,11 @@ def refine_angles(
     volume: torch.Tensor,                       # [Ny, Nz, Nx]
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor | None = None,     # [n_angles] — single-axis mode
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — ZYZ mode (CUDA)
+    *,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — ZYZ mode
     search_range_deg: float = 3.0,
     n_steps: int = 31,
-    num_threads: int | None = None,             # CPU 3D path only
+    num_threads: int | None = None,             # CPU paths
 ) -> torch.Tensor:
     """
     RESIRE angular refinement — brute-force grid search per projection.
@@ -2356,7 +2472,8 @@ def refine_angles(
                 theta_j + search_range_deg,
                 n_steps,
             )
-            projs = forward_project(volume, candidates.to(sinogram.device), N_det=N_det)
+            projs = forward_project(volume, candidates.to(sinogram.device), N_det=N_det,
+                                    num_threads=num_threads)
             measured_j = sinogram[j]
             residuals  = (projs - measured_j.unsqueeze(0)).abs().sum(dim=(-2, -1))
             r_factors  = residuals / (measured_j.abs().sum().clamp(min=1e-12))
@@ -2406,16 +2523,19 @@ def run_resire(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     n_iter: int = 100,
+    *,
     step_size: float = 1.0,
     Nz: int = -1,
     positivity: bool = True,
     mask: bool = False,
-    support: torch.Tensor | None = None,        # [Ny, Nz, Nx] or [1, Nz, Nx] float mask
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — overrides angles_deg
-    return_loss: bool = False,
+    support_mask: torch.Tensor | None = None,   # [Nz, Nx], [1, Nz, Nx] or [Ny, Nz, Nx]
     sparsity: float = 0.0,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — overrides angles_deg
+    warm_start: torch.Tensor | None = None,
+    return_loss: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
+    **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     REal Space Iterative REconstruction (RESIRE, Miao group).  CUDA only.
@@ -2448,9 +2568,13 @@ def run_resire(
 
     Returns volume [Ny, Nz, Nx].
     """
+    support_mask = _deprecated_kwarg(deprecated, "support", "support_mask",
+                                     support_mask, "run_resire")
+    _reject_unknown_kwargs(deprecated, "run_resire")
     setup = _prepare_recon(
         "run_resire", sinogram, angles_deg, Nz=Nz, n_iter=n_iter, require_cuda=True,
-        positivity=positivity, mask=mask, support_mask=support, sparsity=sparsity,
+        warm_start=warm_start, positivity=positivity, mask=mask,
+        support_mask=support_mask, sparsity=sparsity,
     )
     n_angles, Ny, N_det, Nz, Nx = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
@@ -2492,17 +2616,20 @@ def run_grad_descent(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor | None = None,     # [n_angles] — single-axis
     n_iter: int = 200,
+    *,
     lr: float = 1e-2,
     Nz: int = -1,
-    optimizer_cls=torch.optim.Adam,
+    optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
     positivity: bool = False,
     mask: bool = False,
+    support_mask: torch.Tensor | None = None,
     tv_weight: float = 0.0,
-    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — 3D mode (CUDA)
-    use_resire_projector: bool = False,
-    return_loss: bool = False,
-    num_threads: int | None = None,             # CPU 3D path only
     tv_eps: float = 1e-8,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — 3D mode
+    use_resire_projector: bool = False,
+    warm_start: torch.Tensor | None = None,
+    num_threads: int | None = None,             # CPU paths
+    return_loss: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2564,7 +2691,7 @@ def run_grad_descent(
 
     setup = _prepare_recon(
         "run_grad_descent", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        positivity=positivity, mask=mask,
+        warm_start=warm_start, positivity=positivity, mask=mask, support_mask=support_mask,
     )
     n_angles, Ny, N_det, Nz, Nx = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
@@ -2579,7 +2706,7 @@ def run_grad_descent(
         else:
             _fp = lambda v: forward_project_3d(v, euler_zyz_deg, N_det=N_det, num_threads=num_threads)
     else:
-        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
+        _fp = lambda v: forward_project(v, angles_deg, N_det=N_det, num_threads=num_threads)
 
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_grad_descent")
@@ -2637,7 +2764,7 @@ class _MbirState:
     volume: torch.Tensor          # [Ny, Nz, Nx] float32
     d_offsets: torch.Tensor       # [n_angles] float32
     sigma: float
-    e_sino: torch.Tensor          # [n_angles, Ny, N_det] float32 — residual
+    e_sino: torch.Tensor | None   # [n_angles, Ny, N_det] float32 — residual (None: not yet computed)
     n_done: int = 0               # outer iterations run at this scale
 
 
@@ -2731,6 +2858,7 @@ def _mbir_initial_residual(
     sinogram: torch.Tensor,
     cos_a: torch.Tensor,
     sin_a: torch.Tensor,
+    num_threads: int = 1,
 ) -> torch.Tensor:
     """e = g - A_MBIR · f at the start of an MBIR level. Uses the voxel-
     driven scatter FP that matches the column-A model in the ICD kernel.
@@ -2747,7 +2875,7 @@ def _mbir_initial_residual(
             vol, Af, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("volume", (Ny, Nz, Nx)), ("Af", (n_angles, Ny, N_det)),
                     ("cos", (n_angles,)), ("sin", (n_angles,))],
-            num_threads=4)
+            num_threads=num_threads)
     return sinogram - Af
 
 
@@ -2827,6 +2955,7 @@ def _run_mbir_single_scale(
     return_history: bool,
     rec: _LossRecorder,
     it_offset: int = 0,
+    num_threads: int = 1,
 ) -> tuple[_MbirState, list[float]]:
     """Inner loop for one resolution scale. The public `run_mbir` wraps
     this in a coarse-to-fine multiresolution loop.
@@ -2854,7 +2983,7 @@ def _run_mbir_single_scale(
 
     # Residual e = g - A·f - d. d is rolled into A·f via the offset
     # term (we maintain e ≡ g - A·f - d, so initial e adjusts for both).
-    e_sino = _mbir_initial_residual(volume, sinogram, cos_a, sin_a).contiguous()
+    e_sino = _mbir_initial_residual(volume, sinogram, cos_a, sin_a, num_threads).contiguous()
     if d_offsets.abs().sum().item() > 0.0:
         e_sino.sub_(d_offsets.view(n_angles, 1, 1))
 
@@ -2896,7 +3025,7 @@ def _run_mbir_single_scale(
                 vol_snap, torch.from_numpy(perm), cos_a, sin_a,
                 qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
                 sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
-                sigma=sigma_cur, num_threads=4,
+                sigma=sigma_cur, num_threads=num_threads,
             )
         # Closed-form updates for d_k and σ: one implementation, both backends.
         d_offsets, sigma_cur = _mbir_update_offset_variance(
@@ -2956,6 +3085,7 @@ def _resize_volume_zx(vol: torch.Tensor, target_nz: int, target_nx: int) -> torc
 def run_mbir(
     sinogram: torch.Tensor,           # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,         # [n_angles] degrees
+    n_iter: int = 100,                # max outer iterations per scale
     *,
     Nz: int = -1,
     sigma_f: float = 1.0,
@@ -2969,14 +3099,17 @@ def run_mbir(
     sigma_init: float | None = None,
     sigma_min: float | None = None,
     multires_levels: int = 1,
-    outer_iters: int = 100,
     convergence_tol: float = 1e-4,
     seed: int = 0,
     lambdas: torch.Tensor | None = None,
     sigma_f_per_scale: list[float] | None = None,
-    return_history: bool = False,
+    warm_start: torch.Tensor | None = None,
+    num_threads: int | None = None,
+    return_loss: bool = False,
+    return_state: bool = False,
     loss_callback: Callable | None = None,
     progress: bool = False,
+    **deprecated: Any,
 ) -> torch.Tensor | tuple:
     """Classical MBIR (Model-Based Iterative Reconstruction) for single-axis
     parallel-beam tomography.
@@ -3020,16 +3153,34 @@ def run_mbir(
     volume : [Ny, Nz, Nx] float32 tensor.
     If `return_history=True`, also returns (d_offsets, sigma, history).
     """
+    n_iter = _deprecated_kwarg(deprecated, "outer_iters", "n_iter", n_iter, "run_mbir",
+                               default=100)
+    return_history = deprecated.pop("return_history", False)
+    _reject_unknown_kwargs(deprecated, "run_mbir")
+    if return_history:
+        if return_loss or return_state:
+            raise TypeError(
+                "run_mbir: return_history (deprecated) cannot be combined with "
+                "return_loss or return_state."
+            )
+        warnings.warn(
+            "run_mbir: return_history is deprecated; use return_loss=True for the "
+            "loss history and return_state=True for (d_offsets, sigma). It will "
+            "be removed in the next release.",
+            DeprecationWarning, stacklevel=2,
+        )
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
     # fp32 only, like every other fp32 algorithm: other dtypes raise instead
     # of being cast silently. The ICD kernels are fp32-only.
     setup = _prepare_recon(
-        "run_mbir", sinogram, angles_deg, Nz=Nz, n_iter=outer_iters, init_volume=False,
+        "run_mbir", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        init_volume=False, warm_start=warm_start,
     )
     n_angles, Ny, N_det, Nz, Nx = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
-    outer_iters = setup.n_iter
+    n_iter = setup.n_iter
+    nt = _resolve_num_threads(num_threads)
     multires_levels = _as_int(multires_levels, "multires_levels", "run_mbir", minimum=1)
     angles_deg = angles_deg.float()
     # A NaN/inf pixel would otherwise surface as "sigma_init must be finite"
@@ -3092,8 +3243,16 @@ def run_mbir(
 
     history_all: list[list[float]] = []
     state: _MbirState | None = None
-    rec = _LossRecorder(False, loss_callback, progress,
-                        outer_iters * multires_levels, desc="run_mbir")
+    if setup.volume0 is not None:
+        # warm start: resized to the coarsest grid; offsets start at zero
+        state = _MbirState(
+            volume=_resize_volume_zx(setup.volume0, max(Nz // coarse_factor, 1),
+                                     max(Nx // coarse_factor, 1)),
+            d_offsets=torch.zeros(n_angles, device=sinogram.device, dtype=torch.float32),
+            sigma=float(sigma_init), e_sino=None,
+        )
+    rec = _LossRecorder(return_loss, loss_callback, progress,
+                        n_iter * multires_levels, desc="run_mbir")
     it_offset = 0
 
     for lvl, f in enumerate(factors):
@@ -3118,7 +3277,7 @@ def run_mbir(
         # Carry d_offsets across scales unchanged; re-initialize σ from
         # the current sinogram's std (intensity statistics shift with
         # the detector binning).
-        if state is None:
+        if lvl == 0:
             level_sigma = sigma_init
         else:
             level_sigma = max(sigma_min, float(sino_lvl.std().item()))
@@ -3132,14 +3291,14 @@ def run_mbir(
             sigma=level_sigma, sigma_min=sigma_min,
             estimate_offset=estimate_offset,
             estimate_variance=estimate_variance,
-            outer_iters=outer_iters,
+            outer_iters=n_iter,
             convergence_tol=convergence_tol,
             seed=seed + lvl,
             Nz=Nz_lvl, Nx=Nx_lvl,
             init_state=state,
             lambdas=lam_lvl,
             return_history=return_history,
-            rec=rec, it_offset=it_offset,
+            rec=rec, it_offset=it_offset, num_threads=nt,
         )
         history_all.append(hist)
         it_offset += state.n_done
@@ -3156,4 +3315,9 @@ def run_mbir(
     rec.close()
     if return_history:
         return state.volume, state.d_offsets, state.sigma, history_all
-    return state.volume
+    result: list = [state.volume]
+    if return_loss:
+        result.append(rec.history())
+    if return_state:
+        result += [state.d_offsets, state.sigma]
+    return result[0] if len(result) == 1 else tuple(result)
