@@ -46,6 +46,7 @@ from fasttomo.regularizers import _first_order_only
 from fasttomo._backend import (  # noqa: F401
     _assert_cuda,
     _assert_dtype_match,
+    _check_finite_geometry,
     _check_fp16_range,
     _check_shapes,
     _data_ptr,
@@ -112,8 +113,13 @@ _euler_zyz_to_rotmat = euler_zyz_to_rotmat
 
 def _trig_on_device(angles_deg: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """Cos/sin of `angles_deg` (degrees) computed on `device`. Always
-    contiguous float32. The same tables feed the CPU and the CUDA kernels."""
-    a = angles_deg.detach().reshape(-1).to(device=device, dtype=torch.float32) * (math.pi / 180.0)
+    contiguous float32. The same tables feed the CPU and the CUDA kernels.
+    Raises ValueError for a NaN or Inf angle held on the host (the angles as
+    given, or as moved to a CPU ``device``); see `_check_finite_geometry`."""
+    src = angles_deg.detach().reshape(-1)
+    a = src.to(device=device, dtype=torch.float32)
+    _check_finite_geometry(src if a.is_cuda else a, "angles_deg")
+    a = a * (math.pi / 180.0)
     return torch.cos(a).contiguous(), torch.sin(a).contiguous()
 
 
@@ -138,7 +144,10 @@ def _mats_input(mats_flat: torch.Tensor, device: torch.device) -> torch.Tensor:
     if tuple(mats_flat.shape[1:]) not in ((9,), (3, 3)):
         raise ValueError("rotation matrices must have shape [n_angles, 9] or "
                          f"[n_angles, 3, 3], got {tuple(mats_flat.shape)}")
-    return mats_flat.detach().reshape(-1, 9).to(device=device, dtype=torch.float32).contiguous()
+    src = mats_flat.detach().reshape(-1, 9)
+    mats = src.to(device=device, dtype=torch.float32).contiguous()
+    _check_finite_geometry(src if mats.is_cuda else mats, "rotation matrices")
+    return mats
 
 
 def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = None,

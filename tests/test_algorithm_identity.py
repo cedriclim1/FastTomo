@@ -31,6 +31,12 @@ are deterministic now, so all but ``cuda/fp3d_shift_grad_euler`` (its
 detector shifts go through ``grid_sample``, whose CUDA backward uses
 atomics) left ``ATOMIC_KEYS`` for the exact comparison.
 
+Exception (phase 1b, CPU kernels): ``cpu/fbp``, ``cpu/fbp_h`` and
+``cpu/fbp_mask`` were regenerated when CPU ``run_fbp`` switched from the
+ray-driven to the gather back-projection, and ``cpu/fp_grad_angles`` when
+the CPU ``grad_angle`` kernel moved to fixed-order fp64 sums (2.5e-7 of
+0.23). ``tests/data/regenerate_golden_keys.py`` replaced only those keys.
+
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
 

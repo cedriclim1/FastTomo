@@ -536,11 +536,13 @@ def test_rotmat_bp_chunked_matrices_single_view_exact(shape, N_det, n):
 
 @pytest.mark.parametrize("Ny,Nz,Nx,Nd,n_ang", [
     (2, 12, 12, 12, 7), (3, 9, 14, 11, 7), (1, 16, 10, 20, 7), (4, 40, 40, 32, 61),
-    (5, 33, 40, 29, 13), (1, 1, 1, 1, 1), (2, 7, 5, 3, 4)])
+    (5, 33, 40, 29, 13), (1, 1, 1, 1, 1), (2, 7, 5, 3, 4),
+    # Y-batched path (FT_YB = 16 slices per block): full + partial blocks
+    (16, 9, 11, 13, 5), (17, 10, 12, 9, 6), (35, 8, 9, 14, 5)])
 def test_cpu_gather_back_projection_is_bp_gather_bit_for_bit(Ny, Nz, Nx, Nd, n_ang):
     """The C/OpenMP kernel the CPU W-BP uses is `_bp_gather` bit for bit
     (same fp32 arithmetic and order, no FMA), for grids wider and narrower
-    than the detector and any thread count."""
+    than the detector, Ny across the Y-block size and any thread count."""
     from fasttomo.algorithms.analytic import _bp_gather
     from fasttomo.autograd import _back_project_gather_parallel_raw
     g = torch.Generator().manual_seed(Ny * 1000 + Nz * 10 + Nd)

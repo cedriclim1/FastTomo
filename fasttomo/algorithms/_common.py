@@ -23,7 +23,7 @@ from typing import Any, Callable
 import torch
 from tqdm.auto import tqdm
 
-from fasttomo._backend import _assert_dtype_match
+from fasttomo._backend import _assert_dtype_match, _check_finite_geometry
 from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.constraints import (
@@ -236,7 +236,8 @@ def _check_inputs(
         TypeError     if sinogram is not a tensor or its dtype is not in
                       allowed_dtypes.
         ValueError    if sinogram is not 3-D, angles_deg is not 1-D,
-                      or sinogram.shape[0] != len(angles_deg).
+                      sinogram.shape[0] != len(angles_deg), or host-side
+                      angles_deg holds a NaN or Inf.
     """
     if not isinstance(sinogram, torch.Tensor):
         raise TypeError(
@@ -278,6 +279,7 @@ def _check_inputs(
                 f"{op_name}: sinogram has {n_angles} projections but "
                 f"angles_deg has {len(angles_deg)} entries."
             )
+        _check_finite_geometry(angles_deg, f"{op_name}: angles_deg")   # host angles only
 
     Nz_resolved = N_det if Nz < 0 else Nz
     return n_angles, Ny, N_det, Nz_resolved, sinogram.device

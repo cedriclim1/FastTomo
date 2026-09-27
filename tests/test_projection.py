@@ -226,6 +226,14 @@ def test_fp3d_default_is_serial(monkeypatch):
     monkeypatch.setenv("OMP_NUM_THREADS", "8")
     assert _resolve_num_threads(None) == 8
     assert _resolve_num_threads(2) == 2   # explicit kwarg wins over env
+    # OpenMP list syntax (one count per nesting level): the outer level
+    monkeypatch.setenv("OMP_NUM_THREADS", "4,2")
+    assert _resolve_num_threads(None) == 4
+    monkeypatch.setenv("OMP_NUM_THREADS", " 6 ")
+    assert _resolve_num_threads(None) == 6
+    monkeypatch.setenv("OMP_NUM_THREADS", "many")
+    with pytest.warns(RuntimeWarning, match="OMP_NUM_THREADS"):
+        assert _resolve_num_threads(None) == 1
 
 
 # ── N_det != Nx and zero-size inputs ──────────────────────────────────────────

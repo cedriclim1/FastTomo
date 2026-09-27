@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import functools
 import os
+import warnings
 
 import torch
 
@@ -53,26 +54,65 @@ def _assert_dtype_match(a: torch.Tensor, b: torch.Tensor,
         )
 
 
+def _check_finite_geometry(t: torch.Tensor, what: str) -> None:
+    """Raise ValueError if the host tensor ``t`` (tilt angles or rotation
+    matrices) holds a NaN or an Inf.
+
+    A non-finite angle used to crash the process on CPU: the parallel
+    kernels turned the NaN sample coordinate into the index ``(int)NaN``
+    (INT_MIN on x86) and the back-projection wrote there. The kernels now
+    skip NaN samples as well, but a NaN geometry has no meaningful
+    projection, so the Python entry points refuse it. The check is one
+    reduction over ``n_angles`` values on the host; CUDA-resident tensors are
+    skipped, because reading the result back would add a stream sync to
+    every CUDA projection. The CUDA kernels do not crash on such angles, but
+    their results are wrong: the forward and back-projection sample the
+    texture at NaN coordinates and return finite wrong values for that view
+    (grad_angle returns NaN). The NaN-safe predicate for the CUDA kernels is
+    PR B's."""
+    if t.is_cuda:
+        return
+    if not bool(torch.isfinite(t).all()):
+        raise ValueError(f"{what} must be finite; got NaN or Inf in {tuple(t.shape)} values")
+
+
 # ── thread-count resolution ──────────────────────────────────────────────────
 #
-# Resolution order for the CPU 3D rotmat kernels:
+# Resolution order for every CPU (C/OpenMP) kernel:
 #   1. Explicit num_threads kwarg on the Python call
-#   2. OMP_NUM_THREADS environment variable
+#   2. OMP_NUM_THREADS environment variable (its first entry: OpenMP accepts
+#      a comma-separated list, one count per nesting level, e.g. "8,2")
 #   3. 1 (serial)
 #
 # Step 3 is deliberate — OpenMP's stock default of `omp_get_max_threads()`
 # (≈ all cores) would silently parallelize when the user didn't ask. The
 # library defaults to predictable serial execution; the caller opts in.
+#
+# Thread pools: the kernels' OpenMP threads and torch's intra-op threads
+# (the elementwise updates between the projections of a CPU solver loop)
+# come from the same libgomp runtime. torch defaults to every core, the
+# kernels to 1, and mismatched counts oversubscribe the cores: CPU run_sirt
+# at 8x128^2 x 61 views on 16 pinned cores took 1.7 ms/iter with
+# torch.set_num_threads(16) and num_threads=16, but 20.8 ms/iter with torch
+# at its default 128 threads (main before the phase-1b kernels: 9.8 vs 24.3;
+# the phase-1b audit measured 7.3 vs 59.6 on a loaded box). For CPU solver
+# loops and benchmarks set both to the same count (torch.set_num_threads(n),
+# num_threads=n or OMP_NUM_THREADS=n), pin the process (taskset,
+# OMP_PROC_BIND=close) and record n.
 
 def _resolve_num_threads(num_threads: int | None) -> int:
     if num_threads is not None:
         return max(1, int(num_threads))
     env = os.environ.get("OMP_NUM_THREADS")
     if env is not None and env.strip():
+        first = env.split(",")[0].strip()
         try:
-            return max(1, int(env))
+            return max(1, int(first))
         except ValueError:
-            pass
+            warnings.warn(
+                f"OMP_NUM_THREADS={env!r} is not a thread count (or a comma-separated "
+                "list of them); the FastTomo CPU kernels run on 1 thread. Pass "
+                "num_threads= to choose.", RuntimeWarning, stacklevel=2)
     return 1
 
 

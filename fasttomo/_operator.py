@@ -55,6 +55,7 @@ from fasttomo._backend import (
     _TC_SINO_LAYERED,
     _TC_VOL_3D,
     _TC_VOL_LAYERED,
+    _check_finite_geometry,
     _check_fp16_range,
     _dtype_to_tc_code,
     _io_dtype_code,
@@ -356,6 +357,7 @@ class CudaCachedOperator(ProjectionOperator):
         self._last_stream = cur
 
     def _default_trig(self, angles_deg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        _check_finite_geometry(angles_deg, "angles_deg")     # host angles only
         a_rad = angles_deg.to(device=self.device, dtype=torch.float32) * (math.pi / 180.0)
         return a_rad.cos().contiguous(), a_rad.sin().contiguous()
 
@@ -470,8 +472,9 @@ class CudaCachedOperator(ProjectionOperator):
     def _trig(self, geom):
         if geom is None and self._cos is not None:
             return self._cos, self._sin
-        a = self._angles(geom)
-        a = a.detach().reshape(-1).to(device=self.device, dtype=torch.float32) * (math.pi / 180.0)
+        a = self._angles(geom).detach().reshape(-1)
+        _check_finite_geometry(a, "angles_deg")               # host angles only
+        a = a.to(device=self.device, dtype=torch.float32) * (math.pi / 180.0)
         return torch.cos(a).contiguous(), torch.sin(a).contiguous()
 
     def _mats(self, geom) -> torch.Tensor:

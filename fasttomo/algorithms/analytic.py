@@ -11,8 +11,9 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from fasttomo._operator import Geometry, _make_operator
-from fasttomo.autograd import _back_project_gather_parallel_raw
+from fasttomo._backend import _check_fp16_range
+from fasttomo._operator import Geometry, UncachedOperator, _make_operator
+from fasttomo.autograd import _back_project_gather_parallel_raw, _forward_project_parallel_raw
 from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
@@ -120,6 +121,44 @@ def _wbp_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor,
     return _back_project_gather_parallel_raw(sinogram, angles_deg, Nz, Nx, num_threads)
 
 
+class _GatherBackProject(torch.autograd.Function):
+    """CPU FBP back-projection: the C gather kernel forward (shift-invariant,
+    the CUDA back-projection's operator with exact weights), and the CPU
+    forward projector as its backward, the same pairing as the CUDA
+    ``back_project`` (a gather whose backward is the ray-marching forward).
+    ``run_fbp`` stays differentiable w.r.t. the sinogram, but its gradient is
+    now approximate: the ray forward is not the exact adjoint of the gather
+    (relative inner-product gap 2-5e-2 on positive uniform-random data at
+    32^2 x 31 and 64^2 x 61 views, 0.3-1.3 on zero-mean random data: the
+    gap is at high frequencies), where the old ray-driven CPU
+    back-projection was the exact transpose of the CPU forward (gap 5e-9). CUDA has the same mismatched pairing. The
+    MBIR splat forward is the gather's exact adjoint, if an exact gradient
+    is ever needed. Returns fp32."""
+
+    @staticmethod
+    def forward(ctx, sinogram, angles_deg, Nz, Nx, num_threads):
+        ctx.angles_deg, ctx.N_det, ctx.num_threads = angles_deg, sinogram.shape[2], num_threads
+        return _back_project_gather_parallel_raw(sinogram, angles_deg, Nz, Nx, num_threads)
+
+    @staticmethod
+    def backward(ctx, grad):
+        g = _forward_project_parallel_raw(grad, ctx.angles_deg, ctx.N_det, ctx.num_threads)
+        return g, None, None, None, None
+
+
+def _fbp_gather_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor, Nz: int,
+                            Nx: int, num_threads: int | None) -> torch.Tensor:
+    """`_GatherBackProject` in the sinogram's dtype. fp16 (computed in fp32
+    like every CPU kernel) is checked like an fp16 projection: a result
+    beyond the fp16 range raises OverflowError, which `run_fbp` catches to
+    pre-scale."""
+    out = _GatherBackProject.apply(sinogram, angles_deg, Nz, Nx, num_threads)
+    if sinogram.dtype == torch.float16:
+        out = out.to(torch.float16)
+        _check_fp16_range(out, sinogram, "run_fbp")
+    return out
+
+
 def _compute_exact_wf(
     angles_deg: torch.Tensor,   # [n_angles] degrees
     Nz: int, Nx: int,
@@ -211,7 +250,8 @@ def run_fbp(
 ) -> torch.Tensor:
     """Filtered back-projection.
 
-    Ramp-filters every detector row, back-projects and scales by
+    Ramp-filters every detector row, back-projects with the voxel-driven
+    (gather, shift-invariant) back-projection on both backends and scales by
     ``pi / n_angles`` (fp16: if the unscaled back-projection would exceed
     the fp16 range, the filtered sinogram is scaled in fp32 before its cast
     to fp16 instead, so it stays in range whenever the result does).
@@ -265,8 +305,22 @@ def run_fbp(
     op = _make_operator(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
         device, sinogram.dtype, projector, cached=False, num_threads=num_threads)
+    backproject = op.backproject
+    # CPU (own operator or a CPU ParallelProjector): the shift-invariant
+    # gather, like CUDA and the CPU W-BP, with that operator's geometry and
+    # threads (the CPU operator's ray-driven transpose puts a 2-5 % voxel
+    # pattern on a flat field: 0.5-1.1 % RMS error in a uniform cylinder)
+    cpu_op = op if projector is None else getattr(projector, "_op", None)
+    if (isinstance(cpu_op, UncachedOperator) and cpu_op.kind == "parallel"
+            and cpu_op.device.type == "cpu"):
+        def backproject(s):
+            cpu_op._check_device(s, "sinogram")
+            cpu_op._check_shape(s, "sinogram", cpu_op.sino_shape)
+            cpu_op._lock_dtype(s)
+            return _fbp_gather_backproject(s, cpu_op._angles(None), cpu_op.Nz, cpu_op.Nx,
+                                           cpu_op.num_threads)
     if sinogram.dtype != torch.float16:
-        volume = op.backproject(filtered32) * scale
+        volume = backproject(filtered32) * scale
     else:
         # The back-projection sums n_angles filtered views before the
         # scale, so its fp16 result is n / pi times the answer and can
@@ -277,9 +331,9 @@ def run_fbp(
         # fp16 subnormal range (a density of 1e-4 at 720 views: 8 %
         # error, 1e-5: all lost, against 0.08 % and 0.4 % this way).
         try:
-            volume = op.backproject(filtered32.to(torch.float16)) * scale
+            volume = backproject(filtered32.to(torch.float16)) * scale
         except OverflowError:
-            volume = op.backproject((filtered32 * scale).to(torch.float16))
+            volume = backproject((filtered32 * scale).to(torch.float16))
     if support_mask is not None:
         # Validate against the actual output shape — a cached projector may
         # reconstruct with Nz != N_det.

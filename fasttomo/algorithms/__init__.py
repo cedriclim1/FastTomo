@@ -116,8 +116,16 @@ Constraints order
     ``True`` shows a tqdm progress bar (stderr); off by default.
 
 ``num_threads``
-    OpenMP threads for the CPU kernels: keyword, else ``OMP_NUM_THREADS``,
-    else 1. Ignored on CUDA.
+    OpenMP threads for the CPU kernels: keyword, else ``OMP_NUM_THREADS``
+    (its first entry if it is a list), else 1. Ignored on CUDA. The
+    element-wise updates between the projections run on torch's intra-op
+    threads, which share the OpenMP runtime with the kernels: set both to
+    the same count (``torch.set_num_threads(n)`` and ``num_threads=n``) for
+    CPU solver loops. Mismatched, they oversubscribe the cores: CPU
+    ``run_sirt`` at 8x128^2 x 61 views on 16 cores took 1.7 ms/iter with
+    both at 16 and 20.8 ms/iter with torch at its default of all 128 cores
+    (7.3 vs 59.6 ms/iter in the phase-1b audit, before the Y-batched
+    kernels).
 
 Package layout
 ==============

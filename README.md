@@ -141,7 +141,7 @@ CUDAARCHS=86 pip install -e .                                     # same, via th
 
 `-Ccmake.define.CMAKE_CUDA_ARCHITECTURES` wins over `CUDAARCHS`, and an empty `CUDAARCHS` counts as unset. Note that an **activated conda env with `cuda-nvcc` exports its own `CUDAARCHS`** (`75-real;80-real;...;120-real;121`), which replaces FastTomo's default; `unset CUDAARCHS` before installing to get the default list. The value is cached in the CMake build directory, so wipe a persistent build directory when changing architectures.
 
-**CPU tuning.** C sources are compiled with `-O3` and no `-march=native`, so binaries are portable. For a local build tuned to the build machine's CPU add `-Ccmake.define.FASTTOMO_MARCH_NATIVE=ON`. It changes CPU kernel speed, so CPU benchmarks must record whether it was on (builds before PR #76 always used `-march=native`).
+**CPU tuning.** C sources are compiled with `-O3 -ffp-contract=off` and no `-march=native`, so binaries are portable. For a local build tuned to the build machine's CPU add `-Ccmake.define.FASTTOMO_MARCH_NATIVE=ON`. It changes CPU kernel speed but not the results (no FMA contraction, so the bits match the portable build), so CPU benchmarks must record whether it was on (builds before PR #76 always used `-march=native`).
 
 **After pulling.** Re-run the install command after changing anything in `csrc/`. Editable installs made before `fasttomo/algorithms.py` became the package `fasttomo/algorithms/` (PR #86) must be reinstalled: scikit-build-core's editable finder records module paths at install time, so an old install still points at the deleted file and `import fasttomo` fails. The same applies whenever a module is renamed or turned into a package.
 
