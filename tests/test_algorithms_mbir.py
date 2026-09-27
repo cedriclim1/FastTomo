@@ -635,6 +635,22 @@ def test_mbir_two_levels_converge_to_the_single_level_solution(backend):
     assert abs(early[:, inner].mean().item() / vol[:, inner].mean().item() - 1.0) < 0.05
 
 
+def test_mbir_two_levels_with_variance_estimation_reach_the_single_level_solution(backend):
+    """With estimate_variance=True the 2-level and 1-level runs reach the
+    same fixed point, only slowly (#95 review: 17-22 % apart at 30-150
+    iterations). On this noise-free 32^2 cylinder: 26 / 11 / 1.9 % apart at
+    30 / 300 / 1200 iterations per level, with the same final sigma; the
+    slow part is the joint estimate itself (a single level still moves
+    too), see ``multires_levels`` in run_mbir's docstring."""
+    vol, ang, sino, _ = _mbir_cylinder(backend)
+    kw = dict(n_iter=1200, estimate_offset=False, estimate_variance=True,
+              convergence_tol=0.0, return_state=True, seed=1)
+    one, _, s1 = ft.run_mbir(sino, ang, **kw)
+    two, _, s2 = ft.run_mbir(sino, ang, multires_levels=2, **kw)
+    assert ((two - one).norm() / one.norm()).item() < 0.05
+    assert abs(s2 / s1 - 1.0) < 1e-2
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
 @pytest.mark.parametrize("sigma_init", [None, 0.1])
 def test_mbir_rejects_non_finite_sinogram(backend, bad, sigma_init):

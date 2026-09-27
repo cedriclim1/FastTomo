@@ -47,8 +47,18 @@ finer level only resized the volume, so the fine level started at twice
 the object's level, and a `warm_start` reached the coarse level at half
 its values. Both are now rescaled (`x 0.5` per level, `x coarse_factor`
 for a warm start). Multires results differ slightly from earlier versions
-(they converge to the same solution; the fine level starts 8x closer, data
-MSE 6.8 -> 0.82 on a test cylinder). Single-level runs are unchanged.
+(the fine level starts 8x closer, data MSE 6.8 -> 0.82 on a test cylinder).
+With `estimate_variance=False` they converge to the single-level solution
+(5e-4 relative at 60 iterations per level). With `estimate_variance=True`
+(the default) they reach the same fixed point only slowly, as does a single
+level: 2-level vs 1-level differ by 22 / 17 / 10 / 3.6 / 0.3 % at 30 / 150 /
+600 / 2400 / 9600 iterations per level on a noise-free 64^2 cylinder at
++-70 degrees (30-37 % before this fix at the low counts); with
+`estimate_offset=True` as well, a common offset on every view stays
+unsettled. This was investigated and is a property of the joint
+volume/variance(/offset) estimate on noise-free limited-tilt data, not of
+the level hand-over; see `multires_levels` in the `run_mbir` docstring.
+Single-level runs are unchanged.
 
 ### fp16 overflow raises `OverflowError`
 
