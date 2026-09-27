@@ -143,6 +143,9 @@ def refine_angles(
         return torch.linspace(center - search_range_deg, center + search_range_deg, n_steps)
 
     n_angles = sinogram.shape[0]
+    if n_angles == 0:
+        # nothing to refine: an empty [0] / [0, 3] CPU tensor, as before
+        return (angles_deg if angles_deg is not None else euler_zyz_deg).detach().cpu().clone()
     # No gradients are needed: the search only compares residuals.
     with torch.no_grad():
         # per-view L1 normalisers [n_angles, 1]: each sum reduced exactly as

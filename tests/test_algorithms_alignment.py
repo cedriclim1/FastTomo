@@ -276,6 +276,17 @@ def test_refine_angles_host_syncs_do_not_scale_with_views(mode):
     assert many <= (2 if mode == "single" else 6)
 
 
+def test_refine_angles_zero_views_returns_empty(backend):
+    """No views: an empty [0] / [0, 3] CPU tensor of the input's dtype, as
+    the per-view loop returned (the batched search must not stack nothing)."""
+    vol = torch.rand(2, 8, 8, device=backend)
+    sino = torch.zeros(0, 2, 8, device=backend)
+    out = ft.refine_angles(vol, sino, torch.zeros(0))
+    assert out.shape == (0,) and out.dtype == torch.float32 and out.device.type == "cpu"
+    out = ft.refine_angles(vol, sino, euler_zyz_deg=torch.zeros(0, 3, dtype=torch.float64))
+    assert out.shape == (0, 3) and out.dtype == torch.float64 and out.device.type == "cpu"
+
+
 # ── estimate_shifts_xcorr ─────────────────────────────────────────────────────
 
 
