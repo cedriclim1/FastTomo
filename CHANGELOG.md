@@ -95,6 +95,24 @@
   before its update, for SIRT-type algorithms and AD; the `loss_callback`
   contract (values, indices, types) is unchanged.
 
+### ⚠ CPU `run_fbp` output changes: shift-invariant back-projection (more accurate)
+
+CPU `run_fbp` back-projected with the CPU forward projector's ray-driven
+transpose, which is not shift-invariant: a flat field back-projects to a
+2-5 % voxel pattern, so a reconstructed uniform cylinder had 0.5-1.1 %
+interior noise and 0.9-2.5e-2 RMS (0.08-0.30 max) error against an
+independent fp64 FBP, and CPU and CUDA FBP differed by 1.6-3.9e-2. It now
+back-projects with the voxel-driven gather kernel that the CPU W-BP
+already uses (the CUDA back-projection's operator, with exact fp32
+weights): 2.7-4.3e-7 RMS (1.6-6e-6 max) against the fp64 FBP, CPU vs CUDA
+1.1-1.6e-4 (the CUDA texture unit's 8-bit weights). **CPU `run_fbp`
+results differ from earlier versions**; CUDA `run_fbp` and a `run_fbp`
+with a user `projector` are unchanged. The CPU FBP stays differentiable
+w.r.t. the sinogram (the backward is the CPU forward projection, the
+pairing CUDA's back-projection has). The back-projection step is also
+faster (5x at 8x128^2, 61 views, with the Y-batched gather below). Only
+the `cpu/fbp`, `cpu/fbp_h` and `cpu/fbp_mask` golden keys were regenerated.
+
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
 `ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes

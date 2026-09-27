@@ -11,8 +11,9 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from fasttomo._backend import _check_fp16_range
 from fasttomo._operator import Geometry, _make_operator
-from fasttomo.autograd import _back_project_gather_parallel_raw
+from fasttomo.autograd import _back_project_gather_parallel_raw, _forward_project_parallel_raw
 from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
@@ -120,6 +121,38 @@ def _wbp_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor,
     return _back_project_gather_parallel_raw(sinogram, angles_deg, Nz, Nx, num_threads)
 
 
+class _GatherBackProject(torch.autograd.Function):
+    """CPU FBP back-projection: the C gather kernel forward (shift-invariant,
+    the CUDA back-projection's operator with exact weights), and the CPU
+    forward projector as its backward, the same pairing as the CUDA
+    ``back_project`` (a gather whose backward is the ray-marching forward),
+    so ``run_fbp`` stays differentiable w.r.t. the sinogram on both
+    backends. Returns fp32."""
+
+    @staticmethod
+    def forward(ctx, sinogram, angles_deg, Nz, Nx, num_threads):
+        ctx.angles_deg, ctx.N_det, ctx.num_threads = angles_deg, sinogram.shape[2], num_threads
+        return _back_project_gather_parallel_raw(sinogram, angles_deg, Nz, Nx, num_threads)
+
+    @staticmethod
+    def backward(ctx, grad):
+        g = _forward_project_parallel_raw(grad, ctx.angles_deg, ctx.N_det, ctx.num_threads)
+        return g, None, None, None, None
+
+
+def _fbp_gather_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor, Nz: int,
+                            Nx: int, num_threads: int | None) -> torch.Tensor:
+    """`_GatherBackProject` in the sinogram's dtype. fp16 (computed in fp32
+    like every CPU kernel) is checked like an fp16 projection: a result
+    beyond the fp16 range raises OverflowError, which `run_fbp` catches to
+    pre-scale."""
+    out = _GatherBackProject.apply(sinogram, angles_deg, Nz, Nx, num_threads)
+    if sinogram.dtype == torch.float16:
+        out = out.to(torch.float16)
+        _check_fp16_range(out, sinogram, "run_fbp")
+    return out
+
+
 def _compute_exact_wf(
     angles_deg: torch.Tensor,   # [n_angles] degrees
     Nz: int, Nx: int,
@@ -211,7 +244,8 @@ def run_fbp(
 ) -> torch.Tensor:
     """Filtered back-projection.
 
-    Ramp-filters every detector row, back-projects and scales by
+    Ramp-filters every detector row, back-projects with the voxel-driven
+    (gather, shift-invariant) back-projection on both backends and scales by
     ``pi / n_angles`` (fp16: if the unscaled back-projection would exceed
     the fp16 range, the filtered sinogram is scaled in fp32 before its cast
     to fp16 instead, so it stays in range whenever the result does).
@@ -265,8 +299,15 @@ def run_fbp(
     op = _make_operator(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
         device, sinogram.dtype, projector, cached=False, num_threads=num_threads)
+    backproject = op.backproject
+    if projector is None and device.type == "cpu":
+        # CPU: the shift-invariant gather, like CUDA and the CPU W-BP (the
+        # CPU operator's ray-driven transpose puts a 2-5 % voxel pattern on
+        # a flat field, 0.5-1.1 % RMS error in a uniform cylinder)
+        def backproject(s):
+            return _fbp_gather_backproject(s, angles_deg, Nz, N_det, num_threads)
     if sinogram.dtype != torch.float16:
-        volume = op.backproject(filtered32) * scale
+        volume = backproject(filtered32) * scale
     else:
         # The back-projection sums n_angles filtered views before the
         # scale, so its fp16 result is n / pi times the answer and can
@@ -277,9 +318,9 @@ def run_fbp(
         # fp16 subnormal range (a density of 1e-4 at 720 views: 8 %
         # error, 1e-5: all lost, against 0.08 % and 0.4 % this way).
         try:
-            volume = op.backproject(filtered32.to(torch.float16)) * scale
+            volume = backproject(filtered32.to(torch.float16)) * scale
         except OverflowError:
-            volume = op.backproject((filtered32 * scale).to(torch.float16))
+            volume = backproject((filtered32 * scale).to(torch.float16))
     if support_mask is not None:
         # Validate against the actual output shape — a cached projector may
         # reconstruct with Nz != N_det.

@@ -5,6 +5,9 @@ Direct reconstructions: FBP (run_fbp) and weighted back-projection
 
 from __future__ import annotations
 
+import math
+
+import numpy as np
 import pytest
 import torch
 from conftest import (
@@ -17,6 +20,100 @@ from conftest import (
 import fasttomo as ft
 
 # ── FBP ───────────────────────────────────────────────────────────────────────
+
+
+# ── FBP against an independent fp64 FBP of an analytic cylinder ───────────
+#
+# CPU run_fbp back-projects with the shift-invariant gather (the CUDA BP's
+# operator with exact weights), no longer with the CPU forward projector's
+# ray-driven transpose, whose flat-field pattern gave 0.9-2.5 % RMS error
+# (0.08-0.3 max) against this reference (phase-1b CPU audit A2).
+
+def _cylinder_sinogram(N, r, ang_deg, Ny=2):
+    """Pixel-averaged exact chords of a centred unit-density cylinder."""
+    u = np.arange(N) - (N - 1) / 2.0
+    sub = (np.arange(16) + 0.5) / 16 - 0.5
+    p = (2 * np.sqrt(np.clip(r ** 2 - (u[:, None] + sub[None, :]) ** 2, 0, None))).mean(1)
+    return np.broadcast_to(p, (len(ang_deg), Ny, N)).copy()
+
+
+def _fbp_fp64(sino, ang_deg, Nz, Nx):
+    """Independent fp64 FBP: spatial Ram-Lak linear convolution (h[0] = 1/4,
+    h[odd n] = -1/(pi n)^2), linear-interpolation gather back-projection
+    (zero outside the detector), pi / n_angles."""
+    n, Ny, Nd = sino.shape
+    k = np.arange(-(Nd - 1), Nd)
+    h = np.zeros(k.shape)
+    h[k == 0] = 0.25
+    odd = k % 2 == 1
+    h[odd] = -1.0 / (math.pi * k[odd]) ** 2
+    q = np.apply_along_axis(lambda row: np.convolve(row, h)[Nd - 1:2 * Nd - 1], 2, sino)
+    x = np.arange(Nx) - (Nx - 1) / 2
+    z = np.arange(Nz) - (Nz - 1) / 2
+    out = np.zeros((Ny, Nz, Nx))
+    for a, th in enumerate(np.deg2rad(ang_deg)):
+        uu = x[None, :] * math.cos(th) + z[:, None] * math.sin(th) + (Nd - 1) / 2
+        i0 = np.floor(uu).astype(int)
+        w = uu - i0
+        rows = np.pad(q[a], ((0, 0), (1, 1)))
+        r0 = rows[:, np.clip(i0 + 1, 0, Nd + 1)]
+        r1 = rows[:, np.clip(i0 + 2, 0, Nd + 1)]
+        out += (1 - w) * r0 + w * r1
+    return out * math.pi / n
+
+
+@pytest.mark.parametrize("n,rng", [(90, (0, 180)), (41, (-60, 60))])
+def test_fbp_matches_fp64_fbp_of_a_cylinder(backend, n, rng):
+    N, r = 64, 20.0
+    ang = np.linspace(rng[0], rng[1], n, endpoint=(rng != (0, 180)))
+    s64 = _cylinder_sinogram(N, r, ang)
+    ref = _fbp_fp64(s64, ang, N, N)
+    rec = ft.run_fbp(torch.tensor(s64, dtype=torch.float32, device=backend),
+                     torch.tensor(ang, dtype=torch.float32, device=backend)).double().cpu().numpy()
+    rms = float(np.sqrt(((rec - ref) ** 2).mean()))
+    # CPU: exact fp32 weights (measured 3-5e-7); CUDA: 8-bit texture weights (~1e-4)
+    assert rms < (2e-6 if backend.type == "cpu" else 5e-4), rms
+
+
+@needs_cuda
+def test_fbp_cpu_matches_cuda():
+    """Both backends back-project with the same gather operator: they differ
+    by the CUDA texture unit's 8-bit weights only (1.1-1.6e-4 measured; the
+    CPU ray-driven BP was 1.6-3.9e-2 away)."""
+    N, n = 64, 61
+    ang = torch.linspace(-60, 60, n)
+    vol = torch.zeros(3, N, N)
+    vol[:, 16:48, 20:44] = 1.0
+    vol[1, 24:40, 26:30] = 2.0
+    sino = ft.forward_project(vol, ang)
+    cpu = ft.run_fbp(sino, ang, mask=True)
+    gpu = ft.run_fbp(sino.cuda(), ang.cuda(), mask=True).cpu()
+    assert float((gpu - cpu).norm() / cpu.norm()) < 6e-4
+
+
+def test_cpu_fbp_uses_the_gather_kernel_and_stays_differentiable(monkeypatch):
+    """CPU run_fbp back-projects with the C gather kernel (num_threads passed
+    through); its autograd backward is the CPU forward projection of the
+    upstream gradient, the pairing CUDA's back-projection has."""
+    from fasttomo import _core
+    from fasttomo.algorithms.analytic import _GatherBackProject
+
+    calls = []
+    real = _core.back_project_gather_parallel_cpu
+    monkeypatch.setattr(_core, "back_project_gather_parallel_cpu",
+                        lambda *a: (calls.append(a[-1]), real(*a))[1])
+    ang = torch.linspace(-60, 60, 13)
+    sino = torch.rand(13, 2, 24, generator=torch.Generator().manual_seed(2))
+    rec = ft.run_fbp(sino, ang, num_threads=3)
+    assert calls == [3] and rec.shape == (2, 24, 24)
+
+    s = sino.clone().requires_grad_(True)
+    w = torch.rand(2, 24, 24, generator=torch.Generator().manual_seed(3))
+    (_GatherBackProject.apply(s, ang, 24, 24, 1) * w).sum().backward()
+    assert torch.equal(s.grad, ft.forward_project(w, ang))
+    s2 = sino.clone().requires_grad_(True)
+    ft.run_fbp(s2, ang).sum().backward()
+    assert s2.grad is not None and torch.isfinite(s2.grad).all()
 
 
 def test_fbp_shape(backend):
