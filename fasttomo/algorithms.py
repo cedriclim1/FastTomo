@@ -197,6 +197,10 @@ _S3IM_SEED = 42
 # ratio instead of NaN.
 _REL_EPS = 1e-12
 
+# W-BP: absolute floor of the weighting filter's missing-wedge threshold, so
+# a degenerate transfer function (all ~0) never divides by ~0.
+_WBP_MIN_THRESHOLD = 1e-6
+
 # MBIR constants.
 # The convergence check compares every _MBIR_CONVERGENCE_STRIDE-th voxel,
 # O(Nvox / stride) work, negligible next to a sweep.
@@ -865,7 +869,7 @@ def _compute_exact_wf(
 
     TF_amp = torch.fft.rfft2(psf).abs()
     # threshold: avoid division by zero inside missing wedge
-    thresh = max(threshold_scale * TF_amp[0, 0].item() / float(n_angles), 1e-6)
+    thresh = max(threshold_scale * TF_amp[0, 0].item() / float(n_angles), _WBP_MIN_THRESHOLD)
     return torch.where(TF_amp > thresh, 1.0 / TF_amp, torch.zeros_like(TF_amp))
 
 
