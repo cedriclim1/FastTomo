@@ -630,6 +630,13 @@ def _check_qggmrf(p: float, q: float, c: float, sigma_f: float,
     for v in sfs:
         if not (math.isfinite(float(v)) and float(v) > 0.0):
             raise ValueError(f"run_mbir: sigma_f must be finite and > 0, got {v}")
+        # The prior's curvature at D = 0 is 2 / (c sigma_f^2) in fp32: keep it
+        # (and 1/sigma_f^2) far from overflow, which would turn every update
+        # into NaN and clamp it silently to 0 (sigma_f below ~1e-19 at c = 1e-3).
+        if float(c) * float(v) ** 2 < 1e-30:
+            raise ValueError(
+                f"run_mbir: qggmrf_c * sigma_f**2 must be >= 1e-30 (fp32 overflow of the "
+                f"prior's curvature 2 / (c sigma_f^2)), got c={c}, sigma_f={v}")
 
 
 def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
@@ -739,8 +746,10 @@ def run_mbir(
         to 1). ``q=2`` is the exponent near ``D = 0`` (quadratic, smooth),
         ``p=1.2`` the one for large differences (edge preserving), and
         ``c=1e-3`` puts the transition at ``|D| ~ c^(1/(q-p)) sigma_f``
-        (1.8e-4 ``sigma_f`` at the defaults); ``1 <= p <= q <= 2`` and
-        ``c > 0`` are required (ValueError otherwise). ``sigma_f`` sets the
+        (1.8e-4 ``sigma_f`` at the defaults); ``1 <= p <= q <= 2``,
+        ``c > 0`` and ``c * sigma_f**2 >= 1e-30`` (so the prior's fp32
+        curvature ``2 / (c sigma_f^2)`` cannot overflow; ``sigma_f >= 3e-14``
+        at ``c = 1e-3``) are required (ValueError otherwise). ``sigma_f`` sets the
         strength: smaller is smoother. A good start is about a tenth of the
         expected contrast between neighbouring regions (0.1 for a
         0.5-2.2 phantom with 1 % noise: RMSE 0.046). Near ``D = 0`` the prior
@@ -818,7 +827,12 @@ def run_mbir(
         shared memory per block (99 KB on sm_120: 256^3 at 61 views fits,
         512^3 does not). ``"auto"`` (default) takes ``"parallel"`` on CUDA
         where it applies (per multires level) and ``"serial"`` otherwise;
-        ``"parallel"`` raises ValueError where it does not apply. On CPU,
+        ``"parallel"`` raises ValueError where it does not apply. Whether it
+        applies depends on the GPU's opt-in shared-memory limit (64 KB on
+        sm_75, 99 KB on sm_120), so with ``"auto"`` the same problem and
+        ``seed`` can run different sweeps, hence give slightly different
+        volumes, on different GPU models; pass ``"serial"`` (or
+        ``"parallel"`` where it fits everywhere) to pin it. On CPU,
         ``"auto"`` and ``"serial"`` run the C sweep in the voxel order and
         ``"parallel"`` runs it in the parallel sweep's visiting order, so it
         matches a CUDA ``"parallel"`` run up to rounding; with the defaults

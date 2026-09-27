@@ -213,9 +213,11 @@ about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
   3000 iterations per level (5e-4 after 60 before), and a zero start with a
   small `sigma_f` and `estimate_variance=True` can barely move for tens of
   iterations.
-- `qggmrf_p`, `qggmrf_q` must satisfy `1 <= p <= q <= 2` and `qggmrf_c`,
-  `sigma_f` (and `sigma_f_per_scale`) must be positive: `ValueError`
-  otherwise. The old workaround for the paper's prior,
+- `qggmrf_p`, `qggmrf_q` must satisfy `1 <= p <= q <= 2`, `qggmrf_c`,
+  `sigma_f` (and `sigma_f_per_scale`) must be positive, and
+  `qggmrf_c * sigma_f**2 >= 1e-30` (below that the prior's fp32 curvature
+  overflowed and every update became NaN, silently clamped to 0; also on
+  main): `ValueError` otherwise. The old workaround for the paper's prior,
   `qggmrf_p=2, qggmrf_q=1.2`, now raises instead of meaning something else.
 - The 26-neighbour weights are exact to 9 digits (the corner weight read
   0.030219 instead of 0.0302213, so they summed to 0.99999).
@@ -262,7 +264,13 @@ about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
   projection is rounded op by op (no FMA contraction, as in the C code), and
   each lane adds its even- and odd-slot sums before one warp reduction
   (instead of reducing them separately): serial CUDA results change at the
-  ulp level too, and the serial sweep costs ~3 % more per iteration.
+  ulp level too. The serial sweep, now the fallback, is slower than on
+  main per iteration: +8.5 % at 128^3 (8.88 -> 9.64 ms), +2.9 % at 256^3,
+  about equal at 512^3 (the natural-order prepare pays for it there).
+- `sweep_kernel="auto"` decides from the GPU's opt-in shared-memory limit
+  (64 KB on sm_75, 99 KB on sm_120), so the same problem and `seed` can run
+  different sweeps, and give slightly different volumes, on different GPU
+  models; `sweep_kernel="serial"` pins it.
 
 ### `run_mbir`: CUDA runs with a `support_mask` are not bit-reproducible (documented)
 

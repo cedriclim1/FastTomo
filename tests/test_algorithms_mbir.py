@@ -326,6 +326,7 @@ def test_mbir_converges_to_a_stationary_point_of_the_map_cost(backend, p, T, sf)
     (dict(qggmrf_p=0.8), "1 <= qggmrf_p"), (dict(qggmrf_q=2.5), "1 <= qggmrf_p"),
     (dict(qggmrf_c=0.0), "qggmrf_c"), (dict(sigma_f=0.0), "sigma_f"),
     (dict(sigma_f=float("nan")), "sigma_f"), (dict(sigma_f_per_scale=[-1.0]), "sigma_f"),
+    (dict(sigma_f=1e-20), "overflow"), (dict(qggmrf_c=1e-12, sigma_f=1e-10), "overflow"),
 ])
 def test_mbir_rejects_invalid_prior_parameters(kw, match):
     """p and q had swapped roles in the kernels before the prior fix; the old

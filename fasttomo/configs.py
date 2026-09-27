@@ -390,7 +390,11 @@ class MbirConfig:
     call as ``run_mbir(sino, angles, huber_T=3.0)``; the keywords stay the
     primary interface. Passing ``config`` together with a tuning keyword
     that differs from its default raises TypeError. Field meanings and
-    defaults are those of ``run_mbir``'s keywords of the same name.
+    defaults are those of ``run_mbir``'s keywords of the same name. Note
+    that ``sweep_kernel="auto"`` picks the CUDA sweep from the GPU's
+    shared-memory limit, so the same config and ``seed`` can give slightly
+    different results on different GPU models; set ``sweep_kernel="serial"``
+    to pin it.
     """
     sigma_f: float = 1.0
     qggmrf_p: float = 1.2

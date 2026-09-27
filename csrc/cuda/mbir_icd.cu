@@ -648,7 +648,11 @@ __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_kernel(
 
 /* Same sweep for n_angles > 32 * MBIR_MAX_SLOTS: lane l walks its angles
  * l, l+32, ... directly in global memory (no register slots), with the
- * same ownership, order and arithmetic. */
+ * same ownership, voxel order and pinned per-voxel rounding. Its summation
+ * order differs from mbir_data_term's: it reduces the even- and odd-slot
+ * sums with four butterflies and adds them afterwards (the original
+ * kernel's order). The parallel sweep never takes this path (it needs
+ * n_angles <= 256), so no bitwise pairing depends on it. */
 __global__ static void __launch_bounds__(MBIR_WARP) icd_sweep_mbir_generic_kernel(
     const float2 *__restrict__ prior,
     const int   *__restrict__  perm,
