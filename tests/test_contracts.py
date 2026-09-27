@@ -545,11 +545,6 @@ FASTTOMO_PUBLIC_BEFORE_SPLIT = [
     "tilt_ssim_loss", "torch", "tv_loss_3d", "tv_loss_xz", "utilities",
 ]
 
-# Public names added deliberately since the split (each with its PR).
-FASTTOMO_PUBLIC_ADDED = [
-    "release_cached_projectors",   # run_sirt's kept projector/graph (kernel audit F8)
-]
-
 # Every name ``fasttomo.algorithms`` exposed as a module at 2a58dc8, except
 # the stdlib / third-party module aliases it happened to import (torch, np,
 # F, math, typing helpers, ...). Tests, benchmarks and the desktop app may
@@ -591,14 +586,72 @@ ALGORITHMS_NAMES_BEFORE_SPLIT = [
 ]
 
 
+# Public names added deliberately since the split: plain aliases (the same
+# function objects) and release_cached_projectors (run_sirt's kept
+# projector and CUDA graph, kernel audit F8).
+FASTTOMO_PUBLIC_ADDED = ["run_wbp", "tv_loss_zx", "release_cached_projectors"]
+
+
 def test_fasttomo_public_names_unchanged():
-    expected = FASTTOMO_PUBLIC_BEFORE_SPLIT + FASTTOMO_PUBLIC_ADDED
     public = sorted(n for n in dir(ft) if not n.startswith("_"))
-    assert public == sorted(expected)
-    assert sorted(ft.__all__) == sorted(n for n in expected
-                                        if n not in ("algorithms", "autograd", "configs",
-                                                     "constraints", "projection", "projector",
-                                                     "regularizers", "torch", "utilities"))
+    assert public == sorted(FASTTOMO_PUBLIC_BEFORE_SPLIT + FASTTOMO_PUBLIC_ADDED)
+    assert sorted(ft.__all__) == sorted(
+        [n for n in FASTTOMO_PUBLIC_BEFORE_SPLIT
+         if n not in ("algorithms", "autograd", "configs", "constraints", "projection",
+                      "projector", "regularizers", "torch", "utilities")]
+        + FASTTOMO_PUBLIC_ADDED)
+
+
+def test_short_name_aliases():
+    """run_wbp and tv_loss_zx are the same objects as the long names (not
+    deprecated), exported from fasttomo and their modules."""
+    import fasttomo.regularizers as regs
+
+    assert ft.run_wbp is ft.run_weighted_backprojection is algo.run_wbp
+    assert "run_wbp" in algo.__all__
+    assert ft.tv_loss_zx is ft.tv_loss_xz is regs.tv_loss_zx
+
+
+# Every size parameter of the public API whose default means "derive it from
+# the input" uses None; -1 lives only at the binding boundary.
+_SIZE_PARAMS = ("Nz", "Nx", "N_det")
+
+
+def test_size_sentinels_default_to_none():
+    bad = []
+    for name in ft.__all__:
+        obj = getattr(ft, name)
+        if not callable(obj) or isinstance(obj, type):
+            continue
+        for p in inspect.signature(obj).parameters.values():
+            if p.name in _SIZE_PARAMS and p.default is not inspect.Parameter.empty \
+                    and p.default is not None:
+                bad.append(f"{name}({p.name}={p.default!r})")
+    assert bad == []
+
+
+def test_size_none_equals_the_old_minus_one():
+    """None and the former -1 give identical results (projection functions
+    and an algorithm), and so does leaving them out."""
+    g = torch.Generator().manual_seed(4)
+    vol = torch.rand(2, 10, 12, generator=g)
+    ang = torch.linspace(-60, 60, 7)
+    eul = torch.stack([torch.zeros(7), ang, torch.zeros(7)], 1)
+    for fp in (lambda v, n: ft.forward_project(v, ang, n),
+               lambda v, n: ft.forward_project_3d(v, eul, n)):
+        a = fp(vol, None)
+        assert torch.equal(a, fp(vol, -1))
+    sino = ft.forward_project(vol, ang)
+    for bp in (lambda s, **k: ft.back_project(s, ang, **k),
+               lambda s, **k: ft.back_project_3d(s, eul, **k)):
+        a = bp(sino, Nz=None, Nx=None)
+        assert torch.equal(a, bp(sino, Nz=-1, Nx=-1)) and torch.equal(a, bp(sino))
+        assert a.shape == (2, 12, 12)
+        assert bp(sino, Nz=10, Nx=None).shape == (2, 10, 12)
+    r = ft.run_sirt(sino, ang, 2, Nz=None)
+    assert torch.equal(r, ft.run_sirt(sino, ang, 2, Nz=-1))
+    assert torch.equal(r, ft.run_sirt(sino, ang, 2))
+    assert ft.run_fbp(sino, ang, Nz=None).shape == (2, 12, 12)
 
 
 def test_algorithms_package_reexports_old_names():
@@ -617,7 +670,7 @@ def test_algorithms_public_objects_live_in_submodules():
     import fasttomo.algorithms.mbir as mbir
     import fasttomo.algorithms.resire as resire
     owners = {
-        "run_fbp": analytic, "run_weighted_backprojection": analytic,
+        "run_fbp": analytic, "run_weighted_backprojection": analytic, "run_wbp": analytic,
         "run_sirt": algebraic, "run_sart": algebraic, "run_wsirt": algebraic,
         "run_fista": fista, "run_fista_tv": fista, "run_genfire": genfire,
         "run_resire": resire, "run_grad_descent": ad, "run_ad_recon": ad,

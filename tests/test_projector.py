@@ -579,3 +579,45 @@ class TestCrossDevice:
             sino = ft.forward_project(v, a)
             _ = ft.run_sirt(sino, a, n_iter=3)
             torch.cuda.synchronize(dev)
+
+
+# ── one projector, two streams (audit P3) ─────────────────────────────────────
+
+
+@needs_cuda
+@pytest.mark.parametrize("kind", ["parallel", "rotmat"])
+def test_projector_shared_across_two_streams_matches_serial(kind):
+    """Interleaved calls from two streams on one projector give the serial
+    results. The textures are shared: without the stream ordering the
+    second stream's upload overwrote the array while the first stream's
+    kernel still read it (16 of 20 trials wrong at 192^3 x 180 views)."""
+    dev = torch.device("cuda")
+    N, n = 160, 120
+    g = torch.Generator(device=dev).manual_seed(0)
+    va = torch.rand(N, N, N, device=dev, generator=g)
+    vb = torch.rand(N, N, N, device=dev, generator=g) + 5.0
+    ang = torch.linspace(-89, 89, n, device=dev)
+    if kind == "parallel":
+        p = ft.ParallelProjector((N, N, N), ang)
+        fwd, back = p.forward, p.back
+    else:
+        mats = _euler_zyz_to_rotmat(
+            torch.stack([torch.zeros(n), ang.cpu(), torch.zeros(n)], 1)).to(dev)
+        p = ft.RotmatProjector((N, N, N), n_angles=n, device=dev)
+        fwd, back = (lambda v: p.forward(v, mats)), (lambda s: p.back(s, mats))
+    sa, sb = fwd(va).clone(), fwd(vb).clone()
+    ba, bb = back(sa).clone(), back(sb).clone()
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    for _ in range(4):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            a = fwd(va)
+            x = back(sa)
+        with torch.cuda.stream(s2):
+            b = fwd(vb)
+            y = back(sb)
+        with torch.cuda.stream(s1):
+            a2 = fwd(va)
+        torch.cuda.synchronize()
+        assert torch.equal(a, sa) and torch.equal(b, sb) and torch.equal(a2, sa)
+        assert torch.equal(x, ba) and torch.equal(y, bb)

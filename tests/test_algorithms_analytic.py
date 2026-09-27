@@ -30,6 +30,67 @@ def test_fbp_shape(backend):
     assert rec.device.type == backend.type
 
 
+def _cylinder_fbp_level(backend, radius, tilt, N=128):
+    """Mean FBP value over the inner half-radius of a unit-density cylinder
+    (a disk in XZ, constant along Y) of ``radius`` voxels. ``tilt=90``:
+    180 equally spaced views over [-90, 90); else ``linspace(-tilt, tilt)``
+    at the same 1-degree spacing."""
+    z = torch.arange(N) - (N - 1) / 2
+    r2 = z[:, None] ** 2 + z[None, :] ** 2
+    vol = (r2 <= radius ** 2).float().expand(2, N, N).contiguous().to(backend)
+    if tilt == 90:
+        ang = torch.arange(180) * 1.0 - 90
+    else:
+        ang = torch.linspace(-tilt, tilt, 2 * tilt + 1)
+    ang = ang.to(backend)
+    rec = ft.run_fbp(ft.forward_project(vol, ang), ang)
+    return rec[:, r2 <= (radius / 2) ** 2].mean().item()
+
+
+@pytest.mark.parametrize("radius", [20, 40])
+def test_fbp_angular_scale_is_right_for_limited_tilt(backend, radius):
+    """Scope report 2g [S]: FBP scales by pi / n_angles, which looks like
+    it assumes 180 degrees of coverage, so +-70 degrees was suspected to be
+    off by 180/140. Not so: pi / n_angles is pi times the mean over the
+    measured views, and for a rotationally symmetric object every view
+    carries the same ray integral, so the absolute level at +-70 equals the
+    one at 180 degrees. Scaling by the actual spacing (140 degrees / n)
+    would make it 140/180 = 0.78 of that instead."""
+    full = _cylinder_fbp_level(backend, radius, 90)
+    limited = _cylinder_fbp_level(backend, radius, 70)
+    assert abs(limited / full - 1.0) < 5e-3, (limited, full)
+
+
+@pytest.mark.parametrize("tilt", [90, 70])
+@pytest.mark.parametrize("radius", [20, 40, 60])
+def test_fbp_cylinder_absolute_value(backend, radius, tilt):
+    """A unit-density cylinder reconstructs at 1 (inner half-radius mean)
+    at 180 degrees and at +-70 degrees, from a small one to one filling the
+    field of view. The unpadded |xi| ramp gave 0.96 / 0.83 / 0.57."""
+    level = _cylinder_fbp_level(backend, radius, tilt)
+    assert abs(level - 1.0) < 5e-3, level
+
+
+def test_ramp_filter_is_the_linear_ram_lak_convolution():
+    """ramp_filter == the direct (linear, unpadded-wraparound-free)
+    convolution of each row with h[0] = 1/4, h[odd n] = -1/(pi n)^2."""
+    import math
+
+    g = torch.Generator().manual_seed(3)
+    for N_det in (7, 16, 33):
+        sino = torch.rand(2, 3, N_det, generator=g, dtype=torch.float64)
+        n = torch.arange(-(N_det - 1), N_det, dtype=torch.float64)
+        h = torch.where(n.abs() % 2 == 1, -1.0 / (math.pi * n) ** 2, torch.zeros_like(n))
+        h[N_det - 1] = 0.25
+        ref = torch.stack([torch.stack([
+            torch.tensor([(row * h.flip(0)[N_det - 1 - u: 2 * N_det - 1 - u]).sum().item()
+                          for u in range(N_det)], dtype=torch.float64)
+            for row in view]) for view in sino])
+        out = ft.ramp_filter(sino.float())
+        assert out.shape == sino.shape and out.dtype == torch.float32
+        torch.testing.assert_close(out.double(), ref, rtol=0, atol=1e-6)
+
+
 def test_fbp_better_than_plain_backproject(backend):
     """FBP reconstruction MSE should beat raw (unfiltered) back-projection.
 

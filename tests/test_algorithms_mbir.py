@@ -580,6 +580,61 @@ def test_mbir_multires_even_runs():
     assert vol.shape == (2, 16, 16)
 
 
+def _mbir_cylinder(device, N=32):
+    z = torch.arange(N) - (N - 1) / 2
+    r2 = z[:, None] ** 2 + z[None, :] ** 2
+    vol = ((r2 <= 10 ** 2).float() + 0.5 * (r2 <= 4 ** 2).float()).expand(2, N, N)
+    vol = vol.contiguous().to(device)
+    ang = torch.linspace(-70, 70, 41, device=device)
+    return vol, ang, ft.forward_project(vol, ang), (r2 <= 7 ** 2).to(device)
+
+
+def test_mbir_multires_hands_over_fine_grid_values(backend, monkeypatch):
+    """A level with factor f works in voxels f fine voxels wide, so its
+    values are f times the fine-grid ones (a ray crosses f times fewer
+    voxels). The volume handed from the coarse level (f = 2) to the fine one
+    must be halved: it arrived at twice the object's level (scope report 2g
+    [S], confirmed: 2.3 instead of 1.15), which the fine level then had to
+    iterate away. A fine-grid warm start is doubled for the coarse level."""
+    from fasttomo.algorithms import mbir as M
+
+    vol, ang, sino, inner = _mbir_cylinder(backend)
+    seen = []
+    real = M._run_mbir_single_scale
+
+    def spy(*a, **kw):
+        st = kw["init_state"]
+        seen.append((kw["Nz"], None if st is None else st.volume.clone()))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(M, "_run_mbir_single_scale", spy)
+    kw = dict(estimate_offset=False, estimate_variance=False, seed=1)
+    ft.run_mbir(sino, ang, n_iter=20, multires_levels=2, **kw)
+    (nz0, v0), (nz1, v1) = seen
+    assert (nz0, nz1, v0) == (16, 32, None)
+    level = vol[:, inner].mean().item()
+    assert abs(v1[:, inner].mean().item() / level - 1.0) < 0.05
+    # a fine-grid warm start reaches the coarse level at twice its values
+    seen.clear()
+    ft.run_mbir(sino, ang, n_iter=1, multires_levels=2, warm_start=vol, **kw)
+    coarse = seen[0][1]
+    torch.testing.assert_close(coarse, 2.0 * M._resize_volume_zx(vol, 16, 16))
+
+
+def test_mbir_two_levels_converge_to_the_single_level_solution(backend):
+    """Coarse-to-fine reaches the single-level MAP estimate: at 60
+    iterations per level the two agree to 2e-3 relative (5e-4 measured on a
+    64^2 cylinder, 1e-3 before the hand-over rescale), and at 5 iterations
+    the two-level run is already at the object's level."""
+    vol, ang, sino, inner = _mbir_cylinder(backend)
+    kw = dict(estimate_offset=False, estimate_variance=False, seed=1)
+    one = ft.run_mbir(sino, ang, n_iter=60, **kw)
+    two = ft.run_mbir(sino, ang, n_iter=60, multires_levels=2, **kw)
+    assert ((two - one).norm() / one.norm()).item() < 2e-3
+    early = ft.run_mbir(sino, ang, n_iter=5, multires_levels=2, **kw)
+    assert abs(early[:, inner].mean().item() / vol[:, inner].mean().item() - 1.0) < 0.05
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
 @pytest.mark.parametrize("sigma_init", [None, 0.1])
 def test_mbir_rejects_non_finite_sinogram(backend, bad, sigma_init):

@@ -55,6 +55,7 @@ from fasttomo._backend import (
     _TC_SINO_LAYERED,
     _TC_VOL_3D,
     _TC_VOL_LAYERED,
+    _check_fp16_range,
     _dtype_to_tc_code,
     _io_dtype_code,
     _stream_ptr,
@@ -302,6 +303,15 @@ class CudaCachedOperator(ProjectionOperator):
     tensor always uploads. ``_forget_texture_writes()`` drops both records.
     ``upload_counts`` counts performed and skipped uploads (a debug hook for
     tests and measurements; CUDA-graph replays are not counted).
+
+    Streams: every call uploads into the same texture arrays, so a call on
+    one stream must not start before the calls already queued on another
+    stream have finished reading them (it overwrote the array under them:
+    two interleaved streams gave wrong projections in 16 of 20 trials). A
+    call from a different stream than the previous one therefore makes the
+    current stream wait for the previous stream (``wait_stream``, no host
+    sync, only on a stream switch). Nothing is done while a CUDA graph is
+    being captured (run_sirt synchronises the device around its capture).
     """
 
     def __init__(self, geometry: Geometry, device, dtype=None, name=None) -> None:
@@ -328,6 +338,22 @@ class CudaCachedOperator(ProjectionOperator):
         self.upload_counts = {"vol": 0, "vol_skipped": 0, "sino": 0, "sino_skipped": 0}
         self._sirt_graph_cache = {}
         self._sirt_graph_bad_keys = set()
+        # the stream of the latest call that used the textures
+        self._last_stream: torch.cuda.Stream | None = None
+
+    def _order_after_other_streams(self) -> None:
+        """Make the current stream wait for the previous call's stream when
+        they differ, so this call's upload cannot overwrite a texture that a
+        kernel queued there is still reading (see the class docstring)."""
+        cur = torch.cuda.current_stream(self.device)
+        last = self._last_stream
+        if last is None or last == cur:
+            self._last_stream = cur
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        cur.wait_stream(last)
+        self._last_stream = cur
 
     def _default_trig(self, angles_deg: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         a_rad = angles_deg.to(device=self.device, dtype=torch.float32) * (math.pi / 180.0)
@@ -375,19 +401,23 @@ class CudaCachedOperator(ProjectionOperator):
     # ── direct texture writes (run_sirt's fused kernels) ────────────────
     def _vol_write_target(self) -> int | None:
         """The volume texture handle if kernels can write it directly (it
-        has a surface), else None. Needs the dtype locked."""
+        has a surface), else None. Needs the dtype locked. The caller writes
+        on the current stream, ordered after other streams' reads."""
         if self.dtype is None:
             return None
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             h = self._vol_cache()
         return h if _core.tc_has_surface(h) else None
 
     def _sino_write_target(self, n: int) -> int | None:
         """The sinogram texture handle for ``n`` views if kernels can write
-        it directly, else None. Needs the dtype locked."""
+        it directly, else None. Needs the dtype locked. The caller writes on
+        the current stream, ordered after other streams' reads."""
         if self.dtype is None:
             return None
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             h = self._sino_cache(n)
         return h if _core.tc_has_surface(h) else None
 
@@ -421,6 +451,7 @@ class CudaCachedOperator(ProjectionOperator):
         self._check_input(volume, "volume", self.vol_shape)
         vol = volume.contiguous()
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             _core.tc_upload(self._vol_cache(), vol.data_ptr(), _stream_ptr(self.device))
         self.upload_counts["vol"] += 1
         self._mark_vol_written(vol)
@@ -433,6 +464,7 @@ class CudaCachedOperator(ProjectionOperator):
         if out.dtype != self.dtype or not out.is_contiguous():
             raise ValueError(f"{self._name}: _download_vol needs a contiguous {self.dtype} tensor")
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             _core.tc_download(self._vol_cache(), out.data_ptr(), _stream_ptr(self.device))
 
     def _trig(self, geom):
@@ -458,6 +490,7 @@ class CudaCachedOperator(ProjectionOperator):
         io_dtype = self._lock_dtype(volume)
         self._check_input(volume, "volume", self.vol_shape)
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             h = self._vol_cache()
             vol = volume.contiguous()
             # the texture already holds `vol` (a direct write, no upload since)
@@ -497,11 +530,18 @@ class CudaCachedOperator(ProjectionOperator):
         this view count (``_mark_sino_written``), without an upload."""
         if self.dtype is None:
             raise RuntimeError(f"{self._name}: bp_from_texture before any upload")
-        return self._bp(0 if self.dtype == torch.float32 else 1, None, geom)
+        vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom)
+        # the fp16 overflow check `backproject` runs (inside an fp16
+        # run_sirt: a device-side flag); the input sinogram is the texture,
+        # so the output stands in for it (an inf is then never blamed on
+        # the input, which the fused residual kernel produced finite)
+        _check_fp16_range(vol, vol.new_zeros(()), self._name)
+        return vol
 
     def _bp(self, io_dtype, sino, geom):
         """``bp`` of ``sino``, or (``sino`` None) of the texture's contents."""
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             vol = torch.empty(self.Ny, self.Nz, self.Nx, dtype=self.dtype, device=self.device)
             if self.kind == "parallel":
                 cos_a, sin_a = self._trig(geom)
@@ -560,6 +600,7 @@ class CudaCachedOperator(ProjectionOperator):
         # the gradient kernel accumulates in fp32
         gs = grad_sino.contiguous().float()
         with torch.cuda.device(self.device):
+            self._order_after_other_streams()
             _core.grad_rotmat_cuda_cached(
                 io_dtype, self._vol_handle,
                 gs.data_ptr(), mats.data_ptr(), grad_mats.data_ptr(),

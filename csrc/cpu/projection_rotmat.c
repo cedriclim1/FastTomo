@@ -150,7 +150,6 @@ void back_project_rotmat_cpu(
             }
         }
     }
-    (void)g.half_z;  /* unused — declared for parity with CUDA path */
 }
 
 /* ── gradient of 3D rotmat FP w.r.t. rotation matrix (CPU) ─────────────────

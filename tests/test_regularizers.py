@@ -15,6 +15,63 @@ from conftest import (
 import fasttomo as ft
 
 
+# ── SSIM constants: device-side, no host sync (scope report 2g) ──────────────
+
+
+def _ssim_pair(device, seed=5):
+    g = torch.Generator().manual_seed(seed)
+    pred = torch.rand(6, 20, 24, generator=g).to(device)
+    target = (3.0 * torch.rand(6, 20, 24, generator=g) - 0.5).to(device)
+    return pred, target
+
+
+@pytest.mark.parametrize("loss", ["tilt_ssim_loss", "s3im_loss"])
+def test_ssim_losses_unchanged_by_device_side_data_range(backend, loss):
+    """data_range=None now builds C1/C2 on the device instead of reading
+    ``float(target.max() - target.min())`` back; the loss (and gradient) is
+    the one the explicit float gives: identical on CPU, within 1e-6 on
+    CUDA, for a fixed S3IM seed."""
+    pred, target = _ssim_pair(backend)
+    fn = getattr(ft, loss)
+    kw = {}
+    if loss == "s3im_loss":
+        kw = lambda: dict(patch_pixels=256, n_patches=2,             # noqa: E731
+                          generator=torch.Generator(device=backend).manual_seed(42))
+    else:
+        kw = lambda: {}                                              # noqa: E731
+    p1 = pred.clone().requires_grad_(True)
+    p2 = pred.clone().requires_grad_(True)
+    new = fn(p1, target, **kw())
+    old = fn(p2, target, data_range=float(target.max() - target.min()), **kw())
+    new.backward()
+    old.backward()
+    if backend.type == "cpu":
+        assert torch.equal(new, old) and torch.equal(p1.grad, p2.grad)
+    else:
+        assert abs(new.item() - old.item()) <= 1e-6
+        torch.testing.assert_close(p1.grad, p2.grad, rtol=0, atol=1e-6)
+
+
+@needs_cuda
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+def test_ssim_losses_do_not_sync_the_host():
+    """Neither regulariser synchronises the host (sync debug mode 'error'
+    raises on any synchronising call): the S3IM index draw (randperm with
+    a device generator) and the SSIM constants stay on the GPU."""
+    pred, target = _ssim_pair("cuda")
+    pred.requires_grad_(True)
+    gen = torch.Generator(device="cuda").manual_seed(42)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        loss = ft.tilt_ssim_loss(pred, target) + ft.s3im_loss(
+            pred, target, patch_pixels=256, generator=gen)
+        loss.backward()
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    assert torch.isfinite(loss).item()
+
+
 class TestTiltSSIM:
     def test_zero_for_identity(self):
         torch.manual_seed(0)

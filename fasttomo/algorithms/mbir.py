@@ -521,7 +521,8 @@ def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
 
 
 def _resize_volume_zx(vol: torch.Tensor, target_nz: int, target_nx: int) -> torch.Tensor:
-    """Trilinear-style resize in (Z, X) only. Y is preserved."""
+    """Trilinear-style resize in (Z, X) only. Y is preserved. Values are not
+    rescaled; see `_rescale_between_levels`."""
     Ny, Nz, Nx = vol.shape
     if Nz == target_nz and Nx == target_nx:
         return vol
@@ -535,12 +536,30 @@ def _resize_volume_zx(vol: torch.Tensor, target_nz: int, target_nx: int) -> torc
     return v.squeeze(0).squeeze(0).contiguous()
 
 
+def _to_level(vol: torch.Tensor, from_factor: int, to_factor: int,
+              target_nz: int, target_nx: int) -> torch.Tensor:
+    """Carry a volume from the grid of one multires level to another.
+
+    A level with factor ``f`` works on voxels (and averaged detector pixels)
+    ``f`` fine voxels wide, with unit voxel size in its own units: a ray
+    crosses ``f`` times fewer voxels, so matching the same (averaged)
+    measurements takes ``f`` times the fine-grid values (``rho_f = f *
+    rho``; the default ``sigma_f * f`` prior scale per level is in the same
+    units). Resizing between levels therefore also multiplies the values by
+    ``to_factor / from_factor`` (0.5 from one level to the next finer one,
+    ``coarse_factor`` for a fine-grid warm start)."""
+    out = _resize_volume_zx(vol, target_nz, target_nx)
+    if from_factor != to_factor:
+        out = out * (to_factor / from_factor)
+    return out
+
+
 def run_mbir(
     sinogram: torch.Tensor,           # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,         # [n_angles] degrees
     n_iter: int = 100,                # max outer iterations per scale
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     sigma_f: float = 1.0,
     qggmrf_p: float = 1.2,
     qggmrf_q: float = 2.0,
@@ -624,7 +643,8 @@ def run_mbir(
         ``e = g - A f - d`` stays exact. Coarse levels use the support
         max-pooled to their grid.
     warm_start : Tensor, optional
-        Initial volume (resized to the coarsest level); offsets start at 0.
+        Initial volume on the full grid (resized to the coarsest level and
+        scaled to its voxel size, see `_to_level`); offsets start at 0.
     num_threads : int, optional
         CPU threads (it was hardcoded to 4); see Conventions.
     return_loss, loss_callback, progress
@@ -758,8 +778,8 @@ def run_mbir(
     if setup.volume0 is not None:
         # warm start: resized to the coarsest grid; offsets start at zero
         state = _MbirState(
-            volume=_resize_volume_zx(setup.volume0, max(Nz // coarse_factor, 1),
-                                     max(Nx // coarse_factor, 1)),
+            volume=_to_level(setup.volume0, 1, coarse_factor,
+                             max(Nz // coarse_factor, 1), max(Nx // coarse_factor, 1)),
             d_offsets=torch.zeros(n_angles, device=sinogram.device, dtype=torch.float32),
             sigma=float(sigma_init), e_sino=None,
         )
@@ -821,14 +841,16 @@ def run_mbir(
         history_all.append(hist)
         it_offset += state.n_done
 
-        # Carry the current solution to the next scale with an exact resize.
-        # Using a fixed ×2 upsample breaks odd detector sizes (e.g. 65 → 32 → 64),
-        # causing shape mismatches at the next level.
+        # Carry the current solution to the next scale with an exact resize
+        # and the voxel-size rescale (`_to_level`: values halve from one
+        # level to the next finer one). Using a fixed ×2 upsample breaks odd
+        # detector sizes (e.g. 65 → 32 → 64), causing shape mismatches at the
+        # next level.
         if lvl + 1 < len(factors):
             next_f = factors[lvl + 1]
             next_nz = max(Nz // next_f, 1)
             next_nx = max(Nx // next_f, 1)
-            state.volume = _resize_volume_zx(state.volume, next_nz, next_nx)
+            state.volume = _to_level(state.volume, f, next_f, next_nz, next_nx)
 
     rec.close()
     if return_history:

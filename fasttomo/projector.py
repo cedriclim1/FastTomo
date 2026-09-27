@@ -44,6 +44,12 @@ Usage (AD loop, with pose):
 
 The functional API is unchanged; you can mix projector and functional calls
 freely.
+
+Streams: one CUDA projector may be used from several streams. Its textures
+are shared, so a call from a different stream than the previous call makes
+the current stream wait for that stream's queued work first (no host sync;
+before this, two interleaved streams overwrote each other's texture
+uploads). Calls on one stream run fully asynchronously, as before.
 """
 
 from __future__ import annotations

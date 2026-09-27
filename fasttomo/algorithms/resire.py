@@ -27,7 +27,7 @@ def run_resire(
     n_iter: int = 100,
     *,
     step_size: float = 1.0,
-    Nz: int = -1,
+    Nz: int | None = None,
     positivity: bool = True,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,   # [Nz, Nx], [1, Nz, Nx] or [Ny, Nz, Nx]

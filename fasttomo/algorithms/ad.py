@@ -272,7 +272,7 @@ def run_ad_recon(
     angles_deg: torch.Tensor,          # [n_angles] degrees
     n_iter: int | None = None,         # None: config.optim.n_iter
     *,
-    Nz: int = -1,
+    Nz: int | None = None,
     config: AdReconConfig | None = None,
     support_mask: torch.Tensor | None = None,
     projector: object | None = None,
@@ -531,7 +531,7 @@ def run_grad_descent(
     n_iter: int = 200,
     *,
     lr: float = 1e-2,
-    Nz: int = -1,
+    Nz: int | None = None,
     optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
     positivity: bool = False,
     mask: bool = False,

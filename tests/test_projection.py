@@ -673,6 +673,95 @@ def test_bp3d_fp16_matches_fp32():
     assert rel_err(rec_fp16, rec_fp32) < 1e-2
 
 
+# ── fp16 range (audit P2): an fp16 result beyond 65504 raises ──────────────────
+
+
+def _fp16_overflow_inputs(device):
+    """A back-projection of 180 views of a sinogram of 1000 (the result is
+    1.8e5 > 65504, the fp32 accumulator is fine) and a forward projection of
+    a 64-wide volume of 3000 (ray sums ~1.9e5)."""
+    ang = torch.linspace(-89.5, 89.5, 180, device=device)
+    sino = torch.full((180, 2, 16), 1000.0, device=device)
+    vol = torch.full((2, 64, 64), 3000.0, device=device)
+    return ang, sino, vol
+
+
+@pytest.mark.parametrize("op", ["back_project", "forward_project",
+                                "back_project_3d", "forward_project_3d"])
+def test_fp16_overflow_raises(backend, op):
+    ang, sino, vol = _fp16_overflow_inputs(backend)
+    geom = ang if op in ("back_project", "forward_project") else make_euler_pure_y(ang)
+    x = sino if op.startswith("back") else vol
+    fn = getattr(ft, op)
+    ref = fn(x, geom)                           # fp32: finite, beyond fp16 max
+    assert torch.isfinite(ref).all() and ref.abs().max() > 65504
+    with pytest.raises(OverflowError, match=f"{op}: .*fp16 range"):
+        fn(x.half(), geom)
+    # scaled into range (the documented remedy), fp16 is fine
+    out = fn((x / 16).half(), geom)
+    assert torch.isfinite(out).all()
+    assert rel_err(out.float() * 16, ref) < 1e-2
+
+
+def test_fp16_inf_input_propagates_without_error(backend):
+    """An inf that came with the input is not an overflow: no error."""
+    ang, sino, _ = _fp16_overflow_inputs(backend)
+    s = (sino / 1000).half()
+    s[0, 0, 5] = float("inf")
+    out = ft.back_project(s, ang)
+    assert torch.isinf(out).any()
+
+
+@needs_cuda
+def test_fp16_overflow_raises_in_projectors_and_backward():
+    ang, sino, vol = _fp16_overflow_inputs(DEVICE)
+    with pytest.raises(OverflowError, match="ParallelProjector"):
+        ft.ParallelProjector((2, 16, 16), ang).back(sino.half())
+    with pytest.raises(OverflowError, match="ParallelProjector"):
+        ft.ParallelProjector(tuple(vol.shape), ang).forward(vol.half())
+    with pytest.raises(OverflowError, match="RotmatProjector"):
+        ft.RotmatProjector((2, 16, 16), 180, DEVICE).back(
+            sino.half(), ft.euler_zyz_to_rotmat(make_euler_pure_y(ang).to(DEVICE)))
+    # backward of a forward projection: BP of a large incoming gradient
+    v = torch.zeros(2, 64, 64, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    y = ft.forward_project(v, ang)
+    with pytest.raises(OverflowError, match=r"\(backward\)"):
+        y.backward(torch.full_like(y, 1000.0))
+
+
+@needs_cuda
+def test_fp16_overflow_in_iterative_algorithms_raises_once_at_the_end():
+    """FISTA's first gradient is BP(-sinogram): unnormalised fp16 data
+    overflow. The algorithms record a device-side flag per projection and
+    raise when they return; SIRT normalises its residual and does not."""
+    ang, sino, _ = _fp16_overflow_inputs(DEVICE)
+    big = sino[:, :, :].clone()
+    with pytest.raises(OverflowError, match="run_fista: "):
+        ft.run_fista(big.half(), ang, 3)
+    out = ft.run_fista((big / 1000).half(), ang, 3)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(ft.run_sirt(big.half(), ang, 3)).all()
+    assert torch.isfinite(ft.run_sirt(big.half(), ang, 3, return_loss=True)[0]).all()
+
+
+@needs_cuda
+def test_fp16_fbp_overflow_raises():
+    """FBP's back-projection sums n_angles filtered views before the pi /
+    n_angles scale: a density of 400 over 720 views is ~9.2e4 in fp16
+    before scaling (the sinogram itself, up to 2.6e4, fits)."""
+    ang = torch.linspace(-89.75, 89.75, 720, device=DEVICE)
+    vol = torch.zeros(2, 64, 64, device=DEVICE)
+    vol[:, 16:48, 16:48] = 400.0
+    sino = ft.forward_project(vol, ang)
+    assert sino.max() < 65504
+    ref = ft.run_fbp(sino, ang)
+    assert torch.isfinite(ref).all()
+    with pytest.raises(OverflowError, match="fp16 range"):
+        ft.run_fbp(sino.half(), ang)
+    out = ft.run_fbp((sino / 400).half(), ang).float() * 400
+    assert rel_err(out, ref) < 1e-2
+
+
 @needs_cuda
 def test_bf16_raises_on_forward_project():
     N      = 16
@@ -918,9 +1007,87 @@ def test_apply_shifts_2d_zero_is_identity_and_grad(backend):
     assert rel_l2(sh.grad, fd) < 1e-3
 
 
-def test_apply_shifts_2d_rejects_bad_shapes():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64], ids=["fp16", "fp64"])
+@pytest.mark.parametrize("fn", ["apply_shifts", "apply_shifts_2d"])
+def test_apply_shifts_return_the_input_dtype(backend, fn, dtype):
+    """Both shift ops return the sinogram's dtype, like every other op (they
+    returned fp32 for fp16 and fp64 input). fp16 is the fp32 computation
+    rounded once; fp64 runs in fp64."""
+    g = torch.Generator().manual_seed(8)
+    sino = torch.rand(3, 5, 12, generator=g, dtype=torch.float64).to(backend)
+    sh = torch.tensor([0.3, -1.6, 2.2], dtype=torch.float64)
+    if fn == "apply_shifts_2d":
+        sh = torch.stack((sh, torch.tensor([0.4, 0.0, -0.7], dtype=torch.float64)), 1)
+    op = getattr(ft, fn)
+    out = op(sino.to(dtype), sh)
+    assert out.dtype == dtype and out.device.type == backend.type
+    ref = op(sino.to(dtype).float(), sh.float())      # the fp32 computation
+    if dtype == torch.float16:
+        assert torch.equal(out, ref.half())
+    else:
+        # fp64 arithmetic: far closer to the exact shift than fp32 (1e-7)
+        torch.testing.assert_close(out, ref.double(), rtol=0, atol=1e-5)
+        assert not torch.equal(out.float(), ref)
+
+
+def test_apply_shifts_fp16_is_differentiable(backend):
+    sino = torch.rand(2, 4, 8).to(backend).half().requires_grad_(True)
+    sh = torch.tensor([[0.5, 0.25], [-0.5, 0.0]], device=backend, requires_grad=True)
+    ft.apply_shifts_2d(sino, sh).float().sum().backward()
+    assert sino.grad.dtype == torch.float16 and sh.grad is not None
+
+
+@pytest.mark.parametrize("fn", ["apply_shifts", "apply_shifts_2d"])
+def test_shift_ops_reject_bad_shapes(fn):
+    """One shape contract for both shift ops."""
+    op = getattr(ft, fn)
     sino = torch.zeros(3, 4, 5)
-    with pytest.raises(ValueError, match=r"\[n_angles, 2\]"):
-        ft.apply_shifts_2d(sino, torch.zeros(3))
-    with pytest.raises(ValueError, match="3 angles"):
-        ft.apply_shifts_2d(sino, torch.zeros(2, 2))
+    for bad in (torch.zeros(3, 3), torch.zeros(3, 2, 1), torch.zeros(())):
+        with pytest.raises(ValueError, match=r"\[n_angles\] or \[n_angles, 2\]"):
+            op(sino, bad)
+    for bad in (torch.zeros(2), torch.zeros(2, 2)):
+        with pytest.raises(ValueError, match="3 angles"):
+            op(sino, bad)
+    with pytest.raises(ValueError, match=r"\[n_angles, Ny, N_det\]"):
+        op(torch.zeros(3, 5), torch.zeros(3))
+
+
+@pytest.mark.parametrize("fn", ["apply_shifts", "apply_shifts_2d"])
+def test_shift_ops_share_axis_order_and_sign(backend, fn):
+    """Same axis order (column 0 = detector, column 1 = tilt axis) and sign
+    (positive moves toward larger indices) for both ops: an integer shift of
+    a block with a zero margin is the same translation for the Fourier
+    (circular) and the bilinear (zero fill) op."""
+    sino = torch.zeros(2, 8, 12)
+    sino[0, 2:4, 3:6] = torch.arange(1.0, 7.0).reshape(2, 3)
+    sino[1, 3:6, 5:7] = 2.0
+    sh = torch.tensor([[2.0, 1.0], [-3.0, -2.0]])
+    exp = torch.zeros_like(sino)
+    exp[0, 3:5, 5:8] = sino[0, 2:4, 3:6]
+    exp[1, 1:4, 2:4] = 2.0
+    out = getattr(ft, fn)(sino.to(backend), sh)
+    torch.testing.assert_close(out.cpu(), exp, rtol=0, atol=1e-4)
+    # [n_angles] = detector axis only, the same as a zero tilt column
+    out1 = getattr(ft, fn)(sino.to(backend), sh[:, 0])
+    out2 = getattr(ft, fn)(sino.to(backend), torch.stack((sh[:, 0], torch.zeros(2)), 1))
+    torch.testing.assert_close(out1, out2, rtol=0, atol=1e-5)
+    exp1 = torch.zeros_like(sino)
+    exp1[0, 2:4, 5:8] = sino[0, 2:4, 3:6]
+    exp1[1, 3:6, 2:4] = 2.0
+    torch.testing.assert_close(out1.cpu(), exp1, rtol=0, atol=1e-4)
+
+
+def test_apply_shifts_tilt_axis_is_the_detector_shift_transposed(backend):
+    """The Fourier tilt-axis shift is the detector-axis shift of the
+    transposed sinogram (sub-pixel), so both axes follow one model."""
+    g = torch.Generator().manual_seed(9)
+    sino = torch.rand(3, 10, 7, generator=g).to(backend)
+    t = torch.tensor([0.35, -1.2, 2.6])
+    out = ft.apply_shifts(sino, torch.stack((torch.zeros(3), t), 1))
+    ref = ft.apply_shifts(sino.transpose(1, 2).contiguous(), t).transpose(1, 2)
+    torch.testing.assert_close(out, ref, rtol=0, atol=1e-5)
+    # and with both columns: detector then tilt axis
+    both = torch.stack((torch.tensor([0.5, -0.25, 1.5]), t), 1)
+    ref2 = ft.apply_shifts(ft.apply_shifts(sino, both[:, 0]).transpose(1, 2).contiguous(),
+                           t).transpose(1, 2)
+    torch.testing.assert_close(ft.apply_shifts(sino, both), ref2, rtol=0, atol=1e-5)
