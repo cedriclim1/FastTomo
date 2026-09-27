@@ -10,7 +10,9 @@ origin/main 0bf45d6 (generator: `tests/data/frozen_golden_main_gen.py`, old
 keyword names), except the five run_ad_recon keys, regenerated for later
 deliberate AD changes by `tests/data/regenerate_golden_keys.py` (phase 1b:
 deterministic grad_rotmat, fused Adam, the antisymmetric_z total
-derivative). Here the same calls use the new names and pass every new
+derivative; PR G: the loose sampling boundary of the parallel operator for
+ad, ad_reg, ad_staged, and the kink average of grad_rotmat at ad_pose's
+pure-tilt start, tests/data/regen_boundary_goldens.py). Here the same calls use the new names and pass every new
 option at its no-op value, and must reproduce the golden. The input
 sinogram is stored in the golden too (``_input/<device>/sino``, main
 7fdaac2's forward projection, tests/data/freeze_golden_inputs.py), so these
@@ -188,7 +190,8 @@ def ad_cases() -> dict:
 def test_ad_recon_identical_to_main():
     """The five AD keys were regenerated for deliberate changes (phase 1b:
     deterministic grad_rotmat for ad_pose; fused Adam for all five and the
-    antisymmetric_z total derivative for ad_pose) with
+    antisymmetric_z total derivative for ad_pose; PR G's sampling boundary
+    and kink rule for all but ad_support) with
     tests/data/regenerate_golden_keys.py; they pin that behaviour bit for
     bit where the fingerprint matches."""
     golden = _golden()
