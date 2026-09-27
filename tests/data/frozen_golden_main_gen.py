@@ -7,12 +7,20 @@ refactor: support=, ConstraintConfig(mask=, sparsity=)). Needs a CUDA GPU:
 
 Every case here is mirrored, with the new keyword names plus the new
 optional keywords at their no-op values, in test_frozen_identity.py.
+
+``_golden.stamp`` then records this environment's arithmetic fingerprints
+(tests/_golden.py) under ``_arith_fingerprint``: the exact comparisons are
+only made where the fingerprint matches.
 """
 import sys
+from pathlib import Path
 
 import torch
 
 import fasttomo as ft
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _golden import stamp  # noqa: E402
 
 
 def inputs(device):
@@ -78,3 +86,4 @@ def to_cpu(v):
 
 if __name__ == "__main__":
     torch.save({k: to_cpu(v) for k, v in cases_old().items()}, sys.argv[1])
+    stamp(sys.argv[1])

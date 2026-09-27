@@ -1,0 +1,181 @@
+"""
+Arithmetic fingerprint that gates the exact (``torch.equal``) golden checks.
+
+Bit identity with a golden file is a property of the machine's floating-point
+paths (ATen's CPU SIMD dispatch, the BLAS and FFT libraries and the code
+paths they pick for the CPU they run on, the GPU architecture), not of the
+torch version: two GitHub runners with the same torch but different CPUs give
+results a few ulp apart. So instead of trusting a torch version / platform
+list, each golden file stores, under ``FINGERPRINT_KEY``, the fingerprints of
+the environments its exact comparisons were verified in::
+
+    golden["_arith_fingerprint"] == {"cpu": ["<hex>", ...], "cuda": ["<hex>", ...]}
+
+``fingerprint(device)`` runs a fixed small computation on ``device`` through
+the paths the goldens depend on (a float32 matmul, reductions, real and
+complex FFTs of the sizes the algorithms use, exp / log / sqrt / sin / cos /
+atan2, an Adam-style update, fp16 rounding and a trilinear
+``F.interpolate``) and hashes the result bytes together with the SIMD
+dispatch level and ``OMP_NUM_THREADS`` (CPU) or the compute capability and
+CUDA version (GPU, whose texture-unit interpolation no torch op reaches); a
+``grid_sample`` is not needed, no golden goes through it. ``exact_env``
+returns True only where the local fingerprint is one the golden lists; the
+tests then compare with ``torch.equal`` and otherwise fall back to their
+documented tolerance. A fallback is never silent: it is recorded as the
+``golden_exact`` / ``arith_fingerprint`` test properties (JUnit XML) and
+raised as a ``GoldenNotExactWarning`` (listed in pytest's warnings summary).
+
+To add the current environment to a golden after verifying that its exact
+comparison holds here (only the metadata changes; the tensors are checked to
+be byte-identical before the file is rewritten)::
+
+    python tests/_golden.py stamp tests/data/<golden>.pt
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import sys
+import warnings
+
+import torch
+import torch.nn.functional as F
+
+FINGERPRINT_KEY = "_arith_fingerprint"
+
+
+class GoldenNotExactWarning(UserWarning):
+    """The exact branch of a golden comparison was not exercised."""
+
+
+def _bytes(t: torch.Tensor) -> bytes:
+    return t.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+
+
+def _env_tag(device: str) -> str:
+    if device == "cpu":
+        # OMP_NUM_THREADS also sets the thread count of FastTomo's OpenMP
+        # CPU kernels (single-threaded when unset), whose reductions are
+        # ordered per thread: the goldens hold with it unset.
+        omp = os.environ.get("OMP_NUM_THREADS", "").strip() or "unset"
+        return f"cpu:{torch.backends.cpu.get_cpu_capability()}:omp={omp}"
+    major, minor = torch.cuda.get_device_capability()
+    return f"cuda:sm_{major}{minor}:cuda{torch.version.cuda}"
+
+
+def _probe(device: str) -> list[torch.Tensor]:
+    """A fixed computation through the arithmetic the goldens depend on.
+    Sizes are of the order of the goldens' (small, single-threaded on the
+    CPU)."""
+    g = torch.Generator().manual_seed(20260927)
+    a = torch.randn(67, 53, generator=g).to(device)
+    b = torch.randn(53, 71, generator=g).to(device)
+    x = torch.rand(4, 3, 20, 20, generator=g).to(device)
+    s = torch.rand(13, 3, 20, generator=g).to(device)
+    c = torch.complex(torch.randn(3, 40, 40, generator=g),
+                      torch.randn(3, 40, 40, generator=g)).to(device)
+    ang = torch.linspace(-65, 65, 13).to(device)
+    out = [
+        a @ b,                                            # BLAS sgemm
+        torch.bmm(x[0], x[1].transpose(-1, -2)),
+        x.sum(), x.sum(dim=-1), x.mean(dim=(1, 2)), x.norm(), x.amax(dim=(-2, -1)),
+        torch.cumsum(x, dim=-1), (x * s[:4, :, None, :]).sum(dim=(-2, -1)),
+        torch.exp(x - 0.5), torch.log(x + 0.1), torch.sqrt(x), torch.rsqrt(x + 1),
+        torch.sin(torch.deg2rad(ang)), torch.cos(torch.deg2rad(ang)),
+        torch.atan2(x[0], x[1] - 0.5), torch.tanh(x[2]), torch.pow(x[3] + 0.1, 1.2),
+        (x.half() * 1.7).float(), (x * 0.3).half(),
+    ]
+    for n in (16, 20, 26, 33, 64):                        # ramp filter, correlation
+        f = torch.fft.rfft(s, n=n, dim=-1)
+        out += [torch.view_as_real(f), torch.fft.irfft(f * 0.5, n=n, dim=-1)]
+    f2 = torch.fft.rfft2(x)                               # W-BP deconvolution
+    out += [torch.view_as_real(f2), torch.fft.irfft2(f2, s=x.shape[-2:])]
+    fc = torch.fft.fftn(torch.fft.ifftshift(c, dim=(-2, -1)), dim=(-2, -1))  # GENFIRE
+    out += [torch.view_as_real(fc), torch.view_as_real(torch.fft.ifftn(fc, dim=(-2, -1))),
+            torch.view_as_real(torch.fft.fft(c[0], dim=-1))]
+    m, v, p = torch.zeros_like(x), torch.zeros_like(x), x.clone()   # Adam-style
+    for grad in (x - 0.4, 0.5 - x, x * x):
+        m.mul_(0.9).add_(grad, alpha=0.1)
+        v.mul_(0.999).addcmul_(grad, grad, value=0.001)
+        p.addcdiv_(m, v.sqrt().add_(1e-8), value=-0.05)
+    out += [p]
+    out += [F.interpolate(x[None], size=(4, 7, 13), mode="trilinear", align_corners=False)]
+    return out
+
+
+def fingerprint(device: str = "cpu") -> str:
+    """Hex digest of ``_probe(device)``'s bytes and the environment tag."""
+    h = hashlib.sha256(_env_tag(device).encode())
+    with torch.no_grad():
+        for t in _probe(device):
+            h.update(str((t.dtype, tuple(t.shape))).encode())
+            h.update(_bytes(t))
+    return h.hexdigest()[:24]
+
+
+def tensors(golden: dict) -> dict:
+    """The golden's entries without the fingerprint metadata."""
+    return {k: v for k, v in golden.items() if k != FINGERPRINT_KEY}
+
+
+def exact_env(golden: dict, device: str, record_property=None, what: str = "") -> bool:
+    """True when this environment's ``device`` fingerprint is one the golden
+    was verified in, so its deterministic entries must match bit for bit.
+    Otherwise warns (``GoldenNotExactWarning``) and records the fallback, so
+    that losing the exact check is visible rather than silent."""
+    fp = fingerprint(device)
+    known = golden.get(FINGERPRINT_KEY, {}).get(device, [])
+    exact = fp in known
+    if record_property is not None:
+        record_property(f"golden_exact[{device}]", exact)
+        record_property(f"arith_fingerprint[{device}]", f"{_env_tag(device)} {fp}")
+    if not exact:
+        warnings.warn(GoldenNotExactWarning(
+            f"{what or 'golden'}: {device} arithmetic fingerprint {fp} ({_env_tag(device)}) "
+            f"is not one the golden was verified in {known}; exact (torch.equal) branch "
+            "NOT exercised, compared at the documented tolerance instead"), stacklevel=2)
+    return exact
+
+
+def _byte_view(v):
+    if isinstance(v, torch.Tensor):
+        return (str(v.dtype), tuple(v.shape), _bytes(v))
+    if isinstance(v, (tuple, list)):
+        return (type(v).__name__, tuple(_byte_view(x) for x in v))
+    if isinstance(v, dict):
+        return ("dict", tuple((k, _byte_view(x)) for k, x in v.items()))
+    return ("py", repr(v))
+
+
+def same_bytes(a: dict, b: dict) -> bool:
+    """True when the two goldens' entries (metadata excluded) are
+    byte-identical: same keys, dtypes, shapes and bytes."""
+    a, b = tensors(a), tensors(b)
+    return a.keys() == b.keys() and all(_byte_view(a[k]) == _byte_view(b[k]) for k in a)
+
+
+def stamp(path: str) -> dict[str, list[str]]:
+    """Add this environment's fingerprints (CPU, and CUDA when available) to
+    the golden at ``path``. Only the metadata changes."""
+    golden = torch.load(path, weights_only=False)
+    devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+    meta = {d: list(golden.get(FINGERPRINT_KEY, {}).get(d, [])) for d in ("cpu", "cuda")}
+    for d in devices:
+        fp = fingerprint(d)
+        if fp not in meta[d]:
+            meta[d].append(fp)
+    new = dict(tensors(golden))
+    new[FINGERPRINT_KEY] = meta
+    torch.save(new, path)
+    assert same_bytes(torch.load(path, weights_only=False), golden), path
+    return meta
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "stamp":
+        for p in sys.argv[2:]:
+            print(p, stamp(p))
+    else:
+        for d in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+            print(d, _env_tag(d), fingerprint(d))
