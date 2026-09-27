@@ -173,8 +173,9 @@ results differ from earlier versions** (also with a CPU
 `ParallelProjector` as `projector=`); CUDA `run_fbp` is unchanged. The CPU
 FBP stays differentiable w.r.t. the sinogram, but **its gradient is now
 approximate**: the backward is the CPU forward projection, which is not the
-exact adjoint of the gather (inner-product gap 2-5e-2; the same pairing
-CUDA's back-projection has), where the old ray-driven back-projection was
+exact adjoint of the gather (relative inner-product gap 2-5e-2 on
+positive random data, 0.3-1.3 on zero-mean random data, i.e. at high
+frequencies; the same pairing CUDA's back-projection has), where the old ray-driven back-projection was
 the exact transpose of the CPU forward (gap 5e-9). The back-projection step
 is also faster (5x at 8x128^2, 61 views, with the Y-batched gather above).
 Only

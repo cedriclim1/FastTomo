@@ -128,9 +128,10 @@ class _GatherBackProject(torch.autograd.Function):
     ``back_project`` (a gather whose backward is the ray-marching forward).
     ``run_fbp`` stays differentiable w.r.t. the sinogram, but its gradient is
     now approximate: the ray forward is not the exact adjoint of the gather
-    (inner-product gap 2.4e-2 at 64^2 x 61 views, 5.3e-2 at 32^2 x 31),
-    where the old ray-driven CPU back-projection was the exact transpose of
-    the CPU forward (gap 5e-9). CUDA has the same mismatched pairing. The
+    (relative inner-product gap 2-5e-2 on positive uniform-random data at
+    32^2 x 31 and 64^2 x 61 views, 0.3-1.3 on zero-mean random data: the
+    gap is at high frequencies), where the old ray-driven CPU
+    back-projection was the exact transpose of the CPU forward (gap 5e-9). CUDA has the same mismatched pairing. The
     MBIR splat forward is the gather's exact adjoint, if an exact gradient
     is ever needed. Returns fp32."""
 
