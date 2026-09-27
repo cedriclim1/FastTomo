@@ -15,7 +15,9 @@ and the CUDA SIRT/SART/wSIRT/FBP/FISTA outputs; the goldens are unchanged).
   `_core.parallel_channels(io_dtype, Ny)` is the one layout rule; the cached
   projectors and run_sirt's fused texture writes use it too
   (`sirt_residual_tex_packed_kernel` / `sirt_update_packed_kernel` for both
-  formats). An fp32 volume may now have up to 4096 Y-slices and an fp16 one
+  formats, the latter with #104's planar `C_full`), and run_fista's fused
+  update writes both packed formats in place (`fista_update_packed_kernel`;
+  it used to report them unwritable, costing one upload per iteration). An fp32 volume may now have up to 4096 Y-slices and an fp16 one
   8192 (2048 texture layers). `tc_create` accepts `channels=2` (fp32,
   layered kinds) and now rejects packed `TC_VOL_3D` caches (unused; the old
   4-channel 3-D path did not round-trip).

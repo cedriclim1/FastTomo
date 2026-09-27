@@ -1,6 +1,6 @@
 /* ── fasttomo/csrc/cuda/fista_update.cu ────────────────────────────────────
  * Fused elementwise steps of one FISTA iteration (solver audit P4).
- * Kernels: fista_update_kernel<T, MODE>, fista_update_packed_h4_kernel<MODE>.
+ * Kernels: fista_update_kernel<T, MODE>, fista_update_packed_kernel<T, CH, MODE>.
  * Host wrapper: fista_update_cuda.
  *
  * run_fista's iteration, after grad = A^T (A y - b), was 4-6 PyTorch
@@ -139,25 +139,30 @@ __global__ void fista_update_kernel(
     }
 }
 
-/* 4 fp16 values of consecutive Y-slices as one 4-channel texel, the layout
- * of write_half4_vol_kernel (texture_cache.cu). */
-union Half4 {
-    __half h[4];
+/* CH values of consecutive Y-slices as one CH-channel texel (2 fp32 or 4
+ * fp16: 8 bytes), the layout of write_packed_vol_kernel (texture_cache.cu). */
+template <typename T, int CH> union Packed {
+    static_assert(sizeof(T) * CH == sizeof(float2), "packed texels are 8 bytes");
+    T v[CH];
     float2 f;
 };
 
-/* fp16, y' also into a 4-channel packed layered volume texture (Ny % 4 ==
- * 0): one thread per (plane position, Y-slice quad). MODE_FULL and
- * MODE_MOMENTUM only. */
-template <int MODE>
-__global__ void fista_update_packed_h4_kernel(
-    const __half *a_in,
-    const __half *__restrict__ grad,
-    const __half *xp_in,
-    const __half *__restrict__ mask,
+template <typename T> __device__ __forceinline__ T zero_t();
+template <> __device__ __forceinline__ float  zero_t<float>()  { return 0.0f; }
+template <> __device__ __forceinline__ __half zero_t<__half>() { return __ushort_as_half(0); }
+
+/* y' also into a CH-channel packed layered volume texture (CH = 2 fp32, 4
+ * fp16; the channels past Ny stay 0): one thread per (plane position, group
+ * of CH Y-slices). MODE_FULL and MODE_MOMENTUM only. */
+template <typename T, int CH, int MODE>
+__global__ void fista_update_packed_kernel(
+    const T *a_in,
+    const T *__restrict__ grad,
+    const T *xp_in,
+    const T *__restrict__ mask,
     int mask_full,
-    __half *x_out,
-    __half *y_out,
+    T *x_out,
+    T *y_out,
     float step, float beta, int positivity,
     int Ny, int plane, int Nx,
     cudaSurfaceObject_t surf
@@ -165,21 +170,27 @@ __global__ void fista_update_packed_h4_kernel(
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= plane) return;
     int x = p % Nx, z = p / Nx;
-    for (int y4 = blockIdx.y; y4 < Ny / 4; y4 += gridDim.y) {
-        Half4 tmp;
+    int Nyp = (Ny + CH - 1) / CH;
+    for (int yp = blockIdx.y; yp < Nyp; yp += gridDim.y) {
+        Packed<T, CH> tmp;
         #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            size_t i = (size_t)(4 * y4 + k) * plane + p;
+        for (int k = 0; k < CH; k++) {
+            int y = CH * yp + k;
+            if (y >= Ny) {
+                tmp.v[k] = zero_t<T>();
+                continue;
+            }
+            size_t i = (size_t)y * plane + p;
             float m = mask ? ldf(mask, mask_full ? i : (size_t)p) : 1.0f;
             float xo, yo = 0.0f;
-            fista_one<__half, MODE>(
+            fista_one<T, MODE>(
                 ldf(a_in, i), MODE == MODE_MOMENTUM ? 0.0f : ldf(grad, i), ldf(xp_in, i),
                 mask != nullptr, m, step, beta, positivity, &xo, &yo);
-            if (MODE != MODE_MOMENTUM) x_out[i] = __float2half_rn(xo);
-            tmp.h[k] = __float2half_rn(yo);
-            y_out[i] = tmp.h[k];
+            if (MODE != MODE_MOMENTUM) x_out[i] = float_to_t<T>(xo);
+            tmp.v[k] = float_to_t<T>(yo);
+            y_out[i] = tmp.v[k];
         }
-        surf2DLayeredwrite<float2>(tmp.f, surf, x * (int)sizeof(float2), z, y4);
+        surf2DLayeredwrite<float2>(tmp.f, surf, x * (int)sizeof(float2), z, yp);
     }
 }
 
@@ -196,17 +207,18 @@ void launch(const void *a_in, const void *grad, const void *xp_in, const void *m
     CUDA_CHECK_KERNEL();
 }
 
-template <int MODE>
+template <typename T, int CH, int MODE>
 void launch_packed(const void *a_in, const void *grad, const void *xp_in, const void *mask,
                    int mask_full, void *x_out, void *y_out, float step, float beta,
                    int positivity, int Ny, int plane, int Nx, cudaSurfaceObject_t surf,
                    cudaStream_t stream) {
     const int block = 256;
+    int Nyp = tc_packed_extent(Ny, CH);
     dim3 grid((unsigned)((plane + block - 1) / block),
-              (unsigned)(Ny / 4 < 65535 ? Ny / 4 : 65535));
-    fista_update_packed_h4_kernel<MODE><<<grid, block, 0, stream>>>(
-        (const __half *)a_in, (const __half *)grad, (const __half *)xp_in,
-        (const __half *)mask, mask_full, (__half *)x_out, (__half *)y_out, step, beta,
+              (unsigned)(Nyp < 65535 ? Nyp : 65535));
+    fista_update_packed_kernel<T, CH, MODE><<<grid, block, 0, stream>>>(
+        (const T *)a_in, (const T *)grad, (const T *)xp_in,
+        (const T *)mask, mask_full, (T *)x_out, (T *)y_out, step, beta,
         positivity, Ny, plane, Nx, surf);
     CUDA_CHECK_KERNEL();
 }
@@ -237,7 +249,8 @@ int fista_update_cuda(
 
     /* The texture receives y' (MODE_FULL / MODE_MOMENTUM) when it is a
      * volume cache with a surface in a layout this file writes: 1 channel,
-     * or fp16 4-channel packed layered. Returns 1 if it was written. */
+     * or packed layered (2 fp32 / 4 fp16 Y-slices per texel, any Ny, the
+     * padding channels written as 0). Returns 1 if it was written. */
     cudaSurfaceObject_t surf = 0;
     int surf_kind = SURF_NONE, packed = 0;
     if (vol_tc && mode != MODE_STEP) {
@@ -247,20 +260,26 @@ int fista_update_cuda(
         if (vol_tc->surf && vol_tc->channels == 1) {
             surf = vol_tc->surf;
             surf_kind = vol_tc->kind == TC_VOL_3D ? SURF_3D : SURF_LAYERED;
-        } else if (vol_tc->surf && vol_tc->channels == 4 && io_dtype == 1 &&
-                   vol_tc->kind == TC_VOL_LAYERED && Ny % 4 == 0) {
+        } else if (vol_tc->surf && vol_tc->kind == TC_VOL_LAYERED &&
+                   ((vol_tc->channels == 2 && io_dtype == 0) ||
+                    (vol_tc->channels == 4 && io_dtype == 1))) {
             surf = vol_tc->surf;
-            packed = 1;
+            packed = vol_tc->channels;
         }
     }
 
     if (packed) {
-        if (mode == MODE_FULL)
-            launch_packed<MODE_FULL>(a_in, grad, xp_in, mask, mask_full, x_out, y_out,
-                                     step, beta, positivity, Ny, plane, Nx, surf, stream);
-        else
-            launch_packed<MODE_MOMENTUM>(a_in, grad, xp_in, mask, mask_full, x_out, y_out,
-                                         step, beta, positivity, Ny, plane, Nx, surf, stream);
+#define FISTA_PACKED(T, CH, M) launch_packed<T, CH, M>(a_in, grad, xp_in, mask, mask_full, \
+                                   x_out, y_out, step, beta, positivity, Ny, plane, Nx,   \
+                                   surf, stream)
+        if (packed == 2) {
+            if (mode == MODE_FULL) FISTA_PACKED(float, 2, MODE_FULL);
+            else                   FISTA_PACKED(float, 2, MODE_MOMENTUM);
+        } else {
+            if (mode == MODE_FULL) FISTA_PACKED(__half, 4, MODE_FULL);
+            else                   FISTA_PACKED(__half, 4, MODE_MOMENTUM);
+        }
+#undef FISTA_PACKED
         return 1;
     }
 

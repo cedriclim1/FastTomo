@@ -577,8 +577,8 @@ def _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev, vol_shape, N_d
 
     Parallel geometry: both are the same in every Y-slice, bit for bit
     (``test_parallel_normalisers_are_y_invariant``), so they are computed on
-    an operator of one texel row (the main operator's packing: 4 slices for
-    packed fp16 textures, else 1), R_S broadcast into slices of one
+    an operator of one texel row (the main operator's packing: 2 fp32 or 4
+    fp16 slices per packed texel, else 1), R_S broadcast into slices of one
     sinogram and C_S kept as a ``[1, Nz, Nx]`` plane. Rotation matrices:
     full volumes from the main operator."""
     Ny, Nz, Nx = vol_shape

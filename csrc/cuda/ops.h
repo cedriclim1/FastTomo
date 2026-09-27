@@ -314,7 +314,8 @@ void sirt_residual_tex_cuda(
  * then clamp(min=0) if positivity. y_out may alias a_in, x_out may alias
  * xp_in. A non-null vol_tc (volume TextureCache with a surface) also
  * receives y_out in modes 0 and 2 when its layout allows (1 channel, or
- * fp16 4-channel packed layered); returns 1 if it did, else 0.
+ * packed layered: 2 fp32 / 4 fp16 slices per texel, any Ny); returns 1 if
+ * it did, else 0.
  */
 int fista_update_cuda(
     int io_dtype, int mode,
