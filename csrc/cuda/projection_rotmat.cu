@@ -13,6 +13,104 @@
 #include "../include/proj_geom.h"
 #include "ops.h"
 
+#include <climits>
+
+/* ── ray clipping (slab method) ───────────────────────────────────────────────
+ * forward_project_rotmat_kernel samples p(s) = o + s*d for the integer steps
+ * s in [-ray_len, ray_len], p in voxel-index units (o holds the half_*
+ * centring). ray_len covers the volume diagonal, so on rays that cross the
+ * volume at an angle, or miss it, 40-47 % of the steps sample outside it.
+ * A sample contributes only while its trilinear stencil touches the volume,
+ * i.e. p in (-1, N) on every axis; outside that the border-mode linear
+ * texture returns exactly 0.
+ *
+ * rotmat_ray_steps() narrows [-ray_len, ray_len] to an integer range
+ * [lo, hi] that contains every contributing step, and the kernel loops over
+ * it with the SAME step values s and the SAME per-sample arithmetic as the
+ * full loop. A dropped step only ever added exactly 0.0f (sum + 0.0f == sum
+ * for every value the sum can hold: it starts at +0.0f and x + (-x) rounds
+ * to +0.0f, so it is never -0.0f), so the result is bit-identical to the
+ * unclipped loop. The slab is widened to [-2, N+1] (one voxel beyond the
+ * contributing band) and the step range by one more step on each side, so
+ * fp32 rounding in the entry/exit parameters (~1e-4 of a step at N = 4096)
+ * cannot drop a contributing sample. Non-finite ray parameters (a NaN or
+ * Inf matrix) fall back to the full range, which is what the loop did.
+ *
+ * grad_rotmat_kernel marches the same steps but is NOT clipped: its loose
+ * bounds test already skips the 8 texture fetches of an outside sample, so
+ * clipping only saves that test, and measured 0.97-0.98x (block- or
+ * warp-uniform range) and ~0.8x (per-lane range) against the full loop.
+ */
+__device__ __forceinline__ bool rotmat_clip_axis(float o, float d, int N,
+                                                 float &t0, float &t1) {
+    const float lo = -2.0f, hi = (float)N + 1.0f;
+    if (d != 0.0f) {
+        float a = (lo - o) / d, b = (hi - o) / d;
+        t0 = fmaxf(t0, fminf(a, b));
+        t1 = fminf(t1, fmaxf(a, b));
+        return true;
+    }
+    return o > lo && o < hi;     /* parallel to the slab: inside or never */
+}
+
+/* Integer step range [*lo, *hi] of the ray o + s*d (o in voxel-index units,
+ * per axis) that can touch a volume of Nx x Ny x Nz voxels; the empty range
+ * (INT_MAX, INT_MIN) when the ray misses it. clip == 0 returns the full
+ * [-ray_len, ray_len] (the test hook _debug_set_rotmat_ray_clip compares
+ * both paths bit for bit). */
+__device__ __forceinline__ void rotmat_ray_steps(
+    float ox, float oy, float oz, float dx, float dy, float dz,
+    int Nx, int Ny, int Nz, int ray_len, int clip, int *lo, int *hi
+) {
+    *lo = -ray_len;
+    *hi =  ray_len;
+    if (!clip) return;
+    if (!(isfinite(ox) && isfinite(oy) && isfinite(oz) &&
+          isfinite(dx) && isfinite(dy) && isfinite(dz)))
+        return;
+    float t0 = -(float)ray_len, t1 = (float)ray_len;
+    bool hit = rotmat_clip_axis(ox, dx, Nx, t0, t1)
+             & rotmat_clip_axis(oy, dy, Ny, t0, t1)
+             & rotmat_clip_axis(oz, dz, Nz, t0, t1);
+    if (!hit || !(t0 <= t1)) { *lo = INT_MAX; *hi = INT_MIN; return; }
+    /* t0, t1 are finite here (clamped to +-ray_len above). */
+    *lo = max(-ray_len, (int)floorf(t0) - 1);
+    *hi = min( ray_len, (int)ceilf(t1)  + 1);
+}
+
+/* Union of the step ranges over the thread block, so every warp of the
+ * block marches the same steps: neighbouring rays (and the 8 warps of the
+ * 16x16 detector tile) then sample neighbouring texels at the same time and
+ * the texture cache keeps its locality. A thread's extra steps lie outside
+ * its own range, so they add exactly 0 as well. Per-warp ranges measured the
+ * same except 256^3 fp32 ZYZ (1.39x vs 1.71x), per-lane ranges were slower
+ * than no clipping on grad_rotmat. The empty range (INT_MAX, INT_MIN) is the
+ * identity. Every thread of the block must call it (full warps: the block is
+ * 16x16); two barriers, 8 bytes of static shared memory. */
+__device__ __forceinline__ void rotmat_block_union(int *lo, int *hi) {
+    __shared__ int s_lo, s_hi;
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    if (tid == 0) { s_lo = INT_MAX; s_hi = INT_MIN; }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        *lo = min(*lo, __shfl_xor_sync(0xffffffffu, *lo, off));
+        *hi = max(*hi, __shfl_xor_sync(0xffffffffu, *hi, off));
+    }
+    __syncthreads();
+    if ((tid & 31) == 0) { atomicMin(&s_lo, *lo); atomicMax(&s_hi, *hi); }
+    __syncthreads();
+    *lo = s_lo; *hi = s_hi;
+}
+
+/* Host switch for the clipping (on by default). Test hook only. */
+static int g_rotmat_ray_clip = 1;
+
+int _debug_set_rotmat_ray_clip(int on) {
+    int prev = g_rotmat_ray_clip;
+    g_rotmat_ray_clip = on ? 1 : 0;
+    return prev;
+}
+
 /* ── 3D rotation-matrix forward projection ────────────────────────────────────
  * forward_project_rotmat_kernel
  * Grid: (⌈N_det/16⌉, ⌈Ny/16⌉, n_angles)   Block: (16, 16, 1)
@@ -34,13 +132,13 @@ __global__ static void forward_project_rotmat_kernel(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     float half_det, float half_x, float half_z, float half_y,
-    int ray_len
+    int ray_len, int clip
 ) {
     int iu = blockIdx.x * blockDim.x + threadIdx.x;  /* detector u */
     int iv = blockIdx.y * blockDim.y + threadIdx.y;  /* detector v = Y-slice */
     int ia = blockIdx.z;
 
-    if (iu >= N_det || iv >= Ny) return;
+    const bool active = (iu < N_det && iv < Ny);
 
     const float *M = mats + ia * 9;
     float u = iu - half_det;
@@ -52,8 +150,18 @@ __global__ static void forward_project_rotmat_kernel(
     float oz = u * M[2] + v * M[5];
     float dx = M[6], dy = M[7], dz = M[8];  /* ray direction */
 
+    /* Steps whose trilinear stencil can touch the volume, united over the
+     * block (rotmat_ray_steps, rotmat_block_union); the others read border
+     * zeros. Every thread reaches the barriers: the early return comes after. */
+    int step_lo = INT_MAX, step_hi = INT_MIN;
+    if (active)
+        rotmat_ray_steps(ox + half_x, oy + half_y, oz + half_z, dx, dy, dz,
+                         Nx, Ny, Nz, ray_len, clip, &step_lo, &step_hi);
+    rotmat_block_union(&step_lo, &step_hi);
+    if (!active) return;
+
     float sum = 0.0f;
-    for (int step = -ray_len; step <= ray_len; step++) {
+    for (int step = step_lo; step <= step_hi; step++) {
         float s  = (float)step;
         float tx = ox + s * dx + half_x + 0.5f;
         float tz = oz + s * dz + half_z + 0.5f;
@@ -88,12 +196,12 @@ static void forward_project_rotmat_launch(
         forward_project_rotmat_kernel<float><<<grid, block, 0, stream>>>(
             vol_cache->tex, (float *)sino, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-            g.half_det, g.half_x, g.half_z, g.half_y, g.ray_len);
+            g.half_det, g.half_x, g.half_z, g.half_y, g.ray_len, g_rotmat_ray_clip);
     else
         forward_project_rotmat_kernel<__half><<<grid, block, 0, stream>>>(
             vol_cache->tex, (__half *)sino, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
-            g.half_det, g.half_x, g.half_z, g.half_y, g.ray_len);
+            g.half_det, g.half_x, g.half_z, g.half_y, g.ray_len, g_rotmat_ray_clip);
     CUDA_CHECK_KERNEL();
 }
 

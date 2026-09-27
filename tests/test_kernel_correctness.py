@@ -29,7 +29,11 @@ import pytest
 import torch
 
 import fasttomo as ft
-from fasttomo.autograd import _euler_zyz_to_rotmat, _grad_rotmat_raw
+from fasttomo.autograd import (
+    _euler_zyz_to_rotmat,
+    _forward_project_rotmat_raw,
+    _grad_rotmat_raw,
+)
 
 HAS_CUDA = torch.cuda.is_available()
 needs_cuda = pytest.mark.skipif(not HAS_CUDA, reason="no CUDA GPU available")
@@ -174,6 +178,96 @@ def test_grad_rotmat_euler_cpu_cuda_agree_on_box_filling_volume():
         (sino * target.to(dev)).sum().backward()
         grads.append(e.grad.cpu())
     assert _rel(grads[1], grads[0]) < 1e-4
+
+
+# ── F2: ray clipping in the rotmat forward-projection kernel ───────────────
+#
+# forward_project_rotmat_kernel marches only the steps whose trilinear
+# stencil can touch the volume (slab test, widened by a voxel and a step on
+# each side, united over the thread block). The dropped steps read border
+# zeros, so the sinogram must be bit-identical to the full [-ray_len,
+# ray_len] loop, which `_debug_set_rotmat_ray_clip(0)` restores. The
+# gradient w.r.t. the matrices reuses the forward's sinogram and grad_rotmat
+# (not clipped), so it is checked too.
+
+def _clip_cases():
+    g = torch.Generator().manual_seed(77)
+    rnd = torch.rand(4, 3, generator=g) * torch.tensor([360.0, 180.0, 360.0]) - 180.0
+    return {
+        "tilt": torch.stack([torch.zeros(9), torch.linspace(-70, 70, 9), torch.zeros(9)], 1),
+        "zyz": torch.cat([_EULER, rnd]),
+        # axis-aligned rays: direction components exactly 0 (slab-parallel case)
+        "axes": torch.tensor([[0.0, 0.0, 0.0], [0.0, 90.0, 0.0], [90.0, 90.0, 0.0],
+                              [0.0, 180.0, 0.0], [90.0, 0.0, 0.0]]),
+    }
+
+
+def _clip_volumes(shape):
+    g = torch.Generator().manual_seed(sum(shape))
+    Ny, Nz, Nx = shape
+    face = torch.rand(Ny, Nz, Nx, generator=g) + 0.5         # content on every face
+    corners = torch.zeros(Ny, Nz, Nx)
+    for y in (0, Ny - 1):
+        for z in (0, Nz - 1):
+            for x in (0, Nx - 1):
+                corners[y, z, x] = 1.0 + x + 10 * z + 100 * y  # content only at the 8 corners
+    return {"face": face, "corners": corners}
+
+
+def _with_clip(on, fn):
+    from fasttomo import _core
+    prev = _core._debug_set_rotmat_ray_clip(on)
+    try:
+        return fn()
+    finally:
+        _core._debug_set_rotmat_ray_clip(prev)
+
+
+# (Ny, Nz, Nx), N_det: a single 16x16 tile, odd/anisotropic, a detector wider
+# than the volume diagonal (rays that miss it), one narrower than the volume,
+# and a multi-block one (several tiles per view, partial tiles in u and v).
+# The small ones have at most 2 grad_rotmat blocks per view, so its
+# cross-block fp32 atomicAdds are order-independent and the gradient can be
+# compared with torch.equal; the multi-block shape checks the sinogram only.
+_CLIP_SHAPES = [((16, 16, 16), 16), ((7, 13, 10), 10), ((9, 5, 12), 29), ((12, 11, 9), 5),
+                ((37, 30, 41), 45)]
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape,N_det", _CLIP_SHAPES)
+@pytest.mark.parametrize("case", ["tilt", "zyz", "axes"])
+def test_rotmat_ray_clipping_is_bit_identical(shape, N_det, case):
+    euler = _clip_cases()[case]
+    mats = _euler_zyz_to_rotmat(euler).reshape(-1, 9).float().cuda()
+    # also a scaled (non-orthonormal) matrix: the clipping must not assume |d| = 1
+    mats = torch.cat([mats, mats[-1:] * 0.37, mats[:1] * 1.9])
+    n = mats.shape[0]
+    Ny, Nz, Nx = shape
+    small = N_det <= 32 and Ny <= 16
+    gs = torch.randn(n, Ny, N_det, generator=torch.Generator().manual_seed(5)).cuda()
+    for name, vol in _clip_volumes(shape).items():
+        vol = vol.cuda()
+        for dtype in (torch.float32, torch.float16):
+            v = vol.to(dtype)
+
+            def fp(v=v):
+                P = ft.RotmatProjector(shape, n, "cuda", N_det=N_det)
+                return (P.forward(v, mats),
+                        _forward_project_rotmat_raw(v, mats, N_det))
+
+            (a_c, b_c), (a_u, b_u) = _with_clip(1, fp), _with_clip(0, fp)
+            assert torch.equal(a_c, a_u) and torch.equal(b_c, b_u), (name, dtype)
+            assert a_c.abs().sum() > 0
+            if not small:
+                continue
+
+            def grad(v=v):
+                P = ft.RotmatProjector(shape, n, "cuda", N_det=N_det)
+                m = mats.clone().requires_grad_(True)
+                (P.forward(v, m).float() * gs).sum().backward()
+                return m.grad
+
+            assert torch.equal(_with_clip(1, grad), _with_clip(0, grad)), (name, dtype)
 
 
 # ── D5 / P1 / P4: texture-cache lifetime on the CUDA one-shot paths ─────────

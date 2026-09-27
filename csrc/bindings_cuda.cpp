@@ -623,6 +623,11 @@ void register_cuda(py::module_ &m) {
           "3 = after all handles exist, 0 = off).",
           py::arg("stage"));
 
+    m.def("_debug_set_rotmat_ray_clip", &_debug_set_rotmat_ray_clip,
+          "Test hook: 1 = clip rotmat forward-projection rays to the volume "
+          "(default), 0 = march the full ray. Returns the previous setting.",
+          py::arg("on"));
+
     m.attr("cuda_available") = true;
 }
 

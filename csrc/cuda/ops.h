@@ -193,6 +193,14 @@ void grad_rotmat_cuda_cached(
 );
 
 /*
+ * Test hook: turn the ray clipping of forward_project_rotmat_kernel on (1,
+ * the default) or off (0, the full [-ray_len, ray_len] step loop). Returns
+ * the previous setting. Results are bit-identical either way; tests compare
+ * the two paths with torch.equal. Process-wide, not thread-safe: tests only.
+ */
+int _debug_set_rotmat_ray_clip(int on);
+
+/*
  * Gradient of forward projection w.r.t. tilt angles.
  * grad_angles must be zeroed by the caller; result is in radians.
  */
