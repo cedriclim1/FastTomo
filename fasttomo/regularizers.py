@@ -154,6 +154,20 @@ def _gaussian_window(win_size: int, sigma: float,
     return w2[None, None, :, :]
 
 
+def _ssim_constants(target: torch.Tensor, data_range: float | None):
+    """SSIM's ``C1 = (0.01 L)^2`` and ``C2 = (0.03 L)^2``.
+
+    ``L = data_range``, or ``target.max() - target.min()`` when it is None,
+    computed on the device without a host sync: 0-d tensors with the values
+    the former ``float(target.max() - target.min())`` gave (fp64 arithmetic,
+    rounded to fp32 once, as the fp32 ops did with the Python float), so the
+    loss is unchanged bit for bit."""
+    if data_range is not None:
+        return (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    L = (target.max() - target.min()).detach().double()
+    return ((0.01 * L) ** 2).float(), ((0.03 * L) ** 2).float()
+
+
 def _ssim_map(x: torch.Tensor, y: torch.Tensor,
               window: torch.Tensor, *,
               C1: float, C2: float,
@@ -219,10 +233,7 @@ def tilt_ssim_loss(
         raise TypeError("tilt_ssim_loss is fp32-only "
                         f"(got pred={pred.dtype}, target={target.dtype}).")
 
-    if data_range is None:
-        data_range = float(target.max() - target.min())
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
+    C1, C2 = _ssim_constants(target, data_range)
 
     pad = win_size // 2
     window = _gaussian_window(win_size, sigma, pred.device, pred.dtype)
@@ -307,10 +318,7 @@ def s3im_loss(
         raise ValueError(f"patch_pixels ({patch_pixels}) exceeds total sinogram "
                          f"size ({n_total})")
 
-    if data_range is None:
-        data_range = float(target.max() - target.min())
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
+    C1, C2 = _ssim_constants(target, data_range)
 
     pred_flat = pred.reshape(-1)
     target_flat = target.reshape(-1)
