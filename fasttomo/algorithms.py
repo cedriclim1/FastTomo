@@ -1244,8 +1244,9 @@ def run_ad_recon(
 
     Constraints:
         After every optimiser step, inside ``torch.no_grad``, the volume gets
-        ``ConstraintConfig.positivity`` (clamp at 0), then the support mask,
-        then ``ConstraintConfig.sparsity`` as a soft-threshold
+        ``ConstraintConfig.positivity`` (clamp at 0), then the support mask
+        (multiplied in, so a soft mask scales voxels), then
+        ``ConstraintConfig.sparsity`` as a soft-threshold
         ``f <- sign(f) * max(|f| - sparsity, 0)`` (the proximal step of an L1
         penalty, in volume units, once per iteration). It is independent of
         ``RegularizerConfig.sparsity``, which adds ``sparsity * mean(|f|)`` to
@@ -1510,7 +1511,9 @@ def run_ad_recon(
                 volume.mul_(_cmask_mul)
             if constraints_cfg.sparsity > 0.0:
                 # Post-step L1 soft-threshold (ConstraintConfig.sparsity),
-                # applied last as documented: mask -> positivity -> sparsity.
+                # last: positivity -> support mask -> sparsity. Positivity
+                # and a non-negative mask commute, so this is the same as
+                # ConstraintConfig.apply's mask -> positivity -> sparsity.
                 volume.copy_(_apply_sparsity(volume, constraints_cfg.sparsity))
             tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:

@@ -142,8 +142,10 @@ class ConstraintConfig:
     positivity: bool = False
     mask: bool | torch.Tensor | None = None
     # Post-step L1 soft-threshold f <- sign(f) * max(|f| - sparsity, 0), in
-    # volume units, applied once per iteration after mask and positivity
-    # (run_ad_recon included). Not a loss term; see RegularizerConfig.sparsity.
+    # volume units, applied once per iteration after the mask and positivity
+    # (last in apply() and in run_ad_recon; positivity and a non-negative
+    # mask commute, so their relative order does not matter). Not a loss
+    # term; see RegularizerConfig.sparsity.
     sparsity: float = 0.0
 
     def apply(self, volume: torch.Tensor) -> torch.Tensor:

@@ -220,6 +220,34 @@ def test_ad_recon_constraint_sparsity_soft_thresholds(monkeypatch, lam, expected
     torch.testing.assert_close(rec, torch.full_like(rec, expected), rtol=0, atol=1e-6)
 
 
+def test_ad_recon_constraint_order_mask_then_threshold(monkeypatch):
+    """The soft-threshold runs after the support mask. A soft mask tells
+    the orders apart: every voxel is +0.2 after the first Adam step;
+    mask-then-threshold gives max(m * 0.2 - lam, 0), threshold-then-mask
+    gives m * max(0.2 - lam, 0). With m = 0.5, lam = 0.05 these are 0.05 and
+    0.075. (With a binary mask both orders agree, so a binary mask could not
+    pin the order.) A voxel outside the mask (m = 0) ends at 0 either way,
+    and positivity commutes with a non-negative mask, so its position
+    relative to the mask is not observable."""
+    proj = _cpu_ad_recon(monkeypatch)
+    mask = torch.ones(6, 6)
+    mask[:, :2] = 0.5                       # soft region
+    mask[:, 4:] = 0.0                       # outside the support
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=1, lr_volume=0.2, cosine_schedule=False),
+        constraints=ft.ConstraintConfig(positivity=True, sparsity=0.05),
+    )
+    rec = ft.run_ad_recon(torch.full((4, 2, 6), 3.0), torch.linspace(-30, 30, 4),
+                          Nz=6, projector=proj, config=cfg, support_mask=mask)
+    torch.testing.assert_close(rec[:, :, :2], torch.full((2, 6, 2), 0.05), rtol=0, atol=1e-6)
+    torch.testing.assert_close(rec[:, :, 2:4], torch.full((2, 6, 2), 0.15), rtol=0, atol=1e-6)
+    assert torch.equal(rec[:, :, 4:], torch.zeros(2, 6, 2))
+    # and ConstraintConfig.apply uses the same order on the same input
+    applied = ft.ConstraintConfig(positivity=True, mask=mask.unsqueeze(0), sparsity=0.05).apply(
+        torch.full((2, 6, 6), 0.2))
+    torch.testing.assert_close(rec, applied, rtol=0, atol=1e-6)
+
+
 def test_ad_recon_constraint_sparsity_matches_config_apply(monkeypatch):
     """Several iterations: run_ad_recon's result equals a hand-written loop
     (Adam step, then ConstraintConfig.apply) with the same settings."""
