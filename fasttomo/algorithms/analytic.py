@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from fasttomo._backend import _check_fp16_range
-from fasttomo._operator import Geometry, _make_operator
+from fasttomo._operator import Geometry, UncachedOperator, _make_operator
 from fasttomo.autograd import _back_project_gather_parallel_raw, _forward_project_parallel_raw
 from fasttomo.constraints import (
     _maybe_cylindrical_mask,
@@ -300,12 +300,19 @@ def run_fbp(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
         device, sinogram.dtype, projector, cached=False, num_threads=num_threads)
     backproject = op.backproject
-    if projector is None and device.type == "cpu":
-        # CPU: the shift-invariant gather, like CUDA and the CPU W-BP (the
-        # CPU operator's ray-driven transpose puts a 2-5 % voxel pattern on
-        # a flat field, 0.5-1.1 % RMS error in a uniform cylinder)
+    # CPU (own operator or a CPU ParallelProjector): the shift-invariant
+    # gather, like CUDA and the CPU W-BP, with that operator's geometry and
+    # threads (the CPU operator's ray-driven transpose puts a 2-5 % voxel
+    # pattern on a flat field: 0.5-1.1 % RMS error in a uniform cylinder)
+    cpu_op = op if projector is None else getattr(projector, "_op", None)
+    if (isinstance(cpu_op, UncachedOperator) and cpu_op.kind == "parallel"
+            and cpu_op.device.type == "cpu"):
         def backproject(s):
-            return _fbp_gather_backproject(s, angles_deg, Nz, N_det, num_threads)
+            cpu_op._check_device(s, "sinogram")
+            cpu_op._check_shape(s, "sinogram", cpu_op.sino_shape)
+            cpu_op._lock_dtype(s)
+            return _fbp_gather_backproject(s, cpu_op._angles(None), cpu_op.Nz, cpu_op.Nx,
+                                           cpu_op.num_threads)
     if sinogram.dtype != torch.float16:
         volume = backproject(filtered32) * scale
     else:
