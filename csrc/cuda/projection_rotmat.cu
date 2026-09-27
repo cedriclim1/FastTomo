@@ -245,9 +245,17 @@ void forward_project_rotmat_cuda_cached(
  * back_project_rotmat_kernel
  * Grid: (⌈Nx/8⌉, ⌈Nz/8⌉, ⌈Ny/4⌉)   Block: (8, 8, 4)
  * Each thread owns one (ix, iz, iy) voxel and loops over all angles.
- * Rotation matrices loaded into shared memory (9 * n_angles floats).
+ * Rotation matrices are staged in shared memory ROTMAT_BP_CHUNK views at a
+ * time, rows 0 and 1 only (6 floats per view; row 2, the ray direction, is
+ * not needed): 1.5 KB of static shared memory whatever n_angles is. Staging
+ * all 9*n_angles floats (the former layout) cut occupancy from 6 to 3
+ * blocks/SM at 721 views and to 1 at >= 1441 (25.7 vs 14.9 ms at 256^3,
+ * phase1b audit R6). Per-view arithmetic and the order of the sum are
+ * unchanged, so the output is bit-identical to the unchunked kernel.
  * Sinogram sampled with tex2DLayered (n_angles layers of [Ny, N_det]).
  */
+#define ROTMAT_BP_CHUNK 64
+
 template <typename T>
 __global__ static void back_project_rotmat_kernel(
     cudaTextureObject_t  sino_tex,        /* n_angles layers of [Ny, N_det] */
@@ -258,40 +266,47 @@ __global__ static void back_project_rotmat_kernel(
     float half_det, float half_x, float half_z, float half_y
 ) {
     /* Rotation matrices stay fp32 in shared memory. */
-    extern __shared__ float sh_mats[];   /* 9 * n_angles floats */
+    __shared__ float sh_mats[ROTMAT_BP_CHUNK * 6];
 
-    int tid       = threadIdx.x + threadIdx.y * blockDim.x
-                  + threadIdx.z * blockDim.x * blockDim.y;
-    int block_sz  = blockDim.x * blockDim.y * blockDim.z;
-    for (int k = tid; k < n_angles * 9; k += block_sz)
-        sh_mats[k] = mats[k];
-    __syncthreads();
+    const int tid      = threadIdx.x + threadIdx.y * blockDim.x
+                       + threadIdx.z * blockDim.x * blockDim.y;
+    const int block_sz = blockDim.x * blockDim.y * blockDim.z;
 
-    int ix = blockIdx.x * blockDim.x + threadIdx.x;
-    int iz = blockIdx.y * blockDim.y + threadIdx.y;
-    int iy = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (ix >= Nx || iz >= Nz || iy >= Ny) return;
+    const int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    const int iz = blockIdx.y * blockDim.y + threadIdx.y;
+    const int iy = blockIdx.z * blockDim.z + threadIdx.z;
+    /* No early return: every thread takes part in the chunk barriers. */
+    const bool active = (ix < Nx && iz < Nz && iy < Ny);
 
     float x = ix - half_x;
     float y = iy - half_y;
     float z = iz - half_z;
     float val = 0.0f;
 
-    for (int ia = 0; ia < n_angles; ia++) {
-        const float *M = sh_mats + ia * 9;
-        /* u = R[0,:] · (x,y,z)   v = R[1,:] · (x,y,z) */
-        float u_det = M[0]*x + M[1]*y + M[2]*z;
-        float v_det = M[3]*x + M[4]*y + M[5]*z;
-        /* tex2DLayered: x→N_det, y→Ny, layer→ia. Always read as float
-         * — hardware promotes fp16 texels on filtered read. */
-        val += tex2DLayered<float>(sino_tex,
-                                   u_det + half_det + 0.5f,
-                                   v_det + half_y   + 0.5f,
-                                   ia);
+    for (int a0 = 0; a0 < n_angles; a0 += ROTMAT_BP_CHUNK) {
+        const int cn = min(ROTMAT_BP_CHUNK, n_angles - a0);
+        __syncthreads();                     /* previous chunk fully read */
+        for (int k = tid; k < cn * 6; k += block_sz)
+            sh_mats[k] = mats[(size_t)(a0 + k / 6) * 9 + k % 6];
+        __syncthreads();
+        if (active) {
+            for (int a = 0; a < cn; a++) {
+                const float *M = sh_mats + a * 6;
+                /* u = R[0,:] · (x,y,z)   v = R[1,:] · (x,y,z) */
+                float u_det = M[0]*x + M[1]*y + M[2]*z;
+                float v_det = M[3]*x + M[4]*y + M[5]*z;
+                /* tex2DLayered: x→N_det, y→Ny, layer→ia. Always read as
+                 * float — hardware promotes fp16 texels on filtered read. */
+                val += tex2DLayered<float>(sino_tex,
+                                           u_det + half_det + 0.5f,
+                                           v_det + half_y   + 0.5f,
+                                           a0 + a);
+            }
+        }
     }
 
-    vol[((size_t)iy * Nz + iz) * Nx + ix] = float_to_t<T>(val);
+    if (active)
+        vol[((size_t)iy * Nz + iz) * Nx + ix] = float_to_t<T>(val);
 }
 
 /* Upload `sino` into `sino_cache` (already validated) and launch the
@@ -309,20 +324,16 @@ static void back_project_rotmat_launch(
     dim3 grid((g.Nx + 7) / 8,
               (g.Nz + 7) / 8,
               (g.Ny + 3) / 4);
-    size_t smem = 9 * (size_t)n_angles * sizeof(float);
-    if (io_dtype == 0) {
-        enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel<float>, smem);
-        back_project_rotmat_kernel<float><<<grid, block, smem, stream>>>(
+    if (io_dtype == 0)
+        back_project_rotmat_kernel<float><<<grid, block, 0, stream>>>(
             sino_cache->tex, (float *)vol, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y);
-    } else {
-        enable_extended_smem_if_needed((const void *)back_project_rotmat_kernel<__half>, smem);
-        back_project_rotmat_kernel<__half><<<grid, block, smem, stream>>>(
+    else
+        back_project_rotmat_kernel<__half><<<grid, block, 0, stream>>>(
             sino_cache->tex, (__half *)vol, mats,
             g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
             g.half_det, g.half_x, g.half_z, g.half_y);
-    }
     CUDA_CHECK_KERNEL();
 }
 

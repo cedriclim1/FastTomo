@@ -437,6 +437,36 @@ def test_grad_angle_multiblock_matches_fp64_reference():
     assert _rel(got, ref) < 5e-6
 
 
+# ── R6: rotmat BP stages the matrices 64 views at a time ──────────────────
+#
+# back_project_rotmat_kernel loads rows 0 and 1 of the matrices into shared
+# memory in chunks of 64 views. A sinogram that is zero except in view k
+# back-projects (bit for bit: the other views add exactly +0.0) to the
+# one-view back-projection of view k alone, so a chunk that stages the wrong
+# rows, skips views or reads the wrong layer shows up exactly, on both sides
+# of every chunk boundary and far past the old 96 KB (2730-view) cap.
+
+@needs_cuda
+@pytest.mark.parametrize("shape,N_det", [((5, 9, 11), 7), ((1, 17, 13), 19)])
+@pytest.mark.parametrize("n", [63, 64, 65, 129, 1500])
+def test_rotmat_bp_chunked_matrices_single_view_exact(shape, N_det, n):
+    from fasttomo.autograd import _back_project_rotmat_raw
+    g = torch.Generator().manual_seed(n)
+    e = torch.stack([10 * torch.rand(n, generator=g) - 5, torch.linspace(-70, 70, n),
+                     10 * torch.rand(n, generator=g) - 5], 1)
+    mats = _euler_zyz_to_rotmat(e).reshape(n, 9).float().cuda()
+    one = torch.rand(1, shape[0], N_det, generator=g).cuda()
+    for k in sorted({0, 62, 63, 64, 65, 127, 128, n - 1} & set(range(n))):
+        sino = torch.zeros(n, shape[0], N_det, device="cuda")
+        sino[k] = one[0]
+        want = _back_project_rotmat_raw(one, mats[k:k + 1], shape[1], Nx=shape[2])
+        assert want.abs().sum() > 0
+        got = _back_project_rotmat_raw(sino, mats, shape[1], Nx=shape[2])
+        P = ft.RotmatProjector(shape, n, "cuda", N_det=N_det)
+        assert torch.equal(got, want), k
+        assert torch.equal(P.back(sino, mats), want), k
+
+
 # ── CPU voxel-driven (gather) back-projection for W-BP / wSIRT ────────────
 
 @pytest.mark.parametrize("Ny,Nz,Nx,Nd,n_ang", [
