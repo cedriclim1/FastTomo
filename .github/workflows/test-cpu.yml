@@ -14,7 +14,9 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded runs on pull requests only; every push to main is tested.
+# Cancel superseded runs on pull requests only. In-progress runs on main are
+# not cancelled, but a queued run in the same group is still replaced by a
+# newer queued one, so in a burst of merges a middle commit may go untested.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
