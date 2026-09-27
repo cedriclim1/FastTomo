@@ -1330,3 +1330,25 @@ def test_sart_golden_order_converges_faster_after_one_sweep():
         e_seq = (ft.run_sart(sino, ang, 1) - vol).norm() / vol.norm()
         e_gold = (ft.run_sart(sino, ang, 1, view_order="golden") - vol).norm() / vol.norm()
         assert e_gold < 0.8 * e_seq, (e_gold, e_seq)
+
+
+@needs_cuda
+def test_sirt_iteration_launches_no_fill_kernel(monkeypatch):
+    """Hygiene H2: back-projecting the texture-resident residual allocates
+    no zero tensor for the fp16 range check in fp32 (one fill kernel per
+    SIRT iteration before)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    ang = make_angles(10, device=DEVICE)
+    sino = ft.forward_project(torch.rand(2, 24, 24, device=DEVICE), ang)
+    _force_eager_sirt(monkeypatch)
+
+    def fills(n_iter):
+        ft.run_sirt(sino, ang, n_iter)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            ft.run_sirt(sino, ang, n_iter)
+            torch.cuda.synchronize()
+        return sum(e.count for e in prof.key_averages() if "fill" in e.key.lower())
+
+    assert fills(6) == fills(2)
