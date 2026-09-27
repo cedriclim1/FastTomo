@@ -62,19 +62,23 @@ def _estimate_lipschitz(
     for _ in range(n_iter):
         AtAv = _bp(_fp(v))
         nrm = torch.linalg.vector_norm(AtAv, dtype=torch.float32)
-        v = _normalise(AtAv, nrm + _NORM_EPS)
+        v = _normalise(AtAv, nrm)
     L = 0.0 if nrm is None else float(nrm)
     return L * _LIPSCHITZ_SAFETY
 
 
-def _normalise(t: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
-    """``t / den`` for a 0-d fp32 device tensor ``den``, rounded as ATen
-    rounds ``t / float(den)``: on CUDA a Python-scalar divisor becomes a
-    multiplication by its fp32 reciprocal, on CPU an fp32 true division.
-    fp16 ``t`` is computed in fp32 and rounded once (casting ``den`` or its
-    reciprocal to fp16 first would lose it to the subnormal range)."""
+def _normalise(t: torch.Tensor, nrm: torch.Tensor) -> torch.Tensor:
+    """``t / (float(nrm) + _NORM_EPS)`` for a 0-d fp32 device tensor
+    ``nrm``, without a host sync and rounded as ATen rounds that division by
+    a Python float: the divisor ``d = double(nrm) + eps`` is formed in fp64;
+    on CUDA ATen multiplies by ``fp32(1.0 / d)`` (reciprocal in double,
+    rounded once), on CPU it divides by ``fp32(d)`` (checked on torch 2.14
+    over random divisors, fp32 and fp16). fp16 ``t`` is computed in fp32 and
+    rounded once (casting the divisor or its reciprocal to fp16 first would
+    lose it to the subnormal range)."""
+    d = nrm.double() + _NORM_EPS
     t32 = t if t.dtype == torch.float32 else t.float()
-    out = t32 * torch.reciprocal(den) if t.is_cuda else t32 / den
+    out = t32 * torch.reciprocal(d).float() if t.is_cuda else t32 / d.float()
     return out if t.dtype == torch.float32 else out.to(t.dtype)
 
 
@@ -252,8 +256,11 @@ def _tv_prox_3d_cuda(
     v = torch.empty_like(z)
     work = torch.empty((6 if fgp else 3) * z.numel(), dtype=z.dtype, device=z.device)
     betas = torch.tensor(_fgp_betas(n_iter) if fgp else [0.0] * n_iter, dtype=torch.float32)
-    # ATen divides by a Python scalar as a product with its fp32 reciprocal
-    inv_lam = float(np.float32(1.0) / np.float32(lam))
+    # CUDA ATen divides by a Python scalar as a product with its reciprocal
+    # taken in double and rounded once to fp32 (torch 2.14: fp32(1) /
+    # fp32(lam) differs for e.g. lam = 1e-3); pinned by
+    # test_tv_prox_cuda_bit_identical
+    inv_lam = float(np.float32(1.0 / float(lam)))
     with torch.cuda.device(z.device):
         _core.tv_prox_cuda(
             0 if z.dtype == torch.float32 else 1, int(fgp),

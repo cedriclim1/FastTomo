@@ -317,7 +317,8 @@ int fista_update_cuda(
  * bit fasttomo.algorithms.fista._tv_prox_3d: n_iter dual iterations of FGP
  * (fgp = 1; betas[it] the momentum of iteration it, a host array) or
  * Chambolle (fgp = 0; betas ignored), dual step `step`, inv_lam = 1/lam
- * rounded to fp32, then v_out = P_C(z - div(p)), P_C = clamp(min=0) if
+ * computed in double and rounded once to fp32 (what CUDA ATen multiplies by
+ * for `tensor / lam`), then v_out = P_C(z - div(p)), P_C = clamp(min=0) if
  * positivity then * mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter,
  * or null). work: (fgp ? 6 : 3) * Ny*Nz*Nx elements of the I/O dtype
  * (zeroed here). io_dtype 0 = fp32, 1 = fp16; tensors contiguous.

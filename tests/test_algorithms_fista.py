@@ -483,7 +483,9 @@ def test_tv_prox_cuda_bit_identical(monkeypatch, dtype, shape):
              torch.rand(Ny, Nz, Nx, generator=g).to("cuda", dtype)]
     cases = []
     for mode in ("fgp", "chambolle"):
-        for lam in (0.02, 0.37, 1e3):
+        # 1e-3 and 0.5 / 1137.9...: lams whose fp32(1) / fp32(lam) differs
+        # from ATen's double reciprocal rounded to fp32 (review of #104)
+        for lam in (0.02, 0.37, 1e3, 1e-3, 0.5 / 1137.9094970703125):
             for n_iter in (0, 1, 7):
                 cases.append((mode, lam, n_iter, False, None))
         for m in masks:
@@ -558,3 +560,19 @@ def test_fista_200_iterations_pinned(dev, bound):
     err = ((x - xt).norm() / xt.norm()).item()
     assert 0.15 < err < bound, err
     assert x.abs().max() < 1.25 * xt.max()              # no blow-up
+
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+def test_lipschitz_normalise_matches_python_float_division(dev):
+    """_normalise (the sync-free power-iteration step) rounds as ATen's
+    division by the Python float ``float(nrm) + 1e-30`` it replaces, for
+    random fp32 norms over many decades."""
+    from fasttomo.algorithms.fista import _normalise
+
+    g = torch.Generator().manual_seed(7)
+    t = (torch.rand(4096, generator=g) * 100).to(dev)
+    scales = torch.rand(200, generator=g, dtype=torch.float64) * 10 ** (
+        torch.rand(200, generator=g, dtype=torch.float64) * 12 - 4)
+    for s in scales.tolist():
+        nrm = torch.tensor(s, dtype=torch.float32, device=dev)
+        assert torch.equal(_normalise(t, nrm), t / (float(nrm) + 1e-30)), s

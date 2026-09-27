@@ -25,9 +25,10 @@
  *   div:   0 (+ p_y[i-1]) (- p_y[i]) (+ p_z[j-1]) (- p_z[j]) (+ p_x[k-1])
  *          (- p_x[k]), each term only where _tv_div's slice covers the voxel
  *   norm:  sqrt((qy*qy + qz*qz) + qx*qx), q zero on the padded plane
- *   denom: max(norm * inv_lam, 1) with NaN kept; inv_lam = 1/lam rounded to
- *          fp32 (ATen divides by a Python scalar as a product with its fp32
- *          reciprocal); p' = q / denom (true division)
+ *   denom: max(norm * inv_lam, 1) with NaN kept; inv_lam = fp32(1.0 / lam)
+ *          with the reciprocal taken in double and rounded once (CUDA ATen
+ *          divides by a Python scalar as a product with that reciprocal);
+ *          p' = q / denom (true division)
  *   step, beta: Python floats, cast to float as ATen does.
  * Pinned by tests/test_algorithms_fista.py::test_tv_prox_cuda_bit_identical.
  */
