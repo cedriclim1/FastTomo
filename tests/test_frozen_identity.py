@@ -142,6 +142,12 @@ def test_ad_recon_identical_to_main():
         reg=R(tv_weight=1e-3, tv_xz_weight=1e-3, sparsity=1e-3),
         constraints=K(positivity=True, cylinder=True, soft_threshold=1e-3)),
         return_loss=True, **extra)
+    # ad_reg stays exact across PR #92 (fixed-order TV forward) only because
+    # its TV term moved by ~1.8e-12, far below one fp32 ulp (~2.4e-7) of the
+    # ~3.2 total loss, so the recorded loss rounds to the same value (the TV
+    # backward does not read the forward value, so the volume is unchanged).
+    # A golden with a larger tv_weight could legitimately move and would
+    # need regenerating.
     _check(out, golden["ad_reg"], exact, "ad_reg")
     out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
         optim=Opt(n_iter=6),
