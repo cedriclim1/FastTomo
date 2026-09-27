@@ -115,20 +115,40 @@ def clip_and_tv_variants(g) -> None:
 
 
 def mbir_sweep_variants(g) -> None:
-    """Every MBIR ICD sweep kernel: 1, 2, 4, 8 angle slots per lane and the
-    generic kernel (> 256 angles), with and without lambdas and the Huber
-    weight, on odd sizes whose rotated projections leave the detector."""
+    """Every MBIR ICD sweep kernel: the serial kernel with 1, 2, 4, 8 angle
+    slots per lane and the generic kernel (> 256 angles), and the parallel
+    group kernel (up to 256 angles), with and without lambdas and the Huber
+    weight, on odd sizes whose rotated projections leave the detector. The
+    larger slices (> 64 voxels) exercise the serial kernel's record-ring
+    refills and groups with several members; the explicit-order path runs
+    through the serial kernel."""
+    from fasttomo.algorithms import mbir as M
     dev = torch.device("cuda")
     for n_ang in (9, 61, 100, 140, 260):
-        for Ny, Nz, Nx in ((1, 5, 7), (3, 9, 11)):
+        for Ny, Nz, Nx, N_det in ((1, 5, 7, 7), (3, 9, 11, 11), (2, 13, 29, 31), (1, 40, 37, 37)):
             angles = torch.linspace(-75, 75, n_ang, device=dev)
             vol = torch.rand(Ny, Nz, Nx, generator=g).to(dev)
-            sino = ft.forward_project(vol, angles)
+            a = angles * (torch.pi / 180)
+            sino = M._mbir_forward_project(vol, N_det, torch.cos(a), torch.sin(a))
             lam = (torch.rand(sino.shape, generator=g) + 0.5).to(dev)
-            for kw in ({}, {"lambdas": lam}, {"huber_T": 2.0}, {"lambdas": lam, "huber_T": 2.0}):
-                ft.run_mbir(sino, angles, n_iter=2, multires_levels=1, **kw)
+            kernels = ["serial"]
+            if M._mbir_resolve_sweep("auto", dev, torch.cos(a), Nz, Nx, N_det):
+                kernels.append("parallel")
+            for kernel in kernels:
+                for kw in ({}, {"lambdas": lam}, {"huber_T": 2.0},
+                           {"lambdas": lam, "huber_T": 2.0}):
+                    ft.run_mbir(sino, angles, n_iter=2, Nz=Nz, multires_levels=1,
+                                sweep_kernel=kernel, **kw)
+            key = M._mbir_perm_key(1, 0)
+            perm = torch.from_numpy(M._mbir_permutation(Ny, Nz * Nx, key)).to(dev)
+            v = torch.zeros(Ny, Nz, Nx, device=dev)
+            M._mbir_icd_sweep_cuda(v, sino.clone(), lam, v.clone(),
+                                   torch.empty(Ny * Nz * Nx * 2, device=dev), torch.cos(a),
+                                   torch.sin(a), perm_key=key, perm=perm, qggmrf_p=1.2,
+                                   qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.5, huber_T=2.0,
+                                   huber_delta=0.5, sigma=1.0)
             torch.cuda.synchronize()
-            print(f"ok mbir n_angles={n_ang} shape={(Ny, Nz, Nx)}", flush=True)
+            print(f"ok mbir n_angles={n_ang} shape={(Ny, Nz, Nx, N_det)} {kernels}", flush=True)
 
 
 if __name__ == "__main__":

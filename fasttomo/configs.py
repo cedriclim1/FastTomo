@@ -399,6 +399,7 @@ class MbirConfig:
     convergence_tol: float = 1e-4
     seed: int = 0
     sigma_f_per_scale: list[float] | None = None
+    sweep_kernel: str = "auto"
 
 
 @dataclass

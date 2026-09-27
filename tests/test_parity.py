@@ -318,12 +318,15 @@ def _mbir_sino_cpu(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Ten
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA GPU")
-def test_mbir_cpu_cuda_consistency():
+@pytest.mark.parametrize("sweep_kernel", ["serial", "parallel"])
+def test_mbir_cpu_cuda_consistency(sweep_kernel):
     """CPU and CUDA paths use identical math and an identical (seeded)
-    permutation. Differences come from float summation order across the
-    GPU's parallel reductions — bounded but non-zero. We assert max
-    absolute deviation < 1e-4 and mean < 1e-5 (measured 8e-7 and 4e-8) after
-    a modest number of iterations. """
+    visiting order: the serial sweep's, or the parallel sweep's group order
+    (which the CPU then walks sequentially; ``"auto"`` would give CPU and
+    CUDA different orders). Differences come from float summation order
+    across the GPU's parallel reductions — bounded but non-zero. We assert
+    max absolute deviation < 1e-4 and mean < 1e-5 (measured 8e-7 and 4e-8)
+    after a modest number of iterations. """
     Ny = Nz = Nx = 12
     n_angles = 16
     phantom = torch.zeros(Ny, Nz, Nx)
@@ -338,7 +341,7 @@ def test_mbir_cpu_cuda_consistency():
         sigma_f=0.1, qggmrf_p=2.0, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=False,
         sigma_init=0.1,
-        n_iter=20, multires_levels=1, seed=7,
+        n_iter=20, multires_levels=1, seed=7, sweep_kernel=sweep_kernel,
     )
     v_cpu = ft.run_mbir(sino_cpu, angles, **kw)
     v_cu  = ft.run_mbir(sino_cuda, angles.cuda(), **kw).cpu()
@@ -353,7 +356,8 @@ def test_mbir_cpu_cuda_consistency():
 
 
 @needs_cuda
-def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
+@pytest.mark.parametrize("sweep_kernel", ["serial", "parallel"])
+def test_mbir_cpu_cuda_consistency_with_offset_and_variance(sweep_kernel):
     """test_mbir_cpu_cuda_consistency runs with estimation off; this one
     turns on the offset and variance updates, Huber weights and lambdas, so
     the shared update is exercised on both backends. The residual
@@ -370,7 +374,8 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     sino[3, 2, 5] += 8.0
     lam = torch.rand(n, Ny, N, generator=g) + 0.5
     kw = dict(sigma_f=0.1, qggmrf_p=2.0, n_iter=8, multires_levels=1, seed=5, return_state=True,
-              estimate_offset=True, estimate_variance=True, huber_T=3.0)
+              estimate_offset=True, estimate_variance=True, huber_T=3.0,
+              sweep_kernel=sweep_kernel)
     vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
     vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
     assert (dc.abs() > 0.1).any()                        # offsets were estimated
@@ -383,26 +388,31 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
 @pytest.mark.parametrize("n_angles", [9, 61, 100, 200, 300])
 @pytest.mark.parametrize("use_lam,huber_T", [(False, float("inf")), (True, float("inf")),
                                              (False, 3.0), (True, 3.0)])
-def test_mbir_cpu_cuda_consistency_every_sweep_variant(n_angles, use_lam, huber_T):
-    """The CUDA sweep has one kernel per angle-slot count (1, 2, 4, 8 slots
-    of 32 angles per lane, then a generic kernel) and per lambdas / Huber
-    combination; each must agree with the CPU sweep (same voxel order,
-    different summation order). With the quadratic prior (p = q = 2): the
+@pytest.mark.parametrize("sweep_kernel", ["serial", "parallel"])
+def test_mbir_cpu_cuda_consistency_every_sweep_variant(n_angles, use_lam, huber_T, sweep_kernel):
+    """The CUDA sweeps have one kernel per angle-slot count (1, 2, 4, 8 slots
+    of 32 angles per lane, then a generic serial kernel beyond 256 views)
+    and per lambdas / Huber combination, serial and parallel; each must
+    agree with the CPU sweep (same voxel order, different summation order;
+    the CPU walks the parallel sweep's group order for
+    ``sweep_kernel="parallel"``). With the quadratic prior (p = q = 2): the
     first iterations with the edge-preserving prior (p = 1.2) are too
     sensitive for an elementwise check (a 1-ulp perturbation of the
     sinogram moves this 4-iteration volume by up to 2e-2, CPU vs CUDA
     3e-2), so that prior is compared at its fixed point
     (test_mbir_cpu_cuda_reach_the_same_map_estimate) and through its
     formula on both backends (test_algorithms_mbir.py)."""
+    if sweep_kernel == "parallel" and n_angles > 256:
+        pytest.skip("the parallel sweep takes at most 256 views")
     g = torch.Generator().manual_seed(n_angles)
-    Ny, N = 3, 10
+    Ny, N = 3, 12                    # 12: group spacing 6 at +-70 degrees fits
     ph = torch.zeros(Ny, N, N)
-    ph[:, 3:7, 2:8] = 1.0
+    ph[:, 3:8, 2:9] = 1.0
     ang = torch.linspace(-70, 70, n_angles)
     sino = _mbir_sino_cpu(ph, ang) + 0.02 * torch.randn(n_angles, Ny, N, generator=g)
     lam = torch.rand(n_angles, Ny, N, generator=g) + 0.5 if use_lam else None
     kw = dict(sigma_f=0.2, qggmrf_p=2.0, n_iter=4, multires_levels=1, seed=2, huber_T=huber_T,
-              return_state=True)
+              return_state=True, sweep_kernel=sweep_kernel)
     vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
     vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(),
                              lambdas=lam.cuda() if use_lam else None, **kw)

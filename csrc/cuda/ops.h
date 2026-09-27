@@ -348,6 +348,12 @@ void mbir_forward_project_cuda(
  *   d_work            : scratch of Ny*Nz*Nx float2 (8 bytes per voxel,
  *                       8-byte aligned), reusable across calls.
  *   sigma             : current noise std for the Huber surrogate.
+ *   group_spacing     : 0 runs the serial sweep (one warp per Y-slice, the
+ *                       order above); S > 0 the parallel sweep over
+ *                       conflict-free voxel groups of spacing S, in its own
+ *                       keyed group order (d_perm must be null; throws
+ *                       std::invalid_argument when unsupported). The caller
+ *                       guarantees S * min|cos| >= 2 + eps.
  */
 void mbir_icd_sweep_cuda(
     float       *d_volume,
@@ -362,8 +368,14 @@ void mbir_icd_sweep_cuda(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
     float huber_T, float huber_delta, float sigma,
+    int group_spacing,
     cudaStream_t stream
 );
+
+/* Whether the parallel (group) sweep supports n_angles views and N_det
+ * detector pixels on the current device: n_angles <= 256 and
+ * n_angles * (N_det + 1) * 4 bytes of shared memory per block. */
+bool mbir_group_sweep_supported(int n_angles, int N_det);
 
 /*
  * Test hook: the voxel order mbir_icd_sweep_cuda uses when d_perm is null,
