@@ -20,9 +20,12 @@ Comparison:
 
 * Keys listed in ``ATOMIC_KEYS`` come from CUDA kernels that accumulate with
   fp32 atomics (``grad_angle``, ``grad_rotmat``, the RESIRE forward
-  projection, MBIR's forward projection, the TV-loss value), so they are not
-  bit-reproducible even main-vs-main; they are compared at 2e-6 relative /
-  absolute (the observed main-vs-main spread is below 1e-6).
+  projection, MBIR's forward projection), so they are not bit-reproducible
+  even main-vs-main; they are compared at 2e-6 relative / absolute (the
+  observed main-vs-main spread is below 1e-6). The TV-loss value is no longer
+  one of them: since PR #92 its CUDA forward is a fixed-order two-pass
+  reduction, so ``cuda/gd_tv`` and ``cuda/gd_tv_loss`` are ordinary
+  deterministic keys.
 * Every other key is deterministic and compared with ``torch.equal``, but
   only where the machine's arithmetic matches the one the golden was verified
   on: the golden stores the arithmetic fingerprints of those environments
@@ -57,15 +60,15 @@ HAS_CUDA = torch.cuda.is_available()
 LOOSE_TOL = {"cpu": 1e-6, "cuda": 1e-5}
 FP16_TOL = 2.0 ** -10
 
-# Outputs of fp32-atomics kernels (not reproducible run to run).
+# Outputs of fp32-atomics kernels (not reproducible run to run). cuda/gd_tv
+# and cuda/gd_tv_loss are not here: the TV forward is a fixed-order reduction
+# since PR #92, so they get the deterministic-key check.
 ATOMIC_KEYS = {
     "cuda/fp_grad_angles",
     "cuda/fp3d_grad_euler",
     "cuda/fp3d_shift_grad_euler",
     "cuda/proj_rotmat_grad_mats",
     "cuda/proj_rotmat_grad_mats_stale",
-    "cuda/gd_tv",
-    "cuda/gd_tv_loss",
     "cuda/gd_resire",
     "cuda/gd_resire_loss",
     "cuda/mbir",
