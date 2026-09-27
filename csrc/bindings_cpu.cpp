@@ -35,10 +35,11 @@ void register_cpu(py::module_ &m) {
           [](std::intptr_t vol, std::intptr_t sino,
              std::intptr_t cos_a, std::intptr_t sin_a,
              int Ny, int Nz, int Nx, int n_angles, int N_det, int num_threads) {
-              forward_project_parallel_cpu(
-                  P<const float>(vol), P<float>(sino),
-                  P<const float>(cos_a), P<const float>(sin_a),
-                  Ny, Nz, Nx, n_angles, N_det, threads_or_one(num_threads));
+              if (forward_project_parallel_cpu(
+                      P<const float>(vol), P<float>(sino),
+                      P<const float>(cos_a), P<const float>(sin_a),
+                      Ny, Nz, Nx, n_angles, N_det, threads_or_one(num_threads)) != 0)
+                  throw std::bad_alloc();
           }, gil_release(),
           "Single-axis (parallel) forward projection (CPU). Writes every "
           "element of sino [n_angles, Ny, N_det] from vol [Ny, Nz, Nx].",

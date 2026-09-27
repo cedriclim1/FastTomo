@@ -9,7 +9,8 @@ extern "C" {
  * Parallel-beam forward projection (CPU).
  *
  * volume   : [Ny, Nz, Nx]  float32, C-contiguous (Nx is fastest)
- * sinogram : [n_angles, Ny, N_det]  float32, caller-allocated and zeroed
+ * sinogram : [n_angles, Ny, N_det]  float32, caller-allocated; every
+ *            element is written
  * cos_a    : [n_angles]  precomputed cos(angles)
  * sin_a    : [n_angles]  precomputed sin(angles)
  *
@@ -18,9 +19,12 @@ extern "C" {
  * is t = x·cosθ + z·sinθ, with x ∈ [-(Nx-1)/2, (Nx-1)/2] and similarly z.
  * Detector bins are centred: id=0 ↔ t=-(N_det-1)/2.
  *
- * Integration uses 1-pixel steps along the ray with bilinear interpolation.
+ * Integration uses 1-pixel steps along the ray with bilinear interpolation;
+ * a sample counts only if its whole 2x2 stencil is inside the slice.
+ * Y-batched (FT_YB slices per SIMD loop, common.h). Returns 0, or -1 if the
+ * scratch allocation (Nz*Nx*min(Ny, FT_YB) floats, none for Ny = 1) fails.
  */
-void forward_project_parallel_cpu(
+int forward_project_parallel_cpu(
     const float *vol,
     float       *sino,
     const float *cos_a,
