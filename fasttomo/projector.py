@@ -123,6 +123,12 @@ class _ProjectorBase:
         self.dtype: torch.dtype | None = dtype
         self._vol_handle:  int | None = None
         self._sino_handle: int | None = None
+        # run_sirt's CUDA-graph cache for this projector: configuration key
+        # -> captured graph and its static buffers, and the keys whose
+        # capture failed (so they are not retried with this projector).
+        # Owned here so the graphs die with the projector's textures.
+        self._sirt_graph_cache: dict = {}
+        self._sirt_graph_bad_keys: set = set()
 
     def _lock_dtype(self, t: torch.Tensor) -> int:
         """Return the io_dtype int. Locks self.dtype on first call; raises
@@ -252,9 +258,9 @@ class ParallelProjector(_ProjectorBase):
     one-shot calls and for differentiable-angle optimisation. Use this class
     when angles are fixed and FP/BP run many times on the same volume shape.
 
-    ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
-    configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
-    by ``run_sirt`` for constant-time replay of the SIRT iteration body.
+    ``_sirt_graph_cache`` (declared on the base class) holds the CUDA graphs
+    ``run_sirt`` captures with this projector, keyed by reconstruction
+    configuration, for constant-time replay of the SIRT iteration body.
     """
 
     def __init__(
@@ -379,9 +385,8 @@ class RotmatProjector(_ProjectorBase):
     view of the forward's texture cache, falling back to a one-shot texture
     if the cache has been overwritten by a later forward.
 
-    ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
-    configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
-    by ``run_sirt`` for constant-time replay of the SIRT iteration body.
+    ``run_sirt`` never captures a CUDA graph with this projector (rotation
+    matrices are a per-call input), so its ``_sirt_graph_cache`` stays empty.
     """
 
     def __init__(

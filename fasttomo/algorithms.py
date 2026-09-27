@@ -65,6 +65,41 @@ _log = logging.getLogger(__name__)
 # the per-iteration Fourier cutoff fraction.
 _GENFIRE_RES_EXTENSION_PIVOTS = (0.0, 0.5, 0.95, 0.5, 0.0)
 
+# FISTA: the power-iteration estimate of L = ||AᵀA|| is multiplied by this
+# margin so the step 1/L stays inside the contraction region even when the
+# iteration has not fully converged.
+_LIPSCHITZ_SAFETY = 1.01
+
+# Added to a norm before dividing by it, where the norm can be exactly 0
+# (power iteration from a vector that A maps to zero).
+_NORM_EPS = 1e-30
+
+# Dual step of the TV proximal solvers (FGP / Chambolle): 1 / L with
+# L = 12 the upper bound of ||grad ∘ div|| in 3-D (8 in 2-D).
+_TV_DUAL_STEP = 1.0 / 12.0
+
+# Seed of run_ad_recon's S3IM patch sampler (fixed, so runs are repeatable).
+_S3IM_SEED = 42
+
+# Floor of the denominator of relative changes and R-factors
+# (refine_angles, MBIR convergence check): a zero reference gives a large
+# ratio instead of NaN.
+_REL_EPS = 1e-12
+
+# MBIR constants.
+# The convergence check compares every _MBIR_CONVERGENCE_STRIDE-th voxel,
+# O(Nvox / stride) work, negligible next to a sweep.
+_MBIR_CONVERGENCE_STRIDE = 8
+# Offset update skipped for a view whose summed surrogate weight is below
+# this; also the |r| floor of the Huber tail weight delta*T/|r|.
+_MBIR_WEIGHT_EPS = 1e-30
+# Default sigma_init is the sinogram std; below this (a blank sinogram) it
+# falls back to 1.0.
+_MBIR_BLANK_STD = 1e-6
+# Default sigma_min = sigma_init * _MBIR_SIGMA_MIN_RATIO (keeps sigma from
+# collapsing to 0 when the residual vanishes).
+_MBIR_SIGMA_MIN_RATIO = 1e-3
+
 
 # ── private helpers shared across algorithms ───────────────────────────────
 
@@ -943,18 +978,19 @@ def _estimate_lipschitz(
 ) -> float:
     """Spectral norm ||A^T A||_op = L (= Lipschitz constant of ∇(½||Ax-b||²)).
 
-    Power iteration. Returns a Python float with a 1.01 safety margin so the
+    Power iteration. Returns a Python float with a 1.01 safety margin
+    (``_LIPSCHITZ_SAFETY``) so the
     FISTA step size 1/L sits strictly inside the contraction region even if
     the iteration hasn't fully converged.
     """
     v = torch.randn(vol_shape, device=device, dtype=dtype)
-    v = v / (v.norm() + 1e-30)
+    v = v / (v.norm() + _NORM_EPS)
     L = 0.0
     for _ in range(n_iter):
         AtAv = _bp(_fp(v))
         L = float(AtAv.norm())
-        v = AtAv / (L + 1e-30)
-    return L * 1.01
+        v = AtAv / (L + _NORM_EPS)
+    return L * _LIPSCHITZ_SAFETY
 
 
 def _tv_grad(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1047,7 +1083,7 @@ def _tv_prox_3d(
     p_prev_y, p_prev_z, p_prev_x = p_y, p_z, p_x
     r_y, r_z, r_x = p_y, p_z, p_x
     t = 1.0
-    step = 1.0 / 12.0
+    step = _TV_DUAL_STEP
 
     for _ in range(n_iter):
         v = z - _tv_div(r_y, r_z, r_x, Ny, Nz_, Nx)
@@ -1480,6 +1516,165 @@ def run_sart(
     return rec.finish(volume)
 
 
+@dataclass
+class _AdRun:
+    """State of one `run_ad_recon` call that its loop reads and updates."""
+    sinogram: torch.Tensor
+    angles_deg: torch.Tensor              # nominal tilt angles, on the device
+    volume: torch.Tensor                  # leaf tensor, requires_grad
+    proj: Any                             # ParallelProjector | RotmatProjector
+    tilt_angle_opt: torch.Tensor | None   # [n_angles, 3] ZYZ Euler, requires_grad
+    shifts: torch.Tensor | None           # [n_angles, 2], requires_grad
+    optimisers: list                      # [volume, (angles), (shifts)]
+    schedulers: list
+    optim_cfg: OptimConfig
+    reg_cfg: RegularizerConfig
+    constraints_cfg: ConstraintConfig
+    pose_cfg: PoseRefinementConfig | None
+    refine_pose: bool
+    refine_shifts: bool
+    ref_idx: int | None                   # anchored view (anchor_reference)
+    support: torch.Tensor | None          # resolved support, [1|Ny, Nz, Nx]
+    s3im_gen: torch.Generator | None
+    default_step_schedule: bool
+    pose_warmup_iters: int
+    alternating_period: int
+    pred_shape: tuple[int, int, int]      # (n_angles, Ny, N_det)
+
+
+def _ad_loss_terms(run: _AdRun, pred: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Data-fit and regularisation terms, keyed for the loss_callback
+    components contract (only the active ones). Insertion order is the
+    summation order of the total loss (float addition is not associative),
+    kept identical to the historical loop."""
+    optim_cfg, reg_cfg, pose_cfg = run.optim_cfg, run.reg_cfg, run.pose_cfg
+    volume, sinogram, tilt = run.volume, run.sinogram, run.tilt_angle_opt
+    terms: dict[str, torch.Tensor] = {}
+    if optim_cfg.loss_fn == "mse":
+        terms["fidelity"] = F.mse_loss(pred, sinogram)
+    else:
+        terms["fidelity"] = F.l1_loss(pred, sinogram)
+    if reg_cfg.tv_weight > 0.0:
+        terms["tv"] = reg_cfg.tv_weight * tv_loss_3d(volume)
+    if reg_cfg.tv_xz_weight > 0.0:
+        terms["tv_xz"] = reg_cfg.tv_xz_weight * tv_loss_xz(volume)
+    if reg_cfg.sparsity > 0.0:
+        terms["sparsity"] = _ad_sparsity_term(volume, reg_cfg.sparsity)
+    if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt is not None:
+        terms["in_plane"] = pose_cfg.in_plane_weight * (
+            tilt[:, 0].pow(2).mean()
+            + tilt[:, 2].pow(2).mean()
+        )
+    if reg_cfg.s3im_weight > 0.0:
+        terms["s3im"] = reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=run.s3im_gen)
+    if reg_cfg.tilt_ssim_weight > 0.0:
+        terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
+    return terms
+
+
+def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
+    """One `run_ad_recon` iteration up to the optimiser steps: forward
+    projection, loss, backward, the pose-gradient masks and the scheduled
+    optimiser/scheduler steps. Returns whether the volume was stepped."""
+    for opt in run.optimisers:
+        opt.zero_grad()
+
+    # forward project
+    tilt, shifts = run.tilt_angle_opt, run.shifts
+    if run.refine_pose and tilt is not None:
+        mats = euler_zyz_to_rotmat(tilt)
+        pred = run.proj.forward(run.volume, mats)
+    else:
+        pred = run.proj.forward(run.volume)
+
+    # A user-supplied projector built for another geometry would make
+    # the loss broadcast silently (e.g. [1, Ny, N] against the sinogram).
+    # Checked before the shift correction, whose own error ("shifts has
+    # N entries but sinogram has M angles") would name the wrong culprit.
+    _assert_projector_output_shape(
+        pred, run.pred_shape, "forward-projection", "run_ad_recon",
+    )
+
+    # optional shift correction
+    if run.refine_shifts and shifts is not None:
+        pred = apply_shifts_2d(pred, shifts)
+
+    terms = _ad_loss_terms(run, pred)
+    loss = terms["fidelity"]
+    for key, term in terms.items():
+        if key != "fidelity":
+            loss = loss + term
+
+    # .item() (a host sync) only when the loss is returned or streamed
+    if rec.wants_loss:
+        rec.record(it, loss, terms)
+    loss.backward()
+
+    if run.ref_idx is not None:
+        if tilt is not None and tilt.grad is not None:
+            tilt.grad[run.ref_idx] = 0.0
+        if shifts is not None and shifts.grad is not None:
+            shifts.grad[run.ref_idx] = 0.0
+
+    antisymmetric_z = run.pose_cfg is not None and run.pose_cfg.antisymmetric_z
+    if antisymmetric_z and run.refine_pose and tilt is not None:
+        if tilt.grad is not None:
+            tilt.grad[:, 2] = 0.0
+
+    step_volume = True
+    if run.default_step_schedule:
+        # Keep the default path exactly identical to the historical loop.
+        for opt in run.optimisers:
+            opt.step()
+        for sched in run.schedulers:
+            sched.step()
+    else:
+        step_volume, step_pose = _ad_recon_step_schedule(
+            it,
+            pose_warmup_iters=run.pose_warmup_iters,
+            alternating_period=run.alternating_period,
+        )
+        step_flags = [step_volume] + [step_pose] * (len(run.optimisers) - 1)
+        for opt, should_step in zip(run.optimisers, step_flags):
+            if should_step:
+                opt.step()
+        # An inactive optimiser's LR must not decay before its stage runs.
+        for sched, should_step in zip(run.schedulers, step_flags):
+            if should_step:
+                sched.step()
+    return step_volume
+
+
+def _ad_project_constraints(run: _AdRun, step_volume: bool) -> None:
+    """The post-step constraints of `run_ad_recon`, inside ``no_grad`` on
+    the leaf tensors: volume positivity, support, soft-threshold (only if
+    the volume was stepped), then the tilt bound and ``psi = -phi``."""
+    volume, tilt = run.volume, run.tilt_angle_opt
+    constraints_cfg, pose_cfg = run.constraints_cfg, run.pose_cfg
+    with torch.no_grad():
+        if constraints_cfg.positivity:
+            volume.clamp_(min=0.0)
+        if run.support is not None:
+            volume.mul_(run.support)
+        if constraints_cfg.soft_threshold > 0.0 and step_volume:
+            # Post-step L1 soft-threshold (ConstraintConfig.soft_threshold),
+            # last: positivity -> support mask -> soft-threshold. Positivity
+            # and a non-negative mask commute, so this is the constraints
+            # order of fasttomo.constraints (mask -> positivity -> threshold).
+            # Skipped in pose-only iterations: unlike positivity and the
+            # mask it is not idempotent and would shrink a frozen volume.
+            volume.copy_(_soft_threshold(volume, constraints_cfg.soft_threshold))
+        tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
+        if tilt_bound_deg is not None and run.refine_pose and tilt is not None:
+            tilt[:, 1].clamp_(
+                min=run.angles_deg - tilt_bound_deg,
+                max=run.angles_deg + tilt_bound_deg,
+            )
+        antisymmetric_z = pose_cfg is not None and pose_cfg.antisymmetric_z
+        if antisymmetric_z and run.refine_pose and tilt is not None:
+            tilt[:, 2] = -tilt[:, 0]
+
+
 def run_ad_recon(
     sinogram: torch.Tensor,            # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,          # [n_angles] degrees
@@ -1726,130 +1921,28 @@ def run_ad_recon(
             for opt in optimisers
         ]
 
-    # support mask resolved once by _prepare_recon ([1|Ny, Nz, Nx] or None)
-    _cmask_mul: torch.Tensor | None = setup.constraints.support_mask
-
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
     if reg_cfg.s3im_weight > 0.0:
-        _s3im_gen = torch.Generator(device=device).manual_seed(42)
+        _s3im_gen = torch.Generator(device=device).manual_seed(_S3IM_SEED)
 
     # ── iteration ─────────────────────────────────────────────────────────
+    run = _AdRun(
+        sinogram=sinogram, angles_deg=angles_deg, volume=volume, proj=_proj,
+        tilt_angle_opt=tilt_angle_opt, shifts=shifts,
+        optimisers=optimisers, schedulers=schedulers,
+        optim_cfg=optim_cfg, reg_cfg=reg_cfg, constraints_cfg=constraints_cfg,
+        pose_cfg=pose_cfg, refine_pose=refine_pose, refine_shifts=refine_shifts,
+        ref_idx=ref_idx, support=setup.constraints.support_mask, s3im_gen=_s3im_gen,
+        default_step_schedule=default_step_schedule,
+        pose_warmup_iters=pose_warmup_iters, alternating_period=alternating_period,
+        pred_shape=(n_angles, Ny, N_det),
+    )
     rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_ad_recon")
-
     for it in rec.iterate(n_iter):
-        for opt in optimisers:
-            opt.zero_grad()
-
-        # forward project
-        if refine_pose and tilt_angle_opt is not None:
-            mats = euler_zyz_to_rotmat(tilt_angle_opt)
-            pred = _proj.forward(volume, mats)  # type: ignore[arg-type]
-        else:
-            pred = _proj.forward(volume)  # type: ignore[arg-type]
-
-        # A user-supplied projector built for another geometry would make
-        # the loss broadcast silently (e.g. [1, Ny, N] against the sinogram).
-        # Checked before the shift correction, whose own error ("shifts has
-        # N entries but sinogram has M angles") would name the wrong culprit.
-        _assert_projector_output_shape(
-            pred, (n_angles, Ny, N_det), "forward-projection", "run_ad_recon",
-        )
-
-        # optional shift correction
-        if refine_shifts and shifts is not None:
-            pred = apply_shifts_2d(pred, shifts)
-
-        # data-fit + regularisation terms, keyed for the loss_callback
-        # components contract. Insertion order matches the historical
-        # summation order (float addition is non-associative), keeping the
-        # total bit-identical to the pre-callback behaviour.
-        terms: dict[str, torch.Tensor] = {}
-        if optim_cfg.loss_fn == "mse":
-            terms["fidelity"] = F.mse_loss(pred, sinogram)
-        else:
-            terms["fidelity"] = F.l1_loss(pred, sinogram)
-        if reg_cfg.tv_weight > 0.0:
-            terms["tv"] = reg_cfg.tv_weight * tv_loss_3d(volume)
-        if reg_cfg.tv_xz_weight > 0.0:
-            terms["tv_xz"] = reg_cfg.tv_xz_weight * tv_loss_xz(volume)
-        if reg_cfg.sparsity > 0.0:
-            terms["sparsity"] = _ad_sparsity_term(volume, reg_cfg.sparsity)
-        if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt_angle_opt is not None:
-            terms["in_plane"] = pose_cfg.in_plane_weight * (
-                tilt_angle_opt[:, 0].pow(2).mean()
-                + tilt_angle_opt[:, 2].pow(2).mean()
-            )
-        if reg_cfg.s3im_weight > 0.0:
-            terms["s3im"] = reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=_s3im_gen)
-        if reg_cfg.tilt_ssim_weight > 0.0:
-            terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
-
-        loss = terms["fidelity"]
-        for key, term in terms.items():
-            if key != "fidelity":
-                loss = loss + term
-
-        # .item() (a host sync) only when the loss is returned or streamed
-        if rec.wants_loss:
-            rec.record(it, loss, terms)
-        loss.backward()
-
-        if ref_idx is not None:
-            if tilt_angle_opt is not None and tilt_angle_opt.grad is not None:
-                tilt_angle_opt.grad[ref_idx] = 0.0
-            if shifts is not None and shifts.grad is not None:
-                shifts.grad[ref_idx] = 0.0
-
-        antisymmetric_z = pose_cfg is not None and pose_cfg.antisymmetric_z
-        if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
-            if tilt_angle_opt.grad is not None:
-                tilt_angle_opt.grad[:, 2] = 0.0
-
-        step_volume = True
-        if default_step_schedule:
-            # Keep the default path exactly identical to the historical loop.
-            for opt in optimisers:
-                opt.step()
-            for sched in schedulers:
-                sched.step()
-        else:
-            step_volume, step_pose = _ad_recon_step_schedule(
-                it,
-                pose_warmup_iters=pose_warmup_iters,
-                alternating_period=alternating_period,
-            )
-            step_flags = [step_volume] + [step_pose] * (len(optimisers) - 1)
-            for opt, should_step in zip(optimisers, step_flags):
-                if should_step:
-                    opt.step()
-            # An inactive optimiser's LR must not decay before its stage runs.
-            for sched, should_step in zip(schedulers, step_flags):
-                if should_step:
-                    sched.step()
-
-        # constraints applied inside no_grad (leaf-tensor safe)
-        with torch.no_grad():
-            if constraints_cfg.positivity:
-                volume.clamp_(min=0.0)
-            if _cmask_mul is not None:
-                volume.mul_(_cmask_mul)
-            if constraints_cfg.soft_threshold > 0.0 and step_volume:
-                # Post-step L1 soft-threshold (ConstraintConfig.soft_threshold),
-                # last: positivity -> support mask -> sparsity. Positivity
-                # and a non-negative mask commute, so this is the same as
-                # ConstraintConfig.apply's mask -> positivity -> sparsity.
-                # Skipped in pose-only iterations: unlike positivity and the
-                # mask it is not idempotent and would shrink a frozen volume.
-                volume.copy_(_soft_threshold(volume, constraints_cfg.soft_threshold))
-            tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
-            if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
-                tilt_angle_opt[:, 1].clamp_(
-                    min=angles_deg - tilt_bound_deg,
-                    max=angles_deg + tilt_bound_deg,
-                )
-            if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
-                tilt_angle_opt[:, 2] = -tilt_angle_opt[:, 0]
+        step_volume = _ad_step(run, it, rec)
+        _ad_project_constraints(run, step_volume)
+    rec.close()
 
     out = volume.detach()
 
@@ -1873,10 +1966,6 @@ def run_ad_recon(
 # CUDA Graph helper for run_sirt
 # ---------------------------------------------------------------------------
 
-# Set of keys known to fail graph capture — skip recapture on subsequent calls.
-_sirt_graph_bad_keys: set = set()
-
-
 def _run_sirt_cuda_graph(
     volume: torch.Tensor,
     sinogram: torch.Tensor,
@@ -1897,21 +1986,16 @@ def _run_sirt_cuda_graph(
     Returns the reconstructed volume tensor, or ``None`` if capture was
     skipped / failed (caller should fall back to the eager loop).
 
-    The graph is cached on ``projector._sirt_graph_cache[key]``.
-
-    Keys that previously failed capture are remembered in
-    ``_sirt_graph_bad_keys`` so subsequent calls skip capture directly.
+    The graph is cached on ``projector._sirt_graph_cache[key]``; keys whose
+    capture failed are kept in ``projector._sirt_graph_bad_keys`` so later
+    calls with that projector skip capture. Both are declared by the
+    projector base class; a projector without them (a duck-typed object)
+    runs the eager loop.
     """
-    global _sirt_graph_bad_keys
-
-    if key in _sirt_graph_bad_keys:
+    cache = getattr(projector, "_sirt_graph_cache", None)
+    bad_keys = getattr(projector, "_sirt_graph_bad_keys", None)
+    if cache is None or bad_keys is None or key in bad_keys:
         return None
-
-    if projector is None:
-        return None
-    if not hasattr(projector, "_sirt_graph_cache"):
-        projector._sirt_graph_cache = {}
-    cache = projector._sirt_graph_cache
 
     # CUDA Graph capture is rooted on the *current* CUDA device. When the
     # caller's tensors live on a non-default device (e.g. cuda:1 while the
@@ -1979,10 +2063,10 @@ def _run_sirt_cuda_graph(
             _log.warning(
                 "run_sirt: CUDA Graph capture failed for key %s (%s). "
                 "Falling back to eager loop for this and future calls "
-                "with this configuration.",
+                "with this configuration and projector.",
                 key, exc,
             )
-            _sirt_graph_bad_keys.add(key)
+            bad_keys.add(key)
             return None
 
     g, vol_static, sino_static, C_static, R_static, mask_static = cache[key]
@@ -2054,7 +2138,7 @@ def _genfire_hermitian_sym(
     is not; returns updated (grid_real, grid_imag, known_2d).
     """
     flip = np.mod(-np.arange(bigN), bigN).astype(np.int64)
-    flip_t = torch.LongTensor(flip).to(grid_real.device)
+    flip_t = torch.from_numpy(flip).to(grid_real.device)
 
     conj_r =  grid_real[:, flip_t][:, :, flip_t]
     conj_i = -grid_imag[:, flip_t][:, :, flip_t]
@@ -2159,8 +2243,8 @@ def run_genfire(
         grid_r = sinogram.new_zeros(Ny, bigN, bigN)
         grid_i = sinogram.new_zeros(Ny, bigN, bigN)
         grid_w = sinogram.new_zeros(Ny, bigN, bigN)
-        cos_t = torch.Tensor(cos_a).to(device)
-        sin_t = torch.Tensor(sin_a).to(device)
+        cos_t = torch.from_numpy(cos_a).to(device)
+        sin_t = torch.from_numpy(sin_a).to(device)
         with torch.cuda.device(device):
             _core.genfire_gridding_2d_cuda(
                 fk_r.data_ptr(), fk_i.data_ptr(),
@@ -2232,7 +2316,7 @@ def run_genfire(
             np.sqrt(iz_c[:, None] ** 2 + ix_c[None, :] ** 2) / (bigN // 2),
             1.0,
         ).astype(np.float32)
-        res_ind = torch.Tensor(1.0 - R_np).to(device)          # [bigN, bigN] shifted
+        res_ind = torch.from_numpy(1.0 - R_np).to(device)      # [bigN, bigN] shifted
         res_ind_us = torch.fft.ifftshift(res_ind)               # unshifted
 
     # ── iteration ───────────────────────────────────────────────────────────
@@ -2429,7 +2513,7 @@ def refine_angles(
                                     num_threads=num_threads)
             measured_j = sinogram[j]
             residuals  = (projs - measured_j.unsqueeze(0)).abs().sum(dim=(-2, -1))
-            r_factors  = residuals / (measured_j.abs().sum().clamp(min=1e-12))
+            r_factors  = residuals / (measured_j.abs().sum().clamp(min=_REL_EPS))
             refined[j] = candidates[r_factors.argmin()]
 
         return refined
@@ -2441,7 +2525,7 @@ def refine_angles(
 
         for j in range(n_angles):
             measured_j  = sinogram[j]                              # [Ny, N_det]
-            normalizer  = measured_j.abs().sum().clamp(min=1e-12)
+            normalizer  = measured_j.abs().sum().clamp(min=_REL_EPS)
 
             for axis in range(3):  # φ, θ, ψ in sequence
                 current_val = refined[j, axis].item()
@@ -2729,7 +2813,7 @@ def _huber_surr_weight(r_abs: torch.Tensor, T: float, delta: float) -> torch.Ten
     if not math.isfinite(T):
         return torch.ones_like(r_abs)
     inside = r_abs < T
-    outside_w = delta * T / r_abs.clamp(min=1e-30)
+    outside_w = delta * T / r_abs.clamp(min=_MBIR_WEIGHT_EPS)
     return torch.where(inside, torch.ones_like(r_abs), outside_w)
 
 
@@ -2774,7 +2858,7 @@ def _mbir_update_offset_variance(
     if estimate_offset:
         num = (bw * lam * e_sino).double().sum(dim=(1, 2))
         den = (bw * lam).double().sum(dim=(1, 2))
-        delta_d = torch.where(den >= 1e-30, num / den.clamp(min=1e-30),
+        delta_d = torch.where(den >= _MBIR_WEIGHT_EPS, num / den.clamp(min=_MBIR_WEIGHT_EPS),
                               torch.zeros_like(num)).float()
         d_offsets = d_offsets + delta_d
         e_sino.sub_(delta_d.view(n_angles, 1, 1))
@@ -2993,10 +3077,10 @@ def _run_mbir_single_scale(
         # Convergence check: relative L2 change on a strided sample so it
         # scales as O(Nvox / 8). Cheap vs the per-iter compute.
         with torch.no_grad():
-            stride = 8
+            stride = _MBIR_CONVERGENCE_STRIDE
             f_new = volume.flatten()[::stride]
             f_old = vol_snap.flatten()[::stride]
-            denom = f_old.norm().clamp(min=1e-12)
+            denom = f_old.norm().clamp(min=_REL_EPS)
             rel_change = float((f_new - f_old).norm() / denom)
         if return_history:
             history.append(rel_change)
@@ -3188,13 +3272,13 @@ def run_mbir(
 
     if sigma_init is None:
         sigma_init = float(sinogram.std().item())
-        if sigma_init < 1e-6:
+        if sigma_init < _MBIR_BLANK_STD:
             sigma_init = 1.0
     # sigma divides the data term, so zero or negative values blow up.
     if not math.isfinite(float(sigma_init)) or float(sigma_init) <= 0.0:
         raise ValueError(f"run_mbir: sigma_init must be finite and > 0, got {sigma_init}")
     if sigma_min is None:
-        sigma_min = sigma_init * 1e-3
+        sigma_min = sigma_init * _MBIR_SIGMA_MIN_RATIO
     if not math.isfinite(float(sigma_min)) or float(sigma_min) <= 0.0:
         raise ValueError(f"run_mbir: sigma_min must be finite and > 0, got {sigma_min}")
 
