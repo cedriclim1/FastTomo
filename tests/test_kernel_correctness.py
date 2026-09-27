@@ -226,9 +226,8 @@ def _with_clip(on, fn):
 # (Ny, Nz, Nx), N_det: a single 16x16 tile, odd/anisotropic, a detector wider
 # than the volume diagonal (rays that miss it), one narrower than the volume,
 # and a multi-block one (several tiles per view, partial tiles in u and v).
-# The small ones have at most 2 grad_rotmat blocks per view, so its
-# cross-block fp32 atomicAdds are order-independent and the gradient can be
-# compared with torch.equal; the multi-block shape checks the sinogram only.
+# grad_rotmat reduces with a fixed order (no atomics), so the gradient is
+# compared with torch.equal on every shape.
 _CLIP_SHAPES = [((16, 16, 16), 16), ((7, 13, 10), 10), ((9, 5, 12), 29), ((12, 11, 9), 5),
                 ((37, 30, 41), 45)]
 
@@ -243,7 +242,6 @@ def test_rotmat_ray_clipping_is_bit_identical(shape, N_det, case):
     mats = torch.cat([mats, mats[-1:] * 0.37, mats[:1] * 1.9])
     n = mats.shape[0]
     Ny, Nz, Nx = shape
-    small = N_det <= 32 and Ny <= 16
     gs = torch.randn(n, Ny, N_det, generator=torch.Generator().manual_seed(5)).cuda()
     for name, vol in _clip_volumes(shape).items():
         vol = vol.cuda()
@@ -258,16 +256,185 @@ def test_rotmat_ray_clipping_is_bit_identical(shape, N_det, case):
             (a_c, b_c), (a_u, b_u) = _with_clip(1, fp), _with_clip(0, fp)
             assert torch.equal(a_c, a_u) and torch.equal(b_c, b_u), (name, dtype)
             assert a_c.abs().sum() > 0
-            if not small:
-                continue
 
             def grad(v=v):
                 P = ft.RotmatProjector(shape, n, "cuda", N_det=N_det)
                 m = mats.clone().requires_grad_(True)
                 (P.forward(v, m).float() * gs).sum().backward()
-                return m.grad
+                return m.grad, _grad_rotmat_raw(v.float(), gs, mats)
 
-            assert torch.equal(_with_clip(1, grad), _with_clip(0, grad)), (name, dtype)
+            (g_c, r_c), (g_u, r_u) = _with_clip(1, grad), _with_clip(0, grad)
+            assert torch.equal(g_c, g_u) and torch.equal(r_c, r_u), (name, dtype)
+
+
+# ── R1 / R5: geometry gradients are deterministic and exact across blocks ──
+#
+# grad_rotmat and grad_angle reduce per thread block with warp shuffles in a
+# fixed order, write one partial per block, and a second kernel sums each
+# view's partials in a fixed order: no fp32 atomics, so repeated calls are
+# bit-identical (phase1b audit R1/R5). The shapes have several blocks per
+# view (partial tiles in u and v), where the old cross-block atomicAdds
+# differed run to run. The fp64 references below are analytic (not FD) and
+# share no code with the kernels.
+
+def _grad_rotmat_ref(vol: np.ndarray, mats: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """fp64 analytic dL/dM of L = <w, FP(vol, M)> for the loose (-1, N)
+    border-zero trilinear rotmat forward (same model as _fp_rotmat_ref)."""
+    Ny, Nz, Nx = vol.shape
+    N_det = w.shape[-1]
+    ray_len = int(math.ceil(0.5 * math.sqrt(Nx * Nx + Ny * Ny + Nz * Nz))) + 1
+    hd, hx, hy, hz = 0.5 * (N_det - 1), 0.5 * (Nx - 1), 0.5 * (Ny - 1), 0.5 * (Nz - 1)
+    pad = np.zeros((Ny + 2, Nz + 2, Nx + 2))
+    pad[1:-1, 1:-1, 1:-1] = vol
+    V, U, S = np.meshgrid(np.arange(Ny) - hy, np.arange(N_det) - hd,
+                          np.arange(-ray_len, ray_len + 1, dtype=np.float64), indexing="ij")
+    out = np.zeros((mats.shape[0], 9))
+    for a, M in enumerate(mats):
+        fx = U * M[0] + V * M[3] + S * M[6] + hx
+        fy = U * M[1] + V * M[4] + S * M[7] + hy
+        fz = U * M[2] + V * M[5] + S * M[8] + hz
+        inb = (fx > -1) & (fx < Nx) & (fy > -1) & (fy < Ny) & (fz > -1) & (fz < Nz)
+        fx, fy, fz = (np.where(inb, f, 0.0) for f in (fx, fy, fz))
+        x0, y0, z0 = np.floor(fx), np.floor(fy), np.floor(fz)
+        wx, wy, wz = fx - x0, fy - y0, fz - z0
+        xi, yi, zi = (c.astype(int) + 1 for c in (x0, y0, z0))
+
+        def c(dy, dz, dx):
+            return pad[yi + dy, zi + dz, xi + dx]
+
+        dfx = ((1 - wy) * (1 - wz) * (c(0, 0, 1) - c(0, 0, 0)) + wy * (1 - wz) * (c(1, 0, 1) - c(1, 0, 0))
+               + (1 - wy) * wz * (c(0, 1, 1) - c(0, 1, 0)) + wy * wz * (c(1, 1, 1) - c(1, 1, 0)))
+        dfy = ((1 - wx) * (1 - wz) * (c(1, 0, 0) - c(0, 0, 0)) + wx * (1 - wz) * (c(1, 0, 1) - c(0, 0, 1))
+               + (1 - wx) * wz * (c(1, 1, 0) - c(0, 1, 0)) + wx * wz * (c(1, 1, 1) - c(0, 1, 1)))
+        dfz = ((1 - wx) * (1 - wy) * (c(0, 1, 0) - c(0, 0, 0)) + wx * (1 - wy) * (c(0, 1, 1) - c(0, 0, 1))
+               + (1 - wx) * wy * (c(1, 1, 0) - c(1, 0, 0)) + wx * wy * (c(1, 1, 1) - c(1, 0, 1)))
+        gw = w[a][:, :, None] * inb
+        for k, coef in enumerate((U, V, S)):
+            out[a, 3 * k + 0] = (gw * dfx * coef).sum()
+            out[a, 3 * k + 1] = (gw * dfy * coef).sum()
+            out[a, 3 * k + 2] = (gw * dfz * coef).sum()
+    return out
+
+
+def _grad_angle_ref(vol: np.ndarray, angles_deg: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """fp64 analytic dL/dtheta (per degree) of L = <w, FP(vol, theta)> for the
+    tight single-axis forward (same model as _fp_parallel_ref)."""
+    Ny, Nz, Nx = vol.shape
+    N_det = w.shape[-1]
+    ray_len = int(math.ceil(0.5 * math.sqrt(Nx * Nx + Nz * Nz))) + 1
+    hd, hx, hz = 0.5 * (N_det - 1), 0.5 * (Nx - 1), 0.5 * (Nz - 1)
+    T, S = np.meshgrid(np.arange(N_det) - hd,
+                       np.arange(-ray_len, ray_len + 1, dtype=np.float64), indexing="ij")
+    out = np.zeros(len(angles_deg))
+    for a, th in enumerate(np.deg2rad(angles_deg)):
+        x = T * math.cos(th) - S * math.sin(th)
+        z = T * math.sin(th) + S * math.cos(th)
+        fx, fz = x + hx, z + hz
+        inside = (fx >= 0) & (fx < Nx - 1) & (fz >= 0) & (fz < Nz - 1)
+        fx, fz = np.where(inside, fx, 0.0), np.where(inside, fz, 0.0)
+        x0, z0 = np.floor(fx).astype(int), np.floor(fz).astype(int)
+        wx, wz = fx - x0, fz - z0
+        x1, z1 = np.minimum(x0 + 1, Nx - 1), np.minimum(z0 + 1, Nz - 1)
+        v00, v01 = vol[:, z0, x0], vol[:, z0, x1]
+        v10, v11 = vol[:, z1, x0], vol[:, z1, x1]
+        dvx = (1 - wz) * (v01 - v00) + wz * (v11 - v10)
+        dvz = (1 - wx) * (v10 - v00) + wx * (v11 - v01)
+        d = np.where(inside[None], dvx * (-z) + dvz * x, 0.0).sum(-1)   # [Ny, N_det]
+        out[a] = (w[a] * d).sum() * math.pi / 180.0
+    return out
+
+
+def _smooth_volume(shape):
+    Ny, Nz, Nx = shape
+    y, z, x = torch.meshgrid(*(torch.arange(n, dtype=torch.float64) - (n - 1) / 2
+                               for n in shape), indexing="ij")
+    s = max(shape) / 16
+    return (torch.exp(-((x - 1.5 * s) ** 2 + (y + s) ** 2 + (z - 2 * s) ** 2) / (2 * (2.5 * s) ** 2))
+            + 0.5 * torch.exp(-((x + 3 * s) ** 2 + (y - 2 * s) ** 2 + (z + s) ** 2)
+                              / (2 * (1.8 * s) ** 2)))
+
+
+# (Ny, Nz, Nx), N_det: 6 and 9 grad_rotmat blocks per view, partial tiles in u and v
+_MULTIBLOCK = [((20, 24, 40), 44), ((37, 30, 41), 45)]
+_GEN_EULER = torch.cat([_EULER, torch.tensor([[-8.4, 47.6, 11.1], [17.9, -58.3, -4.6],
+                                               [-2.7, 5.9, 9.8]])])
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape,N_det", _MULTIBLOCK)
+def test_grad_rotmat_is_bit_reproducible(shape, N_det):
+    g = torch.Generator().manual_seed(11)
+    vol = (torch.rand(*shape, generator=g) + 0.5).cuda()
+    mats = _euler_zyz_to_rotmat(_GEN_EULER).reshape(-1, 9).float().cuda()
+    n = mats.shape[0]
+    gs = torch.randn(n, shape[0], N_det, generator=g).cuda()
+    runs = {"uncached": [_grad_rotmat_raw(vol, gs, mats) for _ in range(20)]}
+    for dtype in (torch.float32, torch.float16):
+        P = ft.RotmatProjector(shape, n, "cuda", N_det=N_det)
+        runs[str(dtype)] = []
+        for _ in range(20):
+            m = mats.clone().requires_grad_(True)
+            (P.forward(vol.to(dtype), m).float() * gs).sum().backward()
+            runs[str(dtype)].append(m.grad)
+    for key, rs in runs.items():
+        assert rs[0].abs().sum() > 0, key
+        assert all(torch.equal(r, rs[0]) for r in rs[1:]), key
+    assert torch.equal(runs["uncached"][0], runs["torch.float32"][0])
+
+
+@needs_cuda
+def test_grad_angle_is_bit_reproducible():
+    g = torch.Generator().manual_seed(12)
+    Ny, Nz, Nx, N_det, n = 9, 40, 48, 60, 37          # 4 x 3 blocks per y-slice
+    vol = (torch.rand(Ny, Nz, Nx, generator=g) + 0.5).cuda()
+    ang = (torch.linspace(-70, 70, n) + 0.37).cuda()
+    gs = torch.randn(n, Ny, N_det, generator=g).cuda()
+    from fasttomo.autograd import _grad_angle_raw
+    runs = [_grad_angle_raw(vol, gs, ang) for _ in range(20)]
+    assert runs[0].abs().sum() > 0
+    assert all(torch.equal(r, runs[0]) for r in runs[1:])
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape,N_det", _MULTIBLOCK)
+def test_grad_rotmat_multiblock_matches_fp64_reference_and_cpu(shape, N_det):
+    """Cross-block reduction on shapes with several blocks per view (the D2
+    tests have one), cached and uncached, on a smooth phantom with generic
+    angles. Per view against the CPU kernel (measured 1.4e-6 to 6.1e-6: fp32
+    accumulation on both sides); against the analytic fp64 gradient per view
+    on the first shape (measured 1.3e-7 to 3.0e-7) and overall on the second,
+    where two views sit on trilinear kinks (fp32 vs fp64 sample positions,
+    2.3e-4 on the CPU kernel too; audit R8). A mis-indexed or dropped partial
+    would be O(1)."""
+    vol = _smooth_volume(shape)
+    mats = _euler_zyz_to_rotmat(_GEN_EULER).reshape(-1, 9).float()
+    n = mats.shape[0]
+    w = torch.randn(n, shape[0], N_det, generator=torch.Generator().manual_seed(13))
+    ref = _grad_rotmat_ref(vol.numpy(), mats.double().numpy(), w.double().numpy())
+    cpu = _grad_rotmat_raw(vol.float(), w, mats)
+    unc = _grad_rotmat_raw(vol.float().cuda(), w.cuda(), mats.cuda()).cpu()
+    P = ft.RotmatProjector(shape, n, "cuda", N_det=N_det)
+    m = mats.cuda().requires_grad_(True)
+    (P.forward(vol.float().cuda(), m) * w.cuda()).sum().backward()
+    assert torch.equal(unc, m.grad.cpu())
+    for a in range(n):
+        assert _rel(unc[a], cpu[a]) < 2e-5, a
+        if shape == _MULTIBLOCK[0][0]:
+            assert _rel(unc[a], ref[a]) < 5e-6, a
+    assert _rel(unc, ref) < 5e-4
+
+
+@needs_cuda
+def test_grad_angle_multiblock_matches_fp64_reference():
+    from fasttomo.autograd import _grad_angle_raw
+    shape, N_det = (9, 40, 48), 60
+    vol = _smooth_volume(shape)
+    ang = np.linspace(-70, 70, 9) + 0.37
+    w = torch.randn(len(ang), shape[0], N_det, generator=torch.Generator().manual_seed(14))
+    ref = _grad_angle_ref(vol.numpy(), ang, w.double().numpy())
+    got = _grad_angle_raw(vol.float().cuda(), w.cuda(),
+                          torch.tensor(ang, dtype=torch.float32).cuda()).cpu()
+    assert _rel(got, ref) < 5e-6
 
 
 # ── CPU voxel-driven (gather) back-projection for W-BP / wSIRT ────────────
