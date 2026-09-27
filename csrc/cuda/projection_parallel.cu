@@ -216,10 +216,10 @@ static void forward_project_parallel_launch(
     const void *vol, void *sino,
     const float *cos_a, const float *sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream, bool upload
 ) {
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
-    tc_upload(vol_cache, vol, stream);
+    if (upload) tc_upload(vol_cache, vol, stream);
 
     dim3 block(16, 16, 1);
     if (io_dtype == 1 && vol_cache->channels == 4) {
@@ -251,10 +251,10 @@ static void back_project_parallel_launch(
     const void *sino, void *vol,
     const float *cos_a, const float *sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream, bool upload
 ) {
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
-    tc_upload(sino_cache, sino, stream);
+    if (upload) tc_upload(sino_cache, sino, stream);
 
     dim3 block(16, 16, 1);
     size_t smem = 2 * (size_t)n_angles * sizeof(float);
@@ -298,7 +298,7 @@ void forward_project_parallel_cuda(
     ScopedTextureCache tc(TC_VOL_LAYERED, tc_dtype_of(io_dtype),
                           one_shot_channels(io_dtype, Ny), Ny, Nz, Nx, stream);
     forward_project_parallel_launch(io_dtype, tc.get(), vol, sino,
-                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream);
+                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, true);
     tc.finish();
 }
 
@@ -311,13 +311,14 @@ void forward_project_parallel_cuda_cached(
     const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload
 ) {
     check_io_dtype(io_dtype, "forward_project_parallel_cuda_cached");
     tc_validate(vol_cache, TC_VOL_LAYERED, io_dtype, Ny, Nz, Nx,
                 "forward_project_parallel_cuda_cached");
     forward_project_parallel_launch(io_dtype, vol_cache, vol, sino,
-                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream);
+                           cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0);
 }
 
 void back_project_parallel_cuda(
@@ -334,7 +335,7 @@ void back_project_parallel_cuda(
     ScopedTextureCache tc(TC_SINO_LAYERED, tc_dtype_of(io_dtype),
                           one_shot_channels(io_dtype, Ny), n_angles, Ny, N_det, stream);
     back_project_parallel_launch(io_dtype, tc.get(), sino, vol,
-                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream);
+                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, true);
     tc.finish();
 }
 
@@ -347,11 +348,12 @@ void back_project_parallel_cuda_cached(
     const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload
 ) {
     check_io_dtype(io_dtype, "back_project_parallel_cuda_cached");
     tc_validate(sino_cache, TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det,
                 "back_project_parallel_cuda_cached");
     back_project_parallel_launch(io_dtype, sino_cache, sino, vol,
-                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream);
+                        cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0);
 }

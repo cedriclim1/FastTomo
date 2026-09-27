@@ -95,7 +95,8 @@ void forward_project_parallel_cuda_cached(
     const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
 );
 
 void back_project_parallel_cuda_cached(
@@ -107,7 +108,8 @@ void back_project_parallel_cuda_cached(
     const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
 );
 
 void forward_project_rotmat_cuda_cached(
@@ -118,7 +120,8 @@ void forward_project_rotmat_cuda_cached(
     const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
 );
 
 void back_project_rotmat_cuda_cached(
@@ -129,7 +132,8 @@ void back_project_rotmat_cuda_cached(
     const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
 );
 
 /*
@@ -238,7 +242,16 @@ void grad_angle_cuda(
  *     [Ny, Nz, Nx], rounded in run_sirt's eager order (eager_order = 1) or
  *     its CUDA-graph order (0); mask is [1 | Ny, Nz, Nx] (mask_full = 1 for
  *     the latter) or null; soft_thr <= 0 disables the soft threshold.
- *     vol_out may alias vol_in.
+ *     vol_out may alias vol_in. A non-null vol_tc (a volume TextureCache
+ *     with a surface, tc_create_ex) also receives vol_out, so the next
+ *     cached forward projection can skip its upload (upload = 0); with a
+ *     vol_tc, a null vol_in reads the volume from the texture and a null
+ *     vol_out skips the global write (the volume then lives in the texture;
+ *     tc_download fetches it).
+ *   sirt_residual_tex_cuda: res = (sino - fp) * R written into res_tc (a
+ *     [n_angles, Ny, N_det] sinogram TextureCache with a surface) instead
+ *     of global memory, for a cached back-projection with upload = 0;
+ *     raw_out (sino - fp) may be null.
  */
 void sirt_residual_cuda(
     int io_dtype,
@@ -255,6 +268,16 @@ void sirt_update_cuda(
     const void *mask, int mask_full,
     float omega, int positivity, float soft_thr,
     int Ny, int Nz, int Nx,
+    TextureCache *vol_tc,
+    cudaStream_t stream
+);
+
+void sirt_residual_tex_cuda(
+    int io_dtype,
+    const void *sino, const void *fp, const void *R,
+    void *raw_out,
+    TextureCache *res_tc,
+    int n_angles, int Ny, int N_det,
     cudaStream_t stream
 );
 

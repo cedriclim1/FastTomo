@@ -71,6 +71,25 @@ static void check_extent_limits(tc_kind_t kind, const cudaExtent &e) {
             + std::to_string(max_d) + ")");
 }
 
+/* True when `e` fits this device's surface limits for `kind` (surface
+ * extents can be smaller than texture extents on some devices). */
+static bool fits_surface_limits(tc_kind_t kind, const cudaExtent &e) {
+    int dev = 0;
+    FASTTOMO_CUDA_CHECK(cudaGetDevice(&dev));
+    auto attr = [dev](cudaDeviceAttr a) {
+        int v = 0;
+        FASTTOMO_CUDA_CHECK(cudaDeviceGetAttribute(&v, a, dev));
+        return (size_t)v;
+    };
+    if (kind == TC_VOL_3D)
+        return e.width  <= attr(cudaDevAttrMaxSurface3DWidth)
+            && e.height <= attr(cudaDevAttrMaxSurface3DHeight)
+            && e.depth  <= attr(cudaDevAttrMaxSurface3DDepth);
+    return e.width  <= attr(cudaDevAttrMaxSurface2DLayeredWidth)
+        && e.height <= attr(cudaDevAttrMaxSurface2DLayeredHeight)
+        && e.depth  <= attr(cudaDevAttrMaxSurface2DLayeredLayers);
+}
+
 /* Test hook: make the next tc_create throw at a given stage so the
  * regression tests can exercise the cleanup path on the real throw sites.
  * 0 = off, 1 = after cudaMalloc3DArray, 2 = after the linear texture,
@@ -89,6 +108,11 @@ static void maybe_inject_failure(int stage) {
 
 TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
                         int dim_a, int dim_b, int dim_c) {
+    return tc_create_ex(kind, dtype, channels, dim_a, dim_b, dim_c, 0);
+}
+
+TextureCache *tc_create_ex(tc_kind_t kind, tc_dtype_t dtype, int channels,
+                           int dim_a, int dim_b, int dim_c, int want_surface) {
     if (channels != 1 && channels != 4)
         throw std::runtime_error("tc_create: channels must be 1 or 4");
     if (dim_a < 1 || dim_b < 1 || dim_c < 1)
@@ -136,8 +160,12 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
     check_extent_limits(kind, extent);
 
     /* For channels==4 we need surface-write access (the upload kernel uses
-     * surf2DLayeredwrite). cudaArraySurfaceLoadStore enables that. */
-    if (channels == 4) flags |= cudaArraySurfaceLoadStore;
+     * surf2DLayeredwrite). cudaArraySurfaceLoadStore enables that. A
+     * 1-channel cache gets a surface only on request (fused kernels that
+     * write the array directly, sirt_update.cu) and within the surface
+     * limits; without one those callers fall back to tc_upload. */
+    bool surface = channels == 4 || (want_surface && fits_surface_limits(kind, extent));
+    if (surface) flags |= cudaArraySurfaceLoadStore;
 
     TextureCache *tc = (TextureCache *)std::malloc(sizeof(TextureCache));
     if (!tc) throw std::runtime_error("tc_create: malloc failed");
@@ -184,7 +212,7 @@ TextureCache *tc_create(tc_kind_t kind, tc_dtype_t dtype, int channels,
             FASTTOMO_CUDA_CHECK(cudaCreateTextureObject(&tc->tex_point, &rd, &td_point, nullptr));
         }
 
-        if (channels == 4) {
+        if (surface) {
             FASTTOMO_CUDA_CHECK(cudaCreateSurfaceObject(&tc->surf, &rd));
         }
         maybe_inject_failure(3);
@@ -292,6 +320,43 @@ void tc_upload(TextureCache *tc, const void *src, cudaStream_t stream) {
     } else {
         throw std::runtime_error("tc_upload: unknown kind");
     }
+    FASTTOMO_CUDA_CHECK(cudaGetLastError());
+}
+
+/* Inverse of write_half4_vol/sino_kernel: unpack 4-channel texels into the
+ * [a, b, c] source layout (packing along Ny). */
+__global__ static void read_half4_vol_kernel(
+    cudaSurfaceObject_t surf, __half *dst, int Nz, int Nx
+) {
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iz = blockIdx.y * blockDim.y + threadIdx.y;
+    int iy_pack = blockIdx.z;
+    if (ix >= Nx || iz >= Nz) return;
+    union { __half h[4]; float2 f; } tmp;
+    surf2DLayeredread<float2>(&tmp.f, surf, ix * (int)sizeof(float2), iz, iy_pack);
+    size_t base = (size_t)(4 * iy_pack) * Nz * Nx + (size_t)iz * Nx + ix;
+    size_t stride_y = (size_t)Nz * Nx;
+    for (int k = 0; k < 4; k++) dst[base + k * stride_y] = tmp.h[k];
+}
+
+void tc_download(const TextureCache *tc, void *dst, cudaStream_t stream) {
+    if (!tc) throw std::runtime_error("tc_download: null cache");
+    if (tc->channels == 1) {
+        size_t elem = tc_element_size(tc->dtype);
+        cudaMemcpy3DParms cp = {};
+        cp.srcArray = tc->array;
+        cp.dstPtr   = make_cudaPitchedPtr(dst, tc->dim_c * elem, tc->dim_c, tc->dim_b);
+        cp.extent   = make_cudaExtent(tc->dim_c, tc->dim_b, tc->dim_a);
+        cp.kind     = cudaMemcpyDeviceToDevice;
+        FASTTOMO_CUDA_CHECK(cudaMemcpy3DAsync(&cp, stream));
+        return;
+    }
+    if (tc->kind == TC_SINO_LAYERED)
+        throw std::runtime_error("tc_download: 4-channel sinogram caches are not supported");
+    int Ny = tc->dim_a, Nz = tc->dim_b, Nx = tc->dim_c;
+    dim3 block(16, 16, 1);
+    dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny / 4);
+    read_half4_vol_kernel<<<grid, block, 0, stream>>>(tc->surf, (__half *)dst, Nz, Nx);
     FASTTOMO_CUDA_CHECK(cudaGetLastError());
 }
 

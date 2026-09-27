@@ -617,6 +617,147 @@ def test_fused_sirt_kernels_decline_unfusable_inputs():
     assert _fused_update(v, v, v, 1.0, odd, eager_order=True) is None
 
 
+# ── direct texture writes (kernel audit F6) ─────────────────────────────────
+
+
+def _sirt_cases(dtype, Ny):
+    """run_sirt keyword sets covering the graph and eager paths, both
+    geometries, constraints and ``projector=``."""
+    N, n = 24, 10
+    ang = make_angles(n, device=DEVICE)
+    g = torch.Generator(device="cpu").manual_seed(1)
+    vol = torch.rand(Ny, N, N, generator=g).to(DEVICE)
+    sino = ft.forward_project(vol, ang).to(dtype)
+    eul = torch.stack([torch.zeros(n), ang.cpu(), torch.zeros(n)], 1).to(DEVICE)
+    sino3d = ft.forward_project_3d(vol, eul).to(dtype)
+    sm = torch.zeros(Ny, N, N, device=DEVICE, dtype=dtype)
+    sm[:, 3:-3, 2:-5] = 1
+    return [
+        dict(sinogram=sino, angles_deg=ang, n_iter=4),
+        dict(sinogram=sino, angles_deg=ang, n_iter=4, positivity=True, mask=True,
+             sparsity=1e-3, omega=0.8),
+        dict(sinogram=sino, angles_deg=ang, n_iter=4, support_mask=sm, return_loss=True),
+        dict(sinogram=sino, angles_deg=ang, n_iter=3, omega=0.6, positivity=True,
+             projector=ft.ParallelProjector((Ny, N, N), ang, device=DEVICE)),
+        dict(sinogram=sino3d, angles_deg=ang, n_iter=3, euler_zyz_deg=eul,
+             positivity=True),
+        dict(sinogram=sino3d, angles_deg=ang, n_iter=3, euler_zyz_deg=eul,
+             projector=ft.RotmatProjector((Ny, N, N), n_angles=n, device=DEVICE)),
+    ]
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype, Ny", [(torch.float32, 3), (torch.float16, 3),
+                                       (torch.float16, 4)])
+def test_sirt_texture_writes_bit_identical(monkeypatch, caplog, dtype, Ny):
+    """Writing the residual and the updated volume straight into the
+    projector's textures (and, on the graph path, keeping the volume there)
+    gives exactly the bits of the upload path. fp16 with Ny % 4 == 0 covers
+    the 4-channel packed textures, Ny = 3 the 1-channel ones."""
+    from fasttomo.algorithms import algebraic
+
+    def run_all():
+        algebraic._SIRT_OPERATORS.clear()
+        out = []
+        for kw in _sirt_cases(dtype, Ny):
+            r = ft.run_sirt(**kw)
+            out.append(r[0] if isinstance(r, tuple) else r)
+            if isinstance(r, tuple):
+                out.append(r[1])
+        return out
+
+    direct = run_all()
+    monkeypatch.setattr(algebraic, "_tex_target", lambda *a: None)
+    uploads = run_all()
+    algebraic._SIRT_OPERATORS.clear()
+    assert "capture failed" not in caplog.text     # both runs took the graph path
+    for a, b in zip(direct, uploads):
+        assert torch.equal(a, b)
+
+
+@needs_cuda
+def test_sirt_texture_writes_skip_uploads():
+    """The debug counters: the eager loop uploads the volume once (plus the
+    normalisation projections) and never the residual; the graph path
+    uploads the volume once per call; afterwards the projector uploads
+    again as usual (the direct-write records are dropped)."""
+    N, n, n_iter = 24, 10, 6
+    ang = make_angles(n, device=DEVICE)
+    vol = phantom_2d(N, device=DEVICE).unsqueeze(0).expand(2, -1, -1).contiguous()
+    sino = ft.forward_project(vol, ang)
+    proj = ft.ParallelProjector((2, N, N), ang, device=DEVICE)
+    counts = proj._op.upload_counts
+
+    ft.run_sirt(sino, ang, n_iter, projector=proj, return_loss=True)      # eager
+    # normalisations: one sinogram and one volume upload; then iteration 1
+    # uploads the starting volume, every later volume and every residual
+    # come from the fused kernels
+    assert counts == {"vol": 2, "vol_skipped": n_iter - 1,
+                      "sino": 1, "sino_skipped": n_iter}
+
+    for k in counts:
+        counts[k] = 0
+    ft.run_sirt(sino, ang, n_iter, projector=proj)                        # graph
+    ft.run_sirt(sino, ang, n_iter, projector=proj)                        # replay
+    # per call: normalisations (1 + 1) and the start volume (1), plus the
+    # capture's own start-volume load; the replays are not counted
+    assert counts["vol"] == 2 + 2 + 1 and counts["sino"] == 2
+    assert proj._op._vol_tex_token is None and not proj._op._sino_tex_written
+
+    x = torch.rand(2, N, N, device=DEVICE)
+    before = counts["vol"]
+    torch.testing.assert_close(proj.forward(x), ft.forward_project(x, ang), rtol=0, atol=0)
+    assert counts["vol"] == before + 1
+
+
+@needs_cuda
+def test_rotmat_grad_after_sirt_uses_fresh_texture():
+    """run_sirt's direct writes into a RotmatProjector's volume texture move
+    the texture epoch on, so a pose gradient taken after it still matches
+    the uncached kernel (the cached branch only reads a texture its own
+    forward uploaded)."""
+    N, n = 16, 6
+    ang = make_angles(n, device=DEVICE)
+    eul = torch.stack([torch.zeros(n), ang.cpu(), torch.zeros(n)], 1).to(DEVICE)
+    mats = ft.euler_zyz_to_rotmat(eul)
+    rp = ft.RotmatProjector((2, N, N), n_angles=n, device=DEVICE)
+    vol = torch.rand(2, N, N, device=DEVICE)
+    sino = ft.forward_project_3d(vol, eul)
+
+    m = mats.clone().requires_grad_(True)
+    pred = rp.forward(vol, m)                    # uploads vol, token = epoch
+    ft.run_sirt(sino, ang, 3, euler_zyz_deg=eul, projector=rp)   # rewrites the texture
+    pred.sum().backward()
+    m_ref = mats.clone().requires_grad_(True)
+    ft.RotmatProjector((2, N, N), n_angles=n, device=DEVICE).forward(vol, m_ref).sum().backward()
+    torch.testing.assert_close(m.grad, m_ref.grad, rtol=0, atol=0)
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype, channels, kind", [
+    (torch.float32, 1, 0), (torch.float16, 1, 0), (torch.float16, 4, 0),
+    (torch.float32, 1, 2), (torch.float16, 1, 1)])
+def test_tc_download_round_trip(dtype, channels, kind):
+    """tc_download is the exact inverse of tc_upload (the texture-resident
+    SIRT volume comes back bit for bit)."""
+    import fasttomo._core as core
+    from fasttomo._backend import _stream_ptr
+
+    shape = (8, 5, 7)
+    src = torch.randn(*shape, device=DEVICE).to(dtype)
+    dst = torch.empty_like(src)
+    h = core.tc_create(kind, 0 if dtype == torch.float32 else 1, channels, *shape,
+                       surface=True)
+    try:
+        assert core.tc_has_surface(h)
+        core.tc_upload(h, src.data_ptr(), _stream_ptr(src.device))
+        core.tc_download(h, dst.data_ptr(), _stream_ptr(src.device))
+        torch.cuda.synchronize()
+    finally:
+        core.tc_destroy(h)
+    assert torch.equal(dst, src)
+
+
 # ── SART ──────────────────────────────────────────────────────────────────────
 
 

@@ -183,10 +183,10 @@ static void forward_project_rotmat_launch(
     int io_dtype, TextureCache *vol_cache,
     const void *vol, void *sino, const float *mats,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream, bool upload
 ) {
     ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
-    tc_upload(vol_cache, vol, stream);
+    if (upload) tc_upload(vol_cache, vol, stream);
 
     dim3 block(16, 16, 1);
     dim3 grid((g.N_det + 15) / 16,
@@ -218,7 +218,7 @@ void forward_project_rotmat_cuda(
     /* Rotmat samples continuously in Y, so no 4-channel Y packing. */
     ScopedTextureCache tc(TC_VOL_3D, tc_dtype_of(io_dtype), 1, Ny, Nz, Nx, stream);
     forward_project_rotmat_launch(io_dtype, tc.get(), vol, sino,
-                                  mats, Ny, Nz, Nx, n_angles, N_det, stream);
+                                  mats, Ny, Nz, Nx, n_angles, N_det, stream, true);
     tc.finish();
 }
 
@@ -230,13 +230,14 @@ void forward_project_rotmat_cuda_cached(
     const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload
 ) {
     check_io_dtype(io_dtype, "forward_project_rotmat_cuda_cached");
     tc_validate(vol_cache, TC_VOL_3D, io_dtype, Ny, Nz, Nx,
                 "forward_project_rotmat_cuda_cached");
     forward_project_rotmat_launch(io_dtype, vol_cache, vol, sino,
-                                  mats, Ny, Nz, Nx, n_angles, N_det, stream);
+                                  mats, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0);
 }
 
 /* ── 3D rotation-matrix back-projection ──────────────────────────────────────
@@ -298,10 +299,10 @@ static void back_project_rotmat_launch(
     int io_dtype, TextureCache *sino_cache,
     const void *sino, void *vol, const float *mats,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream, bool upload
 ) {
     ProjGeomRotmat g = proj_geom_rotmat(Ny, Nz, Nx, n_angles, N_det);
-    tc_upload(sino_cache, sino, stream);
+    if (upload) tc_upload(sino_cache, sino, stream);
 
     dim3 block(8, 8, 4);
     dim3 grid((g.Nx + 7) / 8,
@@ -337,7 +338,7 @@ void back_project_rotmat_cuda(
     ScopedTextureCache tc(TC_SINO_LAYERED, tc_dtype_of(io_dtype), 1,
                           n_angles, Ny, N_det, stream);
     back_project_rotmat_launch(io_dtype, tc.get(), sino, vol,
-                               mats, Ny, Nz, Nx, n_angles, N_det, stream);
+                               mats, Ny, Nz, Nx, n_angles, N_det, stream, true);
     tc.finish();
 }
 
@@ -349,13 +350,14 @@ void back_project_rotmat_cuda_cached(
     const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload
 ) {
     check_io_dtype(io_dtype, "back_project_rotmat_cuda_cached");
     tc_validate(sino_cache, TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det,
                 "back_project_rotmat_cuda_cached");
     back_project_rotmat_launch(io_dtype, sino_cache, sino, vol,
-                               mats, Ny, Nz, Nx, n_angles, N_det, stream);
+                               mats, Ny, Nz, Nx, n_angles, N_det, stream, upload != 0);
 }
 
 /* ── gradient of 3D rotmat forward projection w.r.t. rotation matrix ─────────
