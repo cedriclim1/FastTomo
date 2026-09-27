@@ -791,8 +791,8 @@ void register_cuda(py::module_ &m) {
           "volume and e_sino. Pass lambdas_ptr=0 for uniform weights "
           "(treated as nullptr). The voxel order of each Y-slice is generated "
           "in the kernel from perm_key unless perm_ptr ([Ny, Nz*Nx] int32) "
-          "is non-zero. work_ptr: fp32 scratch of Ny*Nz*Nx*4 elements "
-          "(16-byte aligned). Asynchronous on the stream. "
+          "is non-zero. work_ptr: fp32 scratch of Ny*Nz*Nx*2 elements "
+          "(8-byte aligned). Asynchronous on the stream. "
           "Per-tilt offset d_k and noise variance σ "
           "are updated in PyTorch by the Python wrapper using the post-call "
           "e_sino (the kernel never reads d_k: e = g - Af - d).",

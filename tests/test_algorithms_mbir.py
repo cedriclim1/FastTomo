@@ -392,7 +392,7 @@ def test_mbir_cuda_in_kernel_order_matches_explicit_perm():
     lam = (torch.rand(n, Ny, Nx, generator=g) + 0.5).to(DEVICE)
     key = _mbir_perm_key(11, 2)
     perm = torch.from_numpy(_mbir_permutation(Ny, Nz * Nx, key)).to(DEVICE)
-    work = torch.empty(Ny * Nz * Nx * 4, device=DEVICE)
+    work = torch.empty(Ny * Nz * Nx * 2, device=DEVICE)
     outs = []
     for perm_ptr in (0, perm.data_ptr()):
         vol, e = vol0.clone(), e0.clone()
@@ -428,7 +428,7 @@ def test_mbir_cuda_explicit_order_is_validated():
     vol = torch.zeros(Ny, Nz, Nx, device=DEVICE)
     e = torch.zeros(n, Ny, Nx, device=DEVICE)
     c = torch.ones(n, device=DEVICE)
-    work = torch.empty(Ny * Nz * Nx * 4, device=DEVICE)
+    work = torch.empty(Ny * Nz * Nx * 2, device=DEVICE)
     good = torch.from_numpy(_mbir_permutation(Ny, Nz * Nx, 7)).to(DEVICE)
     kw = dict(perm_key=7, qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=1.0,
               huber_T=float("inf"), huber_delta=0.5, sigma=1.0)
@@ -478,7 +478,7 @@ def _sweep_golden_cases(pre_restructure: bool = False) -> dict[str, torch.Tensor
         for use_lam in (False, True):
             for T in (float("inf"), 1.5):
                 vol, e = vol0.clone(), e0.clone()
-                work = torch.empty(Ny * Nz * Nx * 4, device=DEVICE)
+                work = torch.empty(Ny * Nz * Nx * 2, device=DEVICE)
                 extra = {} if pre_restructure else {"work_ptr": work.data_ptr()}
                 for it in range(3):
                     snap = vol.clone()
