@@ -30,6 +30,37 @@ def test_fbp_shape(backend):
     assert rec.device.type == backend.type
 
 
+def _cylinder_fbp_level(backend, radius, tilt, N=128):
+    """Mean FBP value over the inner half-radius of a unit-density cylinder
+    (a disk in XZ, constant along Y) of ``radius`` voxels. ``tilt=90``:
+    180 equally spaced views over [-90, 90); else ``linspace(-tilt, tilt)``
+    at the same 1-degree spacing."""
+    z = torch.arange(N) - (N - 1) / 2
+    r2 = z[:, None] ** 2 + z[None, :] ** 2
+    vol = (r2 <= radius ** 2).float().expand(2, N, N).contiguous().to(backend)
+    if tilt == 90:
+        ang = torch.arange(180) * 1.0 - 90
+    else:
+        ang = torch.linspace(-tilt, tilt, 2 * tilt + 1)
+    ang = ang.to(backend)
+    rec = ft.run_fbp(ft.forward_project(vol, ang), ang)
+    return rec[:, r2 <= (radius / 2) ** 2].mean().item()
+
+
+@pytest.mark.parametrize("radius", [20, 40])
+def test_fbp_angular_scale_is_right_for_limited_tilt(backend, radius):
+    """Scope report 2g [S]: FBP scales by pi / n_angles, which looks like
+    it assumes 180 degrees of coverage, so +-70 degrees was suspected to be
+    off by 180/140. Not so: pi / n_angles is pi times the mean over the
+    measured views, and for a rotationally symmetric object every view
+    carries the same ray integral, so the absolute level at +-70 equals the
+    one at 180 degrees. Scaling by the actual spacing (140 degrees / n)
+    would make it 140/180 = 0.78 of that instead."""
+    full = _cylinder_fbp_level(backend, radius, 90)
+    limited = _cylinder_fbp_level(backend, radius, 70)
+    assert abs(limited / full - 1.0) < 5e-3, (limited, full)
+
+
 def test_fbp_better_than_plain_backproject(backend):
     """FBP reconstruction MSE should beat raw (unfiltered) back-projection.
 
