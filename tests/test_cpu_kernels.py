@@ -276,3 +276,79 @@ def test_cpu_parallel_kernels_are_thread_invariant(op):
     ref = run(1)
     for k in (2, 5, 16, 40):
         assert torch.equal(run(k), ref), k
+
+
+# ── P5: rotmat forward (clipping + interior fast path) vs its fp32 port ────
+
+def _fp_rotmat_scalar32(vol, mats, Nd):
+    """forward_project_rotmat_cpu's unclipped loop with border-zero SAMP3
+    corners, in fp32 (the corners read a zero-padded copy)."""
+    v = vol.numpy()
+    Ny, Nz, Nx = v.shape
+    vp = np.pad(v, 1)
+    M = mats.reshape(-1, 9).numpy()
+    R = int(math.ceil(0.5 * math.sqrt(float(np.float32(Nx * Nx + Ny * Ny + Nz * Nz))))) + 1
+    hd, hx = _F(0.5) * _F(Nd - 1), _F(0.5) * _F(Nx - 1)
+    hy, hz = _F(0.5) * _F(Ny - 1), _F(0.5) * _F(Nz - 1)
+    V, U = np.meshgrid(np.arange(Ny).astype(_F) - hy, np.arange(Nd).astype(_F) - hd,
+                       indexing="ij")
+    out = np.zeros((len(M), Ny, Nd), _F)
+    one = _F(1)
+    for a, m in enumerate(M):
+        ox, oy, oz = U * m[0] + V * m[3], U * m[1] + V * m[4], U * m[2] + V * m[5]
+        acc = np.zeros((Ny, Nd), _F)
+        for step in range(-R, R + 1):
+            s = _F(step)
+            fx, fy, fz = ox + s * m[6] + hx, oy + s * m[7] + hy, oz + s * m[8] + hz
+            ok = ((fx > -1) & (fx < _F(Nx)) & (fy > -1) & (fy < _F(Ny))
+                  & (fz > -1) & (fz < _F(Nz)))
+            fx, fy, fz = np.where(ok, fx, _F(0)), np.where(ok, fy, _F(0)), np.where(ok, fz, _F(0))
+            x0, y0, z0 = np.floor(fx), np.floor(fy), np.floor(fz)
+            wx, wy, wz = fx - x0, fy - y0, fz - z0
+            ux, uy, uz = one - wx, one - wy, one - wz
+            x0, y0, z0 = x0.astype(np.int64) + 1, y0.astype(np.int64) + 1, z0.astype(np.int64) + 1
+
+            def c(dy, dz, dx):
+                return vp[y0 + dy, z0 + dz, x0 + dx]
+
+            term = (uy * uz * (ux * c(0, 0, 0) + wx * c(0, 0, 1))
+                    + uy * wz * (ux * c(0, 1, 0) + wx * c(0, 1, 1))
+                    + wy * uz * (ux * c(1, 0, 0) + wx * c(1, 0, 1))
+                    + wy * wz * (ux * c(1, 1, 0) + wx * c(1, 1, 1)))
+            acc = np.where(ok, acc + term, acc)
+        out[a] = acc
+    return torch.from_numpy(out)
+
+
+@pytest.mark.parametrize("shape", [(3, 9, 11, 13), (6, 10, 8, 7), (1, 12, 12, 12)])
+@pytest.mark.parametrize("threads", [1, 4])
+def test_cpu_rotmat_fp_is_the_unclipped_loop_bit_for_bit(shape, threads):
+    from fasttomo.autograd import _forward_project_rotmat_raw, euler_zyz_to_rotmat
+
+    Ny, Nz, Nx, Nd = shape
+    g = torch.Generator().manual_seed(9)
+    vol = torch.rand(Ny, Nz, Nx, generator=g) + 0.5          # non-zero on every face
+    ang = torch.tensor([-90.0, -41.3, 0.0, 27.9, 90.0])
+    # pure tilts (exact 0/1 matrix entries: samples on grid planes) and
+    # generic ZYZ rotations
+    eul = torch.cat([torch.stack([torch.zeros(5), ang, torch.zeros(5)], 1),
+                     torch.stack([torch.linspace(-30, 40, 5), ang, torch.linspace(25, -10, 5)], 1)])
+    mats = euler_zyz_to_rotmat(eul).reshape(-1, 9).contiguous()
+    out = _forward_project_rotmat_raw(vol, mats, Nd, num_threads=threads)
+    assert torch.equal(out, _fp_rotmat_scalar32(vol, mats, Nd))
+
+
+def test_cpu_rotmat_kernels_are_thread_invariant():
+    from fasttomo.autograd import _forward_project_rotmat_raw, _grad_rotmat_raw, euler_zyz_to_rotmat
+
+    g = torch.Generator().manual_seed(4)
+    vol = torch.rand(7, 15, 13, generator=g)
+    eul = torch.stack([torch.linspace(-20, 20, 11), torch.linspace(-65, 65, 11),
+                       torch.linspace(10, -5, 11)], 1)
+    mats = euler_zyz_to_rotmat(eul).reshape(-1, 9).contiguous()
+    gs = torch.randn(11, 7, 17, generator=g)
+    fp1 = _forward_project_rotmat_raw(vol, mats, 17, num_threads=1)
+    gm1 = _grad_rotmat_raw(vol, gs, mats, num_threads=1)
+    for k in (3, 16):
+        assert torch.equal(_forward_project_rotmat_raw(vol, mats, 17, num_threads=k), fp1)
+        assert torch.equal(_grad_rotmat_raw(vol, gs, mats, num_threads=k), gm1)

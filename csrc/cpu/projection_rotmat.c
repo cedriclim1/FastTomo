@@ -6,6 +6,42 @@
 #include <stdlib.h>
 #include <omp.h>
 
+/* Ray clipping for the rotmat kernels (ft_clip_steps): narrow [*lo, *hi] to
+ * the steps at which the sample (ox + s*d) + half, per axis, can be inside
+ * the loose box (-1, N) of every axis. The kernels keep their exact in-loop
+ * test, so the samples taken are unchanged. */
+static inline void clip_ray_rotmat(ProjGeomRotmat g, float ox, float oy, float oz,
+                                   float dxs, float dys, float dzs, int *lo, int *hi)
+{
+    const double mag = fabs((double)ox) + fabs((double)oy) + fabs((double)oz)
+                     + g.ray_len + fmax(g.half_x, fmax(g.half_y, g.half_z)) + 1.0;
+    *lo = -g.ray_len;
+    *hi =  g.ray_len;
+    ft_clip_steps(dxs, (double)ox + g.half_x, -1.0, g.Nx, mag, lo, hi);
+    ft_clip_steps(dys, (double)oy + g.half_y, -1.0, g.Ny, mag, lo, hi);
+    ft_clip_steps(dzs, (double)oz + g.half_z, -1.0, g.Nz, mag, lo, hi);
+}
+
+/* The 8 trilinear corners of the sample with lower corner (ix0, iy0, iz0):
+ * direct loads when all of them are inside the volume (almost every
+ * sample), else the border-zero SAMP3 per corner. The same values either
+ * way, so the fast path does not change any bit. */
+#define LOAD_CORNERS()                                                        \
+    float v000, v001, v010, v011, v100, v101, v110, v111;                    \
+    if (ix0 >= 0 && ix1 < Nx && iy0 >= 0 && iy1 < Ny && iz0 >= 0 && iz1 < Nz) { \
+        const float *p = vol + ((size_t)iy0 * Nz + iz0) * Nx + ix0;           \
+        const size_t sy = (size_t)Nz * Nx;                                    \
+        v000 = p[0];      v001 = p[1];                                        \
+        v010 = p[Nx];     v011 = p[Nx + 1];                                   \
+        v100 = p[sy];     v101 = p[sy + 1];                                   \
+        v110 = p[sy + Nx]; v111 = p[sy + Nx + 1];                             \
+    } else {                                                                  \
+        v000 = SAMP3(ix0, iy0, iz0); v001 = SAMP3(ix1, iy0, iz0);             \
+        v010 = SAMP3(ix0, iy0, iz1); v011 = SAMP3(ix1, iy0, iz1);             \
+        v100 = SAMP3(ix0, iy1, iz0); v101 = SAMP3(ix1, iy1, iz0);             \
+        v110 = SAMP3(ix0, iy1, iz1); v111 = SAMP3(ix1, iy1, iz1);             \
+    }
+
 /* ── 3D rotation-matrix forward projection (CPU) ───────────────────────────
  * Detector-driven; trilinear interpolation in 3D; one ray per (ia, iv, iu).
  * Mirrors forward_project_rotmat_cuda but with explicit interpolation.
@@ -18,7 +54,11 @@
  *   x(s) = u*M[0] + v*M[3] + s*M[6]
  *   y(s) = u*M[1] + v*M[4] + s*M[7]
  *   z(s) = u*M[2] + v*M[5] + s*M[8]
- * Rays may cross all three faces, so ray length covers the full 3D diagonal.
+ * Rays may cross all three faces, so ray length covers the full 3D diagonal;
+ * each ray is clipped to the steps that can reach the loose box below
+ * (clip_ray_rotmat), and interior samples load their 8 corners directly
+ * (LOAD_CORNERS). Both only skip work, never change a sample: bit-identical
+ * to the unclipped, all-SAMP3 loop.
  *
  * Border-zero semantics matching CUDA cudaAddressModeBorder + linear filter:
  * a sample at fx=Nx-1 must still return vol[Nx-1] (the upper neighbour
@@ -48,8 +88,11 @@ void forward_project_rotmat_cpu(
                 float oy = u * M[1] + v * M[4];
                 float oz = u * M[2] + v * M[5];
 
+                int lo, hi;
+                clip_ray_rotmat(g, ox, oy, oz, dxs, dys, dzs, &lo, &hi);
+
                 float sum = 0.0f;
-                for (int step = -g.ray_len; step <= g.ray_len; step++) {
+                for (int step = lo; step <= hi; step++) {
                     float s  = (float)step;
                     float fx = ox + s * dxs + g.half_x;
                     float fy = oy + s * dys + g.half_y;
@@ -71,14 +114,7 @@ void forward_project_rotmat_cpu(
                     float wz = fz - (float)iz0;
                     float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
 
-                    float v000 = SAMP3(ix0, iy0, iz0);
-                    float v001 = SAMP3(ix1, iy0, iz0);
-                    float v010 = SAMP3(ix0, iy0, iz1);
-                    float v011 = SAMP3(ix1, iy0, iz1);
-                    float v100 = SAMP3(ix0, iy1, iz0);
-                    float v101 = SAMP3(ix1, iy1, iz0);
-                    float v110 = SAMP3(ix0, iy1, iz1);
-                    float v111 = SAMP3(ix1, iy1, iz1);
+                    LOAD_CORNERS()
 
                     sum += uy * uz * (ux * v000 + wx * v001)
                          + uy * wz * (ux * v010 + wx * v011)
@@ -195,7 +231,10 @@ void grad_rotmat_cpu(
                 float oy = u * M[1] + v * M[4];
                 float oz = u * M[2] + v * M[5];
 
-                for (int step = -g.ray_len; step <= g.ray_len; step++) {
+                int lo, hi;
+                clip_ray_rotmat(g, ox, oy, oz, dxs, dys, dzs, &lo, &hi);
+
+                for (int step = lo; step <= hi; step++) {
                     float s  = (float)step;
                     float fx = ox + s * dxs + g.half_x;
                     float fy = oy + s * dys + g.half_y;
@@ -215,14 +254,7 @@ void grad_rotmat_cpu(
                     float wz = fz - (float)iz0;
                     float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
 
-                    float v000 = SAMP3(ix0, iy0, iz0);
-                    float v001 = SAMP3(ix1, iy0, iz0);
-                    float v010 = SAMP3(ix0, iy0, iz1);
-                    float v011 = SAMP3(ix1, iy0, iz1);
-                    float v100 = SAMP3(ix0, iy1, iz0);
-                    float v101 = SAMP3(ix1, iy1, iz0);
-                    float v110 = SAMP3(ix0, iy1, iz1);
-                    float v111 = SAMP3(ix1, iy1, iz1);
+                    LOAD_CORNERS()
 
                     float dfx = uy * uz * (v001 - v000) + wy * uz * (v101 - v100)
                               + uy * wz * (v011 - v010) + wy * wz * (v111 - v110);
