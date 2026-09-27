@@ -148,8 +148,9 @@ endif()
 # CMAKE_CUDA_ARCHITECTURES to nvcc's own default (sm_75 for CUDA 13), and a
 # later `if(NOT DEFINED ...)` never fires. sm_70 is not listed because CUDA 13
 # dropped offline compilation for architectures below sm_75. sm_75 (Turing,
-# e.g. T4 / RTX 20xx) stays in the list: its compute_75 PTX is the only code
-# in the binary that can run there.
+# e.g. T4 / RTX 20xx) stays in the list: each entry N generates sm_N SASS plus
+# compute_N PTX, and on Turing it is the sm_75 SASS that runs (the compute_75
+# PTX is only a JIT fallback); nothing else in the binary can run there.
 # Override with -DCMAKE_CUDA_ARCHITECTURES="..." (pip/uv:
 # --config-settings=cmake.define.CMAKE_CUDA_ARCHITECTURES=...) or the
 # CUDAARCHS environment variable. An empty CUDAARCHS counts as unset, matching
