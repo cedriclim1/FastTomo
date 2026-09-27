@@ -167,7 +167,9 @@ class PoseRefinementConfig:
         * ``anchor_reference`` zeroes the pose and shift gradients of the
           view closest to 0 degrees, so that row keeps its initial value.
         These also act on ``pose_init_euler_deg``: the initialiser is used
-        unchanged for iteration 0's forward projection, then after
+        for iteration 0's forward projection (unchanged, except that with
+        ``antisymmetric_z`` its ``psi`` enters as ``(psi + phi) - phi``,
+        equal up to one ulp of rounding), then after
         iteration 0 a ``theta`` outside the bound is clamped and ``psi`` is
         overwritten with ``-phi``. Set ``tilt_bound_deg=None`` and
         ``antisymmetric_z=False`` to keep an initialiser that violates them.

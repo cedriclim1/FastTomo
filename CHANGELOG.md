@@ -60,9 +60,16 @@
 - CPU `tv_loss_3d` returned NaN when a dimension is 1 (and `tv_loss_xz`
   when `Nz` or `Nx` is 1); both now return 0 with a zero gradient, like
   CUDA. A single-slice volume (`Ny = 1`) therefore has no 3-D TV (now
-  documented; `tv_loss_xz` is the per-slice TV). The fused TV backward
-  is `once_differentiable`: a double backward through it raises instead
-  of treating its output as a constant.
+  documented; `tv_loss_xz` is the per-slice TV).
+- **First-order only:** `tilt_ssim_loss`, `s3im_loss` and, on CUDA,
+  `tv_loss_3d` and `tv_loss_xz` have hand-written backwards. A backward
+  with `create_graph=True` (double backward, Hessian-vector products)
+  now raises RuntimeError instead of returning a wrong second derivative.
+  Before this release `tilt_ssim_loss`, `s3im_loss` and CUDA `tv_loss_xz`
+  were plain autograd (exact second order), while CUDA `tv_loss_3d`
+  silently dropped its second-order term; nothing in FastTomo uses
+  second-order gradients. The CPU TV expressions stay differentiable to
+  any order.
 - **`run_ad_recon` pose refinement with `antisymmetric_z=True` (the
   default) changes (accuracy fix).** `phi` was stepped with the partial
   derivative `dL/dphi` and `psi` then overwritten with `-phi`, whose
@@ -72,7 +79,8 @@
   the volume fixed to the truth, the mean in-plane error goes from 0.275 to
   0.051 deg (noise-free) and from 1.92 to 0.73 deg (5 % noise; start
   0.87). The returned Euler angles still satisfy `psi = -phi` exactly, and
-  `pose_init_euler_deg` is still used unchanged in iteration 0.
+  `pose_init_euler_deg` is still used in iteration 0 (its `psi` up to
+  one ulp of rounding).
 - `run_ad_recon` uses the fused CUDA Adam (`fused=True`) for the volume,
   angles and shifts: L2 iteration 1.81 -> 1.72 ms at 256^3 (0.30 -> 0.25
   ms at 128^3), peak 352 -> 304 MiB (no volume-sized temporary). Results move at the ulp level (all `ad_*` goldens were

@@ -33,7 +33,6 @@ import math
 
 import torch
 import torch.nn.functional as F
-from torch.autograd.function import once_differentiable
 
 
 # ── 3-D isotropic Total-Variation loss ────────────────────────────────────
@@ -61,6 +60,10 @@ def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     0 on both backends. In particular a single-slice volume (``Ny = 1``)
     gets no 3-D TV at all, not a 2-D one; use :func:`tv_loss_xz` for a
     per-slice XZ TV.
+
+    The CUDA path is first-order only: a backward with
+    ``create_graph=True`` raises RuntimeError (the CPU expression is
+    differentiable to any order).
 
     Args:
         volume: [Ny, Nz, Nx] float32 tensor.
@@ -119,7 +122,9 @@ def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     On CUDA, a fused kernel (the planar mode of the 3-D TV kernel: one pass
     over the volume, deterministic fixed-order two-pass reduction with fp64
     partials, voxel-driven gather backward); on CPU, the PyTorch
-    expression. ``Nz = 1`` or ``Nx = 1`` leaves no corners: 0 on both.
+    expression. ``Nz = 1`` or ``Nx = 1`` leaves no corners: 0 on both. The
+    CUDA path is first-order only (``create_graph=True`` raises
+    RuntimeError); the CPU expression is differentiable to any order.
 
     Args:
         volume: [Ny, Nz, Nx] float32 tensor.
@@ -185,6 +190,23 @@ def _gaussian_1d(win_size: int, sigma: float,
     return g / g.sum()
 
 
+def _first_order_only(what: str) -> None:
+    """Called at the top of the hand-written backwards (the SSIM helpers
+    and the fused TV kernels): they compute the first derivative only.
+    Autograd runs a backward with grad mode enabled exactly when a graph
+    of the gradient is requested (``create_graph=True``, e.g. for a
+    Hessian-vector product); the result would then treat this backward as
+    a constant and give a wrong second derivative, so raise instead.
+    (``once_differentiable`` catches only the case where the incoming
+    gradient itself requires grad, not a second derivative with respect to
+    the input.)"""
+    if torch.is_grad_enabled():
+        raise RuntimeError(
+            f"{what} supports first-order gradients only: its backward is not "
+            "differentiable, so create_graph=True (double backward, "
+            "Hessian-vector products) is not supported")
+
+
 class _Blur(torch.autograd.Function):
     """Separable Gaussian filter of every channel, as a Function that saves
     nothing but the kernel: the input gradient of a convolution needs only
@@ -204,8 +226,8 @@ class _Blur(torch.autograd.Function):
         return out
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad):
+        _first_order_only("the SSIM Gaussian filter (tilt_ssim_loss / s3im_loss)")
         (g,) = ctx.saved_tensors
         in_shape, mid_shape = ctx.shapes
         s = ctx.stride
@@ -267,8 +289,8 @@ class _SSIMMean(torch.autograd.Function):
         return (lum * cs).mean()
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad):
+        _first_order_only("the SSIM map (tilt_ssim_loss / s3im_loss)")
         E, ey, eyy, c = ctx.saved_tensors
         C1, C2 = ctx.C
         ex, exx, edd = E.unbind(1)
@@ -402,6 +424,10 @@ def tilt_ssim_loss(
     relative in fp32 at sinogram scale on CPU and CUDA, independently of
     cuDNN's TF32 setting.
 
+    First-order only: the gradient is hand-written, and a backward with
+    ``create_graph=True`` (double backward, Hessian-vector products)
+    raises RuntimeError.
+
     Args:
         pred, target: ``[B, H, W]`` float32 tensors on the same device;
             ``H, W > win_size // 2`` (reflect padding).
@@ -446,6 +472,9 @@ def s3im_loss(
     sinogram values across the entire dataset rather than only within each
     projection image. The paper notes M=1 already matches M=10 in practice,
     so the per-step cost is essentially one ``conv2d`` over a small patch.
+
+    First-order only, like :func:`tilt_ssim_loss` (``create_graph=True``
+    raises RuntimeError).
 
     Args:
         pred, target: ``[n_angles, Ny, N_det]`` float32 tensors on the same

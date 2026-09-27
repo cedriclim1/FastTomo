@@ -637,17 +637,66 @@ def test_tv_loss_xz_single_slice_is_the_2d_tv(backend):
     assert ft.tv_loss_3d(v.to(backend)).item() == 0.0
 
 
-@needs_cuda
+def _second_order_cases(device):
+    g = torch.Generator().manual_seed(9)
+    y = (100 + 3 * torch.randn(3, 24, 24, generator=g)).to(device)
+    v3 = torch.rand(4, 5, 6, generator=g).to(device)
+    return {
+        "tilt_ssim_loss": (y + torch.randn(y.shape, generator=g).to(device),
+                           lambda x: ft.tilt_ssim_loss(x, y)),
+        "s3im_loss": (y + torch.randn(y.shape, generator=g).to(device),
+                      lambda x: ft.s3im_loss(x, y, patch_pixels=256,
+                                             generator=torch.Generator(device=device).manual_seed(1))),
+        "tv_loss_3d": (v3, ft.tv_loss_3d),
+        "tv_loss_xz": (v3, ft.tv_loss_xz),
+    }
+
+
+_FIRST_ORDER = [("cpu", "tilt_ssim_loss"), ("cpu", "s3im_loss")] + [
+    pytest.param("cuda", fn, marks=needs_cuda)
+    for fn in ("tilt_ssim_loss", "s3im_loss", "tv_loss_3d", "tv_loss_xz")]
+
+
+@pytest.mark.parametrize("device,fn", _FIRST_ORDER)
+def test_hand_written_backwards_refuse_second_order(device, fn):
+    """The hand-written backwards (SSIM helpers, fused CUDA TV) are first
+    order only. A Hessian-vector product with respect to the input alone
+    (create_graph=True, no weight leaf) must raise, not silently treat the
+    backward as a constant (``once_differentiable`` did not catch this
+    case: the HVP came out 17-22 % wrong for the SSIM losses and without
+    the TV-xz term), and so must a second derivative through a weight. The
+    ordinary first-order gradient is unaffected."""
+    x0, f = _second_order_cases(device)[fn]
+    x = x0.clone().requires_grad_(True)
+    with pytest.raises(RuntimeError, match="first-order gradients only"):
+        (g,) = torch.autograd.grad(f(x), x, create_graph=True)
+        (g * torch.ones_like(g)).sum().backward()          # H @ 1
+    w = torch.tensor(2.0, device=device, requires_grad=True)
+    with pytest.raises(RuntimeError, match="first-order gradients only"):
+        torch.autograd.grad(w * f(x), x, create_graph=True)
+    (g,) = torch.autograd.grad(f(x), x)
+    assert torch.isfinite(g).all() and g.abs().sum() > 0
+
+
 @pytest.mark.parametrize("fn", ["tv_loss_3d", "tv_loss_xz"])
-def test_tv_loss_second_order_raises(fn):
-    """The fused TV backward is not differentiable (once_differentiable):
-    differentiating through it raises instead of treating its output as a
-    constant (here the gradient's dependence on the loss weight ``w``)."""
-    v = torch.rand(4, 5, 6, device=DEVICE, requires_grad=True)
-    w = torch.tensor(2.0, device=DEVICE, requires_grad=True)
-    (g,) = torch.autograd.grad(w * getattr(ft, fn)(v), v, create_graph=True)
-    with pytest.raises(RuntimeError, match="once_differentiable"):
-        g.sum().backward()
+def test_cpu_tv_losses_stay_twice_differentiable(fn):
+    """The CPU TV expressions are plain autograd: their Hessian-vector
+    product matches central finite differences of the gradient."""
+    g = torch.Generator().manual_seed(4)
+    v = torch.rand(3, 5, 6, generator=g)
+    u = torch.randn(3, 5, 6, generator=g)
+    f = getattr(ft, fn)
+    x = v.clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(f(x, eps=1e-2), x, create_graph=True)
+    (hvp,) = torch.autograd.grad((grad * u).sum(), x)
+    h = 1e-3
+
+    def grad_at(z):
+        z = z.clone().requires_grad_(True)
+        return torch.autograd.grad(f(z, eps=1e-2), z)[0]
+
+    fd = (grad_at(v + h * u) - grad_at(v - h * u)) / (2 * h)
+    torch.testing.assert_close(hvp, fd, rtol=2e-2, atol=2e-4)
 
 
 def test_tv_loss_xz_rejects_bad_input():

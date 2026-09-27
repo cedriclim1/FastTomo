@@ -40,6 +40,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 import fasttomo._core as _core
+from fasttomo.regularizers import _first_order_only
 # Moved to fasttomo._backend (ARCH P8); imported here so the raw layer below
 # and the old ``fasttomo.autograd._X`` import paths keep working.
 from fasttomo._backend import (  # noqa: F401
@@ -647,9 +648,10 @@ class _TVLossIso3D(torch.autograd.Function):
     projection ops, this Function's adjoint is exact (it implements the
     closed-form gradient of a smooth scalar function), so ``gradcheck``
     would pass — we still verify against the pure-PyTorch reference instead
-    of relying on it, matching the rest of the test suite. The backward is
-    not itself differentiable (``once_differentiable``: a second-order
-    request raises instead of silently dropping the term).
+    of relying on it, matching the rest of the test suite. First-order
+    only: the backward raises RuntimeError when a graph of the gradient is
+    requested (``create_graph=True``) instead of silently treating it as a
+    constant (``fasttomo.regularizers._first_order_only``).
     """
 
     @staticmethod
@@ -659,8 +661,8 @@ class _TVLossIso3D(torch.autograd.Function):
         return _tv_loss_raw(volume, eps, "tv_loss_3d")
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_out):
+        _first_order_only("tv_loss_3d on CUDA")
         (volume,) = ctx.saved_tensors
         return _tv_loss_grad_raw(volume, grad_out, ctx.eps, "tv_loss_3d"), None
 
@@ -668,7 +670,7 @@ class _TVLossIso3D(torch.autograd.Function):
 class _TVLossXZ(torch.autograd.Function):
     """Fused planar (XZ) TV loss, ``tv_loss_xz`` on CUDA: the 3-D kernel's
     structure without the ``dy`` term, over ``Ny * (Nz-1) * (Nx-1)``
-    corners; same determinism and ``once_differentiable`` backward."""
+    corners; same determinism, first-order only like `_TVLossIso3D`."""
 
     @staticmethod
     def forward(ctx, volume, eps):
@@ -677,7 +679,7 @@ class _TVLossXZ(torch.autograd.Function):
         return _tv_loss_raw(volume, eps, "tv_loss_xz")
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_out):
+        _first_order_only("tv_loss_xz on CUDA")
         (volume,) = ctx.saved_tensors
         return _tv_loss_grad_raw(volume, grad_out, ctx.eps, "tv_loss_xz"), None

@@ -220,8 +220,10 @@ def _ad_pose_euler(run: _AdRun) -> torch.Tensor | None:
     partial ``dL/dphi`` and overwriting ``psi`` converged to the wrong pose).
     ``psi`` is written as ``(psi_leaf + phi).detach() - phi``: exactly
     ``-phi`` once the post-step constraint has set ``psi_leaf = -phi``, and
-    the initialiser's own ``psi`` in iteration 0 (the documented behaviour
-    of ``pose_init_euler_deg``). The leaf's ``psi`` column gets no gradient.
+    in iteration 0 the initialiser's own ``psi`` up to rounding (``(psi0 +
+    phi) - phi`` can differ from ``psi0`` by one ulp), which keeps the
+    documented behaviour of ``pose_init_euler_deg``. The leaf's ``psi``
+    column gets no gradient.
     """
     tilt = run.tilt_angle_opt
     if tilt is None or not (run.pose_cfg is not None and run.pose_cfg.antisymmetric_z):
