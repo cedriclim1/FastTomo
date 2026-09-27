@@ -96,6 +96,30 @@ def test_ad_recon_sparsity_does_not_drift_without_positivity(monkeypatch):
     )
 
 
+def test_ad_recon_rejects_projector_with_wrong_output_shape(monkeypatch):
+    """Regression (#53): run_ad_recon must apply the same projector output
+    shape guard as run_sirt instead of letting the loss broadcast a
+    [1, Ny, N] prediction over the [n_angles, Ny, N] sinogram."""
+    import fasttomo.algorithms as algo
+
+    class WrongGeometryProjector:
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(1, volume.shape[0], volume.shape[2], dtype=volume.dtype)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kwargs):
+        n_angles, Ny, N_det = sinogram.shape
+        return n_angles, Ny, N_det, (N_det if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", WrongGeometryProjector)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+
+    sino = torch.zeros(5, 1, 8)
+    angles = torch.linspace(-20.0, 20.0, 5)
+    cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
+    with pytest.raises(ValueError, match="projector returned forward-projection"):
+        ft.run_ad_recon(sino, angles, projector=WrongGeometryProjector(), config=cfg)
+
+
 # ── adjoint test ───────────────────────────────────────────────────────────
 
 def test_adjoint_cpu():

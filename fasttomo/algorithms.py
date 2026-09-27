@@ -1346,6 +1346,11 @@ def run_ad_recon(
         # optional shift correction
         if refine_shifts and shifts is not None:
             pred = apply_shifts_2d(pred, shifts)
+        # A user-supplied projector built for another geometry would make
+        # the loss broadcast silently (e.g. [1, Ny, N] against the sinogram).
+        _assert_projector_output_shape(
+            pred, (n_angles, Ny, N_det), "forward-projection", "run_ad_recon",
+        )
 
         # data-fit + regularisation terms, keyed for the loss_callback
         # components contract. Insertion order matches the historical

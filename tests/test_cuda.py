@@ -1519,6 +1519,21 @@ class TestRunAdRecon:
             f"error_before={error_before:.3f}°, error_after={error_after:.3f}°"
         )
 
+    def test_projector_geometry_mismatch_raises(self):
+        """Regression (#53): run_ad_recon must reject projector outputs that
+        would broadcast against the sinogram."""
+        N = 16
+        angles = make_angles(20)
+        vol = phantom_2d(N).unsqueeze(0)
+        sino = ft.forward_project(vol, angles)
+
+        # Same volume geometry but n_angles=1: without the shape check the
+        # MSE would broadcast [1, 1, N] over [20, 1, N].
+        bad_proj = ft.ParallelProjector((1, N, N), make_angles(1), device=DEVICE, N_det=N)
+        cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=1))
+        with pytest.raises(ValueError, match="projector returned"):
+            ft.run_ad_recon(sino, angles, projector=bad_proj, config=cfg)
+
     def test_sparsity_does_not_drift_without_positivity(self):
         """Regression (#71/#73): the sparsity term is λ·mean(|f|). With zero
         data and positivity=False a zero volume must stay exactly zero; the
