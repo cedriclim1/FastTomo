@@ -237,9 +237,11 @@ def test_mbir_permutation_cuda_matches_numpy(Ny, nvox, seed, it):
 @needs_cuda
 def test_mbir_cuda_in_kernel_order_matches_explicit_perm():
     """The sweep with perm_ptr=0 (order built in the kernel) equals the sweep
-    given the same order as an explicit [Ny, Nz*Nx] array, bit for bit."""
+    given the same order as an explicit [Ny, Nz*Nx] array, bit for bit; the
+    raw binding and the validated wrapper agree."""
     import fasttomo._core as _core
-    from fasttomo.algorithms.mbir import _mbir_perm_key, _mbir_permutation
+    from fasttomo.algorithms.mbir import (_mbir_icd_sweep_cuda, _mbir_perm_key,
+                                          _mbir_permutation)
     g = torch.Generator().manual_seed(4)
     Ny, Nz, Nx, n = 5, 11, 13, 17
     ang = make_angles(n, max_deg=70.0) * math.pi / 180
@@ -264,8 +266,48 @@ def test_mbir_cuda_in_kernel_order_matches_explicit_perm():
             stream_ptr=torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
         outs.append((vol, e))
+    for p in (None, perm):
+        vol, e = vol0.clone(), e0.clone()
+        _mbir_icd_sweep_cuda(vol, e, lam, vol0, work, cos_a.float(), sin_a.float(),
+                             perm_key=key, perm=p, qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3,
+                             sigma_f=0.3, huber_T=2.0, huber_delta=0.5, sigma=0.7)
+        torch.cuda.synchronize()
+        outs.append((vol, e))
     assert not torch.equal(outs[0][0], vol0)
-    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+    for v, e in outs[1:]:
+        assert torch.equal(outs[0][0], v) and torch.equal(outs[0][1], e)
+
+
+@needs_cuda
+def test_mbir_cuda_explicit_order_is_validated():
+    """The explicit-order path (perm_ptr) is checked like every other input:
+    dtype, shape, value range, and each row a permutation (#89 review)."""
+    from fasttomo.algorithms.mbir import _mbir_icd_sweep_cuda, _mbir_permutation
+    Ny, Nz, Nx, n = 2, 3, 4, 5
+    vol = torch.zeros(Ny, Nz, Nx, device=DEVICE)
+    e = torch.zeros(n, Ny, Nx, device=DEVICE)
+    c = torch.ones(n, device=DEVICE)
+    work = torch.empty(Ny * Nz * Nx * 4, device=DEVICE)
+    good = torch.from_numpy(_mbir_permutation(Ny, Nz * Nx, 7)).to(DEVICE)
+    kw = dict(perm_key=7, qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=1.0,
+              huber_T=float("inf"), huber_delta=0.5, sigma=1.0)
+    _mbir_icd_sweep_cuda(vol, e, None, vol.clone(), work, c, c, perm=good, **kw)
+    dup = good.clone()
+    dup[1, 0] = dup[1, 1]
+    high = good.clone()
+    high[0, 3] = Nz * Nx
+    neg = good.clone()
+    neg[1, 2] = -1
+    for bad, err, match in ((good.long(), TypeError, "int32"),
+                            (good[:, :-1].contiguous(), ValueError, "shape"),
+                            (high, ValueError, r"\[0, 12\)"),
+                            (neg, ValueError, r"\[0, 12\)"),
+                            (dup, ValueError, "permutation"),
+                            (good.cpu(), TypeError, "cuda")):
+        with pytest.raises(err, match=match):
+            _mbir_icd_sweep_cuda(vol, e, None, vol.clone(), work, c, c, perm=bad, **kw)
+    with pytest.raises(ValueError, match="work"):
+        _mbir_icd_sweep_cuda(vol, e, None, vol.clone(), work[:-1], c, c, **kw)
 
 
 # ── CUDA sweep variants ───────────────────────────────────────────────────────

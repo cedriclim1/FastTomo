@@ -293,6 +293,87 @@ def _mbir_icd_sweep_cpu(
     )
 
 
+def _check_mbir_perm(op: str, perm: torch.Tensor, Ny: int, Nvox: int) -> None:
+    """An explicit voxel order must be ``[Ny, Nz*Nx]`` int32 with every row
+    a permutation of ``range(Nz*Nx)``: the sweep indexes the volume and its
+    scratch with it unchecked, and a repeated voxel would be updated twice
+    (the CUDA prepare kernel reads each voxel's pre-sweep value once)."""
+    if perm.dtype != torch.int32:
+        raise TypeError(f"{op}: perm must be int32, got {perm.dtype}")
+    _check_shapes(op, [("perm", perm, (Ny, Nvox))])
+    if perm.numel() == 0:
+        return
+    lo, hi = int(perm.min()), int(perm.max())
+    if lo < 0 or hi >= Nvox:
+        raise ValueError(f"{op}: perm values must lie in [0, {Nvox}), got [{lo}, {hi}]")
+    ref = torch.arange(Nvox, dtype=torch.int32, device=perm.device)
+    if not torch.equal(torch.sort(perm, dim=1).values, ref.expand(Ny, Nvox)):
+        raise ValueError(f"{op}: every perm row must be a permutation of range({Nvox}) "
+                         "(repeated voxel)")
+
+
+def _mbir_icd_sweep_cuda(
+    volume: torch.Tensor,             # [Ny, Nz, Nx] fp32, updated in place
+    e_sino: torch.Tensor,             # [n_angles, Ny, N_det] fp32, updated in place
+    lambdas: torch.Tensor | None,     # [n_angles, Ny, N_det] fp32
+    vol_snap: torch.Tensor,           # [Ny, Nz, Nx] fp32
+    work: torch.Tensor,               # [Ny * Nz * Nx * 4] fp32 scratch
+    cos_a: torch.Tensor,
+    sin_a: torch.Tensor,
+    *,
+    perm_key: int,
+    perm: torch.Tensor | None = None,  # [Ny, Nz*Nx] int32: explicit order (tests)
+    qggmrf_p: float, qggmrf_q: float, qggmrf_c: float, sigma_f: float,
+    huber_T: float, huber_delta: float, sigma: float,
+) -> None:
+    """One CUDA ICD sweep (voxel updates only), on ``volume``'s device and
+    current stream. The voxel order is built in the kernel from
+    ``perm_key`` unless ``perm`` gives it explicitly (validated by
+    `_check_mbir_perm`). Every buffer is checked like the CPU sweep's: the
+    kernels get raw pointers plus dims."""
+    op = "_mbir_icd_sweep_cuda"
+    if volume.ndim != 3 or e_sino.ndim != 3:
+        raise ValueError(f"{op}: volume and e_sino must be 3-D")
+    n_angles, Ny, N_det = e_sino.shape
+    _, Nz, Nx = volume.shape
+    dev = volume.device
+    for name, t, dt in (("volume", volume, torch.float32),
+                        ("e_sino", e_sino, torch.float32),
+                        ("volume_snapshot", vol_snap, torch.float32),
+                        ("work", work, torch.float32),
+                        ("cos_a", cos_a, torch.float32),
+                        ("sin_a", sin_a, torch.float32),
+                        ("lambdas", lambdas, torch.float32),
+                        ("perm", perm, torch.int32)):
+        if t is not None and (t.dtype != dt or t.device != dev):
+            raise TypeError(f"{op}: {name} must be a {dt} tensor on {dev}")
+    _check_shapes(op, [
+        ("volume", volume, (Ny, Nz, Nx)),
+        ("e_sino", e_sino, (n_angles, Ny, N_det)),
+        ("volume_snapshot", vol_snap, (Ny, Nz, Nx)),
+        ("work", work, (Ny * Nz * Nx * 4,)),
+        ("lambdas", lambdas, (n_angles, Ny, N_det)),
+        ("cos_a (angles)", cos_a, (n_angles,)),
+        ("sin_a (angles)", sin_a, (n_angles,)),
+    ])
+    if perm is not None:
+        _check_mbir_perm(op, perm, Ny, Nz * Nx)
+    with torch.cuda.device(dev):   # D7: launch on the data's device
+        _core.mbir_icd_sweep_cuda(
+            vol_ptr=_data_ptr(volume, "volume"),
+            e_sino_ptr=_data_ptr(e_sino, "e_sino"),
+            vol_snapshot_ptr=_data_ptr(vol_snap, "volume_snapshot"),
+            lambdas_ptr=_data_ptr(lambdas, "lambdas") if lambdas is not None else 0,
+            perm_ptr=_data_ptr(perm, "perm") if perm is not None else 0,
+            perm_key=perm_key, work_ptr=_data_ptr(work, "work"),
+            cos_ptr=_data_ptr(cos_a, "cos_a"), sin_ptr=_data_ptr(sin_a, "sin_a"),
+            Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
+            qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c, sigma_f=sigma_f,
+            huber_T=huber_T, huber_delta=huber_delta, sigma=sigma,
+            stream_ptr=torch.cuda.current_stream(dev).cuda_stream,
+        )
+
+
 def _run_mbir_single_scale(
     sinogram: torch.Tensor,       # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,     # [n_angles]
@@ -377,23 +458,13 @@ def _run_mbir_single_scale(
         perm_key = _mbir_perm_key(seed, it)
 
         if device.type == "cuda":
-            stream_ptr = torch.cuda.current_stream(device).cuda_stream
-            with torch.cuda.device(device):   # D7: launch on the data's device
-                _core.mbir_icd_sweep_cuda(
-                    vol_ptr=volume.data_ptr(),
-                    e_sino_ptr=e_sino.data_ptr(),
-                    vol_snapshot_ptr=vol_snap.data_ptr(),
-                    lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
-                    perm_ptr=0, perm_key=perm_key, work_ptr=work.data_ptr(),
-                    cos_ptr=cos_a.data_ptr(),
-                    sin_ptr=sin_a.data_ptr(),
-                    Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
-                    qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q,
-                    qggmrf_c=qggmrf_c, sigma_f=sigma_f,
-                    huber_T=huber_T, huber_delta=huber_delta,
-                    sigma=sigma_cur,
-                    stream_ptr=stream_ptr,
-                )
+            _mbir_icd_sweep_cuda(
+                volume, e_sino, lambdas.contiguous() if lambdas is not None else None,
+                vol_snap, work, cos_a, sin_a, perm_key=perm_key,
+                qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
+                sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
+                sigma=sigma_cur,
+            )
         else:
             _mbir_icd_sweep_cpu(
                 volume, e_sino,
@@ -505,7 +576,9 @@ def run_mbir(
     optionally coarse-to-fine. Recorded loss: the data MSE ``mean(e^2)`` of
     the residual ``e = g - A f - d`` after each outer iteration; indices run
     across multires levels. Stops a level early when the relative volume
-    change falls below ``convergence_tol``.
+    change falls below ``convergence_tol``. On CUDA each level allocates a
+    sweep scratch buffer of 16 bytes per voxel of that level (256 MiB at
+    256^3, 2 GiB at 512^3), released when the level returns.
 
     Parameters
     ----------
@@ -533,7 +606,10 @@ def run_mbir(
     convergence_tol : float
         Per-level stop on the relative L2 volume change (default 1e-4).
     seed : int
-        Seed of the voxel permutation.
+        Seed of the voxel permutation. Since the order moved into the CUDA
+        kernel (a keyed Feistel permutation per Y-slice and iteration, the
+        CPU sweep uses the same order), a given ``seed`` gives a different
+        order, hence slightly different volumes, than before that change.
     lambdas : Tensor ``[n_angles, Ny, N_det]``, optional
         Per-pixel data weights (default 1), the sinogram's dtype.
     sigma_f_per_scale : list of float, optional
