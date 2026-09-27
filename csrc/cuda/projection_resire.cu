@@ -6,7 +6,8 @@
  * Each launch processes ONE projection. The host loops over n_angles.
  * Supersampling: 4 sub-voxel offsets (±0.25, ±0.25) in volume XZ space are
  * rotated to detector coordinates via rows 0–1 of the projection matrix M.
- * The host divides the output by 4 to normalise to the single-sample scale.
+ * The Python wrapper (fasttomo/autograd.py) divides the output by 4 to
+ * normalise to the single-sample scale; the C++ host does not.
  */
 
 #include "common.cuh"

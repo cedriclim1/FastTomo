@@ -22,7 +22,9 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that import from here
 
 import fasttomo._core as _core
-from fasttomo.autograd import _assert_dtype_match, _check_inputs, _euler_zyz_to_rotmat
+from fasttomo.autograd import (
+    _assert_dtype_match, _check_inputs, _check_shapes, _data_ptr, _euler_zyz_to_rotmat, _launch,
+)
 from fasttomo.projection import (
     forward_project,
     back_project,
@@ -33,7 +35,7 @@ from fasttomo.projection import (
 )
 from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
-from fasttomo.projector import ParallelProjector, RotmatProjector
+from fasttomo.projector import ParallelProjector, RotmatProjector, _drain_deferred_handles
 from fasttomo.configs import (
     AdReconConfig,
     ConstraintConfig,
@@ -1609,16 +1611,21 @@ def _run_sirt_cuda_graph(
             # captures on the right device — the implicit side stream is
             # created lazily on the first call's device and reused for later
             # calls, which corrupts cross-device captures.
-            with torch.cuda.device(target_device):
-                torch.cuda.synchronize(target_device)
-                capture_stream = torch.cuda.Stream(device=target_device)
-                g = torch.cuda.CUDAGraph()
-                with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
-                    _sirt_iter_inplace(
-                        vol_static, sino_static, C_static, R_static, omega,
-                        _fp, _bp, static_constraints,
-                    )
-                torch.cuda.synchronize(target_device)
+            try:
+                with torch.cuda.device(target_device):
+                    torch.cuda.synchronize(target_device)
+                    capture_stream = torch.cuda.Stream(device=target_device)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
+                        _sirt_iter_inplace(
+                            vol_static, sino_static, C_static, R_static, omega,
+                            _fp, _bp, static_constraints,
+                        )
+                    torch.cuda.synchronize(target_device)
+            finally:
+                # Free texture caches of projectors collected during the
+                # capture (their release was deferred, see projector.py).
+                _drain_deferred_handles()
 
             cache[key] = (g, vol_static, sino_static, C_static, R_static,
                           mask_static)
@@ -1803,12 +1810,17 @@ def run_genfire(
                 torch.cuda.current_stream(device).cuda_stream,
             )
     else:
-        gr_np, gi_np, gw_np = _core.genfire_gridding_2d_cpu(
-            fk_r.numpy(), fk_i.numpy(), cos_a, sin_a, cutoff_dist,
+        grid_r = torch.zeros(Ny, bigN, bigN, dtype=torch.float32)
+        grid_i = torch.zeros(Ny, bigN, bigN, dtype=torch.float32)
+        grid_w = torch.zeros(Ny, bigN, bigN, dtype=torch.float32)
+        cos_t = torch.from_numpy(cos_a)
+        sin_t = torch.from_numpy(sin_a)
+        _core.genfire_gridding_2d_cpu(
+            _data_ptr(fk_r, "fk_real"), _data_ptr(fk_i, "fk_imag"),
+            _data_ptr(cos_t, "cos_a"), _data_ptr(sin_t, "sin_a"),
+            grid_r.data_ptr(), grid_i.data_ptr(), grid_w.data_ptr(),
+            bigN, Ny, n_angles, cutoff_dist,
         )
-        grid_r = torch.Tensor(gr_np)
-        grid_i = torch.Tensor(gi_np)
-        grid_w = torch.Tensor(gw_np)
 
     # ── normalize by accumulated weights ────────────────────────────────────
     known_2d = grid_w[0] > 0                        # [bigN, bigN]
@@ -2384,7 +2396,6 @@ def _mbir_initial_residual(
     sinogram: torch.Tensor,
     cos_a: torch.Tensor,
     sin_a: torch.Tensor,
-    angles_rad: torch.Tensor,
 ) -> torch.Tensor:
     """e = g - A_MBIR · f at the start of an MBIR level. Uses the voxel-
     driven scatter FP that matches the column-A model in the ICD kernel.
@@ -2395,25 +2406,71 @@ def _mbir_initial_residual(
     Ny, Nz, Nx = volume.shape
     n_angles = sinogram.shape[0]
     N_det = sinogram.shape[2]
-    Af = torch.empty_like(sinogram)
-    if volume.is_cuda:
-        stream_ptr = torch.cuda.current_stream(volume.device).cuda_stream
-        _core.mbir_forward_project_cuda(
-            volume.contiguous().data_ptr(),
-            Af.data_ptr(),
-            cos_a.data_ptr(), sin_a.data_ptr(),
-            Ny, Nz, Nx, n_angles, N_det,
-            stream_ptr,
-        )
-    else:
-        Af_np = _core.mbir_forward_project_cpu(
-            volume.contiguous().cpu().numpy(),
-            angles_rad.cpu().numpy(),
-            N_det,
-            num_threads=4,
-        )
-        Af = torch.from_numpy(Af_np).to(volume.device)
+    Af = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=sinogram.device)
+    vol = volume.detach().float().contiguous()
+    _launch("mbir_forward_project", Af,
+            vol, Af, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
+            shapes=[("volume", (Ny, Nz, Nx)), ("Af", (n_angles, Ny, N_det)),
+                    ("cos", (n_angles,)), ("sin", (n_angles,))],
+            num_threads=4)
     return sinogram - Af
+
+
+def _mbir_icd_sweep_cpu(
+    volume: torch.Tensor,             # [Ny, Nz, Nx] fp32, updated in place
+    e_sino: torch.Tensor,             # [n_angles, Ny, N_det] fp32, updated in place
+    d_offsets: torch.Tensor | None,   # [n_angles] fp32, updated in place
+    lambdas: torch.Tensor | None,     # [n_angles, Ny, N_det] fp32
+    vol_snap: torch.Tensor,           # [Ny, Nz, Nx] fp32
+    perm: torch.Tensor,               # [Ny, Nz*Nx] int32
+    cos_a: torch.Tensor,
+    sin_a: torch.Tensor,
+    *,
+    qggmrf_p: float, qggmrf_q: float, qggmrf_c: float, sigma_f: float,
+    huber_T: float, huber_delta: float, sigma: float, sigma_min: float,
+    estimate_offset: bool, estimate_variance: bool, num_threads: int,
+) -> float:
+    """One CPU ICD sweep; returns the updated sigma. The C code updates
+    volume / e_sino / d_offsets through raw pointers, so every buffer must be
+    a dense CPU tensor of the right dtype: a silent copy would drop the
+    in-place writes, so strided buffers raise instead (#58)."""
+    if volume.ndim != 3 or e_sino.ndim != 3:
+        raise ValueError("_mbir_icd_sweep_cpu: volume and e_sino must be 3-D")
+    n_angles, Ny, N_det = e_sino.shape
+    _, Nz, Nx = volume.shape
+    for name, t, dt in (("volume", volume, torch.float32),
+                        ("e_sino", e_sino, torch.float32),
+                        ("volume_snapshot", vol_snap, torch.float32),
+                        ("perm", perm, torch.int32),
+                        ("d_offsets", d_offsets, torch.float32),
+                        ("lambdas", lambdas, torch.float32)):
+        if t is not None and (t.dtype != dt or t.device.type != "cpu"):
+            raise TypeError(f"_mbir_icd_sweep_cpu: {name} must be a CPU {dt} tensor")
+    # One place for every size the C sweep trusts (#58 checks included).
+    _check_shapes("_mbir_icd_sweep_cpu", [
+        ("volume", volume, (Ny, Nz, Nx)),            # e_sino Ny must match volume
+        ("e_sino", e_sino, (n_angles, Ny, N_det)),
+        ("volume_snapshot", vol_snap, (Ny, Nz, Nx)),
+        ("perm", perm, (Ny, Nz * Nx)),
+        ("d_offsets", d_offsets, (n_angles,)),
+        ("lambdas", lambdas, (n_angles, Ny, N_det)),
+        ("cos_a (angles)", cos_a, (n_angles,)),
+        ("sin_a (angles)", sin_a, (n_angles,)),
+    ])
+    return float(_core.mbir_icd_sweep_cpu(
+        vol_ptr=_data_ptr(volume, "volume"),
+        e_sino_ptr=_data_ptr(e_sino, "e_sino"),
+        vol_snapshot_ptr=_data_ptr(vol_snap, "volume_snapshot"),
+        d_offsets_ptr=_data_ptr(d_offsets, "d_offsets") if d_offsets is not None else 0,
+        lambdas_ptr=_data_ptr(lambdas, "lambdas") if lambdas is not None else 0,
+        perm_ptr=_data_ptr(perm, "perm"),
+        cos_ptr=_data_ptr(cos_a, "cos_a"), sin_ptr=_data_ptr(sin_a, "sin_a"),
+        Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
+        qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c, sigma_f=sigma_f,
+        huber_T=huber_T, huber_delta=huber_delta, sigma=sigma, sigma_min=sigma_min,
+        estimate_offset=estimate_offset, estimate_variance=estimate_variance,
+        num_threads=num_threads,
+    ))
 
 
 def _run_mbir_single_scale(
@@ -2461,7 +2518,7 @@ def _run_mbir_single_scale(
 
     # Residual e = g - A·f - d. d is rolled into A·f via the offset
     # term (we maintain e ≡ g - A·f - d, so initial e adjusts for both).
-    e_sino = _mbir_initial_residual(volume, sinogram, cos_a, sin_a, angles_rad).contiguous()
+    e_sino = _mbir_initial_residual(volume, sinogram, cos_a, sin_a).contiguous()
     if d_offsets.abs().sum().item() > 0.0:
         e_sino.sub_(d_offsets.view(n_angles, 1, 1))
 
@@ -2477,22 +2534,23 @@ def _run_mbir_single_scale(
         if device.type == "cuda":
             perm_dev = torch.from_numpy(perm).to(device).contiguous()
             stream_ptr = torch.cuda.current_stream(device).cuda_stream
-            _core.mbir_icd_sweep_cuda(
-                vol_ptr=volume.data_ptr(),
-                e_sino_ptr=e_sino.data_ptr(),
-                vol_snapshot_ptr=vol_snap.data_ptr(),
-                d_offsets_ptr=d_offsets.data_ptr() if estimate_offset else 0,
-                lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
-                perm_ptr=perm_dev.data_ptr(),
-                cos_ptr=cos_a.data_ptr(),
-                sin_ptr=sin_a.data_ptr(),
-                Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
-                qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q,
-                qggmrf_c=qggmrf_c, sigma_f=sigma_f,
-                huber_T=huber_T, huber_delta=huber_delta,
-                sigma=sigma_cur,
-                stream_ptr=stream_ptr,
-            )
+            with torch.cuda.device(device):   # D7: launch on the data's device
+                _core.mbir_icd_sweep_cuda(
+                    vol_ptr=volume.data_ptr(),
+                    e_sino_ptr=e_sino.data_ptr(),
+                    vol_snapshot_ptr=vol_snap.data_ptr(),
+                    d_offsets_ptr=d_offsets.data_ptr() if estimate_offset else 0,
+                    lambdas_ptr=lambdas.data_ptr() if lambdas is not None else 0,
+                    perm_ptr=perm_dev.data_ptr(),
+                    cos_ptr=cos_a.data_ptr(),
+                    sin_ptr=sin_a.data_ptr(),
+                    Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
+                    qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q,
+                    qggmrf_c=qggmrf_c, sigma_f=sigma_f,
+                    huber_T=huber_T, huber_delta=huber_delta,
+                    sigma=sigma_cur,
+                    stream_ptr=stream_ptr,
+                )
             # Host-side closed-form updates for d_k and σ.
             d_offsets, sigma_cur = _mbir_update_offset_variance(
                 e_sino, d_offsets, sigma_cur, sigma_min,
@@ -2501,21 +2559,17 @@ def _run_mbir_single_scale(
             )
         else:
             # CPU path: single C call does ICD + (optional) offset + (optional) variance.
-            volume_np = volume.numpy()
-            e_np = e_sino.numpy()
-            d_np = d_offsets.numpy() if estimate_offset else None
-            vol_snap_np = vol_snap.numpy()
-            lam_np = lambdas.contiguous().numpy() if lambdas is not None else None
-            sigma_cur = float(_core.mbir_icd_sweep_cpu(
-                volume_np, e_np, d_np, lam_np,
-                vol_snap_np, perm,
-                angles_rad.numpy(),
-                qggmrf_p, qggmrf_q, qggmrf_c, sigma_f,
-                huber_T, huber_delta,
-                sigma_cur, sigma_min,
-                estimate_offset, estimate_variance,
+            sigma_cur = _mbir_icd_sweep_cpu(
+                volume, e_sino, d_offsets if estimate_offset else None,
+                lambdas.contiguous() if lambdas is not None else None,
+                vol_snap, torch.from_numpy(perm), cos_a, sin_a,
+                qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
+                sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
+                sigma=sigma_cur, sigma_min=sigma_min,
+                estimate_offset=estimate_offset,
+                estimate_variance=estimate_variance,
                 num_threads=4,
-            ))
+            )
 
         # Convergence check: relative L2 change on a strided sample so it
         # scales as O(Nvox / 8). Cheap vs the per-iter compute.

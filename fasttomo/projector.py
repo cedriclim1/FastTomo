@@ -16,8 +16,9 @@ Two flavours, mirroring the two functional FP/BP pairs:
                        AD reconstruction without pose optimisation, FBP, SIRT.
   RotmatProjector    — full ZYZ rotation, ``[n_angles, 3, 3]`` rotation matrix
                        passed each call. Differentiable w.r.t. volume,
-                       sinogram, and matrices (the ∂/∂M kernel doesn't use a
-                       texture, so no caching needed there).
+                       sinogram, and matrices (the ∂/∂M kernel samples the
+                       volume texture, and reuses the one the forward
+                       uploaded).
 
 Both classes are CUDA-only — they wrap the ``*_cuda_cached`` entry points.
 On CPU you should use the functional API.
@@ -51,7 +52,7 @@ import torch
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
-    _FP2DCached, _BP2DCached, _FP3DCached, _BP3DCached, _io_dtype_code,
+    _FPParallelCached, _BPParallelCached, _FPRotmatCached, _BPRotmatCached, _io_dtype_code,
     _on_device,
 )
 
@@ -169,26 +170,69 @@ class _ProjectorBase:
         self._check_shape(sinogram, "sinogram", (self.n_angles, self.Ny, self.N_det))
 
     def __del__(self) -> None:
-        # Tear down explicitly.  tc_destroy is safe-on-null and frees both the
-        # cudaArray and the textureObject. GC may fire while a different CUDA
-        # device is current (e.g. the user has since switched to cuda:0), so
-        # pin the current device to the projector's construction device first.
+        # Tear down explicitly. ``_core.tc_destroy`` synchronizes the device
+        # before freeing, so an FP/BP still queued on any stream (the last
+        # call of run_sirt, say) finishes reading the texture first. GC may
+        # fire while a different CUDA device is current, so pin the
+        # projector's construction device.
         try:
-            has_handles = (
-                getattr(self, "_vol_handle", None) is not None
-                or getattr(self, "_sino_handle", None) is not None
-            )
-            if not has_handles:
-                return
-            with torch.cuda.device(self.device):
-                if getattr(self, "_vol_handle", None) is not None:
-                    _core.tc_destroy(self._vol_handle)
-                    self._vol_handle = None
-                if getattr(self, "_sino_handle", None) is not None:
-                    _core.tc_destroy(self._sino_handle)
-                    self._sino_handle = None
+            handles = [h for h in (getattr(self, "_vol_handle", None),
+                                   getattr(self, "_sino_handle", None))
+                       if h is not None]
+            self._vol_handle = None
+            self._sino_handle = None
+            if handles:
+                _release_handles(self.device, handles)
         except Exception:
             pass
+
+
+# Handles of projectors collected while this thread was capturing a CUDA
+# graph. Releasing then is illegal: in the default (global) capture mode
+# the device sync and cudaFreeArray are prohibited for the whole thread,
+# whatever device the capture runs on, and would invalidate the capture.
+# They wait here until _drain_deferred_handles() runs after the capture
+# (run_sirt calls it) or the next projector is released.
+# Limitation (as on main, where cudaFreeArray had the same effect): only a
+# capture on the *calling* thread is detected. If GC finalizes a projector
+# on thread B while thread A captures in global mode, the free still breaks
+# A's capture; keep projectors alive across captures in threaded code.
+_deferred_handles: list[tuple[torch.device, int]] = []
+
+
+def _capturing(device: torch.device) -> bool:
+    """True if this thread is capturing a CUDA graph on the current device
+    or on ``device`` (the projector's)."""
+    if torch.cuda.is_current_stream_capturing():
+        return True
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+def _destroy(device: torch.device, handle: int) -> None:
+    try:
+        with torch.cuda.device(device):
+            _core.tc_destroy(handle)
+    except Exception:
+        pass   # best effort: one failing handle must not strand the rest
+
+
+def _drain_deferred_handles() -> None:
+    """Release the handles deferred during a CUDA-graph capture. No-op while
+    a capture is still running on the current device."""
+    if not _deferred_handles or torch.cuda.is_current_stream_capturing():
+        return
+    while _deferred_handles:
+        _destroy(*_deferred_handles.pop())
+
+
+def _release_handles(device: torch.device, handles: list[int]) -> None:
+    if _capturing(device):
+        _deferred_handles.extend((device, h) for h in handles)
+        return
+    for h in handles:
+        _destroy(device, h)
+    _drain_deferred_handles()
 
 
 class ParallelProjector(_ProjectorBase):
@@ -278,7 +322,7 @@ class ParallelProjector(_ProjectorBase):
                 self.n_angles, self.Ny, self.N_det,
                 dtype=self.dtype, device=self.device,
             )
-            _core.forward_project_cuda_cached(
+            _core.forward_project_parallel_cuda_cached(
                 io_dtype,
                 self._vol_handle,
                 vol.data_ptr(), sino.data_ptr(),
@@ -297,7 +341,7 @@ class ParallelProjector(_ProjectorBase):
                 self.Ny, self.Nz, self.Nx,
                 dtype=self.dtype, device=self.device,
             )
-            _core.back_project_cuda_cached(
+            _core.back_project_parallel_cuda_cached(
                 io_dtype,
                 self._sino_handle,
                 sino.data_ptr(), vol.data_ptr(),
@@ -311,12 +355,12 @@ class ParallelProjector(_ProjectorBase):
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
         self._check_device(volume, "volume")
         self._check_volume_shape(volume)
-        return _FP2DCached.apply(volume, self)
+        return _FPParallelCached.apply(volume, self)
 
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
-        return _BP2DCached.apply(sinogram, self)
+        return _BPParallelCached.apply(sinogram, self)
 
 
 class RotmatProjector(_ProjectorBase):
@@ -326,7 +370,9 @@ class RotmatProjector(_ProjectorBase):
     call (since pose optimisation makes them learnable). Only the texture
     caches are persistent; the matrix tensor is consumed via its ``.data_ptr()``
     on each FP/BP. Differentiable w.r.t. ``volume``, ``sinogram``, and
-    ``matrices`` (the ∂/∂M kernel doesn't use a texture so it stays uncached).
+    ``matrices``: the ∂/∂M kernel reads the volume through the point-filter
+    view of the forward's texture cache, falling back to a one-shot texture
+    if the cache has been overwritten by a later forward.
 
     ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
     configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
@@ -480,11 +526,11 @@ class RotmatProjector(_ProjectorBase):
         self._check_volume_shape(volume)
         self._check_device(mats, "mats")
         mats_flat = self._normalize_and_validate_mats(mats)
-        return _FP3DCached.apply(volume, mats_flat, self)
+        return _FPRotmatCached.apply(volume, mats_flat, self)
 
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
         self._check_device(mats, "mats")
         mats_flat = self._normalize_and_validate_mats(mats)
-        return _BP3DCached.apply(sinogram, mats_flat, self)
+        return _BPRotmatCached.apply(sinogram, mats_flat, self)

@@ -1057,18 +1057,18 @@ class TestRunSart:
 
 def _mbir_sino_cpu(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Tensor:
     """CPU voxel-driven bilinear FP (the same model used inside CPU ICD)."""
-    import math
-    import fasttomo._core as _core
+    from fasttomo.autograd import _launch, _trig_on_device
     Ny, Nz, Nx = phantom.shape
     N_det = Nx
-    angles_rad = (angles_deg.float() * (math.pi / 180.0)).numpy().copy()
-    sino_np = _core.mbir_forward_project_cpu(
-        phantom.contiguous().numpy(),
-        angles_rad,
-        N_det,
-        num_threads=1,
-    )
-    return torch.from_numpy(sino_np)
+    n_angles = angles_deg.numel()
+    vol = phantom.float().contiguous()
+    cos_a, sin_a = _trig_on_device(angles_deg, vol.device)
+    sino = torch.empty(n_angles, Ny, N_det)
+    return _launch("mbir_forward_project", sino,
+                   vol, sino, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
+                   shapes=[("volume", (Ny, Nz, Nx)), ("sino", (n_angles, Ny, N_det)),
+                           ("cos", (n_angles,)), ("sin", (n_angles,))],
+                   num_threads=1)
 
 
 def test_mbir_cpu_runs():
@@ -1128,20 +1128,15 @@ def test_mbir_fp_matches_standard_fp_off_axis_voxel():
     on the detector. A Z-symmetric phantom hides the sign bug; placing the
     voxel at iz=8 (well off the iz=Nz//2 centre) makes the sign error visible
     as a shifted detector hit."""
-    import math
     import numpy as np
-    import fasttomo._core as _core
     Ny, Nz, Nx = 4, 32, 32
     N_det = Nx
     n_angles = 12
     phantom = torch.zeros(Ny, Nz, Nx)
     phantom[Ny // 2, 8, Nx // 2] = 1.0   # off-centre in Z, on-centre in X
     angles_deg = make_angles(n_angles, max_deg=60.0)
-    angles_rad = (angles_deg.float() * (math.pi / 180.0)).numpy().copy()
 
-    sino_mbir = _core.mbir_forward_project_cpu(
-        phantom.contiguous().numpy(), angles_rad, N_det, num_threads=1,
-    )
+    sino_mbir = _mbir_sino_cpu(phantom, angles_deg).numpy()
     sino_std = ft.forward_project(phantom, angles_deg)
 
     det_idx = np.arange(N_det, dtype=np.float32)
@@ -1288,39 +1283,38 @@ def test_mbir_noncontiguous_lambdas_matches_contiguous():
     assert torch.allclose(vol_contig, vol_expand, atol=1e-6, rtol=1e-6)
 
 
-def test_mbir_cpu_binding_rejects_noncontiguous_buffers():
-    """The CPU MBIR binding must not silently ignore numpy strides (#58)."""
-    import numpy as np
-    from fasttomo import _core
+def test_mbir_cpu_sweep_rejects_noncontiguous_buffers():
+    """The CPU MBIR sweep writes volume / e_sino through raw pointers, so a
+    strided buffer must raise rather than be misread or silently copied (#58)."""
+    from fasttomo.algorithms import _mbir_icd_sweep_cpu
+    from fasttomo.autograd import _trig_on_device
 
     Ny, Nz, Nx, n_angles = 2, 4, 4, 3
     N_det = Nx
-    angles = np.linspace(-0.5, 0.5, n_angles).astype(np.float32)
-    perm = np.tile(np.arange(Nz * Nx, dtype=np.int32), (Ny, 1))
+    cos_a, sin_a = _trig_on_device(torch.linspace(-30, 30, n_angles), torch.device("cpu"))
+    perm = torch.arange(Nz * Nx, dtype=torch.int32).repeat(Ny, 1)
 
     def call(volume, e_sino, lambdas):
-        return _core.mbir_icd_sweep_cpu(
-            volume, e_sino, None, lambdas,
-            np.zeros((Ny, Nz, Nx), np.float32), perm, angles,
-            1.2, 2.0, 0.01, 1.0,
-            float("inf"), 1.0,
-            1.0, 1e-3,
-            False, False,
-            num_threads=1,
+        return _mbir_icd_sweep_cpu(
+            volume, e_sino, None, lambdas, torch.zeros(Ny, Nz, Nx), perm,
+            cos_a, sin_a,
+            qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=0.01, sigma_f=1.0,
+            huber_T=float("inf"), huber_delta=1.0, sigma=1.0, sigma_min=1e-3,
+            estimate_offset=False, estimate_variance=False, num_threads=1,
         )
 
-    vol = np.zeros((Ny, Nz, Nx), np.float32)
-    e = np.ones((n_angles, Ny, N_det), np.float32)
-    lam = np.ones((n_angles, Ny, N_det), np.float32)
-    call(vol, e.copy(), lam)  # dense buffers are accepted
+    vol = torch.zeros(Ny, Nz, Nx)
+    e = torch.ones(n_angles, Ny, N_det)
+    lam = torch.ones(n_angles, Ny, N_det)
+    call(vol, e.clone(), lam)  # dense buffers are accepted
 
-    lam_strided = np.broadcast_to(np.ones((1, Ny, N_det), np.float32), (n_angles, Ny, N_det))
+    lam_strided = torch.ones(1, Ny, N_det).expand(n_angles, Ny, N_det)
     with pytest.raises(ValueError, match="lambdas must be C-contiguous"):
-        call(vol, e.copy(), lam_strided)
+        call(vol, e.clone(), lam_strided)
 
-    vol_strided = np.zeros((Ny, Nx, Nz), np.float32).transpose(0, 2, 1)
+    vol_strided = torch.zeros(Ny, Nx, Nz).transpose(1, 2)
     with pytest.raises(ValueError, match="volume must be C-contiguous"):
-        call(vol_strided, e.copy(), lam)
+        call(vol_strided, e.clone(), lam)
 
 
 def test_mbir_multires_not_divisible_raises():

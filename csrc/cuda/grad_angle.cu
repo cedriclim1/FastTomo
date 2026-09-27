@@ -11,7 +11,7 @@
 
 /* ── gradient of forward projection w.r.t. tilt angles ───────────────────────
  * Grid:  (ceil(N_det/16), ceil(n_angles/16), Ny)   Block: (16, 16, 1)
- * Same detector-driven layout as forward_project_kernel.
+ * Same detector-driven layout as forward_project_parallel_kernel.
  *
  * Reduction strategy: each (ia, ty) row of 16 threads sits inside a single
  * warp (block is 16×16 = 256 threads = 8 warps; for ty even, those 16
@@ -20,7 +20,7 @@
  * which threadIdx.x==0 issues one atomicAdd per row.
  */
 __global__ static void grad_angle_kernel(
-    const float *__restrict__ volume,     /* [Ny, Nz, Nx] */
+    const float *__restrict__ vol,     /* [Ny, Nz, Nx] */
     const float *__restrict__ grad_sino,  /* [n_angles, Ny, N_det] */
     const float *__restrict__ cos_a,
     const float *__restrict__ sin_a,
@@ -41,7 +41,7 @@ __global__ static void grad_angle_kernel(
         float gs  = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
 
         if (gs != 0.0f) {
-            const float *slice = volume + (size_t)iy * Nz * Nx;
+            const float *slice = vol + (size_t)iy * Nz * Nx;
 
             for (int step = -ray_len; step <= ray_len; step++) {
                 float s  = (float)step;
@@ -86,16 +86,16 @@ __global__ static void grad_angle_kernel(
 }
 
 void grad_angle_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_cos_a,
-    const float *d_sin_a,
-    float       *d_grad_angles,
+    const float *vol,
+    const float *grad_sino,
+    const float *cos_a,
+    const float *sin_a,
+    float       *grad_angles,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     dim3 block(16, 16, 1);
     dim3 grid((g.N_det    + 15) / 16,
@@ -103,7 +103,7 @@ void grad_angle_cuda(
               g.Ny);
 
     grad_angle_kernel<<<grid, block, 0, stream>>>(
-        d_volume, d_grad_sino, d_cos_a, d_sin_a, d_grad_angles,
+        vol, grad_sino, cos_a, sin_a, grad_angles,
         g.Ny, g.Nz, g.Nx, g.n_angles, g.N_det,
         g.half_det, g.half_x, g.half_z, g.ray_len
     );

@@ -1324,7 +1324,7 @@ def test_rotmat_projector_strided_mats_forward_and_pose_grad():
 
 def test_rotmat_grad_paths_accept_strided_mats():
     """Both backward gradient kernels (cached _grad_mats_raw and uncached
-    _grad_rotmat_raw) must densify mats themselves: _FP3DCached.backward
+    _grad_rotmat_raw) must densify mats themselves: _FPRotmatCached.backward
     passes the saved mats straight through."""
     from fasttomo.autograd import _grad_rotmat_raw
 

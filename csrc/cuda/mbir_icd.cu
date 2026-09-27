@@ -7,13 +7,13 @@
  *            for the project-side narrative and the surrogate-MM derivation.
  *
  * Kernels:
- *   mbir_forward_project_kernel - voxel-driven bilinear scatter FP (1 sample
+ *   forward_project_mbir_kernel - voxel-driven bilinear scatter FP (1 sample
  *       per voxel, 2 detector pixels per angle, atomicAdd). Used to compute
  *       the initial residual e = g - A·f and to validate against the CPU
- *       reference. Distinct from `forward_project_kernel` in projection_2d.cu
+ *       reference. Distinct from `forward_project_parallel_kernel` in projection_parallel.cu
  *       (which is ray-marching detector-driven); this voxel-driven model is
  *       what the ICD column-A access pattern reproduces.
- *   mbir_icd_sweep_kernel       - one outer iteration: per-Y-slice ICD walk
+ *   icd_sweep_mbir_kernel       - one outer iteration: per-Y-slice ICD walk
  *       through the slice's permutation, threads cooperate on the per-voxel
  *       data-term reduction over angles and qGGMRF-prior reduction over the
  *       26-neighbour stencil; thread 0 applies the closed-form update, all
@@ -119,7 +119,7 @@ __device__ __forceinline__ float block_reduce_sum_64(float v, float *sh2) {
  * Sinogram must be zeroed before the kernel launch — the kernel atomicAdds
  * each voxel's contribution into the 2 detector pixels it touches per angle.
  */
-__global__ static void mbir_forward_project_kernel(
+__global__ static void forward_project_mbir_kernel(
     const float *__restrict__ volume,    /* [Ny, Nz, Nx] */
     float *__restrict__       sinogram,  /* [n_angles, Ny, N_det] */
     const float *__restrict__ cos_a,
@@ -157,9 +157,11 @@ __global__ static void mbir_forward_project_kernel(
  *   - One block owns one Y-slice. Parallel-beam single-axis: Y-slices are
  *     fully independent for the data term, so blocks have no cross-block
  *     dependencies on `e` or `volume` within the data path.
- *   - The 26-neighbour qGGMRF reads of `volume` use a tex3D snapshot
- *     (read-only across the kernel) — cross-Y neighbour reads come from
- *     the start-of-outer-iter state ("Jacobi-loose" across Y).
+ *   - All 26 qGGMRF neighbour reads, in-slice ones included, come from a
+ *     tex3D snapshot of the start-of-outer-iter volume (read-only across
+ *     the kernel). The prior term is therefore Jacobi within a slice as
+ *     well as across Y; only the data term is Gauss-Seidel (through the
+ *     live error sinogram). The CPU sweep does the same.
  *
  * Within the block, voxels are processed sequentially in the per-slice
  * permutation order; threads cooperate on the per-voxel reductions.
@@ -170,7 +172,7 @@ __global__ static void mbir_forward_project_kernel(
  * angle loop strided (ia = tid, tid + blockDim, ...); for any single
  * (ia, iy) pair, exactly one thread writes both detector pixels (u0 and
  * u0+1) the voxel touches. No collision possible. */
-__global__ static void mbir_icd_sweep_kernel(
+__global__ static void icd_sweep_mbir_kernel(
     cudaTextureObject_t       vol_snapshot_tex, /* tex3D over [Ny, Nz, Nx] read-only */
     float *__restrict__       volume,           /* [Ny, Nz, Nx] live (read+write) */
     float *__restrict__       e_sino,           /* [n_angles, Ny, N_det] live */
@@ -190,7 +192,7 @@ __global__ static void mbir_icd_sweep_kernel(
     float *vol_slice = volume + (size_t)iy * Nz * Nx;
 
     /* Shared: 2-element scratch for block reduction (one slot per warp);
-     * + 4 scalars for {theta1, theta2, n1, n2, fj_old, fj_new, df}. */
+     * + 5 broadcast scalars: theta1, theta2, n1, n2 and the update df. */
     __shared__ float sh_red[2];
     __shared__ float sh_t1, sh_t2, sh_n1, sh_n2, sh_df;
 
@@ -313,7 +315,7 @@ void mbir_forward_project_cuda(
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     /* Zero the destination sinogram — the scatter only adds positive
      * contributions, so explicit zeroing is required. */
@@ -322,7 +324,7 @@ void mbir_forward_project_cuda(
 
     dim3 block(16, 16, 1);
     dim3 grid((Nx + 15) / 16, (Nz + 15) / 16, Ny);
-    mbir_forward_project_kernel<<<grid, block, 0, stream>>>(
+    forward_project_mbir_kernel<<<grid, block, 0, stream>>>(
         d_volume, d_sinogram, d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det,
         g.half_x, g.half_z, g.half_det
@@ -344,7 +346,7 @@ void mbir_icd_sweep_cuda(
     float huber_T, float huber_delta, float sigma,
     cudaStream_t stream
 ) {
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     MbirHyper H{};
     H.p = qggmrf_p; H.q = qggmrf_q; H.c = qggmrf_c; H.sigma_f = sigma_f;
@@ -353,26 +355,21 @@ void mbir_icd_sweep_cuda(
     FASTTOMO_CUDA_CHECK(cudaMemcpyToSymbolAsync(
         mbir_H, &H, sizeof(MbirHyper), 0, cudaMemcpyHostToDevice, stream));
 
-    /* tex3D snapshot of `volume` for qGGMRF reads. Allocate, upload, bind,
-     * launch, destroy — per outer iter. The cudaArray lifecycle uses the
-     * existing TextureCache helpers for 3D fp32 single-channel volumes
-     * (TC_VOL_3D dim_a=Ny, dim_b=Nz, dim_c=Nx). */
-    TextureCache *snap = tc_create(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx);
-    tc_upload(snap, d_volume_snapshot, stream);
+    /* tex3D snapshot of `volume` for qGGMRF reads: a one-shot TC_VOL_3D
+     * cache (dim_a=Ny, dim_b=Nz, dim_c=Nx) per outer iteration.
+     * ScopedTextureCache releases it on every path; finish() syncs the
+     * stream first, so the kernel is done before the texture goes away. */
+    ScopedTextureCache snap(TC_VOL_3D, TC_DTYPE_FP32, 1, Ny, Nz, Nx, stream);
+    tc_upload(snap.get(), d_volume_snapshot, stream);
 
     dim3 block(64, 1, 1);
     dim3 grid(Ny, 1, 1);
-    mbir_icd_sweep_kernel<<<grid, block, 0, stream>>>(
-        snap->tex,
+    icd_sweep_mbir_kernel<<<grid, block, 0, stream>>>(
+        snap.get()->tex,
         d_volume, d_e_sino, d_d_offsets, d_lambdas, d_perm,
         d_cos_a, d_sin_a,
         Ny, Nz, Nx, n_angles, N_det
     );
     CUDA_CHECK_KERNEL();
-
-    /* The kernel reads the texture asynchronously on this stream; tc_destroy
-     * is stream-synchronous on the cudaArray free. Sync the stream first so
-     * the kernel completes before we tear down the texture. */
-    FASTTOMO_CUDA_CHECK(cudaStreamSynchronize(stream));
-    tc_destroy(snap);
+    snap.finish();
 }

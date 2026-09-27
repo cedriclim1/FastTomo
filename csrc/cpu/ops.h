@@ -20,9 +20,9 @@ extern "C" {
  *
  * Integration uses 1-pixel steps along the ray with bilinear interpolation.
  */
-void forward_project_cpu(
-    const float *volume,
-    float       *sinogram,
+void forward_project_parallel_cpu(
+    const float *vol,
+    float       *sino,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -39,9 +39,9 @@ void forward_project_cpu(
  *
  * For each voxel, accumulates linearly-interpolated sinogram values over all angles.
  */
-void back_project_cpu(
-    const float *sinogram,
-    float       *volume,
+void back_project_parallel_cpu(
+    const float *sino,
+    float       *vol,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -74,7 +74,7 @@ void back_project_cpu(
  * grad_angles : [n_angles] — zeroed by caller; returned in radians
  */
 void grad_angle_cpu(
-    const float *volume,
+    const float *vol,
     const float *grad_sino,
     float       *grad_angles,
     const float *cos_a,
@@ -94,19 +94,19 @@ void grad_angle_cpu(
  * Slower than the CUDA path by O(10×) — useful for testing on hosts without
  * a GPU and as a reference for the autograd backward.
  */
-void forward_project_3d_cpu(
-    const float *volume,
-    float       *sinogram,
-    const float *matrices,
+void forward_project_rotmat_cpu(
+    const float *vol,
+    float       *sino,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
 );
 
-void back_project_3d_cpu(
-    const float *sinogram,
-    float       *volume,
-    const float *matrices,
+void back_project_rotmat_cpu(
+    const float *sino,
+    float       *vol,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
@@ -115,14 +115,14 @@ void back_project_3d_cpu(
 /*
  * Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries
  * (CPU). grad_matrices: [n_angles*9] zeroed by this function before
- * accumulating. Used by _FP3D's autograd backward on CPU; PyTorch chains
+ * accumulating. Used by _FPRotmat's autograd backward on CPU; PyTorch chains
  * the result through _euler_zyz_to_rotmat to yield ∂L/∂euler.
  */
 void grad_rotmat_cpu(
-    const float *volume,
+    const float *vol,
     const float *grad_sino,
-    const float *matrices,
-    float       *grad_matrices,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
@@ -143,7 +143,7 @@ void genfire_gridding_2d_cpu(
 /*
  * MBIR voxel-driven bilinear forward projection (CPU).
  *
- * Distinct from `forward_project_cpu` — this uses the voxel-driven scatter
+ * Distinct from `forward_project_parallel_cpu` — this uses the voxel-driven scatter
  * model A_MBIR that matches the column-A used in `mbir_icd_sweep_cpu`.
  * For voxel (ix, iz, iy) at angle θ_k the detector coord is
  *   u = (ix - half_x)·cos θ_k - (iz - half_z)·sin θ_k + half_det,
@@ -168,9 +168,9 @@ void mbir_forward_project_cpu(
  *   perm[Ny, Nz*Nx]                      : per-Y-slice voxel permutation
  *   lambdas[n_angles, Ny, N_det]         : per-pixel Λ data weights; NULL → 1
  *
- * Y-slices are parallelized via OpenMP (cross-slice qGGMRF reads use
- * the snapshot, so slices are independent — "Jacobi-loose" semantics
- * matching the paper). Within a slice, the sweep is sequential
+ * Y-slices are parallelized via OpenMP. All 26 qGGMRF neighbour reads
+ * (in-slice ones included) use the snapshot, so slices are independent
+ * and the prior is Jacobi. Within a slice the data term is sequential
  * Gauss-Seidel ICD via the incremental error sinogram.
  *
  * Set estimate_offset=0 / estimate_variance=0 (and pass NULL for

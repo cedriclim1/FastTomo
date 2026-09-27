@@ -8,9 +8,9 @@
  * Tomography", IEEE TCI 1(1).
  *
  * Provided entry points (mirroring `csrc/cpu/ops.h`):
- *   mbir_forward_project_mbir_cpu - voxel-driven bilinear FP (no super-
+ *   mbir_forward_project_cpu - voxel-driven bilinear FP (no super-
  *       sampling) used inside MBIR. Distinct from the existing ray-marching
- *       `forward_project_cpu` so the column-A model used in the ICD updates
+ *       `forward_project_parallel_cpu` so the column-A model used in the ICD updates
  *       below matches the FP used to compute the initial e = g - Af.
  *   mbir_icd_sweep_cpu - one full outer iteration: ICD sweep over all
  *       voxels (Y-parallel via OpenMP), optional offset update, optional
@@ -112,7 +112,7 @@ static inline float huber_surr_weight(float r, float T, float delta) {
  * Parallel-safe: writes to disjoint per-angle, per-iy strips of sinogram
  * because we iterate the angle/iy outer loops and accumulate via a local
  * partial-sum then write once. This matches the existing
- * `forward_project_cpu` parallelism shape. */
+ * `forward_project_parallel_cpu` parallelism shape. */
 void mbir_forward_project_cpu(
     const float *volume,        /* [Ny, Nz, Nx] */
     float       *sinogram,      /* [n_angles, Ny, N_det] — overwritten */
@@ -123,7 +123,7 @@ void mbir_forward_project_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
 
     /* Zero sinogram up-front; the voxel scatter only adds positive
      * contributions so memset suffices. */
@@ -166,10 +166,10 @@ void mbir_forward_project_cpu(
  *   2. (Optional) Update per-tilt offset d_k from the just-updated e.
  *   3. (Optional) Update noise variance σ from the just-updated e.
  *
- * The qGGMRF prior reads from `volume_snapshot` (start-of-outer-iter copy),
- * not the live volume — this is the Jacobi-loose semantics across Y-slices
- * that matches the paper and OpenMBIR-TEM. Within a Y-slice the data term
- * uses the live (in-iteration) error sinogram, preserving Gauss-Seidel ICD.
+ * The qGGMRF prior reads all 26 neighbours, in-slice ones included, from
+ * `volume_snapshot` (start-of-outer-iter copy), not the live volume: the
+ * prior is Jacobi within a slice as well as across Y-slices. The data term
+ * uses the live (in-iteration) error sinogram, so it stays Gauss-Seidel ICD.
  *
  * In-place mutated outputs: volume, e_sino, d_offsets, sigma_out.
  * Returns 0 on success. */
@@ -190,13 +190,14 @@ int mbir_icd_sweep_cpu(
     int num_threads
 ) {
     if (num_threads < 1) num_threads = 1;
-    ProjGeom2D g = proj_geom_2d(Ny, Nz, Nx, n_angles, N_det);
+    ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
     const float half_x = g.half_x, half_z = g.half_z, half_det = g.half_det;
 
     /* ── ICD sweep ─────────────────────────────────────────────────────────
-     * Cross-slice neighbour reads of qGGMRF come from the snapshot so
-     * slices are independent and parallelizable. Within a slice the
-     * sweep is sequential (Gauss-Seidel via the incremental error sino). */
+     * Every qGGMRF neighbour read (in-slice and cross-slice) comes from the
+     * snapshot, so slices are independent and parallelizable. Within a
+     * slice the sweep is sequential (Gauss-Seidel via the incremental
+     * error sino). */
     #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int iy = 0; iy < Ny; iy++) {
         const int nvox_slice = Nz * Nx;

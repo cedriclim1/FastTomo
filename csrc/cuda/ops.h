@@ -5,12 +5,20 @@
 #include "texture_cache.h"
 
 /*
- * All CUDA entry points run on a caller-supplied stream so the kernels
- * compose cleanly with PyTorch's stream model. None of them call
- * cudaDeviceSynchronize — the caller (PyTorch) syncs implicitly when the
- * output tensor is read.
+ * All CUDA entry points launch on a caller-supplied stream. Synchronisation:
+ *   - The *_cached entry points and the texture-free kernels (grad_angle,
+ *     TV, GENFIRE, RESIRE, MBIR forward) never synchronize; PyTorch orders
+ *     the work through the stream.
+ *   - The one-shot entry points that build their own texture
+ *     (forward/back_project_parallel_cuda, forward/back_project_rotmat_cuda,
+ *     grad_rotmat_cuda, mbir_icd_sweep_cuda) call cudaStreamSynchronize on
+ *     their stream before releasing it (ScopedTextureCache,
+ *     texture_cache.h). cudaFreeArray would synchronize anyway.
+ *   - The Python-side `tc_destroy` binding synchronizes the device.
  *
- * Every host-callable function may throw std::runtime_error on a CUDA error.
+ * Every host-callable function may throw: std::runtime_error on a CUDA error,
+ * std::invalid_argument (Python ValueError) for a cache that does not match
+ * the call (tc_validate) or an extent beyond the device texture limits.
  *
  * Cos/sin tables (single-axis kernels) are passed as device pointers so the
  * trig precompute can stay on the GPU.
@@ -27,23 +35,23 @@
  * templated impl. cos/sin tables and rotation matrices stay fp32 in all
  * paths. Out-of-scope ops below (RESIRE, grad_*) keep their fp32-only
  * signatures. */
-void forward_project_cuda(
+void forward_project_parallel_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_cos_a,
-    const float *d_sin_a,
+    const void  *vol,
+    void        *sino,
+    const float *cos_a,
+    const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
 );
 
-void back_project_cuda(
+void back_project_parallel_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_cos_a,
-    const float *d_sin_a,
+    const void  *sino,
+    void        *vol,
+    const float *cos_a,
+    const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -55,9 +63,9 @@ void back_project_cuda(
  */
 void forward_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_matrices,
+    const void  *vol,
+    void        *sino,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -65,9 +73,9 @@ void forward_project_rotmat_cuda(
 
 void back_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_matrices,
+    const void  *sino,
+    void        *vol,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -79,25 +87,25 @@ void back_project_rotmat_cuda(
  * cudaArray, then launches the kernel. Output buffer is written through a
  * regular device pointer.
  */
-void forward_project_cuda_cached(
+void forward_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_cos_a,
-    const float  *d_sin_a,
+    const void   *vol,
+    void         *sino,
+    const float  *cos_a,
+    const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
 );
 
-void back_project_cuda_cached(
+void back_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_cos_a,
-    const float  *d_sin_a,
+    const void   *sino,
+    void         *vol,
+    const float  *cos_a,
+    const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -106,9 +114,9 @@ void back_project_cuda_cached(
 void forward_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_matrices,
+    const void   *vol,
+    void         *sino,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -117,9 +125,9 @@ void forward_project_rotmat_cuda_cached(
 void back_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_matrices,
+    const void   *sino,
+    void         *vol,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -153,15 +161,15 @@ void back_project_resire_cuda(
 
 /*
  * Gradient of 3D rotation-matrix forward projection w.r.t. the rotation
- * matrix entries. d_grad_matrices is [n_angles*9] row-major, must be zeroed
- * by the caller. Used by _FP3D's autograd backward; the host chains the
+ * matrix entries. grad_mats is [n_angles*9] row-major, must be zeroed
+ * by the caller. Used by _FPRotmat's autograd backward; the host chains the
  * result through _euler_zyz_to_rotmat (pure-PyTorch) to yield ∂L/∂euler.
  */
 void grad_rotmat_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *vol,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -172,14 +180,14 @@ void grad_rotmat_cuda(
  * already uploaded by a preceding forward_project_rotmat_cuda_cached call.
  * Uses vol_cache->tex_point (point-filter view) for bit-exact corner reads.
  * io_dtype: 0=fp32, 1=fp16 (controls which kernel template is instantiated).
- * d_grad_matrices must be zeroed by the caller; result is accumulated via atomicAdd.
+ * grad_mats must be zeroed by the caller; result is accumulated via atomicAdd.
  */
 void grad_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -187,14 +195,14 @@ void grad_rotmat_cuda_cached(
 
 /*
  * Gradient of forward projection w.r.t. tilt angles.
- * d_grad_angles must be zeroed by the caller; result is in radians.
+ * grad_angles must be zeroed by the caller; result is in radians.
  */
 void grad_angle_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_cos_a,
-    const float *d_sin_a,
-    float       *d_grad_angles,
+    const float *vol,
+    const float *grad_sino,
+    const float *cos_a,
+    const float *sin_a,
+    float       *grad_angles,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -241,7 +249,7 @@ void genfire_gridding_2d_cuda(
 
 /*
  * MBIR voxel-driven bilinear scatter forward projection (CUDA). Distinct
- * from forward_project_cuda's ray-marching FP — this matches the column-A
+ * from forward_project_parallel_cuda's ray-marching FP — this matches the column-A
  * model used by mbir_icd_sweep_cuda. Output sinogram is zeroed by the
  * wrapper before the kernel launches (atomicAdd scatter).
  */

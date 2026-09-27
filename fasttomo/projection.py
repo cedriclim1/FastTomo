@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 
 from fasttomo.autograd import (
-    _FP2D, _BP2D, _FP3D, _BP3D, _FPResire, _BPResire,
+    _FPParallel, _BPParallel, _FPRotmat, _BPRotmat, _FPResire, _BPResire,
     _euler_zyz_to_rotmat, _resolve_num_threads,
 )
 from fasttomo.utilities import apply_shifts_2d
@@ -44,7 +44,7 @@ def forward_project(
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
     nt = _resolve_num_threads(num_threads)
-    return _FP2D.apply(volume, angles_deg, N_det, nt)
+    return _FPParallel.apply(volume, angles_deg, N_det, nt)
 
 
 def back_project(
@@ -66,7 +66,7 @@ def back_project(
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
     nt = _resolve_num_threads(num_threads)
-    return _BP2D.apply(sinogram, angles_deg, Nz, nt)
+    return _BPParallel.apply(sinogram, angles_deg, Nz, nt)
 
 
 def forward_project_3d(
@@ -112,7 +112,7 @@ def forward_project_3d(
         volume = volume.unsqueeze(0)
     nt = _resolve_num_threads(num_threads)
     mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    sino = _FP3D.apply(volume, mats, N_det, nt)
+    sino = _FPRotmat.apply(volume, mats, N_det, nt)
     if shifts is not None:
         sino = apply_shifts_2d(sino, shifts)
     return sino
@@ -139,7 +139,7 @@ def back_project_3d(
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
     nt = _resolve_num_threads(num_threads)
-    return _BP3D.apply(sinogram, euler_zyz_deg, Nz, nt)
+    return _BPRotmat.apply(sinogram, euler_zyz_deg, Nz, nt)
 
 
 def forward_project_resire(
