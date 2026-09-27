@@ -1217,7 +1217,7 @@ def _sync_count(fn) -> int:
 
 @needs_cuda
 @pytest.mark.parametrize("algo", ["sirt", "sirt_rotmat", "wsirt", "fista", "fista_tv",
-                                  "sart", "sart_cpu_angles"])
+                                  "sart", "sart_cpu_angles", "sart_golden"])
 def test_loss_recording_host_syncs(algo):
     """return_loss alone costs no host sync per iteration (the losses stay
     on the device until the end); a loss_callback one per iteration (the
@@ -1237,6 +1237,7 @@ def test_loss_recording_host_syncs(algo):
         # SART: no sync per subset step either, CPU angles included (P2)
         "sart": lambda k, **kw: ft.run_sart(sino, ang, k, **kw),
         "sart_cpu_angles": lambda k, **kw: ft.run_sart(sino, ang.cpu(), k, subset_size=3, **kw),
+        "sart_golden": lambda k, **kw: ft.run_sart(sino, ang, k, view_order="golden", **kw),
     }[algo]
     for kw, per_iter in ((dict(return_loss=True), 0), (dict(loss_callback=lambda i, v: None), 1)):
         a = _sync_count(lambda: run(3, **kw))
@@ -1272,20 +1273,57 @@ def test_parallel_normalisers_are_y_invariant(dev, dtype, Ny, Nz, N, N_det):
 
 
 @needs_cuda
-def test_sart_memory_is_planar():
+@pytest.mark.parametrize("view_order", ["sequential", "golden"])
+def test_sart_memory_is_planar(view_order):
     """run_sart keeps one sinogram of ray normalisers and one [1, Nz, Nx]
     plane per subset instead of one volume per subset (P2): at 64^3 with 61
     single-view subsets the peak is below 5 volumes + 2 sinograms (the
     volume, the back-projection, the constraint output, 61 planes, the ray
-    normalisers; it was 61 volumes of normalisers alone)."""
+    normalisers and, for "golden", the permuted sinogram; it was 61 volumes
+    of normalisers alone)."""
     N, n = 64, 61
     ang = torch.linspace(-60, 60, n, device=DEVICE)
     sino = ft.forward_project(torch.rand(N, N, N, device=DEVICE), ang)
-    ft.run_sart(sino, ang, 1)                              # warm-up
+    ft.run_sart(sino, ang, 1, view_order=view_order)       # warm-up
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    ft.run_sart(sino, ang, 1)
+    ft.run_sart(sino, ang, 1, view_order=view_order)
     peak = torch.cuda.max_memory_allocated() - base
     vol_b, sino_b = N ** 3 * 4, n * N * N * 4
     assert peak < 5 * vol_b + 2 * sino_b, (peak, vol_b, sino_b)
+
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+def test_sart_view_order(dev):
+    """view_order="golden" visits the views in the golden-ratio order; with
+    all views in one subset it is one SIRT-like step either way, and it is
+    what a sequential run on the permuted data gives."""
+    from fasttomo.algorithms.algebraic import _golden_view_order
+
+    perm = _golden_view_order(61)
+    assert sorted(perm.tolist()) == list(range(61))
+    assert perm[:4].tolist() == [0, 34, 13, 47]
+    N, n = 24, 13
+    ang = make_angles(n, device=dev)
+    vol = phantom_2d(N, device=dev).unsqueeze(0).repeat(2, 1, 1)
+    sino = ft.forward_project(vol, ang)
+    p = _golden_view_order(n).to(dev)
+    for sub in (1, 4):
+        a = ft.run_sart(sino, ang, 2, subset_size=sub, view_order="golden")
+        b = ft.run_sart(sino[p], ang[p], 2, subset_size=sub)
+        assert torch.equal(a, b)
+    with pytest.raises(ValueError, match="view_order"):
+        ft.run_sart(sino, ang, 1, view_order="random")
+
+
+def test_sart_golden_order_converges_faster_after_one_sweep():
+    """Solver audit A5: after one sweep of single-view SART the golden-ratio
+    order is much closer to the phantom than the sequential order."""
+    N = 48
+    vol = phantom_2d(N).unsqueeze(0)
+    for ang in (torch.linspace(0, 179, 90), torch.linspace(-60, 60, 61)):
+        sino = ft.forward_project(vol, ang)
+        e_seq = (ft.run_sart(sino, ang, 1) - vol).norm() / vol.norm()
+        e_gold = (ft.run_sart(sino, ang, 1, view_order="golden") - vol).norm() / vol.norm()
+        assert e_gold < 0.8 * e_seq, (e_gold, e_seq)
