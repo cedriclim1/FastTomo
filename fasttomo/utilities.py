@@ -7,34 +7,20 @@ All public functions accept and return torch.Tensor (float32).
 from __future__ import annotations
 
 import math
-import numpy as np
+
 import torch
 
+# Moved to fasttomo.constraints (ARCH P10); re-exported here, its historical home.
+from fasttomo.constraints import cylindrical_mask
 
-# ── cylindrical support mask ──────────────────────────────────────────────
-
-def cylindrical_mask(
-    Nz: int,
-    Nx: int,
-    radius: float | None = None,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """
-    Inscribed-cylinder support mask for the XZ reconstruction plane.
-
-    Returns [Nz, Nx] float32 tensor — 1.0 inside the cylinder, 0.0 outside.
-    Multiply a volume [Ny, Nz, Nx] by ``mask.unsqueeze(0)`` to apply.
-
-    Default radius = min(Nz, Nx) / 2, which inscribes the cylinder in the
-    smaller dimension.  Uses the same centering as the projection kernels:
-    pixel index ``i`` maps to coordinate ``i - (N-1)/2``.
-    """
-    r = float(min(Nz, Nx)) / 2.0 if radius is None else radius
-    iz = np.linspace(-(Nz - 1) / 2.0, (Nz - 1) / 2.0, Nz, dtype=np.float32)
-    ix = np.linspace(-(Nx - 1) / 2.0, (Nx - 1) / 2.0, Nx, dtype=np.float32)
-    mask_np = (iz[:, None] ** 2 + ix[None, :] ** 2 <= r ** 2).astype(np.float32)
-    mask = torch.Tensor(mask_np)  # CPU float32; torch.Tensor is a class, not a factory
-    return mask.to(device) if device is not None else mask
+__all__ = [
+    "cylindrical_mask",
+    "ramp_filter",
+    "tv_loss_3d",
+    "apply_shifts",
+    "apply_shifts_2d",
+    "estimate_shifts_xcorr",
+]
 
 
 # ── ramp filter (PyTorch, runs on same device as input) ───────────────────

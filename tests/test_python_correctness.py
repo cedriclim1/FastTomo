@@ -176,7 +176,7 @@ def test_forward_project_3d_autograd_nx_ne_ndet(backend, Nx, N_det):
     torch.testing.assert_close(small, big, rtol=0, atol=0)
 
 
-# ── ConstraintConfig.sparsity honoured by run_ad_recon ─────────────────────
+# ── ConstraintConfig.soft_threshold (formerly sparsity) honoured by run_ad_recon ─────────────────────
 
 class _MeanZProjector:
     """CPU stand-in for ParallelProjector: every view is the Z-mean of the
@@ -215,7 +215,7 @@ def test_ad_recon_constraint_sparsity_soft_thresholds(monkeypatch, lam, expected
     sino = torch.full((4, 2, 6), 3.0)           # target above the start: v grows
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=1, lr_volume=0.2, cosine_schedule=False),
-        constraints=ft.ConstraintConfig(sparsity=lam),
+        constraints=ft.ConstraintConfig(soft_threshold=lam),
     )
     rec = ft.run_ad_recon(sino, torch.linspace(-30, 30, 4), Nz=6,
                           projector=proj, config=cfg)
@@ -237,7 +237,7 @@ def test_ad_recon_constraint_order_mask_then_threshold(monkeypatch):
     mask[:, 4:] = 0.0                       # outside the support
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=1, lr_volume=0.2, cosine_schedule=False),
-        constraints=ft.ConstraintConfig(positivity=True, sparsity=0.05),
+        constraints=ft.ConstraintConfig(positivity=True, soft_threshold=0.05),
     )
     rec = ft.run_ad_recon(torch.full((4, 2, 6), 3.0), torch.linspace(-30, 30, 4),
                           Nz=6, projector=proj, config=cfg, support_mask=mask)
@@ -245,7 +245,7 @@ def test_ad_recon_constraint_order_mask_then_threshold(monkeypatch):
     torch.testing.assert_close(rec[:, :, 2:4], torch.full((2, 6, 2), 0.15), rtol=0, atol=1e-6)
     assert torch.equal(rec[:, :, 4:], torch.zeros(2, 6, 2))
     # and ConstraintConfig.apply uses the same order on the same input
-    applied = ft.ConstraintConfig(positivity=True, mask=mask.unsqueeze(0), sparsity=0.05).apply(
+    applied = ft.ConstraintConfig(positivity=True, support_mask=mask.unsqueeze(0), soft_threshold=0.05).apply(
         torch.full((2, 6, 6), 0.2))
     torch.testing.assert_close(rec, applied, rtol=0, atol=1e-6)
 
@@ -256,7 +256,7 @@ def test_ad_recon_constraint_sparsity_matches_config_apply(monkeypatch):
     proj = _cpu_ad_recon(monkeypatch)
     g = torch.Generator().manual_seed(5)
     sino = torch.rand(4, 2, 6, generator=g) * 2 - 0.5
-    cons = ft.ConstraintConfig(positivity=False, sparsity=0.02)
+    cons = ft.ConstraintConfig(positivity=False, soft_threshold=0.02)
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=6, lr_volume=0.1, cosine_schedule=False),
         constraints=cons,
@@ -295,11 +295,11 @@ def test_ad_recon_constraint_sparsity_cuda():
     rec0 = ft.run_ad_recon(sino, ang, Nz=N, config=base)
     rec0b = ft.run_ad_recon(sino, ang, Nz=N, config=ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=40, lr_volume=0.05),
-        constraints=ft.ConstraintConfig(sparsity=0.0)))
+        constraints=ft.ConstraintConfig(soft_threshold=0.0)))
     assert torch.equal(rec0, rec0b)
     rec = ft.run_ad_recon(sino, ang, Nz=N, config=ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=40, lr_volume=0.05),
-        constraints=ft.ConstraintConfig(sparsity=0.01)))
+        constraints=ft.ConstraintConfig(soft_threshold=0.01)))
     bg = vol == 0
     assert (rec[bg] == 0).float().mean() > 0.5 > (rec0[bg] == 0).float().mean()
     assert _rel(rec, vol) < 1.0

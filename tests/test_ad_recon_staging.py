@@ -206,8 +206,9 @@ def test_cosine_schedule_reaches_floor_per_optimiser(monkeypatch, warmup, period
     (lambda c: setattr(c.optim, "n_iter", -1), "n_iter"),
     (lambda c: setattr(c.optim, "lr_volume", -0.1), "lr_volume"),
     (lambda c: setattr(c.reg, "tv_weight", -1.0), "tv_weight"),
-    (lambda c: setattr(c.constraints, "sparsity", float("inf")), "sparsity"),
-    (lambda c: setattr(c.constraints, "mask", "cylinder"), "mask"),
+    (lambda c: setattr(c.constraints, "soft_threshold", float("inf")), "soft_threshold"),
+    (lambda c: setattr(c.constraints, "support_mask", "cylinder"), "support_mask"),
+    (lambda c: setattr(c.constraints, "cylinder", "yes"), "cylinder"),
     (lambda c: setattr(c, "pose", object()), "PoseRefinementConfig"),
 ])
 def test_run_ad_recon_revalidates_mutated_config(mutate, match) -> None:

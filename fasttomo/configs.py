@@ -6,17 +6,17 @@ tweak nested fields inline (``cfg.reg.tv_weight = 0.01``). Any function
 that accepts one of these should default the argument to ``None`` and
 instantiate inside, to avoid the mutable-default footgun.
 
-A note on the dual semantics of ``sparsity``:
+Two L1 knobs, deliberately with different names:
 
 * :attr:`RegularizerConfig.sparsity` is an autograd loss term added each
-  iteration as ``λ · mean(|f|)`` (used by ``run_ad_recon``).
-* :attr:`ConstraintConfig.sparsity` is a post-step soft-threshold
-  ``f ← sign(f) · max(|f| − λ, 0)`` applied by :meth:`ConstraintConfig.apply`
-  (used by SIRT/SART/RESIRE/FISTA) and, once per iteration after the
-  optimiser step, by ``run_ad_recon``.
+  iteration as ``λ · mean(|f|)`` (``run_ad_recon``).
+* :attr:`ConstraintConfig.soft_threshold` (formerly ``sparsity``) is a
+  post-step soft-threshold ``f ← sign(f) · max(|f| − λ, 0)`` applied by
+  :meth:`ConstraintConfig.apply`; ``run_ad_recon`` applies it once per
+  iteration in which the volume was stepped. The ``sparsity=`` keyword of
+  the classical ``run_*`` functions is this same soft-threshold.
 
-The two are different operations sharing the same name because they
-serve the same modelling goal in two different optimisation regimes.
+The runtime constraint logic lives in :mod:`fasttomo.constraints`.
 """
 
 from __future__ import annotations
@@ -24,10 +24,18 @@ from __future__ import annotations
 import math
 import numbers
 import operator
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
+
+from fasttomo.constraints import (
+    _maybe_cylindrical_mask,
+    _soft_threshold,
+    apply_constraints,
+    apply_constraints_,
+)
 
 
 __all__ = [
@@ -36,12 +44,12 @@ __all__ = [
     "PoseRefinementConfig",
     "ConstraintConfig",
     "AdReconConfig",
+    "MbirConfig",
 ]
 
 
-def _apply_sparsity(vol: torch.Tensor, weight: float) -> torch.Tensor:
-    """L1 soft-threshold (proximal operator of weight·‖·‖₁)."""
-    return vol.sign() * (vol.abs() - weight).clamp_(min=0.0)
+# Former name of the soft-threshold helper, kept for existing imports.
+_apply_sparsity = _soft_threshold
 
 
 def _real_or_none(value: object) -> float | None:
@@ -214,57 +222,183 @@ class PoseRefinementConfig:
             raise ValueError("pose_init_shifts requires refine_shifts=True.")
 
 
-@dataclass
+_UNSET: Any = object()
+
+
+def _warn_renamed(old: str, new: str) -> None:
+    warnings.warn(
+        f"ConstraintConfig.{old} is deprecated, use {new} instead; the old name "
+        "will be removed in the next release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _split_mask(mask: object) -> tuple[bool, Any]:
+    """Legacy ``ConstraintConfig.mask`` value -> ``(cylinder, support_mask)``."""
+    if mask is None or mask is False:
+        return False, None
+    if mask is True:
+        return True, None
+    return False, mask      # a tensor, or garbage that validate() rejects
+
+
+@dataclass(init=False)
 class ConstraintConfig:
-    """Post-step constraints applied each iteration.
+    """Post-step constraints applied after every iteration of
+    ``run_ad_recon`` (the other algorithms build one from their flat
+    ``positivity`` / ``mask`` / ``support_mask`` / ``sparsity`` keywords).
 
-    Used by SIRT/SART/RESIRE/FISTA and (via field access) by run_ad_recon.
-    Construct once before the iteration loop; for SIRT/SART/etc. callers,
-    the ``mask`` field must hold a precomputed ``[1, Nz, Nx]`` tensor.
+    Fields
+    ------
+    positivity : bool
+        Clamp the volume at 0.
+    cylinder : bool
+        Restrict the volume to the inscribed cylinder of the XZ plane
+        (``cylindrical_mask``). Mutually exclusive with ``support_mask``.
+    support_mask : Tensor or None
+        Arbitrary support, ``[Nz, Nx]``, ``[1, Nz, Nx]`` or
+        ``[Ny, Nz, Nx]`` (contract in :mod:`fasttomo.constraints`).
+    soft_threshold : float
+        Post-step L1 soft-threshold ``f <- sign(f) * max(|f| - t, 0)`` in
+        volume units (``>= 0``; 0 disables it). Not a loss term: compare
+        ``RegularizerConfig.sparsity``, which adds ``sparsity * mean(|f|)``
+        to the AD loss.
 
-    For ``run_ad_recon``, ``mask`` may be ``True`` — in which case
-    ``run_ad_recon`` materialises a ``cylindrical_mask`` internally — or
-    a precomputed tensor, or ``None``/``False`` to disable.
+    The order is the constraints order of :mod:`fasttomo.constraints`:
+    support, positivity, soft-threshold. `apply` honours both support forms
+    (``cylinder`` is built for the volume's ``(Nz, Nx)`` on first use).
 
-    ``apply`` / ``apply_inplace_`` operate only on the tensor case: a
-    bool ``mask`` is treated as a no-op there (callers that want
-    masking via ``apply`` must materialise the mask themselves).
-
-    Application order: mask → positivity → sparsity.
+    Deprecated aliases (one release, DeprecationWarning): ``mask`` (``True``
+    -> ``cylinder=True``, a tensor -> ``support_mask``) and ``sparsity``
+    (-> ``soft_threshold``), as constructor keywords and as attributes.
+    Everything after ``positivity`` is keyword-only.
     """
     positivity: bool = False
-    mask: bool | torch.Tensor | None = None
-    # Post-step L1 soft-threshold f <- sign(f) * max(|f| - sparsity, 0), in
-    # volume units, applied once per iteration after the mask and positivity
-    # (last in apply() and in run_ad_recon; positivity and a non-negative
-    # mask commute, so their relative order does not matter). Not a loss
-    # term; see RegularizerConfig.sparsity.
-    sparsity: float = 0.0
+    cylinder: bool = False
+    support_mask: torch.Tensor | None = None
+    soft_threshold: float = 0.0
+
+    def __init__(
+        self,
+        positivity: bool = False,
+        *,
+        cylinder: bool = False,
+        support_mask: torch.Tensor | None = None,
+        soft_threshold: float = 0.0,
+        mask: Any = _UNSET,
+        sparsity: Any = _UNSET,
+    ) -> None:
+        if mask is not _UNSET:
+            _warn_renamed("mask", "cylinder or support_mask")
+            if cylinder or support_mask is not None:
+                raise TypeError("ConstraintConfig: pass cylinder/support_mask or the "
+                                "deprecated mask, not both.")
+            cylinder, support_mask = _split_mask(mask)
+        if sparsity is not _UNSET:
+            _warn_renamed("sparsity", "soft_threshold")
+            if soft_threshold != 0.0:
+                raise TypeError("ConstraintConfig: pass soft_threshold or the "
+                                "deprecated sparsity, not both.")
+            soft_threshold = sparsity
+        self.positivity = positivity
+        self.cylinder = cylinder
+        self.support_mask = support_mask
+        self.soft_threshold = soft_threshold
+
+    # ── deprecated attribute aliases ──────────────────────────────────────
+    @property
+    def mask(self) -> bool | torch.Tensor | None:
+        """Deprecated: ``support_mask`` if set, else ``True`` for the
+        cylinder, else None."""
+        _warn_renamed("mask", "cylinder or support_mask")
+        if self.support_mask is not None:
+            return self.support_mask
+        return True if self.cylinder else None
+
+    @mask.setter
+    def mask(self, value: object) -> None:
+        _warn_renamed("mask", "cylinder or support_mask")
+        self.cylinder, self.support_mask = _split_mask(value)
+
+    @property
+    def sparsity(self) -> float:
+        """Deprecated alias of ``soft_threshold``."""
+        _warn_renamed("sparsity", "soft_threshold")
+        return self.soft_threshold
+
+    @sparsity.setter
+    def sparsity(self, value: float) -> None:
+        _warn_renamed("sparsity", "soft_threshold")
+        self.soft_threshold = value
 
     def validate(self) -> None:
-        """Raise ValueError on an invalid field (called by ``run_ad_recon``)."""
-        _check_weight("ConstraintConfig", "sparsity", self.sparsity)
-        if not (self.mask is None or isinstance(self.mask, (bool, torch.Tensor))):
-            raise ValueError("ConstraintConfig.mask must be None, a bool or a "
-                             f"tensor, got {type(self.mask).__name__}")
+        """Raise ValueError on an invalid field or on both supports set
+        (called by ``run_ad_recon``)."""
+        _check_weight("ConstraintConfig", "soft_threshold", self.soft_threshold)
+        if not isinstance(self.cylinder, bool):
+            raise ValueError("ConstraintConfig.cylinder must be a bool, "
+                             f"got {type(self.cylinder).__name__}")
+        if self.support_mask is not None and not isinstance(self.support_mask, torch.Tensor):
+            raise ValueError("ConstraintConfig.support_mask must be None or a tensor, "
+                             f"got {type(self.support_mask).__name__}")
+        if self.cylinder and self.support_mask is not None:
+            raise ValueError("ConstraintConfig: cylinder=True and support_mask are "
+                             "mutually exclusive — pass one support per reconstruction.")
+
+    def _support_for(self, volume: torch.Tensor) -> torch.Tensor | None:
+        """The support to multiply ``volume`` by: ``support_mask``, or the
+        cylinder for the volume's ``(Nz, Nx)`` (cached), or None."""
+        if self.support_mask is not None:
+            return self.support_mask
+        if not self.cylinder:
+            return None
+        key = (volume.shape[-2], volume.shape[-1], volume.device, volume.dtype)
+        cache = self.__dict__.setdefault("_cylinder_cache", {})
+        if key not in cache:
+            cache[key] = _maybe_cylindrical_mask(key[0], key[1], volume.device, True,
+                                                 dtype=volume.dtype)
+        return cache[key]
 
     def apply(self, volume: torch.Tensor) -> torch.Tensor:
-        if isinstance(self.mask, torch.Tensor):
-            volume = volume * self.mask
-        if self.positivity:
-            volume = volume.clamp(min=0.0)
-        if self.sparsity > 0.0:
-            volume = _apply_sparsity(volume, self.sparsity)
-        return volume
+        """Return ``volume`` with the constraints applied (new tensor)."""
+        return apply_constraints(
+            volume, positivity=self.positivity,
+            support_mask=self._support_for(volume), soft_threshold=self.soft_threshold,
+        )
 
     def apply_inplace_(self, volume: torch.Tensor) -> None:
         """In-place variant for leaf tensors and CUDA Graph paths."""
-        if isinstance(self.mask, torch.Tensor):
-            volume.mul_(self.mask)
-        if self.positivity:
-            volume.clamp_(min=0.0)
-        if self.sparsity > 0.0:
-            volume.copy_(_apply_sparsity(volume, self.sparsity))
+        apply_constraints_(
+            volume, positivity=self.positivity,
+            support_mask=self._support_for(volume), soft_threshold=self.soft_threshold,
+        )
+
+
+@dataclass
+class MbirConfig:
+    """Optional bundle of :func:`fasttomo.run_mbir`'s tuning keywords.
+
+    ``run_mbir(sino, angles, config=MbirConfig(huber_T=3.0))`` is the same
+    call as ``run_mbir(sino, angles, huber_T=3.0)``; the keywords stay the
+    primary interface. Passing ``config`` together with a tuning keyword
+    that differs from its default raises TypeError. Field meanings and
+    defaults are those of ``run_mbir``'s keywords of the same name.
+    """
+    sigma_f: float = 1.0
+    qggmrf_p: float = 1.2
+    qggmrf_q: float = 2.0
+    qggmrf_c: float = 1e-3
+    huber_T: float = float("inf")
+    huber_delta: float = 0.5
+    estimate_offset: bool = True
+    estimate_variance: bool = True
+    sigma_init: float | None = None
+    sigma_min: float | None = None
+    multires_levels: int = 1
+    convergence_tol: float = 1e-4
+    seed: int = 0
+    sigma_f_per_scale: list[float] | None = None
 
 
 @dataclass

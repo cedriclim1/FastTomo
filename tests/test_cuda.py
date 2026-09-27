@@ -1597,7 +1597,7 @@ class TestRunAdRecon:
         mask_3d = torch.ones(1, N, N, device=DEVICE)
         cfg = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=5),
-            constraints=ft.ConstraintConfig(mask=mask_3d),
+            constraints=ft.ConstraintConfig(support_mask=mask_3d),
         )
         vol = ft.run_ad_recon(sino, angles, config=cfg)
         assert vol.shape == (1, N, N)
@@ -1611,7 +1611,7 @@ class TestRunAdRecon:
         mask_3d = torch.ones(Ny, N, N, device=DEVICE)
         cfg = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=5),
-            constraints=ft.ConstraintConfig(mask=mask_3d),
+            constraints=ft.ConstraintConfig(support_mask=mask_3d),
         )
         vol = ft.run_ad_recon(sino, angles, config=cfg)
         assert vol.shape == (Ny, N, N)
@@ -1624,7 +1624,7 @@ class TestRunAdRecon:
         bad_mask = torch.ones(3, N, N, device=DEVICE)  # Ny=3 but sino has Ny=1
         cfg = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=1),
-            constraints=ft.ConstraintConfig(mask=bad_mask),
+            constraints=ft.ConstraintConfig(support_mask=bad_mask),
         )
         with pytest.raises(ValueError, match="3-D"):
             ft.run_ad_recon(sino, angles, config=cfg)
@@ -2278,14 +2278,14 @@ class TestAdReconSupportMask:
 
         cfg_true = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=1),
-            constraints=ft.ConstraintConfig(mask=True),
+            constraints=ft.ConstraintConfig(cylinder=True),
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
             ft.run_ad_recon(sino, angles, config=cfg_true, support_mask=M)
 
         cfg_tensor = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=1),
-            constraints=ft.ConstraintConfig(mask=M),
+            constraints=ft.ConstraintConfig(support_mask=M),
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
             ft.run_ad_recon(sino, angles, config=cfg_tensor, support_mask=M)

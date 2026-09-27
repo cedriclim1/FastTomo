@@ -37,13 +37,19 @@ from fasttomo.projection import (
     forward_project_resire,
     back_project_resire,
 )
-from fasttomo.utilities import apply_shifts_2d, cylindrical_mask, ramp_filter, tv_loss_3d
+from fasttomo.constraints import (
+    _maybe_cylindrical_mask,
+    _resolve_support_mask,
+    _soft_threshold,
+    cylindrical_mask,
+)
+from fasttomo.utilities import apply_shifts_2d, ramp_filter, tv_loss_3d
 from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector, _drain_deferred_handles
 from fasttomo.configs import (
-    _apply_sparsity,
     AdReconConfig,
     ConstraintConfig,
+    MbirConfig,
     OptimConfig,
     PoseRefinementConfig,
     RegularizerConfig,
@@ -61,23 +67,6 @@ _GENFIRE_RES_EXTENSION_PIVOTS = (0.0, 0.5, 0.95, 0.5, 0.0)
 
 
 # ── private helpers shared across algorithms ───────────────────────────────
-
-
-def _maybe_cylindrical_mask(
-    Nz: int,
-    Nx: int,
-    device: torch.device,
-    apply: bool,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor | None:
-    """Return a [1, Nz, Nx] cylindrical mask if apply=True, else None.
-
-    The mask is cast to ``dtype`` so callers can multiply it against a
-    volume in any supported precision (fp16 / fp32) without an upcast.
-    """
-    if not apply:
-        return None
-    return cylindrical_mask(Nz, Nx, device=device).to(dtype).unsqueeze(0)
 
 
 def _ad_recon_step_schedule(
@@ -140,43 +129,6 @@ def _prepare_ad_recon_pose_init(
     if not bool(torch.isfinite(initial).all()):
         raise ValueError(f"{name} must contain only finite values")
     return initial.detach().clone()
-
-
-def _resolve_support_mask(
-    support_mask: torch.Tensor,
-    Ny: int,
-    Nz: int,
-    Nx: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    op_name: str,
-) -> torch.Tensor:
-    """Validate and normalise a user-supplied support mask.
-
-    Accepts ``[Nz, Nx]`` (broadcast along the tilt axis), ``[1, Nz, Nx]``,
-    or full ``[Ny, Nz, Nx]``. Returns a 3-D tensor on ``device`` cast to
-    ``dtype``, ready to multiply against the volume. Values are expected
-    binary {0, 1}; soft values in [0, 1] act as a smooth weighting.
-    """
-    if support_mask.ndim == 2:
-        if support_mask.shape != (Nz, Nx):
-            raise ValueError(
-                f"{op_name}: support_mask must have shape ({Nz}, {Nx}) "
-                f"when 2-D; got {tuple(support_mask.shape)}."
-            )
-        support_mask = support_mask.unsqueeze(0)
-    elif support_mask.ndim == 3:
-        if support_mask.shape[1:] != (Nz, Nx) or support_mask.shape[0] not in (1, Ny):
-            raise ValueError(
-                f"{op_name}: support_mask must have shape (1, {Nz}, {Nx}) or "
-                f"({Ny}, {Nz}, {Nx}) when 3-D; got {tuple(support_mask.shape)}."
-            )
-    else:
-        raise ValueError(
-            f"{op_name}: support_mask must be 2-D or 3-D; "
-            f"got {support_mask.ndim}-D."
-        )
-    return support_mask.to(device=device, dtype=dtype).contiguous()
 
 
 def _assert_warm_start_shape(
@@ -439,7 +391,8 @@ def _prepare_recon(
       mutually exclusive (ValueError). ``support_mask`` is validated and
       broadcast by `_resolve_support_mask`; either becomes a tensor in the
       compute dtype on the compute device.
-    * ``ConstraintConfig(positivity, mask=<resolved support>, sparsity)``.
+    * ``ConstraintConfig(positivity, support_mask=<resolved support>,
+      soft_threshold=sparsity)``.
     """
     if support_mask is not None and mask:
         raise ValueError(
@@ -476,7 +429,8 @@ def _prepare_recon(
         )
     else:
         support = _maybe_cylindrical_mask(Nz, Nx, device, bool(mask), dtype=compute_dtype)
-    constraints = ConstraintConfig(positivity=positivity, mask=support, sparsity=sparsity)
+    constraints = ConstraintConfig(positivity=positivity, support_mask=support,
+                                   soft_threshold=sparsity)
     return _ReconSetup(
         n_angles=n_angles, Ny=Ny, N_det=N_det, Nz=Nz, Nx=Nx, device=device,
         compute_dtype=compute_dtype, volume0=volume0, constraints=constraints,
@@ -777,7 +731,7 @@ def run_fbp(
             mask,
             dtype=volume.dtype,
         )
-    return ConstraintConfig(positivity=positivity, mask=_mask).apply(volume)
+    return ConstraintConfig(positivity=positivity, support_mask=_mask).apply(volume)
 
 
 def run_weighted_backprojection(
@@ -954,9 +908,9 @@ def run_sirt(
                  sinogram.dtype,
                  float(omega),
                  constraints.positivity,
-                 float(constraints.sparsity),
-                 tuple(constraints.mask.shape)
-                 if isinstance(constraints.mask, torch.Tensor) else None,
+                 float(constraints.soft_threshold),
+                 tuple(constraints.support_mask.shape)
+                 if constraints.support_mask is not None else None,
                  euler_zyz_deg is not None),
             on_replay=rec.tick,
         )
@@ -1378,7 +1332,7 @@ def run_fista_tv(
         else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
     )
 
-    _mask = setup.constraints.mask
+    _mask = setup.constraints.support_mask
     lam = tv_weight / L_eff
     prox = lambda u: _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
@@ -1655,21 +1609,20 @@ def run_ad_recon(
 
     # ── support: ConstraintConfig.mask (bool True → cylinder; tensor → that
     # support) or the support_mask kwarg, one support per reconstruction ──
-    _mask_cfg: bool | torch.Tensor | None = constraints_cfg.mask
     if support_mask is not None:
-        if isinstance(_mask_cfg, torch.Tensor) or _mask_cfg is True:
+        if constraints_cfg.cylinder or constraints_cfg.support_mask is not None:
             raise ValueError(
-                "run_ad_recon: support_mask and ConstraintConfig.mask are "
-                "mutually exclusive — pass one support per reconstruction."
+                "run_ad_recon: support_mask and ConstraintConfig.cylinder/support_mask "
+                "are mutually exclusive — pass one support per reconstruction."
             )
-    elif isinstance(_mask_cfg, torch.Tensor):
-        support_mask = _mask_cfg
+    else:
+        support_mask = constraints_cfg.support_mask
 
     setup = _prepare_recon(
         "run_ad_recon", sinogram, angles_deg, Nz=Nz,
         n_iter=optim_cfg.n_iter if n_iter is None else n_iter,
         require_cuda=True, warm_start=warm_start,
-        mask=_mask_cfg is True, support_mask=support_mask,
+        mask=constraints_cfg.cylinder, support_mask=support_mask,
     )
     n_angles, Ny, N_det, Nz, Nx, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
@@ -1774,7 +1727,7 @@ def run_ad_recon(
         ]
 
     # support mask resolved once by _prepare_recon ([1|Ny, Nz, Nx] or None)
-    _cmask_mul: torch.Tensor | None = setup.constraints.mask
+    _cmask_mul: torch.Tensor | None = setup.constraints.support_mask
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
@@ -1881,14 +1834,14 @@ def run_ad_recon(
                 volume.clamp_(min=0.0)
             if _cmask_mul is not None:
                 volume.mul_(_cmask_mul)
-            if constraints_cfg.sparsity > 0.0 and step_volume:
-                # Post-step L1 soft-threshold (ConstraintConfig.sparsity),
+            if constraints_cfg.soft_threshold > 0.0 and step_volume:
+                # Post-step L1 soft-threshold (ConstraintConfig.soft_threshold),
                 # last: positivity -> support mask -> sparsity. Positivity
                 # and a non-negative mask commute, so this is the same as
                 # ConstraintConfig.apply's mask -> positivity -> sparsity.
                 # Skipped in pose-only iterations: unlike positivity and the
                 # mask it is not idempotent and would shrink a frozen volume.
-                volume.copy_(_apply_sparsity(volume, constraints_cfg.sparsity))
+                volume.copy_(_soft_threshold(volume, constraints_cfg.soft_threshold))
             tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
                 tilt_angle_opt[:, 1].clamp_(
@@ -1981,13 +1934,13 @@ def _run_sirt_cuda_graph(
             C_static = C_vol.clone()
             R_static = R_sino.clone()
             mask_static = (
-                constraints.mask.clone()
-                if isinstance(constraints.mask, torch.Tensor) else None
+                constraints.support_mask.clone()
+                if constraints.support_mask is not None else None
             )
             static_constraints = ConstraintConfig(
                 positivity=constraints.positivity,
-                mask=mask_static,
-                sparsity=constraints.sparsity,
+                support_mask=mask_static,
+                soft_threshold=constraints.soft_threshold,
             )
 
             # Warmup: one eager iteration with the static buffer.
@@ -2047,7 +2000,7 @@ def _run_sirt_cuda_graph(
     C_static.copy_(C_vol)
     R_static.copy_(R_sino)
     if mask_static is not None:
-        mask_static.copy_(constraints.mask)
+        mask_static.copy_(constraints.support_mask)
 
     with torch.cuda.device(target_device):
         for _ in range(n_iter):
@@ -2251,7 +2204,7 @@ def run_genfire(
     x0 = (bigN - Nx) // 2;  x1 = x0 + Nx
     if support_mask is not None:
         # [1|Ny, Nz, Nx] support, zero on the oversampling margin
-        user_support = setup.constraints.mask
+        user_support = setup.constraints.support_mask
         support = sinogram.new_zeros(user_support.shape[0], bigN, bigN)
         support[:, z0:z1, x0:x1] = user_support
     else:
@@ -2284,7 +2237,7 @@ def run_genfire(
 
     # ── iteration ───────────────────────────────────────────────────────────
     _inner_constraints = ConstraintConfig(
-        positivity=positivity, mask=support, sparsity=sparsity,
+        positivity=positivity, support_mask=support, soft_threshold=sparsity,
     )
     current_F = measured_K.clone()
     if setup.volume0 is not None:
@@ -3103,6 +3056,7 @@ def run_mbir(
     seed: int = 0,
     lambdas: torch.Tensor | None = None,
     sigma_f_per_scale: list[float] | None = None,
+    config: MbirConfig | None = None,
     warm_start: torch.Tensor | None = None,
     num_threads: int | None = None,
     return_loss: bool = False,
@@ -3169,6 +3123,29 @@ def run_mbir(
             "be removed in the next release.",
             DeprecationWarning, stacklevel=2,
         )
+    if config is not None:
+        if not isinstance(config, MbirConfig):
+            raise TypeError(f"run_mbir: config must be an MbirConfig, "
+                            f"got {type(config).__name__}")
+        tuning = dict(
+            sigma_f=sigma_f, qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
+            huber_T=huber_T, huber_delta=huber_delta, estimate_offset=estimate_offset,
+            estimate_variance=estimate_variance, sigma_init=sigma_init,
+            sigma_min=sigma_min, multires_levels=multires_levels,
+            convergence_tol=convergence_tol, seed=seed,
+            sigma_f_per_scale=sigma_f_per_scale,
+        )
+        defaults = MbirConfig()
+        clash = [k for k, v in tuning.items() if not _is_default(v, getattr(defaults, k))]
+        if clash:
+            raise TypeError(
+                f"run_mbir: pass the tuning options either through config or as "
+                f"keywords, not both (got config and {', '.join(clash)})."
+            )
+        (sigma_f, qggmrf_p, qggmrf_q, qggmrf_c, huber_T, huber_delta,
+         estimate_offset, estimate_variance, sigma_init, sigma_min,
+         multires_levels, convergence_tol, seed, sigma_f_per_scale) = (
+            getattr(config, k) for k in tuning)
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
     # fp32 only, like every other fp32 algorithm: other dtypes raise instead

@@ -83,6 +83,7 @@ from fasttomo.regularizers import tilt_ssim_loss, s3im_loss, logsum_sparsity, tv
 from fasttomo.configs import (
     AdReconConfig,
     ConstraintConfig,
+    MbirConfig,
     OptimConfig,
     PoseRefinementConfig,
     RegularizerConfig,
@@ -123,6 +124,7 @@ __all__ = [
     "tv_loss_xz",
     "AdReconConfig",
     "ConstraintConfig",
+    "MbirConfig",
     "OptimConfig",
     "PoseRefinementConfig",
     "RegularizerConfig",
