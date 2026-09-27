@@ -744,11 +744,10 @@ def test_fp16_overflow_in_iterative_algorithms_raises_once_at_the_end():
     assert torch.isfinite(ft.run_sirt(big.half(), ang, 3, return_loss=True)[0]).all()
 
 
-def test_fp16_fbp_scales_before_the_fp16_cast(backend):
-    """FBP's back-projection sums n_angles filtered views; run_fbp scales
-    them by pi / n_angles in fp32 *before* the fp16 cast, so a density of
-    400 over 720 views (the unscaled sum is ~9.2e4, beyond fp16) comes back
-    at ~400 instead of raising OverflowError (#95 review)."""
+def test_fp16_fbp_avoids_overflow_without_breaking_the_result(backend):
+    """A high-density fp16 FBP call still returns the right answer when the
+    unscaled fp16 back-projection overflows: run_fbp retries with a scaled
+    filtered sinogram instead of raising OverflowError (#95 review)."""
     ang = torch.linspace(-89.75, 89.75, 720, device=backend)
     vol = torch.zeros(2, 64, 64, device=backend)
     vol[:, 16:48, 16:48] = 400.0
@@ -763,6 +762,20 @@ def test_fp16_fbp_scales_before_the_fp16_cast(backend):
     assert out.dtype == torch.float16 and torch.isfinite(out).all()
     assert rel_err(out.float(), ref) < 1e-2
     assert abs(out[:, 24:40, 24:40].float().mean().item() - 400.0) < 4.0
+
+
+def test_fp16_fbp_keeps_low_amplitudes_when_unscaled_path_fits(backend):
+    """Low-amplitude fp16 FBP should keep the unscaled path when it fits:
+    pre-scaling by pi / n_angles before the fp16 cast can underflow tiny
+    filtered values and collapse the reconstruction toward zero."""
+    ang = torch.linspace(-89.75, 89.75, 720, device=backend)
+    vol = torch.zeros(2, 64, 64, device=backend)
+    vol[:, 16:48, 16:48] = 1e-5
+    sino = ft.forward_project(vol, ang)
+    ref = ft.run_fbp(sino, ang).float()
+    out = ft.run_fbp(sino.half(), ang).float()
+    assert rel_err(out, ref) < 1e-2
+    assert abs(out[:, 24:40, 24:40].mean().item() - 1e-5) < 2e-7
 
 
 def test_fp16_nan_is_reported_separately_from_overflow(backend):

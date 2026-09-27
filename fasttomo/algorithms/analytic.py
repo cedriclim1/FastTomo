@@ -212,10 +212,11 @@ def run_fbp(
     """Filtered back-projection.
 
     Ramp-filters every detector row, back-projects and scales by
-    ``pi / n_angles`` (fp16: the filtered sinogram is scaled in fp32 before
-    its cast to fp16, so the back-projection stays in range whenever the
-    result does). ``pi / n_angles`` is pi times the mean over the measured
-    views: it keeps the mean level correct at limited tilt too, but
+    ``pi / n_angles``. fp16 first uses the unscaled filtered sinogram (best
+    precision at low amplitudes), and if that back-projection overflows it
+    retries with the filtered sinogram scaled by ``pi / n_angles`` in fp32
+    before the fp16 cast. ``pi / n_angles`` is pi times the mean over the
+    measured views: it keeps the mean level correct at limited tilt too, but
     anisotropic objects still show an orientation-dependent bias there
     (the missing wedge), which no angular scale removes. Shapes, dtypes (fp32/fp16), the support contract and
     the return value follow the Conventions of :mod:`fasttomo.algorithms`;
@@ -260,20 +261,26 @@ def run_fbp(
     # the measured views; keeps the mean level right at limited tilt too)
     scale = math.pi / n_angles
     if sinogram.dtype == torch.float16:
-        # Scale the filtered sinogram in fp32, before its cast to fp16: the
-        # back-projection then sums n_angles values of ~density * pi / n
-        # into a result of ~density, instead of an unscaled sum n / pi
-        # times larger that can exceed the fp16 range (OverflowError) when
-        # the answer itself fits (density 400 over 720 views).
-        filtered = (_ramp_filter_fp32(sinogram) * scale).to(torch.float16)
+        filtered_fp32 = _ramp_filter_fp32(sinogram)
+        filtered = filtered_fp32.to(torch.float16)
     else:
         filtered = ramp_filter(sinogram)
     # one back-projection: the one-shot (scoped-texture) path on CUDA
     op = _make_operator(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
         device, filtered.dtype, projector, cached=False, num_threads=num_threads)
-    volume = op.backproject(filtered)
-    if sinogram.dtype != torch.float16:
+    if sinogram.dtype == torch.float16:
+        try:
+            volume = op.backproject(filtered)
+            volume = volume * scale
+        except OverflowError:
+            # Keep fp16 precision for small values when it fits, and fall
+            # back to pre-scaled filtering only when the unscaled fp16
+            # back-projection overflows.
+            filtered = (filtered_fp32 * scale).to(torch.float16)
+            volume = op.backproject(filtered)
+    else:
+        volume = op.backproject(filtered)
         volume = volume * scale
     if support_mask is not None:
         # Validate against the actual output shape — a cached projector may
