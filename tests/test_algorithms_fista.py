@@ -458,3 +458,54 @@ def test_fista_fused_path_bit_identical(monkeypatch, dtype, Ny):
         b = fn(**kw)
         for x, y in zip(a if isinstance(a, tuple) else (a,), b if isinstance(b, tuple) else (b,)):
             assert torch.equal(x, y), (fn.__name__, kw.keys())
+
+
+# ── CUDA TV prox (solver audit P1) ───────────────────────────────────────────
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("shape", [(3, 5, 7), (1, 9, 11), (4, 1, 6), (5, 6, 1),
+                                   (2, 33, 65), (1, 1, 1)])
+def test_tv_prox_cuda_bit_identical(monkeypatch, dtype, shape):
+    """The CUDA TV prox (two kernels per inner iteration) gives the bits of
+    the PyTorch FGP / Chambolle reference for every mode, constraint, mask
+    shape, weight and iteration count, degenerate dimensions and NaN / inf /
+    signed-zero inputs included."""
+    from fasttomo.algorithms import fista
+
+    g = torch.Generator().manual_seed(0)
+    Ny, Nz, Nx = shape
+    z = (torch.randn(*shape, generator=g) * 2).to("cuda", dtype)
+    if z.numel() > 13:
+        z = _edge(z)
+    masks = [None, (torch.rand(1, Nz, Nx, generator=g) > 0.3).to("cuda", dtype),
+             torch.rand(Ny, Nz, Nx, generator=g).to("cuda", dtype)]
+    cases = []
+    for mode in ("fgp", "chambolle"):
+        for lam in (0.02, 0.37, 1e3):
+            for n_iter in (0, 1, 7):
+                cases.append((mode, lam, n_iter, False, None))
+        for m in masks:
+            for pos in (False, True):
+                cases.append((mode, 0.1, 20, pos, m))
+    got = [fista._tv_prox_3d(z, lam, pos, m, n, mode) for mode, lam, n, pos, m in cases]
+    monkeypatch.setattr(fista, "_tv_prox_3d_cuda", lambda *a: None)
+    for (mode, lam, n, pos, m), a in zip(cases, got):
+        b = fista._tv_prox_3d(z, lam, pos, m, n, mode)
+        assert torch.equal(_bits(a), _bits(b)), (mode, lam, n, pos, m is not None)
+
+
+@needs_cuda
+def test_tv_prox_cuda_matches_cpu_reference():
+    """The CUDA prox and the CPU PyTorch prox agree to fp32 rounding (CPU
+    and GPU elementwise results differ only in the last bits of sqrt / div
+    they share)."""
+    from fasttomo.algorithms.fista import _tv_prox_3d
+
+    g = torch.Generator().manual_seed(3)
+    z = torch.rand(6, 20, 24, generator=g) * 2
+    for mode in ("fgp", "chambolle"):
+        a = _tv_prox_3d(z.cuda(), 0.1, True, None, 20, mode).cpu()
+        b = _tv_prox_3d(z, 0.1, True, None, 20, mode)
+        assert (a - b).abs().max() <= 1e-6 * b.abs().max()

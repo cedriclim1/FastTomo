@@ -312,6 +312,25 @@ int fista_update_cuda(
     cudaStream_t stream
 );
 
+/*
+ * 3-D isotropic TV proximal operator of run_fista_tv (tv_prox.cu), bit for
+ * bit fasttomo.algorithms.fista._tv_prox_3d: n_iter dual iterations of FGP
+ * (fgp = 1; betas[it] the momentum of iteration it, a host array) or
+ * Chambolle (fgp = 0; betas ignored), dual step `step`, inv_lam = 1/lam
+ * rounded to fp32, then v_out = P_C(z - div(p)), P_C = clamp(min=0) if
+ * positivity then * mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter,
+ * or null). work: (fgp ? 6 : 3) * Ny*Nz*Nx elements of the I/O dtype
+ * (zeroed here). io_dtype 0 = fp32, 1 = fp16; tensors contiguous.
+ */
+void tv_prox_cuda(
+    int io_dtype, int fgp,
+    const void *z, void *v_out, void *work,
+    const void *mask, int mask_full, int positivity,
+    float step, float inv_lam, const float *betas, int n_iter,
+    int Ny, int Nz, int Nx,
+    cudaStream_t stream
+);
+
 long long tv_loss_iso_3d_workspace(int Ny, int Nz, int Nx);
 
 void tv_loss_iso_3d_cuda(

@@ -416,6 +416,24 @@ static int py_fista_update_cuda(
         to_stream(stream_ptr));
 }
 
+static void py_tv_prox_cuda(
+    int io_dtype, int fgp,
+    long z_ptr, long v_out_ptr, long work_ptr,
+    long mask_ptr, int mask_full, int positivity,
+    float step, float inv_lam, long betas_ptr, int n_iter,
+    int Ny, int Nz, int Nx,
+    long stream_ptr
+) {
+    tv_prox_cuda(
+        io_dtype, fgp,
+        reinterpret_cast<const void *>(z_ptr),
+        reinterpret_cast<void *>(v_out_ptr),
+        reinterpret_cast<void *>(work_ptr),
+        reinterpret_cast<const void *>(mask_ptr), mask_full, positivity,
+        step, inv_lam, reinterpret_cast<const float *>(betas_ptr), n_iter,
+        Ny, Nz, Nx, to_stream(stream_ptr));
+}
+
 static void py_tc_upload(long handle, long src_ptr, long stream_ptr) {
     tc_upload(reinterpret_cast<TextureCache *>(handle),
               reinterpret_cast<const void *>(src_ptr), to_stream(stream_ptr));
@@ -789,6 +807,19 @@ void register_cuda(py::module_ &m) {
           py::arg("step"), py::arg("beta"), py::arg("positivity"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L);
+
+    m.def("tv_prox_cuda", &py_tv_prox_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "3-D isotropic TV prox (FGP fgp=1 / Chambolle fgp=0), bit for bit "
+          "fasttomo.algorithms.fista._tv_prox_3d. betas_ptr: host fp32 array "
+          "of n_iter FGP momenta. work_ptr: (fgp ? 6 : 3) * Ny*Nz*Nx elements "
+          "of the I/O dtype. mask_ptr 0 = none (mask_full = 1 for [Ny, Nz, Nx]).",
+          py::arg("io_dtype"), py::arg("fgp"),
+          py::arg("z_ptr"), py::arg("v_out_ptr"), py::arg("work_ptr"),
+          py::arg("mask_ptr"), py::arg("mask_full"), py::arg("positivity"),
+          py::arg("step"), py::arg("inv_lam"), py::arg("betas_ptr"), py::arg("n_iter"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("stream_ptr") = 0L);
 
     m.def("tc_upload", &py_tc_upload,
           py::call_guard<py::gil_scoped_release>(),

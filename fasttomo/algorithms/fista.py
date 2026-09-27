@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from typing import Any, Callable
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -158,11 +159,18 @@ def _tv_prox_3d(
     "chambolle"`` uses Chambolle 2004's first-order dual projection
     (O(1/k)). Dual step size 1/12 — the upper bound on ||grad ∘ div||_op in
     3-D (8 in 2-D, 12 in 3-D).
+
+    On CUDA (fp32 / fp16) this runs as the two kernels per inner iteration
+    of ``csrc/cuda/tv_prox.cu`` (`_tv_prox_3d_cuda`), bit for bit the
+    PyTorch code below, which stays the CPU path and the reference.
     """
     if mode not in ("fgp", "chambolle"):
         raise ValueError(
             f"_tv_prox_3d: unknown mode {mode!r}; expected 'fgp' or 'chambolle'."
         )
+    out = _tv_prox_3d_cuda(z, lam, positivity, mask, n_iter, mode)
+    if out is not None:
+        return out
     Ny, Nz_, Nx = z.shape
     device, dtype = z.device, z.dtype
 
@@ -204,6 +212,55 @@ def _tv_prox_3d(
         v = v.clamp(min=0.0)
     if mask is not None:
         v = v * mask
+    return v
+
+
+def _fgp_betas(n_iter: int) -> list[float]:
+    """The FGP momenta ``(t_k - 1) / t_{k+1}`` of `_tv_prox_3d`'s loop."""
+    t, betas = 1.0, []
+    for _ in range(n_iter):
+        t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+        betas.append((t - 1.0) / t_new)
+        t = t_new
+    return betas
+
+
+def _tv_prox_3d_cuda(
+    z: torch.Tensor,
+    lam: float,
+    positivity: bool,
+    mask: torch.Tensor | None,
+    n_iter: int,
+    mode: str,
+) -> torch.Tensor | None:
+    """`_tv_prox_3d` as the fused CUDA kernels (solver audit P1), or None
+    when not applicable (CPU, another dtype, an unexpected mask shape): the
+    caller then runs the PyTorch reference. Memory: the output plus 6 (FGP)
+    or 3 (Chambolle) dual volumes, no per-iteration allocation."""
+    if not (z.is_cuda and z.dtype in (torch.float32, torch.float16) and z.ndim == 3
+            and hasattr(_core, "tv_prox_cuda")):
+        return None
+    Ny, Nz_, Nx = z.shape
+    if mask is not None:
+        if not (mask.device == z.device and mask.dtype == z.dtype and mask.ndim == 3
+                and tuple(mask.shape[1:]) == (Nz_, Nx) and mask.shape[0] in (1, Ny)):
+            return None
+        mask = mask.contiguous()
+    z = z.contiguous()
+    fgp = mode == "fgp"
+    v = torch.empty_like(z)
+    work = torch.empty((6 if fgp else 3) * z.numel(), dtype=z.dtype, device=z.device)
+    betas = torch.tensor(_fgp_betas(n_iter) if fgp else [0.0] * n_iter, dtype=torch.float32)
+    # ATen divides by a Python scalar as a product with its fp32 reciprocal
+    inv_lam = float(np.float32(1.0) / np.float32(lam))
+    with torch.cuda.device(z.device):
+        _core.tv_prox_cuda(
+            0 if z.dtype == torch.float32 else 1, int(fgp),
+            z.data_ptr(), v.data_ptr(), work.data_ptr(),
+            0 if mask is None else mask.data_ptr(),
+            int(mask is not None and mask.shape[0] == Ny and Ny > 1),
+            int(bool(positivity)), float(_TV_DUAL_STEP), inv_lam,
+            betas.data_ptr(), int(n_iter), Ny, Nz_, Nx, _stream_ptr(z.device))
     return v
 
 

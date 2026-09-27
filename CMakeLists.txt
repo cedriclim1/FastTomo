@@ -209,6 +209,7 @@ if(FASTTOMO_CUDA)
         csrc/cuda/tv_loss.cu
         csrc/cuda/sirt_update.cu
         csrc/cuda/fista_update.cu
+        csrc/cuda/tv_prox.cu
         csrc/cuda/texture_cache.cu
         csrc/cuda/mbir_icd.cu
     )
