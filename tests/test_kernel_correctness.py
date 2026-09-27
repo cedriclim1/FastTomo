@@ -635,15 +635,16 @@ def _sweep_args(Ny=2, Nz=4, Nx=4, n_angles=3):
     cos_a, sin_a = _trig_on_device(torch.linspace(-30, 30, n_angles), torch.device("cpu"))
     return dict(
         volume=torch.zeros(Ny, Nz, Nx), e_sino=torch.ones(n_angles, Ny, Nx),
-        d_offsets=torch.zeros(n_angles), lambdas=None,
+        lambdas=None,
         vol_snap=torch.zeros(Ny, Nz, Nx),
         perm=torch.arange(Nz * Nx, dtype=torch.int32).repeat(Ny, 1),
         cos_a=cos_a, sin_a=sin_a)
 
 
-@pytest.mark.parametrize("bad", ["e_sino_Ny", "angles", "d_offsets", "perm", "snapshot"])
+@pytest.mark.parametrize("bad", ["e_sino_Ny", "angles", "lambdas", "perm", "snapshot"])
 def test_mbir_cpu_sweep_rejects_mismatched_sizes(bad):
-    """The #58 size checks (e_sino Ny, angles, d_offsets) and the others."""
+    """The #58 size checks (e_sino Ny, angles) and the others. (d_offsets is
+    no longer passed to the C sweep: the offset update moved to Python, P12.)"""
     from fasttomo.algorithms import _mbir_icd_sweep_cpu
 
     kw = _sweep_args()
@@ -651,20 +652,19 @@ def test_mbir_cpu_sweep_rejects_mismatched_sizes(bad):
         kw["e_sino"] = torch.ones(3, 1, 4)
     elif bad == "angles":
         kw["cos_a"], kw["sin_a"] = kw["cos_a"][:2], kw["sin_a"][:2]
-    elif bad == "d_offsets":
-        kw["d_offsets"] = torch.zeros(2)
+    elif bad == "lambdas":
+        kw["lambdas"] = torch.ones(3, 2, 3)
     elif bad == "perm":
         kw["perm"] = kw["perm"][:, :5].contiguous()
     else:
         kw["vol_snap"] = torch.zeros(2, 4, 3)
     hyper = dict(qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=0.01, sigma_f=1.0,
-                 huber_T=float("inf"), huber_delta=1.0, sigma=1.0, sigma_min=1e-3,
-                 estimate_offset=True, estimate_variance=False, num_threads=1)
+                 huber_T=float("inf"), huber_delta=1.0, sigma=1.0, num_threads=1)
     with pytest.raises(ValueError):
-        _mbir_icd_sweep_cpu(kw["volume"], kw["e_sino"], kw["d_offsets"], kw["lambdas"],
+        _mbir_icd_sweep_cpu(kw["volume"], kw["e_sino"], kw["lambdas"],
                             kw["vol_snap"], kw["perm"], kw["cos_a"], kw["sin_a"], **hyper)
     _mbir_icd_sweep_cpu(*(_sweep_args()[k] for k in
-                          ("volume", "e_sino", "d_offsets", "lambdas", "vol_snap",
+                          ("volume", "e_sino", "lambdas", "vol_snap",
                            "perm", "cos_a", "sin_a")), **hyper)   # valid call runs
 
 

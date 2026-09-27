@@ -2421,13 +2421,22 @@ def _mbir_update_offset_variance(
 ) -> tuple[torch.Tensor, float]:
     """Closed-form updates for d_k and σ under the quadratic surrogate.
 
-    The host-side counterpart of the offset/variance updates that the CPU
-    kernel does internally. For the CUDA path the kernel only runs the ICD
-    sweep, so the Python wrapper computes d_k / σ here on the live e_sino.
+    The only implementation: the CPU and CUDA sweeps run the ICD voxel
+    updates only, and `_run_mbir_single_scale` calls this afterwards on the
+    live e_sino for both backends (the C copy was removed, ARCH P12).
+
+        Δd_k = Σ_i b·Λ·e / Σ_i b·Λ   (per tilt k; skipped if Σ b·Λ < 1e-30)
+        σ    = sqrt( Σ b·Λ·e² / (n_angles·Ny·N_det) ), floored at sigma_min
+
+    with b the Huber surrogate weight of r = e·√Λ/σ, recomputed after the
+    offset update. Element products are fp32; the sums accumulate in fp64
+    on both backends (large M·K would otherwise lose digits).
 
     Returns (d_offsets_new, sigma_new) and mutates e_sino in place to
     maintain the invariant e = g - A·f - d.
     """
+    if not (estimate_offset or estimate_variance):
+        return d_offsets, sigma
     n_angles, Ny, N_det = e_sino.shape
     if lambdas is None:
         r = e_sino / sigma
@@ -2438,9 +2447,10 @@ def _mbir_update_offset_variance(
     lam = lambdas if lambdas is not None else torch.ones_like(e_sino)
 
     if estimate_offset:
-        num = (bw * lam * e_sino).sum(dim=(1, 2))
-        den = (bw * lam).sum(dim=(1, 2)).clamp(min=1e-30)
-        delta_d = num / den
+        num = (bw * lam * e_sino).double().sum(dim=(1, 2))
+        den = (bw * lam).double().sum(dim=(1, 2))
+        delta_d = torch.where(den >= 1e-30, num / den.clamp(min=1e-30),
+                              torch.zeros_like(num)).float()
         d_offsets = d_offsets + delta_d
         e_sino.sub_(delta_d.view(n_angles, 1, 1))
         # recompute weights for the variance update on the updated residual
@@ -2455,8 +2465,8 @@ def _mbir_update_offset_variance(
     sigma_new = sigma
     if estimate_variance:
         total = n_angles * Ny * N_det
-        s2 = (bw * lam * e_sino * e_sino).sum() / total
-        sigma_new = max(sigma_min, float(s2.clamp(min=0.0).sqrt().item()))
+        s2 = (bw * lam * e_sino * e_sino).double().sum() / total
+        sigma_new = max(sigma_min, float(s2.clamp(min=0.0).sqrt().float().item()))
 
     return d_offsets, sigma_new
 
@@ -2499,7 +2509,6 @@ def _mbir_initial_residual(
 def _mbir_icd_sweep_cpu(
     volume: torch.Tensor,             # [Ny, Nz, Nx] fp32, updated in place
     e_sino: torch.Tensor,             # [n_angles, Ny, N_det] fp32, updated in place
-    d_offsets: torch.Tensor | None,   # [n_angles] fp32, updated in place
     lambdas: torch.Tensor | None,     # [n_angles, Ny, N_det] fp32
     vol_snap: torch.Tensor,           # [Ny, Nz, Nx] fp32
     perm: torch.Tensor,               # [Ny, Nz*Nx] int32
@@ -2507,13 +2516,13 @@ def _mbir_icd_sweep_cpu(
     sin_a: torch.Tensor,
     *,
     qggmrf_p: float, qggmrf_q: float, qggmrf_c: float, sigma_f: float,
-    huber_T: float, huber_delta: float, sigma: float, sigma_min: float,
-    estimate_offset: bool, estimate_variance: bool, num_threads: int,
-) -> float:
-    """One CPU ICD sweep; returns the updated sigma. The C code updates
-    volume / e_sino / d_offsets through raw pointers, so every buffer must be
-    a dense CPU tensor of the right dtype: a silent copy would drop the
-    in-place writes, so strided buffers raise instead (#58)."""
+    huber_T: float, huber_delta: float, sigma: float, num_threads: int,
+) -> None:
+    """One CPU ICD sweep (voxel updates only; the offset/variance updates
+    are `_mbir_update_offset_variance`, shared with CUDA). The C code updates
+    volume / e_sino through raw pointers, so every buffer must be a dense
+    CPU tensor of the right dtype: a silent copy would drop the in-place
+    writes, so strided buffers raise instead (#58)."""
     if volume.ndim != 3 or e_sino.ndim != 3:
         raise ValueError("_mbir_icd_sweep_cpu: volume and e_sino must be 3-D")
     n_angles, Ny, N_det = e_sino.shape
@@ -2522,7 +2531,6 @@ def _mbir_icd_sweep_cpu(
                         ("e_sino", e_sino, torch.float32),
                         ("volume_snapshot", vol_snap, torch.float32),
                         ("perm", perm, torch.int32),
-                        ("d_offsets", d_offsets, torch.float32),
                         ("lambdas", lambdas, torch.float32)):
         if t is not None and (t.dtype != dt or t.device.type != "cpu"):
             raise TypeError(f"_mbir_icd_sweep_cpu: {name} must be a CPU {dt} tensor")
@@ -2532,25 +2540,22 @@ def _mbir_icd_sweep_cpu(
         ("e_sino", e_sino, (n_angles, Ny, N_det)),
         ("volume_snapshot", vol_snap, (Ny, Nz, Nx)),
         ("perm", perm, (Ny, Nz * Nx)),
-        ("d_offsets", d_offsets, (n_angles,)),
         ("lambdas", lambdas, (n_angles, Ny, N_det)),
         ("cos_a (angles)", cos_a, (n_angles,)),
         ("sin_a (angles)", sin_a, (n_angles,)),
     ])
-    return float(_core.mbir_icd_sweep_cpu(
+    _core.mbir_icd_sweep_cpu(
         vol_ptr=_data_ptr(volume, "volume"),
         e_sino_ptr=_data_ptr(e_sino, "e_sino"),
         vol_snapshot_ptr=_data_ptr(vol_snap, "volume_snapshot"),
-        d_offsets_ptr=_data_ptr(d_offsets, "d_offsets") if d_offsets is not None else 0,
         lambdas_ptr=_data_ptr(lambdas, "lambdas") if lambdas is not None else 0,
         perm_ptr=_data_ptr(perm, "perm"),
         cos_ptr=_data_ptr(cos_a, "cos_a"), sin_ptr=_data_ptr(sin_a, "sin_a"),
         Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
         qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c, sigma_f=sigma_f,
-        huber_T=huber_T, huber_delta=huber_delta, sigma=sigma, sigma_min=sigma_min,
-        estimate_offset=estimate_offset, estimate_variance=estimate_variance,
+        huber_T=huber_T, huber_delta=huber_delta, sigma=sigma,
         num_threads=num_threads,
-    ))
+    )
 
 
 def _run_mbir_single_scale(
@@ -2631,25 +2636,21 @@ def _run_mbir_single_scale(
                     sigma=sigma_cur,
                     stream_ptr=stream_ptr,
                 )
-            # Host-side closed-form updates for d_k and σ.
-            d_offsets, sigma_cur = _mbir_update_offset_variance(
-                e_sino, d_offsets, sigma_cur, sigma_min,
-                huber_T, huber_delta, lambdas,
-                estimate_offset, estimate_variance,
-            )
         else:
-            # CPU path: single C call does ICD + (optional) offset + (optional) variance.
-            sigma_cur = _mbir_icd_sweep_cpu(
-                volume, e_sino, d_offsets if estimate_offset else None,
+            _mbir_icd_sweep_cpu(
+                volume, e_sino,
                 lambdas.contiguous() if lambdas is not None else None,
                 vol_snap, torch.from_numpy(perm), cos_a, sin_a,
                 qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
                 sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
-                sigma=sigma_cur, sigma_min=sigma_min,
-                estimate_offset=estimate_offset,
-                estimate_variance=estimate_variance,
-                num_threads=4,
+                sigma=sigma_cur, num_threads=4,
             )
+        # Closed-form updates for d_k and σ: one implementation, both backends.
+        d_offsets, sigma_cur = _mbir_update_offset_variance(
+            e_sino, d_offsets, sigma_cur, sigma_min,
+            huber_T, huber_delta, lambdas,
+            estimate_offset, estimate_variance,
+        )
 
         # Convergence check: relative L2 change on a strided sample so it
         # scales as O(Nvox / 8). Cheap vs the per-iter compute.

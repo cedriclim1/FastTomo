@@ -1296,11 +1296,10 @@ def test_mbir_cpu_sweep_rejects_noncontiguous_buffers():
 
     def call(volume, e_sino, lambdas):
         return _mbir_icd_sweep_cpu(
-            volume, e_sino, None, lambdas, torch.zeros(Ny, Nz, Nx), perm,
+            volume, e_sino, lambdas, torch.zeros(Ny, Nz, Nx), perm,
             cos_a, sin_a,
             qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=0.01, sigma_f=1.0,
-            huber_T=float("inf"), huber_delta=1.0, sigma=1.0, sigma_min=1e-3,
-            estimate_offset=False, estimate_variance=False, num_threads=1,
+            huber_T=float("inf"), huber_delta=1.0, sigma=1.0, num_threads=1,
         )
 
     vol = torch.zeros(Ny, Nz, Nx)

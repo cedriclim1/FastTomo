@@ -704,3 +704,106 @@ def test_mbir_rejects_non_finite_sinogram(backend, bad, sigma_init):
     with pytest.raises(ValueError, match="sinogram contains NaN or inf"):
         ft.run_mbir(sino, torch.linspace(-40, 40, 6, device=backend),
                     outer_iters=1, multires_levels=1, sigma_init=sigma_init)
+
+
+# ── ARCH P12: one MBIR offset/variance implementation ──────────────────────
+
+def _offset_variance_ref(e, d, sigma, sigma_min, T, delta, lam, est_off, est_var):
+    """fp64 NumPy reference of the closed-form MBIR updates."""
+    e = e.astype(np.float64).copy()
+    d = d.astype(np.float64).copy()
+    lam = np.ones_like(e) if lam is None else lam.astype(np.float64)
+
+    def weights(e):
+        r = np.abs(e * np.sqrt(lam) / sigma)
+        if not math.isfinite(T):
+            return np.ones_like(r)
+        return np.where(r < T, 1.0, delta * T / np.maximum(r, 1e-30))
+
+    if est_off:
+        bw = weights(e)
+        for k in range(e.shape[0]):
+            den = (bw[k] * lam[k]).sum()
+            if den < 1e-30:
+                continue
+            dd = (bw[k] * lam[k] * e[k]).sum() / den
+            d[k] += dd
+            e[k] -= dd
+    s = sigma
+    if est_var:
+        bw = weights(e)
+        s = max(sigma_min, math.sqrt((bw * lam * e * e).sum() / e.size))
+    return e, d, s
+
+
+@pytest.mark.parametrize("T", [float("inf"), 1.5])
+@pytest.mark.parametrize("use_lam", [False, True])
+@pytest.mark.parametrize("flags", [(True, True), (True, False), (False, True), (False, False)])
+def test_mbir_offset_variance_matches_reference(backend, T, use_lam, flags):
+    """The single offset/variance implementation (both backends) against an
+    fp64 reference, with Huber weights, per-pixel lambdas and one view whose
+    weights are all zero (its offset must stay put, as in the removed C code)."""
+    from fasttomo.algorithms import _mbir_update_offset_variance
+    rng = np.random.default_rng(13)
+    e = (rng.standard_normal((5, 3, 7)) + rng.standard_normal((5, 1, 1))).astype(np.float32)
+    e[1, 0, 2] = 9.0                                   # Huber outlier
+    lam = (rng.random((5, 3, 7)) + 0.5).astype(np.float32) if use_lam else None
+    if use_lam:
+        lam[4] = 0.0                                   # a view with no weight
+    d0 = rng.standard_normal(5).astype(np.float32)
+    e_ref, d_ref, s_ref = _offset_variance_ref(e, d0, 0.8, 1e-3, T, 0.5, lam, *flags)
+
+    e_t = torch.from_numpy(e).to(backend)
+    d_new, s_new = _mbir_update_offset_variance(
+        e_t, torch.from_numpy(d0).to(backend), 0.8, 1e-3, T, 0.5,
+        torch.from_numpy(lam).to(backend) if use_lam else None, *flags)
+    torch.testing.assert_close(e_t.cpu().double(), torch.from_numpy(e_ref), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(d_new.cpu().double(), torch.from_numpy(d_ref), rtol=1e-6, atol=1e-6)
+    assert s_new == pytest.approx(s_ref, rel=1e-6)
+    if use_lam and flags[0]:
+        assert d_new[4].item() == d0[4]
+
+
+def test_mbir_cpu_uses_the_python_offset_variance_update(monkeypatch):
+    """The CPU path calls _mbir_update_offset_variance once per outer
+    iteration (before P12 the C sweep did its own copy of the update)."""
+    import fasttomo.algorithms as algo
+    calls = []
+    real = algo._mbir_update_offset_variance
+
+    def counting(*args, **kwargs):
+        calls.append(args[-2:])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(algo, "_mbir_update_offset_variance", counting)
+    sino = torch.rand(6, 2, 8, generator=torch.Generator().manual_seed(14))
+    ft.run_mbir(sino, torch.linspace(-40, 40, 6), outer_iters=3, multires_levels=1,
+                convergence_tol=0.0, estimate_offset=True, estimate_variance=True)
+    assert calls == [(True, True)] * 3
+
+
+@needs_cuda
+def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
+    """test_mbir_cpu_cuda_consistency runs with estimation off; this one
+    turns on the offset and variance updates, Huber weights and lambdas, so
+    the shared update is exercised on both backends. The residual
+    difference is float summation order in the sweeps (~3e-7 here)."""
+    import fasttomo.algorithms as algo
+    g = torch.Generator().manual_seed(21)
+    Ny, N, n = 6, 16, 18
+    ph = torch.zeros(Ny, N, N)
+    ph[1:5, 4:12, 5:11] = 1.0
+    ang = torch.linspace(-60, 60, n)
+    a = ang * math.pi / 180
+    sino = -algo._mbir_initial_residual(ph, torch.zeros(n, Ny, N), torch.cos(a), torch.sin(a))
+    sino = sino + 0.3 * torch.linspace(-1, 1, n).view(n, 1, 1) + 0.05 * torch.randn(n, Ny, N, generator=g)
+    sino[3, 2, 5] += 8.0
+    lam = torch.rand(n, Ny, N, generator=g) + 0.5
+    kw = dict(sigma_f=0.1, outer_iters=8, multires_levels=1, seed=5, return_history=True,
+              estimate_offset=True, estimate_variance=True, huber_T=3.0)
+    vc, dc, sc, _ = ft.run_mbir(sino, ang, lambdas=lam, **kw)
+    vg, dg, sg, _ = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
+    assert (dc.abs() > 0.1).any()                        # offsets were estimated
+    torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
+    torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)
+    assert sg == pytest.approx(sc, rel=1e-5)
