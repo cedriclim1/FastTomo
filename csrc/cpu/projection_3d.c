@@ -154,7 +154,10 @@ void back_project_3d_cpu(
 }
 
 /* ── gradient of 3D rotmat FP w.r.t. rotation matrix (CPU) ─────────────────
- * Mirrors grad_rotmat_cuda exactly. Detector-driven loop accumulates per-ray
+ * Same sampling, loose bounds (-1, N) and border-zero corners as
+ * grad_rotmat_kernel (CUDA) and forward_project_3d_cpu, so it is the exact
+ * gradient of the forward away from trilinear kinks; the two backends differ
+ * only in fp32 summation order. Detector-driven loop accumulates per-ray
  * partials of all 9 matrix entries, no reduction needed (pure serial).
  *
  * Per ray step (s = step):

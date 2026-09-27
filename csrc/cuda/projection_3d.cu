@@ -394,12 +394,22 @@ __global__ static void grad_rotmat_kernel(
                 float fy = oy + s * dys + half_y;
                 float fz = oz + s * dzs + half_z;
 
-                if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                    fy < 0.0f || fy >= (float)(Ny - 1) ||
-                    fz < 0.0f || fz >= (float)(Nz - 1))
+                /* Loose bounds, the same as forward_project_rotmat_kernel
+                 * (border-mode linear texture) and grad_rotmat_cpu: a sample
+                 * contributes while any of its 8 corners is inside the
+                 * volume, i.e. fx in (-1, Nx) and likewise for y, z. Corners
+                 * outside the volume read 0 through the border-mode point
+                 * texture, so the samples within one voxel of a face carry
+                 * the (large) derivative of the fall-off to zero. A tight
+                 * [0, N-1) test drops them and is not the gradient of the
+                 * forward. floorf, not (int) truncation, because fx can be
+                 * negative here. */
+                if (fx <= -1.0f || fx >= (float)Nx ||
+                    fy <= -1.0f || fy >= (float)Ny ||
+                    fz <= -1.0f || fz >= (float)Nz)
                     continue;
 
-                int ix0 = (int)fx, iy0 = (int)fy, iz0 = (int)fz;
+                int ix0 = (int)floorf(fx), iy0 = (int)floorf(fy), iz0 = (int)floorf(fz);
                 int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
                 float wx = fx - (float)ix0;
                 float wy = fy - (float)iy0;
