@@ -220,6 +220,48 @@ about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
 - Golden keys `cpu/mbir`, `cuda/mbir` and every key of
   `tests/data/mbir_sweep_golden.pt` were regenerated.
 
+### ⚠ `run_mbir` on CUDA: parallel ICD sweep by default (new visiting order), `sweep_kernel=`
+
+- New keyword-only `sweep_kernel="auto" | "serial" | "parallel"` on
+  `run_mbir` and `MbirConfig`. The parallel sweep updates voxels of a row
+  that are `S = ceil((2 + eps) / min|cos theta|)` apart (5 at +-60 degrees,
+  6 at +-70, 12 at +-80) at the same time: their detector footprints are
+  disjoint in every view, so this is still exact Gauss-Seidel ICD (it equals
+  the serial sweep run on the same visiting order, bit for bit; tested). One
+  block per Y-slice, the slice's error sinogram in shared memory. `"auto"`
+  (the default) uses it on CUDA where it applies (a spacing `S <= Nx // 2`,
+  i.e. no view near 90 degrees; at most 256 views; `n_angles * (N_det + 1)
+  * 4` bytes of shared memory per block, 99 KB on sm_120) and the serial
+  sweep otherwise (e.g. 512^3 at 61 views); `"parallel"` raises where it
+  does not apply.
+- **CUDA results for a given `seed` change** (groups visited in a keyed
+  order instead of single voxels), and the group order needs 1.2-1.3x more
+  iterations to the same `convergence_tol`. Measured (61 views +-60
+  degrees, fp32, RTX PRO 6000 Blackwell, `sigma_f=0.1`, fixed sigma):
+
+  | | serial | parallel |
+  |---|---|---|
+  | 128^3 per iteration | 9.72 ms | 1.25 ms |
+  | 128^3 to tol 1e-3 / 1e-4 | 54 / 201 it, 525 / 1945 ms | 69 / 255 it, 86 / 318 ms |
+  | 256^3 per iteration | 40.2 ms | 8.80 ms |
+  | 256^3 to tol 1e-3 / 1e-4 | 33 / 151 it, 1326 / 6017 ms | 39 / 195 it, 343 / 1707 ms |
+
+- **CPU and CUDA no longer visit the voxels in the same order by default**
+  (the CPU keeps the serial voxel order); they agree at convergence (the
+  same MAP estimate, tested through the MAP cost), not iteration by
+  iteration. `sweep_kernel="parallel"` on CPU runs the C sweep in the
+  parallel sweep's order, which matches a CUDA `"parallel"` run up to
+  rounding; `"serial"` on both backends matches as before.
+- The prepare kernel computes the prior sums in natural voxel order (3.0 ->
+  1.5 ms at 256^3, 26 -> 12 ms at 512^3; bit-identical) and the CUDA sweep
+  scratch is 8 instead of 16 bytes per voxel (128 MiB at 256^3, 1 GiB at
+  512^3).
+- The per-voxel arithmetic of every CUDA sweep and of the MBIR forward
+  projection is rounded op by op (no FMA contraction, as in the C code), and
+  each lane adds its even- and odd-slot sums before one warp reduction
+  (instead of reducing them separately): serial CUDA results change at the
+  ulp level too, and the serial sweep costs ~3 % more per iteration.
+
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
 `ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes

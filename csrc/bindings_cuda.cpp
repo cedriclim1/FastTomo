@@ -453,7 +453,7 @@ static void py_mbir_icd_sweep_cuda(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
     float huber_T, float huber_delta, float sigma,
-    long stream_ptr
+    long stream_ptr, int group_spacing
 ) {
     mbir_icd_sweep_cuda(
         reinterpret_cast<float *>(vol_ptr),
@@ -467,7 +467,7 @@ static void py_mbir_icd_sweep_cuda(
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
         qggmrf_p, qggmrf_q, qggmrf_c, sigma_f,
-        huber_T, huber_delta, sigma,
+        huber_T, huber_delta, sigma, group_spacing,
         to_stream(stream_ptr)
     );
 }
@@ -795,7 +795,12 @@ void register_cuda(py::module_ &m) {
           "(8-byte aligned). Asynchronous on the stream. "
           "Per-tilt offset d_k and noise variance σ "
           "are updated in PyTorch by the Python wrapper using the post-call "
-          "e_sino (the kernel never reads d_k: e = g - Af - d).",
+          "e_sino (the kernel never reads d_k: e = g - Af - d). "
+          "group_spacing = 0 runs the serial sweep (one warp per slice); "
+          "S > 0 the parallel sweep over conflict-free voxel groups of "
+          "spacing S (the caller guarantees S * min|cos| >= 2 + eps, see "
+          "fasttomo.algorithms.mbir._mbir_group_spacing; needs perm_ptr = 0 "
+          "and mbir_group_sweep_supported).",
           py::arg("vol_ptr"), py::arg("e_sino_ptr"),
           py::arg("vol_snapshot_ptr"),
           py::arg("lambdas_ptr"),
@@ -806,7 +811,13 @@ void register_cuda(py::module_ &m) {
           py::arg("qggmrf_p"), py::arg("qggmrf_q"),
           py::arg("qggmrf_c"), py::arg("sigma_f"),
           py::arg("huber_T"), py::arg("huber_delta"), py::arg("sigma"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("group_spacing") = 0);
+
+    m.def("mbir_group_sweep_supported", &mbir_group_sweep_supported,
+          "Whether the parallel MBIR sweep can run for this many views and "
+          "detector pixels on the current device (n_angles <= 256 and the "
+          "slice's error sinogram fits in shared memory).",
+          py::arg("n_angles"), py::arg("N_det"));
 
     m.def("mbir_permutation_cuda", &py_mbir_permutation_cuda,
           "Test hook: write the in-kernel MBIR voxel order ([Ny, nvox] int32) "

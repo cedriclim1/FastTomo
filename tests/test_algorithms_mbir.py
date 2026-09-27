@@ -519,6 +519,179 @@ def test_mbir_cuda_sweep_matches_pre_restructure_golden():
     assert not bad, f"differ from the pre-restructure sweep (exact={exact}): {bad}"
 
 
+# ── parallel sweep (conflict-free voxel groups) ─────────────────────────────
+
+
+@pytest.mark.parametrize("Ny,Nz,Nx,S", [(1, 1, 7, 3), (2, 5, 16, 5), (3, 9, 13, 6), (2, 4, 40, 12)])
+def test_mbir_group_permutation_is_the_flattened_group_order(Ny, Nz, Nx, S):
+    """The NumPy mirror of the parallel sweep's order: every row a
+    permutation of the slice's voxels, made of whole groups (one row iz,
+    x = r, r + S, ... in increasing order) that follow the Feistel order of
+    the Nz * S groups."""
+    from fasttomo.algorithms.mbir import (_mbir_group_permutation, _mbir_perm_key,
+                                          _mbir_permutation)
+    key = _mbir_perm_key(4, 2)
+    p = _mbir_group_permutation(Ny, Nz, Nx, S, key)
+    assert p.dtype == np.int32 and p.shape == (Ny, Nz * Nx)
+    groups = _mbir_permutation(Ny, Nz * S, key)
+    for iy in range(Ny):
+        assert np.array_equal(np.sort(p[iy]), np.arange(Nz * Nx))
+        want = [iz * Nx + x for g in groups[iy] for iz, r in [divmod(int(g), S)]
+                for x in range(r, Nx, S)]
+        assert np.array_equal(p[iy], want)
+
+
+def test_mbir_group_spacing():
+    """S * min|cos| must reach 2 plus a rounding margin (so the two-pixel
+    footprints of a group's members are disjoint in every view), and a group
+    needs at least two members (S <= Nx // 2); otherwise 0 (serial)."""
+    from fasttomo.algorithms.mbir import _mbir_group_spacing as gs
+
+    def c(*v):
+        return torch.tensor(v, dtype=torch.float32)
+
+    assert gs(c(0.5, 1.0), 64, 64, 64) == 5          # S * cos = 2.5
+    assert gs(c(0.4, 0.9), 64, 64, 64) == 6          # 5 * 0.4 = 2 exactly is not enough
+    assert gs(c(0.401, 1.0), 64, 64, 64) == 5        # 2.005 >= 2 + 1e-3
+    assert gs(c(0.4001, 1.0), 64, 64, 64) == 6       # 2.0005 < 2 + 1e-3
+    assert gs(c(1.0), 64, 64, 64) == 3
+    assert gs(c(0.0, 1.0), 64, 64, 64) == 0          # a view at 90 degrees
+    assert gs(c(0.5), 64, 9, 64) == 0                # S = 5 > 9 // 2
+    assert gs(c(0.5), 64, 10, 64) == 5
+    # the margin grows with the coordinates' size (fp32 rounding of u)
+    assert gs(c(2.0 / 5 + 2.0e-3 / 5), 4096, 4096, 4096) == 6
+    ang = torch.linspace(-85, 85, 61) * math.pi / 180  # +-85 degrees: S = 23
+    assert gs(torch.cos(ang), 32, 32, 32) == 0 and gs(torch.cos(ang), 64, 64, 64) == 23
+
+
+def _group_sweep_case(g, Ny, Nz, Nx, Nd, n, tilt):
+    ang = torch.linspace(-tilt, tilt, n) * math.pi / 180
+    cos_a, sin_a = torch.cos(ang).to(DEVICE), torch.sin(ang).to(DEVICE)
+    vol0 = (torch.rand(Ny, Nz, Nx, generator=g) * (torch.rand(Ny, Nz, Nx, generator=g) > 0.3))
+    e0 = torch.randn(n, Ny, Nd, generator=g)
+    lam = torch.rand(n, Ny, Nd, generator=g) + 0.2
+    return cos_a, sin_a, vol0.to(DEVICE), e0.to(DEVICE), lam.to(DEVICE)
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape", [(3, 16, 16, 16, 61, 60), (2, 13, 29, 31, 100, 70),
+                                   (4, 40, 36, 36, 9, 60), (2, 17, 40, 40, 140, 75),
+                                   (3, 20, 33, 35, 250, 65), (1, 7, 12, 9, 33, 60)])
+def test_mbir_parallel_sweep_matches_serial_on_its_order(shape):
+    """The parallel sweep updates the members of a voxel group at the same
+    time; they are independent, so the result must equal the serial sweep
+    given the flattened group order (_mbir_group_permutation) through the
+    explicit-order hook, bit for bit: volume and error sinogram after three
+    sweeps, for 1, 2, 4 and 8 angle slots per lane (9..250 views), with and
+    without lambdas and the Huber weight, odd sizes and N_det != Nx."""
+    from fasttomo.algorithms.mbir import (_mbir_group_permutation, _mbir_group_spacing,
+                                          _mbir_icd_sweep_cuda, _mbir_perm_key)
+    Ny, Nz, Nx, Nd, n, tilt = shape
+    g = torch.Generator().manual_seed(sum(shape))
+    cos_a, sin_a, vol0, e0, lam = _group_sweep_case(g, Ny, Nz, Nx, Nd, n, tilt)
+    S = _mbir_group_spacing(cos_a, Nz, Nx, Nd)
+    assert S > 0
+    for use_lam in (False, True):
+        for T in (float("inf"), 1.5):
+            outs = []
+            for kernel in ("parallel", "serial"):
+                vol, e = vol0.clone(), e0.clone()
+                work = torch.empty(Ny * Nz * Nx * 2, device=DEVICE)
+                for it in range(3):
+                    key = _mbir_perm_key(5, it)
+                    perm = (None if kernel == "parallel" else
+                            torch.from_numpy(_mbir_group_permutation(Ny, Nz, Nx, S, key)).to(DEVICE))
+                    _mbir_icd_sweep_cuda(vol, e, lam if use_lam else None, vol.clone(), work,
+                                         cos_a, sin_a, perm_key=key, perm=perm,
+                                         qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.4,
+                                         huber_T=T, huber_delta=0.5, sigma=0.8,
+                                         sweep_kernel=kernel)
+                torch.cuda.synchronize()
+                outs.append((vol, e))
+            assert not torch.equal(outs[0][0], vol0)
+            assert torch.equal(outs[0][0], outs[1][0]), (use_lam, T)
+            assert torch.equal(outs[0][1], outs[1][1]), (use_lam, T)
+
+
+@needs_cuda
+def test_mbir_sweep_kernel_selection(monkeypatch):
+    """sweep_kernel="auto" takes the parallel sweep on CUDA when it applies
+    and falls back to the serial one when it does not: no group spacing
+    (+-85 degrees on a 32-wide volume needs S = 23), more than 256 views, or
+    a slice error sinogram too large for shared memory (61 views x 512
+    pixels = 125 KB). "parallel" raises in those cases, CPU "auto" is
+    serial, and an unknown name raises."""
+    import fasttomo._core as _core
+    from fasttomo.algorithms import mbir as M
+    seen = []
+    real = _core.mbir_icd_sweep_cuda
+
+    def spy(**kw):
+        seen.append(kw["group_spacing"])
+        return real(**kw)
+
+    monkeypatch.setattr(M._core, "mbir_icd_sweep_cuda", spy)
+
+    def run(n, tilt, Nx, kernel="auto", N_det=None, dev=DEVICE):
+        seen.clear()
+        N_det = N_det or Nx
+        ang = torch.linspace(-tilt, tilt, n, device=dev)
+        ft.run_mbir(torch.rand(n, 2, N_det, device=dev), ang, n_iter=1, Nz=8,
+                    sweep_kernel=kernel)
+        return seen[0] if seen else None
+
+    assert run(61, 60, 32) == 5
+    assert run(61, 60, 32, "serial") == 0
+    assert run(61, 85, 32) == 0
+    assert run(61, 85, 64) == 23
+    assert run(300, 60, 32) == 0
+    assert run(61, 60, 32, N_det=512) == 0
+    assert _core.mbir_group_sweep_supported(n_angles=61, N_det=256)
+    assert not _core.mbir_group_sweep_supported(n_angles=61, N_det=512)
+    with pytest.raises(ValueError, match="90 degrees"):
+        run(61, 85, 32, "parallel")
+    with pytest.raises(ValueError, match="256"):
+        run(300, 60, 32, "parallel")
+    with pytest.raises(ValueError, match="shared memory"):
+        run(61, 60, 32, "parallel", N_det=512)
+    assert run(61, 60, 32, dev=torch.device("cpu")) is None      # CPU: no CUDA sweep call
+    with pytest.raises(ValueError, match="sweep_kernel"):
+        run(61, 60, 32, "fast")
+    v = torch.zeros(2, 8, 32, device=DEVICE)
+    c = torch.cos(torch.linspace(-1, 1, 61, device=DEVICE))
+    perm = torch.from_numpy(M._mbir_permutation(2, 256, 1)).to(DEVICE)
+    with pytest.raises(ValueError, match="explicit perm"):
+        M._mbir_icd_sweep_cuda(v, torch.zeros(61, 2, 32, device=DEVICE), None, v,
+                               torch.empty(2 * 8 * 32 * 2, device=DEVICE), c, c, perm_key=1,
+                               perm=perm, qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3,
+                               sigma_f=1.0, huber_T=float("inf"), huber_delta=0.5, sigma=1.0,
+                               sweep_kernel="parallel")
+
+
+def test_mbir_cpu_parallel_order_is_the_group_order(monkeypatch):
+    """On CPU, sweep_kernel="parallel" runs the serial C sweep on the
+    parallel sweep's visiting order (so CPU and CUDA runs can be compared
+    like for like); "auto" and "serial" keep the Feistel voxel order."""
+    from fasttomo.algorithms import mbir as M
+    orders = []
+    real = M._mbir_icd_sweep_cpu
+
+    def spy(volume, e_sino, lambdas, vol_snap, perm, *a, **kw):
+        orders.append(perm.clone())
+        return real(volume, e_sino, lambdas, vol_snap, perm, *a, **kw)
+
+    monkeypatch.setattr(M, "_mbir_icd_sweep_cpu", spy)
+    ang = torch.linspace(-60, 60, 21)
+    sino = torch.rand(21, 2, 16)
+    key = M._mbir_perm_key(3, 0)
+    for kernel, want in (("auto", M._mbir_permutation(2, 256, key)),
+                         ("serial", M._mbir_permutation(2, 256, key)),
+                         ("parallel", M._mbir_group_permutation(2, 16, 16, 5, key))):
+        orders.clear()
+        ft.run_mbir(sino, ang, n_iter=1, seed=3, sweep_kernel=kernel)
+        assert np.array_equal(orders[0].numpy(), want), kernel
+
+
 @needs_cuda
 def test_mbir_cuda_sweep_requires_work_buffer():
     import fasttomo._core as _core
