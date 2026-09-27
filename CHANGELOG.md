@@ -55,7 +55,7 @@
   fp64 partials, gather backward). Forward + backward at 256^3 2.19 ->
   0.16 ms; `run_ad_recon` with `tv_xz_weight` 4.05 -> 2.00 ms per
   iteration, peak 608 -> 368 MiB. Values move by fp32 rounding only
-  (<= 2.7e-7 relative); the `ad_reg` golden was regenerated.
+  (<= 2.7e-7 relative vs the torch expression).
 - CPU `tv_loss_3d` returned NaN when a dimension is 1 (and `tv_loss_xz`
   when `Nz` or `Nx` is 1); both now return 0 with a zero gradient, like
   CUDA. A single-slice volume (`Ny = 1`) therefore has no 3-D TV (now
