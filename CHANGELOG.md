@@ -12,11 +12,32 @@ instead of 1. The filter is now the spatial-domain Ram-Lak kernel
 next power of two `>= 2 N_det - 1`; the same cylinders reconstruct at
 1.000 +- 0.002, at 180 degrees and at +-70 degrees alike. **`run_fbp` and
 `ramp_filter` results differ from earlier versions** (only the FBP and
-ramp-filter keys of the algorithm golden were regenerated). The
-`pi / n_angles` scale is unchanged and is right for limited tilt ranges
-too: it is pi times the mean over the measured views, so a +-70 degree
-series gives the same level as a full one (checked; the scope report had
-suspected it was off by 180/140).
+ramp-filter keys of the algorithm golden were regenerated).
+
+- **Old FBP results cannot be converted by one factor.** The old error
+  depended on the object's size (a unit cylinder read 0.96 to 0.57 from
+  small to large, with a negative halo of -0.04 to -0.39 around it), so
+  anything tuned on old FBP output needs re-tuning: thresholds,
+  segmentation levels or colour limits (e.g. in the desktop app), and
+  comparisons made through `benchmarks/scripts/utils/torch_radon_wrapper.py`,
+  which imports `ramp_filter`.
+- **FBP is 7-12 % slower**: the zero-padded FFT is at least twice as long.
+  `ramp_filter` 0.07 -> 0.26 ms and 0.85 -> 2.25 ms, `run_fbp` 1.44 ->
+  1.54 ms and 11.1 -> 12.5 ms, at 121 x 256^2 and 121 x 512^2 (CUDA).
+- The `pi / n_angles` scale is unchanged. It is pi times the mean over the
+  measured views, so it keeps the mean level correct at limited tilt too:
+  a +-70 degree series of a rotationally symmetric object gives the same
+  level as a full one (the scope report had suspected it was off by
+  180/140). Anisotropic objects still show an orientation-dependent bias at
+  limited tilt (a 4:1 ellipse at +-70 reads 1.20 or 0.50 depending on its
+  orientation; the missing wedge), which no angular scale removes.
+- fp16 `run_fbp` now applies `pi / n_angles` to the filtered sinogram in
+  fp32, before its cast to fp16, instead of to the fp16 back-projection.
+  The back-projection used to sum `n_angles` unscaled views and could
+  overflow (OverflowError) although the result fits (density 400 over 720
+  views); now it overflows only when the result itself does. fp16 results
+  differ in the last fp16 bit (`cpu/fbp_h` and `cuda/fbp_h` of the
+  algorithm golden regenerated); fp32 is unchanged.
 
 ### ⚠ `run_mbir(multires_levels > 1)`: coarse levels hand over the right values
 
@@ -33,12 +54,14 @@ MSE 6.8 -> 0.82 on a test cylinder). Single-level runs are unchanged.
 
 fp16 projections accumulate in fp32 but store fp16, so a result above
 65504 (the back-projection of an unnormalised sinogram, the forward
-projection of a large volume with large values, FBP before its
-`pi / n_angles` scale, FISTA's first gradient) came back as `inf`. The
-projection functions, the projector classes, `run_fbp` and autograd
-backward now raise `OverflowError` with the remedy (scale the data into
-range, or use fp32) instead; an `inf` that came with the input is passed
-through. `run_sirt`, `run_sart`, `run_fista` and `run_fista_tv` check
+projection of a large volume with large values, FISTA's first gradient)
+came back as `inf`. The projection functions, the projector classes,
+`run_fbp` and autograd backward now raise `OverflowError` with the remedy
+(scale the data into range, or use fp32) instead; an `inf` that came with
+the input is passed through. A NaN from finite input is reported
+separately, as `FloatingPointError` with its own message (it used to be
+reported as an overflow by the algorithms and not at all by the direct
+calls); where an overflow came first, the overflow is reported. `run_sirt`, `run_sart`, `run_fista` and `run_fista_tv` check
 their projections on the device and raise once when they return. fp32 is
 never checked; a direct fp16 call on CUDA pays one flag read (0.06-0.07 ms measured).
 

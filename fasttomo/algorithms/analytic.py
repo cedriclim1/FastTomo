@@ -17,7 +17,7 @@ from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
 )
-from fasttomo.utilities import ramp_filter
+from fasttomo.utilities import _ramp_filter_fp32, ramp_filter
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
     _WBP_MIN_THRESHOLD,
@@ -212,7 +212,12 @@ def run_fbp(
     """Filtered back-projection.
 
     Ramp-filters every detector row, back-projects and scales by
-    ``pi / n_angles``. Shapes, dtypes (fp32/fp16), the support contract and
+    ``pi / n_angles`` (fp16: the filtered sinogram is scaled in fp32 before
+    its cast to fp16, so the back-projection stays in range whenever the
+    result does). ``pi / n_angles`` is pi times the mean over the measured
+    views: it keeps the mean level correct at limited tilt too, but
+    anisotropic objects still show an orientation-dependent bias there
+    (the missing wedge), which no angular scale removes. Shapes, dtypes (fp32/fp16), the support contract and
     the return value follow the Conventions of :mod:`fasttomo.algorithms`;
     the support is applied once, to the final volume
     (``run_fbp(s, a, support_mask=M) == run_fbp(s, a) * M`` bit for bit).
@@ -251,14 +256,25 @@ def run_fbp(
     )
     n_angles, Ny, N_det, Nz, device = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.device)
-    filtered = ramp_filter(sinogram)
+    # angular sampling normalisation: π / n_angles (π times the mean over
+    # the measured views; keeps the mean level right at limited tilt too)
+    scale = math.pi / n_angles
+    if sinogram.dtype == torch.float16:
+        # Scale the filtered sinogram in fp32, before its cast to fp16: the
+        # back-projection then sums n_angles values of ~density * pi / n
+        # into a result of ~density, instead of an unscaled sum n / pi
+        # times larger that can exceed the fp16 range (OverflowError) when
+        # the answer itself fits (density 400 over 720 views).
+        filtered = (_ramp_filter_fp32(sinogram) * scale).to(torch.float16)
+    else:
+        filtered = ramp_filter(sinogram)
     # one back-projection: the one-shot (scoped-texture) path on CUDA
     op = _make_operator(
         Geometry("parallel", (Ny, Nz, N_det), N_det, n_angles, angles_deg),
         device, filtered.dtype, projector, cached=False, num_threads=num_threads)
     volume = op.backproject(filtered)
-    # angular sampling normalisation: π / n_angles
-    volume = volume * (math.pi / n_angles)
+    if sinogram.dtype != torch.float16:
+        volume = volume * scale
     if support_mask is not None:
         # Validate against the actual output shape — a cached projector may
         # reconstruct with Nz != N_det.
