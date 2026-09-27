@@ -95,6 +95,68 @@
   before its update, for SIRT-type algorithms and AD; the `loss_callback`
   contract (values, indices, types) is unchanged.
 
+### CPU projection kernels: Y-batched SIMD, 5-9x faster, same bits
+
+The single-axis CPU kernels computed the sample geometry of every ray step
+once per Y slice in scalar code. They now process Y in blocks of 16 slices
+on Y-innermost copies, compute the geometry once per step and apply it to
+the block with a SIMD loop, over a clipped step range; every lane does the
+scalar loop's fp32 operations in the same order, so the results are
+**bit-identical** to the previous kernels (memcmp over 11 shapes x
+1/3/8/16 threads). Interleaved A/B on an EPYC 9555 (default portable
+build), 1 / 8 threads:
+
+| kernel | 8x128^2, 61 views | 32x256^2, 61 views |
+|---|---|---|
+| `forward_project` (parallel) | 5.8x / 5.7x | 8.7x / 8.8x |
+| `back_project` (ray-driven, parallel) | 5.6x / 3.8x | 8.7x / 7.3x |
+| gather back-projection (W-BP, wSIRT, CPU FBP) | 5.3x / 5.0x | 6.4x / 6.4x |
+| `grad_angle` | 5.6x / 5.5x | 7.3x / 7.3x |
+| `forward_project_3d` (rotmat) | 1.7x / 1.7x | |
+
+- The parallel back-projection now uses all threads for any Ny (it
+  parallelised over Y only; Ny = 1 ran on one thread: 7x at 8 threads for
+  1x256^2), and its result does not depend on `num_threads`.
+- The rotmat forward and `grad_rotmat` clip rays to the volume and load
+  interior trilinear corners directly (1.7x and 1.1-1.2x, bit-identical).
+- **`grad_angle` (CPU) changes in the last bits**: its per-angle sums are
+  now fp64 in an order fixed by the geometry, so the result no longer
+  depends on the thread count, and its error against an fp64 evaluation
+  drops from 1e-6..8e-6 to about 2e-7 (only the `cpu/fp_grad_angles`
+  golden key was regenerated).
+- CPU SIRT/SART/FISTA/GD iterations are dominated by these kernels (CPU
+  `run_sirt` 8x128^2 x 61 views, 16 threads: 9.8 -> 1.7 ms/iter).
+- Scratch memory: the kernels allocate up to Nz*Nx*16 floats (plus
+  n_angles*N_det*16 for the back-projection) per call; an allocation
+  failure raises MemoryError.
+
+### Non-finite tilt angles raise ValueError
+
+A NaN or Inf tilt angle crashed the process on CPU (the parallel kernels
+indexed memory with `(int)NaN`). Host-side angles and rotation matrices
+holding NaN or Inf now raise ValueError at every entry point, on both
+backends (CUDA-resident angles are not checked, which would add a sync to
+every CUDA projection; the CUDA kernels do not crash), and the CPU kernels
+skip NaN samples instead of reading out of bounds.
+
+### Build: `-ffp-contract=off` for the C kernels
+
+`FASTTOMO_MARCH_NATIVE=ON` let the compiler fuse `a*b + c` into FMA
+instructions, which changed CPU results in the last bits (and
+`grad_rotmat` by up to 3.4e-2 of its max at trilinear kinks) without the
+golden fingerprint noticing. Both builds now pass `-ffp-contract=off`: a
+native build gives the same bits as the portable one and is still 1.1-2x
+faster at 32x256^2 (AVX-512). The default build is unchanged.
+
+### `OMP_NUM_THREADS` lists
+
+`OMP_NUM_THREADS="4,2"` (OpenMP's per-nesting-level list) made the CPU
+kernels run on 1 thread; they now use the first entry. A value that is not
+a thread count warns and uses 1. The `num_threads` documentation now says
+to set torch's intra-op threads to the same count for CPU solver loops
+(both share one OpenMP runtime; mismatched they oversubscribe the cores:
+1.7 vs 20.8 ms per CPU SIRT iteration above).
+
 ### ⚠ CPU `run_fbp` output changes: shift-invariant back-projection (more accurate)
 
 CPU `run_fbp` back-projected with the CPU forward projector's ray-driven
