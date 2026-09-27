@@ -19,6 +19,7 @@ from fasttomo._operator import (
     _UserProjectorOperator,
     _drain_deferred_handles,
     _make_operator,
+    _release_texture_pool,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.autograd import euler_zyz_to_rotmat
@@ -576,8 +577,8 @@ def _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev, vol_shape, N_d
 
     Parallel geometry: both are the same in every Y-slice, bit for bit
     (``test_parallel_normalisers_are_y_invariant``), so they are computed on
-    an operator of one texel row (the main operator's packing: 4 slices for
-    packed fp16 textures, else 1), R_S broadcast into slices of one
+    an operator of one texel row (the main operator's packing: 2 fp32 or 4
+    fp16 slices per packed texel, else 1), R_S broadcast into slices of one
     sinogram and C_S kept as a ``[1, Nz, Nx]`` plane. Rotation matrices:
     full volumes from the main operator."""
     Ny, Nz, Nx = vol_shape
@@ -817,9 +818,17 @@ def release_cached_projectors() -> int:
     64 MiB per device reserved for the life of the process, outside
     PyTorch's allocator (not counted by ``torch.cuda.memory_*``).
 
+    It also frees the texture pool of the one-shot CUDA projections
+    (``forward_project``, ``back_project``, the ``*_3d`` variants and
+    ``run_fbp``): up to 4 texture arrays of the most recently used shapes,
+    kept so that repeated calls neither allocate nor synchronise
+    (``fasttomo._operator._TexturePool``); they are not counted in the
+    return value.
+
     Returns the number of configurations released (0 or 1). Safe to call at
     any time, also without CUDA.
     """
+    _release_texture_pool()
     _clear_wf_cache()
     n = _SIRT_OPERATORS.clear()
     if n and torch.cuda.is_available():

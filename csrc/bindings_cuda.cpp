@@ -23,7 +23,7 @@ static void py_forward_project_parallel_cuda(
     long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, long nonfinite_ptr
 ) {
     forward_project_parallel_cuda(
         io_dtype,
@@ -32,7 +32,8 @@ static void py_forward_project_parallel_cuda(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr),
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -41,7 +42,7 @@ static void py_back_project_parallel_cuda(
     long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr
+    long stream_ptr, long nonfinite_ptr
 ) {
     back_project_parallel_cuda(
         io_dtype,
@@ -50,7 +51,8 @@ static void py_back_project_parallel_cuda(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr)
+        to_stream(stream_ptr),
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -174,8 +176,8 @@ static long py_tc_create(int kind, int dtype, int channels,
         throw std::invalid_argument("tc_create: kind must be 0..2");
     if (dtype < 0 || dtype > 1)
         throw std::invalid_argument("tc_create: dtype must be 0 (fp32) or 1 (fp16)");
-    if (channels != 1 && channels != 4)
-        throw std::invalid_argument("tc_create: channels must be 1 or 4");
+    if (channels != 1 && channels != 2 && channels != 4)
+        throw std::invalid_argument("tc_create: channels must be 1, 2 or 4");
     TextureCache *tc = tc_create_ex(
         static_cast<tc_kind_t>(kind),
         static_cast<tc_dtype_t>(dtype),
@@ -209,7 +211,7 @@ static void py_forward_project_parallel_cuda_cached(
     long vol_ptr, long sino_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr, bool upload
+    long stream_ptr, bool upload, long nonfinite_ptr
 ) {
     forward_project_parallel_cuda_cached(
         io_dtype,
@@ -219,7 +221,8 @@ static void py_forward_project_parallel_cuda_cached(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr), upload ? 1 : 0
+        to_stream(stream_ptr), upload ? 1 : 0,
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -229,7 +232,7 @@ static void py_back_project_parallel_cuda_cached(
     long sino_ptr, long vol_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
-    long stream_ptr, bool upload
+    long stream_ptr, bool upload, long nonfinite_ptr
 ) {
     back_project_parallel_cuda_cached(
         io_dtype,
@@ -239,7 +242,8 @@ static void py_back_project_parallel_cuda_cached(
         reinterpret_cast<const float *>(cos_ptr),
         reinterpret_cast<const float *>(sin_ptr),
         Ny, Nz, Nx, n_angles, N_det,
-        to_stream(stream_ptr), upload ? 1 : 0
+        to_stream(stream_ptr), upload ? 1 : 0,
+        reinterpret_cast<int *>(nonfinite_ptr)
     );
 }
 
@@ -524,24 +528,26 @@ void register_cuda(py::module_ &m) {
           py::call_guard<py::gil_scoped_release>(),
           "Forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints. "
-          "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream).",
+          "stream_ptr: torch.cuda.Stream.cuda_stream (0 → default stream). "
+          "nonfinite_ptr: optional device int32, fp16 stores OR in 1 (inf) / 2 (NaN).",
           py::arg("io_dtype"),
           py::arg("vol_ptr"), py::arg("sino_ptr"),
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("nonfinite_ptr") = 0L);
 
     m.def("back_project_parallel_cuda", &py_back_project_parallel_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "Back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
-          "All ptr args are device data_ptr() ints.",
+          "All ptr args are device data_ptr() ints. nonfinite_ptr: optional "
+          "device int32, fp16 stores OR in 1 (inf) / 2 (NaN).",
           py::arg("io_dtype"),
           py::arg("sino_ptr"), py::arg("vol_ptr"),
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("nonfinite_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda", &py_forward_project_rotmat_cuda,
           py::call_guard<py::gil_scoped_release>(),
@@ -625,9 +631,10 @@ void register_cuda(py::module_ &m) {
           "Allocate a persistent cudaArray + cudaTextureObject. "
           "kind: 0=TC_VOL_LAYERED (FP scalar), 1=TC_SINO_LAYERED (BP scalar/rotmat), "
           "2=TC_VOL_3D (FP rotmat). dtype: 0=fp32, 1=fp16. "
-          "channels: 1 (default) or 4. channels=4 enables TorchRadon-style "
-          "Y-axis packing (4 Y-slices per texel) — fp16 only, packing-axis "
-          "must be divisible by 4. dim_a/b/c match the source-tensor dims "
+          "channels: 1 (default), 2 or 4: TorchRadon-style Y-axis packing "
+          "(2 Y-slices per float2 texel for fp32, 4 per texel for fp16; any "
+          "Ny, the last texel is zero-padded; layered kinds only; see "
+          "parallel_channels). dim_a/b/c match the source-tensor dims "
           "in C order: vol is (Ny,Nz,Nx); sino is (n_angles,Ny,N_det). "
           "Returns an opaque integer handle — pass to tc_destroy when done. "
           "surface=True also creates a surface object on a 1-channel cache "
@@ -636,6 +643,12 @@ void register_cuda(py::module_ &m) {
           py::arg("kind"), py::arg("dtype"), py::arg("channels"),
           py::arg("dim_a"), py::arg("dim_b"), py::arg("dim_c"),
           py::arg("surface") = false);
+
+    m.def("parallel_channels", &parallel_channels,
+          "Y slices per texel of the parallel FP/BP textures for io_dtype "
+          "(0 = fp32, 1 = fp16) and Ny: what the one-shot wrappers use, and "
+          "what a cached caller passes to tc_create so both share a layout.",
+          py::arg("io_dtype"), py::arg("Ny"));
 
     m.def("tc_has_surface", &py_tc_has_surface,
           "True if the TextureCache handle has a surface object (writable "
@@ -661,7 +674,8 @@ void register_cuda(py::module_ &m) {
           py::arg("cos_ptr"),    py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true,
+          py::arg("nonfinite_ptr") = 0L);
 
     m.def("back_project_parallel_cuda_cached", &py_back_project_parallel_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
@@ -673,7 +687,8 @@ void register_cuda(py::module_ &m) {
           py::arg("cos_ptr"),      py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("n_angles"), py::arg("N_det"),
-          py::arg("stream_ptr") = 0L, py::arg("upload") = true);
+          py::arg("stream_ptr") = 0L, py::arg("upload") = true,
+          py::arg("nonfinite_ptr") = 0L);
 
     m.def("forward_project_rotmat_cuda_cached", &py_forward_project_rotmat_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),

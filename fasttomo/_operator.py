@@ -29,7 +29,10 @@ Adapters (chosen by ``_make_operator``):
 
 ``UncachedOperator``     every call goes through the raw ``_launch`` layer
                          (fasttomo/autograd.py). The CPU adapter; on CUDA it
-                         is the one-shot path (a scoped texture per call).
+                         is the one-shot path: the functional API and FBP.
+                         Its textures come from a small process-wide pool
+                         (:class:`_TexturePool`) instead of being allocated
+                         and freed (with a stream sync) on every call.
 ``CudaCachedOperator``   persistent ``TextureCache`` handles reused across
                          calls (what the cached projectors always did); the
                          parallel angle gradient falls back to the uncached
@@ -45,7 +48,10 @@ layout, so they agree bit for bit (``tests/test_parity.py``).
 
 from __future__ import annotations
 
+import itertools
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -98,6 +104,11 @@ class Geometry:
     N_det: int
     n_angles: int
     angles_deg: torch.Tensor | None = None
+
+
+def _word_ptr(word: torch.Tensor | None) -> int:
+    """Binding pointer of an optional non-finite report word (0 = none)."""
+    return 0 if word is None else word.data_ptr()
 
 
 class ProjectionOperator:
@@ -174,6 +185,21 @@ class ProjectionOperator:
         cached rotmat adapter's volume-texture upload). ``None`` if the
         adapter keeps none."""
         return None
+
+    def _nonfinite_word(self, x: torch.Tensor) -> torch.Tensor | None:
+        """A zeroed int32 device word for ``fp(x, nonfinite=...)`` /
+        ``bp(x, nonfinite=...)`` when this adapter's kernels report the
+        non-finite values they store (the fp16 parallel CUDA kernels: 1 =
+        an inf, 2 = a NaN), else None. The fp16 range check then reads the
+        word instead of scanning the result (`_backend._check_fp16_range`).
+        None while a CUDA graph is being captured (nothing is checked)."""
+        return None
+
+    def _parallel_fp16_word(self, x: torch.Tensor) -> torch.Tensor | None:
+        if (self.kind != "parallel" or not x.is_cuda or x.dtype != torch.float16
+                or torch.cuda.is_current_stream_capturing()):
+            return None
+        return torch.zeros(1, dtype=torch.int32, device=x.device)
 
     # ── differentiable layer ─────────────────────────────────────────────
     def project(self, volume: torch.Tensor, geom: torch.Tensor | None = None) -> torch.Tensor:
@@ -256,19 +282,25 @@ class UncachedOperator(ProjectionOperator):
         # zero-size errors; otherwise they name the kernel
         self._label = name
 
-    def fp(self, volume, geom=None):
+    def fp(self, volume, geom=None, *, nonfinite=None):
         if self.kind == "parallel":
             return _forward_project_parallel_raw(volume, self._angles(geom), self.N_det,
-                                                 self.num_threads, label=self._label)
+                                                 self.num_threads, label=self._label,
+                                                 nonfinite=nonfinite, texture=_TEXTURE_POOL)
         return _forward_project_rotmat_raw(volume, self._rotmat_geom(geom), self.N_det,
-                                           self.num_threads, label=self._label)
+                                           self.num_threads, label=self._label,
+                                           texture=_TEXTURE_POOL)
 
-    def bp(self, sinogram, geom=None):
+    def bp(self, sinogram, geom=None, *, nonfinite=None):
         if self.kind == "parallel":
             return _back_project_parallel_raw(sinogram, self._angles(geom), self.Nz,
-                                              self.num_threads, Nx=self.Nx, label=self._label)
+                                              self.num_threads, Nx=self.Nx, label=self._label,
+                                              nonfinite=nonfinite, texture=_TEXTURE_POOL)
         return _back_project_rotmat_raw(sinogram, self._rotmat_geom(geom), self.Nz,
-                                        self.num_threads, Nx=self.Nx, label=self._label)
+                                        self.num_threads, Nx=self.Nx, label=self._label,
+                                        texture=_TEXTURE_POOL)
+
+    _nonfinite_word = ProjectionOperator._parallel_fp16_word
 
     def grad_geom(self, volume, grad_sino, geom=None, token=None):
         if self.kind == "parallel":
@@ -282,9 +314,10 @@ class CudaCachedOperator(ProjectionOperator):
     One volume ``TextureCache`` (layered for parallel, 3-D for rotmat) and
     one sinogram cache per view count, created on first use and released
     when the operator is collected (deferred while a CUDA graph is being
-    captured). The I/O dtype locks on first use; fp16 parallel caches pack
-    4 Y-slices per texel when ``Ny % 4 == 0``, exactly like the one-shot
-    wrappers, so cached and uncached results are identical.
+    captured). The I/O dtype locks on first use; parallel caches pack
+    Y-slices into one texel (2 per float2 texel for fp32, 4 for fp16; see
+    ``_channels``), exactly like the one-shot wrappers, so cached and
+    uncached results are identical.
 
     Gradients w.r.t. the geometry: parallel falls back to the uncached
     ``grad_angle`` kernel; rotmat samples the volume texture its forward
@@ -377,11 +410,13 @@ class CudaCachedOperator(ProjectionOperator):
             self._sin.copy_(sin_a)
 
     def _channels(self) -> int:
-        # 4-channel packed-Y mode for fp16 parallel caches when Ny % 4 == 0
-        # (TorchRadon's batch-channel-packing trick); rotmat needs continuous
-        # Y interpolation (tex3D) and stays single-channel.
-        if self.kind == "parallel" and self.dtype == torch.float16 and self.Ny % 4 == 0:
-            return 4
+        # Y-slice packing of the parallel textures (TorchRadon's
+        # batch-channel-packing trick), the layout the one-shot wrappers use:
+        # _core.parallel_channels (2 slices per float2 texel for fp32, 4 per
+        # fp16 texel; texture_cache.h). Rotmat needs continuous Y
+        # interpolation (tex3D) and stays single-channel.
+        if self.kind == "parallel":
+            return int(_core.parallel_channels(_dtype_to_tc_code(self.dtype), self.Ny))
         return 1
 
     def _vol_cache(self) -> int:
@@ -489,7 +524,9 @@ class CudaCachedOperator(ProjectionOperator):
         self._check_device(t, name)
         self._check_shape(t, name, shape)
 
-    def fp(self, volume, geom=None):
+    _nonfinite_word = ProjectionOperator._parallel_fp16_word
+
+    def fp(self, volume, geom=None, *, nonfinite=None):
         io_dtype = self._lock_dtype(volume)
         self._check_input(volume, "volume", self.vol_shape)
         with torch.cuda.device(self.device):
@@ -506,7 +543,7 @@ class CudaCachedOperator(ProjectionOperator):
                     io_dtype, h, vol.data_ptr(), sino.data_ptr(),
                     cos_a.data_ptr(), sin_a.data_ptr(),
                     self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
-                    upload=upload)
+                    upload=upload, nonfinite_ptr=_word_ptr(nonfinite))
             else:
                 mats = self._mats(geom)
                 n = mats.shape[0]
@@ -524,26 +561,29 @@ class CudaCachedOperator(ProjectionOperator):
             self.upload_counts["vol_skipped"] += 1
         return sino
 
-    def bp(self, sinogram, geom=None):
+    def bp(self, sinogram, geom=None, *, nonfinite=None):
         io_dtype = self._lock_dtype(sinogram)
-        return self._bp(io_dtype, sinogram.contiguous(), geom)
+        return self._bp(io_dtype, sinogram.contiguous(), geom, nonfinite)
 
     def bp_from_texture(self, geom=None) -> torch.Tensor:
         """Back-project the sinogram a kernel wrote into the texture for
         this view count (``_mark_sino_written``), without an upload."""
         if self.dtype is None:
             raise RuntimeError(f"{self._name}: bp_from_texture before any upload")
-        vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom)
+        word = None
+        if self.dtype == torch.float16:     # fp32: nothing is checked
+            word = self._nonfinite_word(torch.empty(0, dtype=self.dtype, device=self.device))
+        vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom, word)
         # the fp16 overflow check `backproject` runs (inside an fp16
         # run_sirt: a device-side flag); the input sinogram is the texture,
         # so a zero stands in for it (an inf is then never blamed on the
         # input, which the fused residual kernel produced finite). fp32 has
         # no check: no zero tensor (one fill kernel per SIRT iteration).
         if vol.dtype == torch.float16:
-            _check_fp16_range(vol, vol.new_zeros(()), self._name)
+            _check_fp16_range(vol, vol.new_zeros(()), self._name, nonfinite=word)
         return vol
 
-    def _bp(self, io_dtype, sino, geom):
+    def _bp(self, io_dtype, sino, geom, nonfinite=None):
         """``bp`` of ``sino``, or (``sino`` None) of the texture's contents."""
         with torch.cuda.device(self.device):
             self._order_after_other_streams()
@@ -570,7 +610,7 @@ class CudaCachedOperator(ProjectionOperator):
                     io_dtype, self._sino_cache(n), sino_ptr, vol.data_ptr(),
                     cos_a.data_ptr(), sin_a.data_ptr(),
                     self.Ny, self.Nz, self.Nx, n, self.N_det, _stream_ptr(self.device),
-                    upload=upload)
+                    upload=upload, nonfinite_ptr=_word_ptr(nonfinite))
             else:
                 _core.back_project_rotmat_cuda_cached(
                     io_dtype, self._sino_cache(n), sino_ptr, vol.data_ptr(),
@@ -766,3 +806,121 @@ def _release_handles(device: torch.device, handles: list[int]) -> None:
     for h in handles:
         _destroy(device, h)
     _drain_deferred_handles()
+
+
+# ── texture pool of the one-shot CUDA path (functional API, FBP) ────────────
+
+class _TexturePool:
+    """Texture caches of the one-shot CUDA path, kept between calls.
+
+    ``forward_project`` / ``back_project`` / ``*_3d`` and ``run_fbp`` on CUDA
+    used to build a texture per call (``cudaMalloc3DArray`` + texture object),
+    run the kernel, then synchronise the stream and free it: +0.15 ms per
+    call at 128-256^3 and +1.5 ms at 512^3 fp32, and the host blocked until
+    the kernel had finished, so a Python loop of calls could not queue work.
+    Now `_launch` leases a cache from this pool, runs the cached kernel
+    (upload + launch, stream-ordered, no sync) and returns the cache.
+
+    * Keyed by (device index, texture kind, I/O dtype, channels, dims): a
+      cache is only reused for the same shape and layout.
+    * At most ``maxsize`` (4) caches are kept, least recently used evicted;
+      memory retained is up to 4 textures, e.g. a 512^3 fp32 volume texture
+      is 512 MiB (outside PyTorch's allocator, not counted by
+      ``torch.cuda.memory_allocated``). :func:`release_cached_projectors`
+      (fasttomo.algorithms) frees them; so does an allocation failure of a
+      new texture (the pool is emptied and the allocation retried once).
+    * Thread-safe: a lease takes the cache out of the pool (``checkout``)
+      until the call has queued its work, so concurrent calls never share
+      one (a second one is created instead).
+    * Streams: the lease records the stream it ran on. A later call on
+      another stream makes its stream wait for that one first
+      (``wait_stream``, no host sync), so its upload cannot overwrite the
+      texture while the earlier kernel still reads it (the ordering
+      ``CudaCachedOperator`` applies since PR #95). Destroying a cache
+      synchronises the device first.
+    * CUDA-graph capture: not used (a captured graph would keep reading a
+      cache the pool may evict later); a call during capture takes the
+      one-shot binding as before.
+    """
+
+    def __init__(self, maxsize: int = 4) -> None:
+        self.maxsize = maxsize
+        # serial -> (key, handle, stream of the last lease); oldest first
+        self._free: OrderedDict[int, tuple] = OrderedDict()
+        self._serial = itertools.count()
+        self._lock = threading.Lock()
+        self.created = 0       # debug counter (tests): textures created
+
+    def launch(self, op: str, spec: tuple, ptrs: list, device: torch.device,
+               kwargs: dict) -> None:
+        """Run ``_core.<op>_cuda_cached`` for the one-shot binding's
+        arguments ``ptrs`` (io_dtype first) on a leased cache of layout
+        ``spec`` = (kind, io_dtype, channels, dim_a, dim_b, dim_c)."""
+        stream_ptr = _stream_ptr(device)
+        if torch.cuda.is_current_stream_capturing():
+            getattr(_core, op + "_cuda")(*ptrs, stream_ptr, **kwargs)
+            return
+        key = (device.index, *spec)
+        handle, last = self._checkout(key, device)
+        cur = torch.cuda.current_stream(device)
+        try:
+            if last is not None and last != cur:
+                cur.wait_stream(last)
+            getattr(_core, op + "_cuda_cached")(ptrs[0], handle, *ptrs[1:], stream_ptr,
+                                                upload=True, **kwargs)
+        finally:
+            self._checkin(key, handle, cur)
+
+    def _checkout(self, key: tuple, device: torch.device) -> tuple[int, object]:
+        with self._lock:
+            for serial, (k, handle, last) in self._free.items():
+                if k == key:
+                    del self._free[serial]
+                    return handle, last
+        kind, dtype, channels, a, b, c = key[1:]
+        try:
+            handle = int(_core.tc_create(kind, dtype, channels, a, b, c))
+        except RuntimeError:
+            # most likely out of memory: free what the pool holds, retry once
+            if not self.clear(device):
+                raise
+            handle = int(_core.tc_create(kind, dtype, channels, a, b, c))
+        self.created += 1
+        return handle, None
+
+    def _checkin(self, key: tuple, handle: int, stream) -> None:
+        with self._lock:
+            self._free[next(self._serial)] = (key, handle, stream)
+            evicted = []
+            while len(self._free) > self.maxsize:
+                evicted.append(self._free.popitem(last=False)[1])
+        for k, h, _ in evicted:
+            _release_handles(torch.device("cuda", k[0]), [h])
+
+    def clear(self, device: torch.device | None = None) -> int:
+        """Destroy the pooled caches (of ``device`` only, if given); returns
+        how many. Caches leased by a running call are not affected."""
+        with self._lock:
+            keep, drop = OrderedDict(), []
+            for serial, entry in self._free.items():
+                if device is None or entry[0][0] == device.index:
+                    drop.append(entry)
+                else:
+                    keep[serial] = entry
+            self._free = keep
+        for k, h, _ in drop:
+            _release_handles(torch.device("cuda", k[0]), [h])
+        return len(drop)
+
+    def __len__(self) -> int:
+        return len(self._free)
+
+
+_TEXTURE_POOL = _TexturePool()
+
+
+def _release_texture_pool() -> int:
+    """Free the one-shot path's pooled textures (release_cached_projectors)."""
+    if not _TEXTURE_POOL:
+        return 0
+    return _TEXTURE_POOL.clear()

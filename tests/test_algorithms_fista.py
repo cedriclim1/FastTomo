@@ -441,9 +441,10 @@ def _fista_cases(dtype, Ny):
                                        (torch.float16, 4)])
 def test_fista_fused_path_bit_identical(monkeypatch, dtype, Ny):
     """run_fista / run_fista_tv with the fused kernels and direct volume-
-    texture writes give exactly the PyTorch chain's bits (fp16 with
-    Ny % 4 == 0: packed textures; rotmat: 3-D texture), and the forward
-    projection of the new iterate skips its upload."""
+    texture writes give exactly the PyTorch chain's bits (Ny >= 2: packed
+    textures, 2 fp32 or 4 fp16 slices per texel, Ny = 3 zero-padded;
+    rotmat: 3-D texture), and the forward projection of the new iterate
+    skips its upload."""
     from fasttomo.algorithms import fista
 
     fused = []

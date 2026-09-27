@@ -614,8 +614,8 @@ def _assert_no_leak(fail_once, array_bytes, n_calls=200, attempts=3):
                 f"(bound {bound // _MiB} MiB)")
 
 
-# grid.z = n_angles (rotmat FP / grad) and grid.y = ceil(n_angles / 16)
-# (parallel FP) exceed the 65535 launch limit: the launch fails *after* the
+# grid.z = n_angles (rotmat FP / grad) and grid.y = ceil(n_angles / 8)
+# (parallel FP, 32x8 blocks) exceed the 65535 launch limit: the launch fails *after* the
 # one-shot cudaArray was created and filled, which used to leak it (D5).
 _TOO_MANY_ROTMAT = 65536
 _TOO_MANY_PARALLEL = 65535 * 16 + 1
@@ -675,8 +675,10 @@ def test_tc_create_failure_does_not_leak(stage, kind, dtype, channels, dims):
 @needs_cuda
 def test_texture_limits_raise_clear_error_without_leak():
     """P4: more than 2048 layers is a clear ValueError, not a generic CUDA
-    'invalid argument', and it leaks nothing."""
-    vol = torch.zeros(2049, 8, 8, device="cuda")
+    'invalid argument', and it leaks nothing. An fp32 volume packs 2
+    Y-slices per float2 texel, so its limit is 4096 slices (2048 layers)."""
+    ft.forward_project(torch.zeros(2049, 8, 8, device="cuda"), torch.zeros(4, device="cuda"))
+    vol = torch.zeros(4097, 8, 8, device="cuda")
     with pytest.raises(ValueError, match="limit"):
         ft.forward_project(vol, torch.zeros(4, device="cuda"))
     sino = torch.zeros(2049, 1, 8, device="cuda")

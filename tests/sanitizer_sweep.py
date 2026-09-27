@@ -7,11 +7,14 @@ down by orders of magnitude and CI has no GPU. Run on a free GPU with
     compute-sanitizer --tool racecheck --error-exitcode 1 python tests/sanitizer_sweep.py
 
 (append ``tv`` to run only the TV-loss kernels, ``solvers`` for the SIRT,
-SART, FISTA-update and TV-prox kernels).
+SART, FISTA-update and TV-prox kernels, ``parallel`` for the parallel-beam
+FP/BP, texture-pool and packed-texture variants).
 
-Sizes 1, 15, 17, 33 and 37 cover single-element, partial-block (16x16 and
-8x8x4 blocks), multi-block and prime extents; Ny = 4 and 8 take the 4-channel
-packed fp16 path, the others the 1-channel path.
+Sizes 1, 15, 17, 33 and 37 cover single-element, partial-block (16x16,
+32x8 and 8x8x4 blocks), multi-block and prime extents; Ny = 1 takes the
+1-channel parallel textures, every Ny >= 2 the packed ones (2 fp32 slices
+per float2 texel, 4 fp16 slices per texel, zero-padded when Ny is not a
+multiple).
 """
 
 import torch
@@ -56,6 +59,65 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
     clip_and_tv_variants(g)
     sirt_variants(g)
     solver_variants(g)
+    parallel_variants(g)
+
+
+def parallel_variants(g) -> None:
+    """The parallel-beam FP/BP kernels (1-channel, float2 and 4-channel half
+    textures) for Ny = 1..8 (every Ny % 4, padded last texels), N_det above
+    and below Nx: the one-shot binding, the pooled functional path, a cached
+    projector, CUDA-resident NaN angles (the checked BP loop), the fp16
+    non-finite report word, packed tc_download, and run_sirt's packed fused
+    kernels (eager and graph) on odd Ny."""
+    from fasttomo._operator import _TEXTURE_POOL
+    from fasttomo.algorithms import algebraic
+    from fasttomo.autograd import _back_project_parallel_raw, _forward_project_parallel_raw
+    import fasttomo._core as core
+    from fasttomo._backend import _stream_ptr
+
+    dev = torch.device("cuda")
+    for (Nz, Nx), N_det in (((1, 2), 3), ((15, 17), 13), ((33, 31), 37)):
+        for Ny in (1, 2, 3, 4, 5, 6, 7, 8):
+            n_ang = 7
+            angles = torch.linspace(-90, 90, n_ang, device=dev)
+            bad = angles.clone()
+            bad[3] = float("nan")
+            vol = torch.rand(Ny, Nz, Nx, generator=g).to(dev)
+            for dtype in (torch.float32, torch.float16):
+                v = vol.to(dtype)
+                s = _forward_project_parallel_raw(v, angles, N_det)
+                _back_project_parallel_raw(s, angles, Nz, Nx=Nx)
+                s = ft.forward_project(v, angles, N_det=N_det)
+                ft.back_project(s, angles, Nz=Nz, Nx=Nx)
+                ft.forward_project(v, bad, N_det=N_det)
+                ft.back_project(s, bad, Nz=Nz, Nx=Nx)
+                pp = ft.ParallelProjector((Ny, Nz, Nx), angles, N_det=N_det)
+                pp.back(pp.forward(v))
+                if dtype == torch.float16:
+                    try:
+                        ft.back_project(torch.full_like(s, 3e4), angles, Nz=Nz, Nx=Nx)
+                    except OverflowError:
+                        pass
+                    h = core.tc_create(0, 1, 4, Ny, Nz, Nx) if Ny > 1 else None
+                else:
+                    h = core.tc_create(0, 0, 2, Ny, Nz, Nx) if Ny > 1 else None
+                if h is not None:
+                    out = torch.empty_like(v)
+                    core.tc_upload(h, v.data_ptr(), _stream_ptr(dev))
+                    core.tc_download(h, out.data_ptr(), _stream_ptr(dev))
+                    torch.cuda.synchronize()
+                    core.tc_destroy(h)
+                sino = s.float().to(dtype)
+                sm = (torch.rand(Ny, Nz, N_det, generator=g) > 0.3).to(dev, dtype)
+                for kw in (dict(), dict(positivity=True, support_mask=sm, return_loss=True)):
+                    algebraic._SIRT_OPERATORS.clear()
+                    ft.run_sirt(sino, angles, 2, Nz=Nz, **kw)
+                    ft.run_sirt(sino, angles, 2, Nz=Nz, **kw)
+                del pp
+            torch.cuda.synchronize()
+            print(f"ok parallel Ny={Ny} Nz={Nz} Nx={Nx} N_det={N_det}", flush=True)
+    algebraic._SIRT_OPERATORS.clear()
+    _TEXTURE_POOL.clear()
 
 
 def sirt_variants(g) -> None:
@@ -209,5 +271,7 @@ if __name__ == "__main__":
         g = torch.Generator(device="cpu").manual_seed(0)
         sirt_variants(g)
         solver_variants(g)
+    elif sys.argv[1:] == ["parallel"]:  # only the parallel-beam kernels
+        parallel_variants(torch.Generator(device="cpu").manual_seed(0))
     else:
         sweep()

@@ -44,6 +44,9 @@ from fasttomo.regularizers import _first_order_only
 # Moved to fasttomo._backend (ARCH P8); imported here so the raw layer below
 # and the old ``fasttomo.autograd._X`` import paths keep working.
 from fasttomo._backend import (  # noqa: F401
+    _TC_SINO_LAYERED,
+    _TC_VOL_3D,
+    _TC_VOL_LAYERED,
     _assert_cuda,
     _assert_dtype_match,
     _check_finite_geometry,
@@ -150,8 +153,31 @@ def _mats_input(mats_flat: torch.Tensor, device: torch.device) -> torch.Tensor:
     return mats
 
 
+def _nonfinite_kwargs(nonfinite: torch.Tensor | None, t: torch.Tensor) -> dict | None:
+    """The CUDA binding keyword for an optional non-finite report word."""
+    if nonfinite is None or not t.is_cuda:
+        return None
+    return {"nonfinite_ptr": _data_ptr(nonfinite, "nonfinite", t.device)}
+
+
+def _texture_spec(texture, t: torch.Tensor, kind: int, channels, dims) -> tuple | None:
+    """``(pool, (kind, io_dtype, channels, *dims))`` for `_launch` when a CUDA
+    call should lease a pooled texture (``texture`` is the pool,
+    fasttomo._operator._TexturePool), else None. ``channels`` is a callable
+    of io_dtype (only evaluated on a CUDA build)."""
+    if texture is None or not t.is_cuda or not _core.cuda_available:
+        return None
+    io = _io_dtype_code(t)
+    return texture, (kind, io, int(channels(io)), *(int(d) for d in dims))
+
+
+def _parallel_channels(Ny: int):
+    return lambda io: _core.parallel_channels(io, Ny)
+
+
 def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = None,
-            num_threads: int | None = None, label: str | None = None) -> torch.Tensor:
+            num_threads: int | None = None, label: str | None = None,
+            cuda_kwargs: dict | None = None, texture: tuple | None = None) -> torch.Tensor:
     """Run ``_core.<op>_cuda`` or ``_core.<op>_cpu`` on ``out``'s device.
 
     ``shapes`` lists ``(name, expected_shape)`` for every tensor argument, in
@@ -167,7 +193,11 @@ def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = No
     cannot launch an empty grid or build an empty texture, and the CPU
     kernels used to return empty tensors instead; one backend-independent
     error is the chosen contract. ``label`` (default ``op``) heads that
-    error: the public function a one-shot call came from.
+    error: the public function a one-shot call came from. ``cuda_kwargs``
+    are passed by keyword to the CUDA binding only. ``texture`` (from
+    `_texture_spec`): run the ``<op>_cuda_cached`` binding on a texture
+    leased from that pool instead of the one-shot binding, which allocates
+    and frees a texture (and syncs the stream) on every call.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
     if len(shapes) != len(tensors):
@@ -189,7 +219,11 @@ def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = No
         if io_dtype is not None:
             ptrs.insert(0, io_dtype)
         with _on_device(out):
-            getattr(_core, op + "_cuda")(*ptrs, _stream_ptr(out.device))
+            if texture is not None:
+                pool, spec = texture
+                pool.launch(op, spec, ptrs, out.device, cuda_kwargs or {})
+            else:
+                getattr(_core, op + "_cuda")(*ptrs, _stream_ptr(out.device), **(cuda_kwargs or {}))
     else:
         getattr(_core, op + "_cpu")(*ptrs, _resolve_num_threads(num_threads))
     return out
@@ -202,8 +236,13 @@ def _forward_project_parallel_raw(
     num_threads: int | None = None,
     *,
     label: str | None = None,
+    nonfinite: torch.Tensor | None = None,
+    texture=None,
 ) -> torch.Tensor:
-    """Single-axis FP. Output dtype = volume dtype (CPU computes in fp32)."""
+    """Single-axis FP. Output dtype = volume dtype (CPU computes in fp32).
+    ``nonfinite`` (CUDA): an int32 device word the fp16 kernel ORs 1 (inf)
+    or 2 (NaN) into when it stores a non-finite value. ``texture`` (CUDA):
+    a texture pool to lease the volume texture from (`_launch`)."""
     vol = _kernel_input(volume, "volume")
     Ny, Nz, Nx = vol.shape
     n_angles = angles_deg.numel()
@@ -214,7 +253,10 @@ def _forward_project_parallel_raw(
             vol, sino, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("volume", (Ny, Nz, Nx)), ("sinogram", (n_angles, Ny, N_det)),
                     ("cos", (n_angles,)), ("sin", (n_angles,))],
-            io_dtype=_io_dtype_code(vol), num_threads=num_threads, label=label)
+            io_dtype=_io_dtype_code(vol), num_threads=num_threads, label=label,
+            cuda_kwargs=_nonfinite_kwargs(nonfinite, vol),
+            texture=_texture_spec(texture, vol, _TC_VOL_LAYERED, _parallel_channels(Ny),
+                                  (Ny, Nz, Nx)))
     return sino.to(volume.dtype)
 
 
@@ -226,10 +268,13 @@ def _back_project_parallel_raw(
     *,
     Nx: int = -1,
     label: str | None = None,
+    nonfinite: torch.Tensor | None = None,
+    texture=None,
 ) -> torch.Tensor:
     """Single-axis BP. Output dtype = sinogram dtype (CPU computes in fp32).
     ``Nx`` and ``Nz`` default to N_det; pass the volume's Nx when the
-    detector is wider or narrower than the volume (the kernels centre both)."""
+    detector is wider or narrower than the volume (the kernels centre both).
+    ``nonfinite``, ``texture``: as in `_forward_project_parallel_raw`."""
     sino = _kernel_input(sinogram, "sinogram")
     n_angles, Ny, N_det = sino.shape
     Nx = N_det if Nx < 0 else Nx
@@ -240,7 +285,10 @@ def _back_project_parallel_raw(
             sino, vol, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("sinogram", (n_angles, Ny, N_det)), ("volume", (Ny, Nz, Nx)),
                     ("angles", (n_angles,)), ("angles", (n_angles,))],
-            io_dtype=_io_dtype_code(sino), num_threads=num_threads, label=label)
+            io_dtype=_io_dtype_code(sino), num_threads=num_threads, label=label,
+            cuda_kwargs=_nonfinite_kwargs(nonfinite, sino),
+            texture=_texture_spec(texture, sino, _TC_SINO_LAYERED, _parallel_channels(Ny),
+                                  (n_angles, Ny, N_det)))
     return vol.to(sinogram.dtype)
 
 
@@ -275,11 +323,13 @@ def _forward_project_rotmat_raw(
     num_threads: int | None = None,
     *,
     label: str | None = None,
+    texture=None,
 ) -> torch.Tensor:
     """Rotmat FP from rotation matrices (the euler→rotmat conversion lives in
     PyTorch, outside the autograd Function, so ∂L/∂euler chains through it).
     ``num_threads`` only applies to the CPU path. Output dtype = volume
-    dtype; the matrices are always read as float32."""
+    dtype; the matrices are always read as float32. ``texture``: as in
+    `_forward_project_parallel_raw`."""
     vol = _kernel_input(volume, "volume")
     Ny, Nz, Nx = vol.shape
     mats = _mats_input(mats_flat, vol.device)
@@ -290,7 +340,8 @@ def _forward_project_rotmat_raw(
             vol, sino, mats, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("volume", (Ny, Nz, Nx)), ("sinogram", (n_angles, Ny, N_det)),
                     ("matrices", (n_angles, 9))],
-            io_dtype=_io_dtype_code(vol), num_threads=num_threads, label=label)
+            io_dtype=_io_dtype_code(vol), num_threads=num_threads, label=label,
+            texture=_texture_spec(texture, vol, _TC_VOL_3D, lambda io: 1, (Ny, Nz, Nx)))
     return sino.to(volume.dtype)
 
 
@@ -302,10 +353,11 @@ def _back_project_rotmat_raw(
     *,
     Nx: int = -1,
     label: str | None = None,
+    texture=None,
 ) -> torch.Tensor:
     """Adjoint partner of _forward_project_rotmat_raw. Output dtype =
     sinogram dtype. ``Nx`` and ``Nz``
-    default to N_det."""
+    default to N_det. ``texture``: as in `_forward_project_parallel_raw`."""
     sino = _kernel_input(sinogram, "sinogram")
     n_angles, Ny, N_det = sino.shape
     Nx = N_det if Nx < 0 else Nx
@@ -316,7 +368,9 @@ def _back_project_rotmat_raw(
             sino, vol, mats, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("sinogram", (n_angles, Ny, N_det)), ("volume", (Ny, Nz, Nx)),
                     ("matrices", (n_angles, 9))],
-            io_dtype=_io_dtype_code(sino), num_threads=num_threads, label=label)
+            io_dtype=_io_dtype_code(sino), num_threads=num_threads, label=label,
+            texture=_texture_spec(texture, sino, _TC_SINO_LAYERED, lambda io: 1,
+                                  (n_angles, Ny, N_det)))
     return vol.to(sinogram.dtype)
 
 
@@ -516,6 +570,17 @@ class _BPResire(torch.autograd.Function):
 # wire the adjoint pairs: FP.backward = BP (+ grad_geom), BP.backward = FP.
 
 
+def _checked(fn, op, x: torch.Tensor, geom, name: str) -> torch.Tensor:
+    """``fn(x, geom)`` (``op.fp`` or ``op.bp``) followed by the fp16 range
+    check of its result; an operator whose kernels report non-finite stores
+    (``op._nonfinite_word``) gets a word to fill, so the check need not scan
+    the result."""
+    word = op._nonfinite_word(x)
+    out = fn(x, geom) if word is None else fn(x, geom, nonfinite=word)
+    _check_fp16_range(out, x, name, nonfinite=word)
+    return out
+
+
 class _Project(torch.autograd.Function):
     """``op.fp(volume, geom)``, differentiable w.r.t. ``volume`` (via
     ``op.bp``) and ``geom`` (via ``op.grad_geom``)."""
@@ -527,8 +592,7 @@ class _Project(torch.autograd.Function):
         need_geom = ctx.needs_input_grad[1]
         ctx.save_for_backward(volume.detach() if need_geom else None,
                               None if geom is None else geom.detach())
-        sino = op.fp(volume, geom)
-        _check_fp16_range(sino, volume, op._name)
+        sino = _checked(op.fp, op, volume, geom, op._name)
         # e.g. which volume upload a cached texture holds right now; handed
         # back to op.grad_geom, which alone knows what it means
         ctx.token = op.fp_token()
@@ -545,8 +609,7 @@ class _Project(torch.autograd.Function):
         grad_sino = grad_sino.contiguous()
         grad_vol = None
         if ctx.needs_input_grad[0]:
-            grad_vol = op.bp(grad_sino, geom)
-            _check_fp16_range(grad_vol, grad_sino, op._name + " (backward)")
+            grad_vol = _checked(op.bp, op, grad_sino, geom, op._name + " (backward)")
         grad_geom = None
         if ctx.needs_input_grad[1]:
             grad_geom = op.grad_geom(volume, grad_sino, geom, token=ctx.token)
@@ -564,17 +627,14 @@ class _BackProject(torch.autograd.Function):
     def forward(ctx, sinogram, geom, op):
         ctx.op = op
         ctx.save_for_backward(None if geom is None else geom.detach())
-        vol = op.bp(sinogram, geom)
-        _check_fp16_range(vol, sinogram, op._name)
-        return vol
+        return _checked(op.bp, op, sinogram, geom, op._name)
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_vol):
         (geom,) = ctx.saved_tensors
         grad_vol = grad_vol.contiguous()
-        grad_sino = ctx.op.fp(grad_vol, geom)
-        _check_fp16_range(grad_sino, grad_vol, ctx.op._name + " (backward)")
+        grad_sino = _checked(ctx.op.fp, ctx.op, grad_vol, geom, ctx.op._name + " (backward)")
         return grad_sino, None, None
 
 

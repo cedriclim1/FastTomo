@@ -21,7 +21,7 @@ Python package `fasttomo/`:
 | `algorithms/resire.py` | `run_resire`. **Frozen.** |
 | `algorithms/mbir.py` | `run_mbir` (ICD sweeps, offset/variance update, multi-resolution, Feistel voxel order). |
 | `algorithms/alignment.py` | `refine_angles`. |
-| `_operator.py` | The projection-operator seam: `Geometry`, `ProjectionOperator` (`fp` / `bp` / `grad_geom`, differentiable `project` / `backproject`), adapters `UncachedOperator`, `CudaCachedOperator`, `ResireOperator`, `_UserProjectorOperator`, chosen by `_make_operator`. Every projection goes through it (except MBIR's own model and GENFIRE's gridding). |
+| `_operator.py` | The projection-operator seam: `Geometry`, `ProjectionOperator` (`fp` / `bp` / `grad_geom`, differentiable `project` / `backproject`), adapters `UncachedOperator`, `CudaCachedOperator`, `ResireOperator`, `_UserProjectorOperator`, chosen by `_make_operator`. Every projection goes through it (except MBIR's own model and GENFIRE's gridding). `_TexturePool`: the one-shot CUDA path's (functional API, FBP) process-wide pool of up to 4 texture caches, freed by `release_cached_projectors()`. |
 | `_backend.py` | Device guard, stream pointer, dtype codes, input and shape guards (incl. `_check_finite_geometry`: NaN/Inf host angles raise), `_resolve_num_threads` (keyword, else the first entry of `OMP_NUM_THREADS`, else 1). |
 | `autograd.py` | Raw kernel layer (`_launch`, `*_raw`), the generic `_Project` / `_BackProject` autograd Functions, RESIRE and TV-loss Functions, `euler_zyz_to_rotmat`. |
 | `projection.py` | Functional projections (`forward_project`, `back_project`, `*_3d`, `*_resire`) as transient operators; `apply_shifts`, `apply_shifts_2d`. |
@@ -31,7 +31,7 @@ Python package `fasttomo/`:
 | `utilities.py` | `ramp_filter`, `estimate_shifts_xcorr`; re-exports `cylindrical_mask`, `tv_loss_3d`, `apply_shifts*` from their current homes. |
 | `configs.py` | `AdReconConfig` (`OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`), `MbirConfig`. |
 
-Native code `csrc/`: `bindings.cpp` (module), `bindings_cpu.cpp`, `bindings_cuda.cpp` (the CUDA bindings compile to stubs in a CPU-only build); `cpu/` (`projection_parallel.c`, `projection_rotmat.c`, `genfire.c`, `mbir_icd.c`); `cuda/` (`projection_parallel.cu`, `projection_rotmat.cu`, `projection_resire.cu`, `genfire.cu`, `grad_angle.cu`, `tv_loss.cu`, `sirt_update.cu` (run_sirt's and run_sart's fused elementwise kernels), `fista_update.cu` (fused FISTA step / constraints / momentum), `tv_prox.cu` (run_fista_tv's TV prox), `texture_cache.cu`, `mbir_icd.cu`, `scratch_pool.cuh` (header-only stream-ordered per-device scratch pool for the fixed-order two-pass reductions of `grad_rotmat` / `grad_angle`; it keeps up to 64 MiB per device reserved for the life of the process, invisible to `torch.cuda.memory_*` and not freed by `release_cached_projectors()`)).
+Native code `csrc/`: `bindings.cpp` (module), `bindings_cpu.cpp`, `bindings_cuda.cpp` (the CUDA bindings compile to stubs in a CPU-only build); `cpu/` (`projection_parallel.c`, `projection_rotmat.c`, `genfire.c`, `mbir_icd.c`); `cuda/` (`projection_parallel.cu`, `projection_rotmat.cu`, `projection_resire.cu`, `genfire.cu`, `grad_angle.cu`, `tv_loss.cu`, `sirt_update.cu` (run_sirt's and run_sart's fused elementwise kernels), `fista_update.cu` (fused FISTA step / constraints / momentum), `tv_prox.cu` (run_fista_tv's TV prox), `texture_cache.cu` (cudaArray + texture caches; parallel caches pack 2 fp32 or 4 fp16 Y-slices per texel for Ny >= 2, zero-padded, `parallel_channels` in `projection_parallel.cu` is the layout rule), `mbir_icd.cu`, `scratch_pool.cuh` (header-only stream-ordered per-device scratch pool for the fixed-order two-pass reductions of `grad_rotmat` / `grad_angle`; it keeps up to 64 MiB per device reserved for the life of the process, invisible to `torch.cuda.memory_*` and not freed by `release_cached_projectors()`)).
 
 ## Frozen algorithms
 
@@ -82,6 +82,7 @@ Layout, by topic:
 | `test_algorithms_analytic.py`, `_algebraic.py`, `_fista.py`, `_ad.py`, `_mbir.py`, `_genfire_resire.py`, `_alignment.py` | Per-family behaviour and input handling. |
 | `test_contracts.py` | The uniform API over one `ALGOS` capability table and the frozen `loss_callback` / `support_mask` contracts the desktop app relies on. |
 | `test_regularizers.py` | Regularisers and the TV loss. |
+| `test_parallel_cuda_kernels.py` | Parallel-beam CUDA FP/BP: CUDA-resident NaN angles, packed textures vs per-slice results (bit for bit), the fp16 non-finite report word, the one-shot texture pool (reuse, bound, two streams, threads). |
 | `test_kernel_correctness.py` | Kernel-level correctness: finite-difference geometry gradients, strided inputs, size checks, leak-free failure paths of the scoped texture cache. |
 | `test_cpu_kernels.py` | CPU C/OpenMP kernels: NaN/Inf angles (raise; the raw kernels survive them), the Y-batched kernels bit for bit against fp32 NumPy ports of the scalar loops, thread invariance, `grad_angle` against an fp64 evaluation. |
 | `test_frozen_identity.py`, `test_algorithm_identity.py` | Bit-identity goldens (`tests/data/*.pt`). |
@@ -92,7 +93,7 @@ Layout, by topic:
 - Full suite on one GPU: `CUDA_VISIBLE_DEVICES=<idx> python -m pytest tests -q`. About 19 tests skip on one card (17 cross-device tests need 2 visible GPUs, 1 needs scikit-image, 1 needs `FASTTOMO_EXPECT_CUDA`).
 - CPU only: `CUDA_VISIBLE_DEVICES= python -m pytest tests -q` (the `gpu` tests skip themselves), or `pytest tests -m "not gpu"` to deselect them.
 - With a non-editable install, run the `pytest` entry point rather than `python -m pytest` from the repo root, otherwise the source tree (without a compiled `_core`) shadows the installed package.
-- `tests/sanitizer_sweep.py` (not collected) is the size sweep for `compute-sanitizer` memcheck/racecheck; run it on a free GPU after any CUDA kernel change (`python tests/sanitizer_sweep.py tv` or `solvers` runs only the TV-loss or the SIRT / SART / FISTA / TV-prox kernels).
+- `tests/sanitizer_sweep.py` (not collected) is the size sweep for `compute-sanitizer` memcheck/racecheck; run it on a free GPU after any CUDA kernel change (`python tests/sanitizer_sweep.py tv` or `solvers` runs only the TV-loss or the SIRT / SART / FISTA / TV-prox kernels, `parallel` the parallel-beam FP/BP and texture-pool variants).
 
 ### Golden files and the arithmetic fingerprint
 

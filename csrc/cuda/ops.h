@@ -34,6 +34,17 @@
  * templated impl. cos/sin tables and rotation matrices stay fp32 in all
  * paths. Out-of-scope ops below (RESIRE, grad_*) keep their fp32-only
  * signatures. */
+
+/* Channel count (Y slices per texel) of the parallel FP/BP textures for
+ * io_dtype and Ny: 2 for fp32 and 4 for fp16 when Ny >= 2, else 1
+ * (texture_cache.h). The one-shot wrappers use it; a cached caller
+ * creates its caches with it so both paths share one layout. */
+int parallel_channels(int io_dtype, int Ny);
+
+/* The four parallel FP/BP entry points take an optional `nonfinite` device
+ * int (null = off): an fp16 kernel ORs 1 into it when it stores an inf and 2
+ * when it stores a NaN, so the fp16 overflow check reads 4 bytes instead of
+ * scanning the output (fp32 outputs never set it). The caller zeroes it. */
 void forward_project_parallel_cuda(
     int io_dtype,
     const void  *vol,
@@ -42,7 +53,8 @@ void forward_project_parallel_cuda(
     const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite = nullptr
 );
 
 void back_project_parallel_cuda(
@@ -53,7 +65,8 @@ void back_project_parallel_cuda(
     const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite = nullptr
 );
 
 /*
@@ -96,7 +109,8 @@ void forward_project_parallel_cuda_cached(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream,
-    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int upload = 1,  /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int *nonfinite = nullptr
 );
 
 void back_project_parallel_cuda_cached(
@@ -109,7 +123,8 @@ void back_project_parallel_cuda_cached(
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream,
-    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int upload = 1,  /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int *nonfinite = nullptr
 );
 
 void forward_project_rotmat_cuda_cached(
@@ -299,7 +314,8 @@ void sirt_residual_tex_cuda(
  * then clamp(min=0) if positivity. y_out may alias a_in, x_out may alias
  * xp_in. A non-null vol_tc (volume TextureCache with a surface) also
  * receives y_out in modes 0 and 2 when its layout allows (1 channel, or
- * fp16 4-channel packed layered); returns 1 if it did, else 0.
+ * packed layered: 2 fp32 / 4 fp16 slices per texel, any Ny); returns 1 if
+ * it did, else 0.
  */
 int fista_update_cuda(
     int io_dtype, int mode,
