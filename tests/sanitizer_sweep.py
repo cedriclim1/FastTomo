@@ -6,8 +6,9 @@ down by orders of magnitude and CI has no GPU. Run on a free GPU with
     compute-sanitizer --tool memcheck  --error-exitcode 1 python tests/sanitizer_sweep.py
     compute-sanitizer --tool racecheck --error-exitcode 1 python tests/sanitizer_sweep.py
 
-(append ``tv`` to run only the TV-loss kernels, ``parallel`` to run only the
-parallel-beam FP/BP, texture-pool and packed-texture variants).
+(append ``tv`` to run only the TV-loss kernels, ``solvers`` for the SIRT,
+SART, FISTA-update and TV-prox kernels, ``parallel`` for the parallel-beam
+FP/BP, texture-pool and packed-texture variants).
 
 Sizes 1, 15, 17, 33 and 37 cover single-element, partial-block (16x16,
 32x8 and 8x8x4 blocks), multi-block and prime extents; Ny = 1 takes the
@@ -57,6 +58,7 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
     mbir_sweep_variants(g)
     clip_and_tv_variants(g)
     sirt_variants(g)
+    solver_variants(g)
     parallel_variants(g)
 
 
@@ -152,6 +154,40 @@ def sirt_variants(g) -> None:
         print(f"ok sirt shape={(Ny, Nz, Nx)} n_angles={n_ang}", flush=True)
 
 
+def solver_variants(g) -> None:
+    """The classical-solver kernels of PR E: run_sart (fused SIRT kernels on
+    subsets, plane voxel normalisers C_full = 0, 1-row normaliser operator),
+    the fused FISTA update (csrc/cuda/fista_update.cu: modes 0-2, global
+    memory, 1-channel / 4-channel packed / 3-D surfaces) and the CUDA TV
+    prox (csrc/cuda/tv_prox.cu: FGP and Chambolle, masks, degenerate
+    dimensions, partial blocks)."""
+    from fasttomo.algorithms.fista import _tv_prox_3d
+
+    dev = torch.device("cuda")
+    for (Ny, Nz, Nx), n_ang in (((1, 1, 2), 1), ((3, 5, 7), 4), ((4, 17, 33), 7),
+                                ((8, 16, 24), 9), ((2, 1, 9), 3)):
+        angles = torch.linspace(-60, 60, n_ang, device=dev)
+        euler = torch.stack([angles * 0.1, angles, -angles * 0.1], dim=1)
+        vol = torch.rand(Ny, Nz, Nx, generator=g).to(dev)
+        sm = (torch.rand(1, Nz, Nx, generator=g) > 0.3).float().to(dev)
+        for dtype in (torch.float32, torch.float16):
+            sino = ft.forward_project(vol, angles, N_det=Nx).to(dtype)
+            sino3 = ft.forward_project_3d(vol, euler, N_det=Nx).to(dtype)
+            ft.run_sart(sino, angles, 2, Nz=Nz, positivity=True, return_loss=True)
+            ft.run_sart(sino, angles, 1, Nz=Nz, subset_size=3, view_order="golden")
+            ft.run_sart(sino3, angles, 1, Nz=Nz, subset_size=2, euler_zyz_deg=euler)
+            for kw in (dict(), dict(positivity=True, support_mask=sm.to(dtype))):
+                ft.run_fista(sino, angles, 3, Nz=Nz, L=50.0, **kw)
+                ft.run_fista(sino3, angles, 2, Nz=Nz, L=50.0, euler_zyz_deg=euler, **kw)
+                for mode in ("fgp", "chambolle"):
+                    ft.run_fista_tv(sino, angles, 2, Nz=Nz, L=50.0, tv_weight=1.0,
+                                    tv_inner=mode, tv_inner_iter=3, **kw)
+            m_full = (torch.rand(Ny, Nz, Nx, generator=g) > 0.5).to(dev, dtype)
+            _tv_prox_3d(vol.to(dtype), 0.1, True, m_full, 3, "fgp")
+        torch.cuda.synchronize()
+        print(f"ok solvers shape={(Ny, Nz, Nx)} n_angles={n_ang}", flush=True)
+
+
 def clip_and_tv_variants(g) -> None:
     """The ray-clipped rotmat forward on its edge cases (axis-aligned rays,
     a detector wider than the volume so rays miss it, a narrower one,
@@ -231,6 +267,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["tv"]:          # only the TV kernels (quick)
         tv_variants(torch.Generator(device="cpu").manual_seed(0))
+    elif sys.argv[1:] == ["solvers"]:   # only the solver kernels (PR E)
+        g = torch.Generator(device="cpu").manual_seed(0)
+        sirt_variants(g)
+        solver_variants(g)
     elif sys.argv[1:] == ["parallel"]:  # only the parallel-beam kernels
         parallel_variants(torch.Generator(device="cpu").manual_seed(0))
     else:

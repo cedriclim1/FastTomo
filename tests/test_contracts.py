@@ -499,18 +499,20 @@ def test_loss_recorder_skips_the_loss_when_nobody_wants_it():
 # ── SIRT CUDA-graph path with progress=True (#85 review follow-up) ─────────
 
 @needs_cuda
-def test_sirt_graph_path_taken_with_progress(capsys):
+def test_sirt_graph_path_taken_with_progress(capsys, monkeypatch):
     """progress=True keeps run_sirt on the CUDA-graph fast path (the bar
     ticks once per replay through ``on_replay``) and gives the eager loop's
-    result bit for bit at omega=1 (``return_loss=True`` forces the eager
-    loop)."""
+    result bit for bit at omega=1."""
+    from fasttomo.algorithms import algebraic
+
     sino, ang = _data("cuda")
     proj = ft.ParallelProjector((NY, SIZE, SIZE), ang, device="cuda")
     graph = ft.run_sirt(sino, ang, 5, Nz=SIZE, projector=proj, progress=True)
     assert len(proj._sirt_graph_cache) == 1        # captured, not the eager loop
     err = capsys.readouterr().err
     assert "run_sirt" in err and "5/5" in err      # the bar reached the end
-    eager, _ = ft.run_sirt(sino, ang, 5, Nz=SIZE, return_loss=True)
+    monkeypatch.setattr(algebraic, "_run_sirt_cuda_graph", lambda **kw: None)
+    eager = ft.run_sirt(sino, ang, 5, Nz=SIZE)
     assert torch.equal(graph, eager)
 
 
@@ -930,7 +932,8 @@ class TestAdReconCallback:
 
 @requires_cuda
 def test_sirt_cuda_callback_matches_loss_history():
-    """A callback forces the eager loop past the CUDA-Graph fast path."""
+    """With a callback the CUDA-graph path records the loss after every
+    replay; the callback and the history get the same values."""
     sino, angles = make_sino("cuda")
     cb = Recorder()
     _, hist = ft.run_sirt(
@@ -939,3 +942,32 @@ def test_sirt_cuda_callback_matches_loss_history():
     assert [i for i, _ in cb.calls] == list(range(N_ITER))
     for i, loss in cb.calls:
         assert loss == pytest.approx(hist[i].item(), rel=1e-6)
+
+
+# ── device-side loss recorder (solver audit P5, AD audit A6-8) ─────────────
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+def test_device_loss_recorder_matches_item(dev):
+    """_DeviceLossRecorder gives the history and callback values `.item()`
+    gives, for fp32 and fp16 losses, more records than ``n_iter`` and
+    non-tensor values mixed in."""
+    from fasttomo.algorithms._common import _DeviceLossRecorder
+
+    rng = torch.Generator().manual_seed(0)
+    vals = [torch.rand((), generator=rng).to(dev) * 10 for _ in range(7)]
+    vals = [v if i % 2 else v.half() for i, v in enumerate(vals)]
+    want = [v.item() for v in vals]
+
+    rec = _DeviceLossRecorder(True, None, False, 3)     # buffer smaller than the run
+    for i, v in enumerate(vals):
+        rec.record(i, v if i != 4 else want[4])             # one Python float
+    _, hist = rec.finish(torch.zeros(1))
+    assert hist.tolist() == torch.tensor(want, dtype=torch.float32).tolist()
+
+    got = []
+    rec = _DeviceLossRecorder(True, lambda i, v: got.append((i, v)), False, 7)
+    for i, v in enumerate(vals):
+        rec.record(i, v)
+    _, hist = rec.finish(torch.zeros(1))
+    assert got == list(enumerate(want))
+    assert hist.tolist() == torch.tensor(want, dtype=torch.float32).tolist()

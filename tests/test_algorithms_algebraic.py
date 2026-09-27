@@ -381,6 +381,13 @@ def test_sirt_support_mask_full_3d_cuda():
 # ── SIRT CUDA graph ───────────────────────────────────────────────────────────
 
 
+def _force_eager_sirt(mp) -> None:
+    """Make run_sirt take its eager loop (as if the graph capture failed):
+    a requested loss no longer does that (solver audit P5)."""
+    from fasttomo.algorithms import algebraic
+    mp.setattr(algebraic, "_run_sirt_cuda_graph", lambda **kw: None)
+
+
 @needs_cuda
 class TestRunSirtCudaGraph:
     """Verify the CUDA-Graph-accelerated path in run_sirt.
@@ -395,14 +402,14 @@ class TestRunSirtCudaGraph:
         sino   = ft.forward_project(vol, angles)
         return sino, angles
 
-    def test_graph_matches_eager(self):
+    def test_graph_matches_eager(self, monkeypatch):
         """Graph path must produce volumes within 1e-5 RMSE of the eager path."""
         sino, angles = self._make_inputs(N=32, n_angles=20)
         n_iter = 20
 
-        # Eager path: return_loss=True forces the eager loop regardless.
-        rec_eager, _ = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
-                                   return_loss=True)
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            rec_eager = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32)
 
         # Graph path: default CUDA path with return_loss=False.
         rec_graph = ft.run_sirt(sino, angles, n_iter=n_iter, Nz=32,
@@ -430,7 +437,7 @@ class TestRunSirtCudaGraph:
             f"expected 1 cached graph, got {len(proj._sirt_graph_cache)}"
         )
 
-    def test_graph_cache_uses_latest_inputs(self):
+    def test_graph_cache_uses_latest_inputs(self, monkeypatch):
         """
         Cached graph replay must respect call-time sinogram and omega values.
 
@@ -454,10 +461,10 @@ class TestRunSirtCudaGraph:
         rec_graph_same_omega = ft.run_sirt(
             sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj
         )
-        rec_eager_same_omega, _ = ft.run_sirt(
-            sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj,
-            return_loss=True,
-        )
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            rec_eager_same_omega = ft.run_sirt(
+                sino_b, angles, n_iter=6, Nz=N, omega=1.0, projector=proj)
         rmse_same_omega = ((rec_graph_same_omega - rec_eager_same_omega) ** 2).mean().sqrt().item()
         assert rmse_same_omega < 1e-5, (
             f"cached graph ignored updated sinogram: RMSE={rmse_same_omega:.2e}"
@@ -467,10 +474,10 @@ class TestRunSirtCudaGraph:
         rec_graph_new_omega = ft.run_sirt(
             sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj
         )
-        rec_eager_new_omega, _ = ft.run_sirt(
-            sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj,
-            return_loss=True,
-        )
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            rec_eager_new_omega = ft.run_sirt(
+                sino_b, angles, n_iter=6, Nz=N, omega=0.5, projector=proj)
         rmse_new_omega = ((rec_graph_new_omega - rec_eager_new_omega) ** 2).mean().sqrt().item()
         assert rmse_new_omega < 1e-5, (
             f"cached graph ignored updated omega: RMSE={rmse_new_omega:.2e}"
@@ -610,11 +617,12 @@ class TestRunSirtCudaGraph:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         vol_bytes = Ny * N * N * 4
-        # kept: live tensors (static volume and C, >= 2 volumes), plus the
-        # graph pool's reserved blocks (BP output) and the volume texture
-        # array outside torch's allocator: >= 4 volumes of device memory
-        assert torch.cuda.memory_allocated() - alloc0 >= 2 * vol_bytes
-        assert free0 - torch.cuda.mem_get_info()[0] >= 4 * vol_bytes
+        # kept: live tensors (static volume, >= 1 volume; C is one plane),
+        # plus the graph pool's reserved blocks (BP output) and the volume
+        # texture array outside torch's allocator: >= 3 volumes of device
+        # memory
+        assert torch.cuda.memory_allocated() - alloc0 >= vol_bytes
+        assert free0 - torch.cuda.mem_get_info()[0] >= 3 * vol_bytes
         assert len(algebraic._SIRT_OPERATORS) == 1
 
         assert ft.release_cached_projectors() == 1
@@ -789,29 +797,32 @@ def test_fused_sirt_kernels_bit_identical_to_torch_chain(dtype, shape):
     assert torch.equal(_bits(raw), _bits(sino - fp))
     assert torch.equal(_bits(res), _bits((sino - fp) * R))
 
-    for mask_shape in (None, (1, Nz, Nx), (Ny, Nz, Nx)):
-        mask = None if mask_shape is None else rand(*mask_shape, scale=2.0, positive=True)
-        for omega in (1.0, 0.8, 0.37):
-            for positivity in (False, True):
-                for soft in (0.0, 1e-3, 0.5):
-                    cons = ConstraintConfig(positivity=positivity, support_mask=mask,
-                                            soft_threshold=soft)
-                    # run_sirt's eager loop
-                    want = cons.apply(vol + omega * C * upd)
-                    got = _fused_update(vol, upd, C, omega, cons, eager_order=True)
-                    assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
-                                                                   positivity, soft)
-                    # _sirt_iter_inplace (in place, as in the CUDA graph)
-                    want = vol.clone()
-                    u = upd.clone()
-                    u.mul_(C)
-                    want.add_(u, alpha=omega)
-                    cons.apply_inplace_(want)
-                    got = vol.clone()
-                    assert _fused_update(got, upd, C, omega, cons, eager_order=False,
-                                         out=got) is got
-                    assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
-                                                                   positivity, soft)
+    # C as a full volume, and as one [1, Nz, Nx] plane broadcast over Y
+    # (run_sirt / run_sart in parallel geometry, P2 / P6)
+    for C in (C, C[:1].contiguous()):
+        for mask_shape in (None, (1, Nz, Nx), (Ny, Nz, Nx)):
+            mask = None if mask_shape is None else rand(*mask_shape, scale=2.0, positive=True)
+            for omega in (1.0, 0.8, 0.37):
+                for positivity in (False, True):
+                    for soft in (0.0, 1e-3, 0.5):
+                        cons = ConstraintConfig(positivity=positivity, support_mask=mask,
+                                                soft_threshold=soft)
+                        # run_sirt's eager loop
+                        want = cons.apply(vol + omega * C * upd)
+                        got = _fused_update(vol, upd, C, omega, cons, eager_order=True)
+                        assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
+                                                                       positivity, soft)
+                        # _sirt_iter_inplace (in place, as in the CUDA graph)
+                        want = vol.clone()
+                        u = upd.clone()
+                        u.mul_(C)
+                        want.add_(u, alpha=omega)
+                        cons.apply_inplace_(want)
+                        got = vol.clone()
+                        assert _fused_update(got, upd, C, omega, cons, eager_order=False,
+                                             out=got) is got
+                        assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
+                                                                       positivity, soft)
 
 
 @needs_cuda
@@ -891,7 +902,7 @@ def test_sirt_texture_writes_bit_identical(monkeypatch, caplog, dtype, Ny):
 
 
 @needs_cuda
-def test_sirt_texture_writes_skip_uploads():
+def test_sirt_texture_writes_skip_uploads(monkeypatch):
     """The debug counters: the eager loop uploads the volume once (plus the
     normalisation projections) and never the residual; the graph path
     uploads the volume once per call; afterwards the projector uploads
@@ -903,7 +914,9 @@ def test_sirt_texture_writes_skip_uploads():
     proj = ft.ParallelProjector((2, N, N), ang, device=DEVICE)
     counts = proj._op.upload_counts
 
-    ft.run_sirt(sino, ang, n_iter, projector=proj, return_loss=True)      # eager
+    with monkeypatch.context() as m:
+        _force_eager_sirt(m)
+        ft.run_sirt(sino, ang, n_iter, projector=proj)                    # eager
     # normalisations: one sinogram and one volume upload; then iteration 1
     # uploads the starting volume, every later volume and every residual
     # come from the fused kernels
@@ -1137,3 +1150,207 @@ def test_run_wsirt_rejects_fp16():
     sino     = ft.forward_project(phantom_2d(N, device=DEVICE).unsqueeze(0), angles).half()
     with pytest.raises(TypeError, match=r"torch\.float32 sinogram"):
         ft.run_wsirt(sino, angles, Nz=N, n_iter=2)
+
+
+# ── loss recording without per-iteration syncs (solver audit P5) ───────────
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype, Ny", [(torch.float32, 3), (torch.float16, 3),
+                                       (torch.float16, 4)])
+def test_sirt_loss_on_graph_path_bit_identical(monkeypatch, dtype, Ny):
+    """A requested loss (return_loss or a callback) keeps run_sirt on the
+    CUDA-graph path; volume and loss history equal the eager loop's bit for
+    bit, for every omega (the loss graph uses the eager rounding order)."""
+    from fasttomo.algorithms import algebraic
+
+    cases = [c for c in _sirt_cases(dtype, Ny) if "euler_zyz_deg" not in c]
+    for kw in cases:
+        kw = dict(kw, return_loss=True)
+        if "projector" in kw:
+            kw["projector"] = ft.ParallelProjector(tuple(kw["projector"]._op.vol_shape),
+                                                   kw["angles_deg"], device=DEVICE)
+        algebraic._SIRT_OPERATORS.clear()
+        captures = algebraic._sirt_graph_captures
+        calls = []
+        vol_g, hist_g = ft.run_sirt(**kw, loss_callback=lambda i, v: calls.append((i, v)))
+        assert algebraic._sirt_graph_captures == captures + 1      # the graph path
+        vol_r, hist_r = ft.run_sirt(**kw)                          # replayed
+        assert algebraic._sirt_graph_captures == captures + 1
+        with monkeypatch.context() as m:
+            _force_eager_sirt(m)
+            vol_e, hist_e = ft.run_sirt(**kw)
+        for v, h in ((vol_g, hist_g), (vol_r, hist_r)):
+            assert torch.equal(v, vol_e) and torch.equal(h, hist_e), kw.keys()
+        assert [i for i, _ in calls] == list(range(kw["n_iter"]))
+        assert torch.equal(torch.tensor([v for _, v in calls], dtype=torch.float32), hist_e)
+    algebraic._SIRT_OPERATORS.clear()
+
+
+@needs_cuda
+def test_sirt_loss_and_plain_graphs_share_the_kept_operator():
+    """Calls with and without a loss alternate on one kept operator (two
+    graphs), without re-capturing."""
+    from fasttomo.algorithms import algebraic
+
+    algebraic._SIRT_OPERATORS.clear()
+    ang = make_angles(10, device=DEVICE)
+    sino = ft.forward_project(torch.rand(2, 24, 24, device=DEVICE), ang)
+    c0 = algebraic._sirt_graph_captures
+    for _ in range(2):
+        ft.run_sirt(sino, ang, 3)
+        ft.run_sirt(sino, ang, 3, return_loss=True)
+    assert algebraic._sirt_graph_captures == c0 + 2
+    assert len(algebraic._SIRT_OPERATORS) == 1
+    algebraic._SIRT_OPERATORS.clear()
+
+
+def _sync_count(fn) -> int:
+    """Synchronising CUDA operations torch reports while ``fn`` runs."""
+    import warnings
+    fn()                            # warm-up (graph capture, caches)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fn()
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    return sum("synchroniz" in str(x.message) for x in w)
+
+
+@needs_cuda
+@pytest.mark.parametrize("algo", ["sirt", "sirt_rotmat", "wsirt", "fista", "fista_tv",
+                                  "sart", "sart_cpu_angles", "sart_golden"])
+def test_loss_recording_host_syncs(algo):
+    """return_loss alone costs no host sync per iteration (the losses stay
+    on the device until the end); a loss_callback one per iteration (the
+    frozen contract hands it a CPU float every iteration)."""
+    N, n = 24, 10
+    ang = make_angles(n, device=DEVICE)
+    vol = torch.rand(2, N, N, device=DEVICE)
+    sino = ft.forward_project(vol, ang)
+    eul = torch.stack([torch.zeros(n), ang.cpu(), torch.zeros(n)], 1).to(DEVICE)
+    sino3d = ft.forward_project_3d(vol, eul)
+    run = {
+        "sirt": lambda k, **kw: ft.run_sirt(sino, ang, k, **kw),
+        "sirt_rotmat": lambda k, **kw: ft.run_sirt(sino3d, ang, k, euler_zyz_deg=eul, **kw),
+        "wsirt": lambda k, **kw: ft.run_wsirt(sino, ang, k, **kw),
+        "fista": lambda k, **kw: ft.run_fista(sino, ang, k, L=100.0, **kw),
+        "fista_tv": lambda k, **kw: ft.run_fista_tv(sino, ang, k, L=100.0, tv_weight=0.1, **kw),
+        # SART: no sync per subset step either, CPU angles included (P2)
+        "sart": lambda k, **kw: ft.run_sart(sino, ang, k, **kw),
+        "sart_cpu_angles": lambda k, **kw: ft.run_sart(sino, ang.cpu(), k, subset_size=3, **kw),
+        "sart_golden": lambda k, **kw: ft.run_sart(sino, ang, k, view_order="golden", **kw),
+    }[algo]
+    for kw, per_iter in ((dict(return_loss=True), 0), (dict(loss_callback=lambda i, v: None), 1)):
+        a = _sync_count(lambda: run(3, **kw))
+        b = _sync_count(lambda: run(9, **kw))
+        assert b - a == 6 * per_iter, (kw, a, b)
+
+
+# ── planar normalisers (solver audit P2 / P6) ──────────────────────────────
+
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("Ny, Nz, N, N_det", [(3, 17, 17, 17), (4, 12, 16, 20),
+                                              (8, 9, 13, 11), (5, 16, 16, 16)])
+def test_parallel_normalisers_are_y_invariant(dev, dtype, Ny, Nz, N, N_det):
+    """BP(1) and FP(1) of the parallel-beam operator are the same in every
+    Y-slice, bit for bit (fp16 with Ny % 4 == 0 uses the packed textures),
+    for all views at once and for one view: run_sirt and run_sart keep one
+    plane of the voxel normaliser (and run_sart computes both on an operator
+    of one texel row)."""
+    from fasttomo._operator import Geometry, _make_operator
+
+    n = 7
+    ang = torch.linspace(-63, 58, n, device=dev)
+    op = _make_operator(Geometry("parallel", (Ny, Nz, N), N_det, n, ang),
+                        torch.device(dev), dtype)
+    for geom in (None, ang[2:3]):
+        k = n if geom is None else 1
+        c = op.backproject(torch.ones(k, Ny, N_det, device=dev, dtype=dtype), geom)
+        r = op.project(torch.ones(Ny, Nz, N, device=dev, dtype=dtype), geom)
+        assert torch.equal(c, c[:1].expand_as(c))
+        assert torch.equal(r, r[:, :1].expand_as(r))
+
+
+@needs_cuda
+@pytest.mark.parametrize("view_order", ["sequential", "golden"])
+def test_sart_memory_is_planar(view_order):
+    """run_sart keeps one sinogram of ray normalisers and one [1, Nz, Nx]
+    plane per subset instead of one volume per subset (P2): at 64^3 with 61
+    single-view subsets the peak is below 5 volumes + 2 sinograms (the
+    volume, the back-projection, the constraint output, 61 planes, the ray
+    normalisers and, for "golden", the permuted sinogram; it was 61 volumes
+    of normalisers alone)."""
+    N, n = 64, 61
+    ang = torch.linspace(-60, 60, n, device=DEVICE)
+    sino = ft.forward_project(torch.rand(N, N, N, device=DEVICE), ang)
+    ft.run_sart(sino, ang, 1, view_order=view_order)       # warm-up
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    ft.run_sart(sino, ang, 1, view_order=view_order)
+    peak = torch.cuda.max_memory_allocated() - base
+    vol_b, sino_b = N ** 3 * 4, n * N * N * 4
+    assert peak < 5 * vol_b + 2 * sino_b, (peak, vol_b, sino_b)
+
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+def test_sart_view_order(dev):
+    """view_order="golden" visits the views in the golden-ratio order; with
+    all views in one subset it is one SIRT-like step either way, and it is
+    what a sequential run on the permuted data gives."""
+    from fasttomo.algorithms.algebraic import _golden_view_order
+
+    perm = _golden_view_order(61)
+    assert sorted(perm.tolist()) == list(range(61))
+    assert perm[:4].tolist() == [0, 34, 13, 47]
+    N, n = 24, 13
+    ang = make_angles(n, device=dev)
+    vol = phantom_2d(N, device=dev).unsqueeze(0).repeat(2, 1, 1)
+    sino = ft.forward_project(vol, ang)
+    p = _golden_view_order(n).to(dev)
+    for sub in (1, 4):
+        a = ft.run_sart(sino, ang, 2, subset_size=sub, view_order="golden")
+        b = ft.run_sart(sino[p], ang[p], 2, subset_size=sub)
+        assert torch.equal(a, b)
+    with pytest.raises(ValueError, match="view_order"):
+        ft.run_sart(sino, ang, 1, view_order="random")
+
+
+def test_sart_golden_order_converges_faster_after_one_sweep():
+    """Solver audit A5: after one sweep of single-view SART the golden-ratio
+    order is much closer to the phantom than the sequential order."""
+    N = 48
+    vol = phantom_2d(N).unsqueeze(0)
+    for ang in (torch.linspace(0, 179, 90), torch.linspace(-60, 60, 61)):
+        sino = ft.forward_project(vol, ang)
+        e_seq = (ft.run_sart(sino, ang, 1) - vol).norm() / vol.norm()
+        e_gold = (ft.run_sart(sino, ang, 1, view_order="golden") - vol).norm() / vol.norm()
+        assert e_gold < 0.8 * e_seq, (e_gold, e_seq)
+
+
+@needs_cuda
+def test_sirt_iteration_launches_no_fill_kernel(monkeypatch):
+    """Hygiene H2: back-projecting the texture-resident residual allocates
+    no zero tensor for the fp16 range check in fp32 (one fill kernel per
+    SIRT iteration before)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    ang = make_angles(10, device=DEVICE)
+    sino = ft.forward_project(torch.rand(2, 24, 24, device=DEVICE), ang)
+    _force_eager_sirt(monkeypatch)
+
+    def fills(n_iter):
+        ft.run_sirt(sino, ang, n_iter)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            ft.run_sirt(sino, ang, n_iter)
+            torch.cuda.synchronize()
+        return sum(e.count for e in prof.key_averages() if "fill" in e.key.lower())
+
+    assert fills(6) == fills(2)

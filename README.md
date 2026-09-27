@@ -10,13 +10,13 @@ All are exported from `fasttomo` (and `fasttomo.algorithms`).
 
 | Algorithm | Function | Backends | One line |
 |---|---|---|---|
-| FBP | `run_fbp` | CPU, CUDA | Ramp-filtered back-projection (fp32/fp16). |
+| FBP | `run_fbp` | CPU, CUDA | Ramp-filtered back-projection (fp32/fp16); optional `window="hann"` / `"hamming"` apodisation. |
 | Weighted back-projection | `run_weighted_backprojection` (alias `run_wbp`) | CPU, CUDA | Exact W-BP (Wolf et al. 2014): back-projection deconvolved by the numerically computed weighting filter. |
 | SIRT | `run_sirt` | CPU, CUDA | Simultaneous iterative reconstruction; the CUDA path replays the loop as a CUDA graph. |
 | wSIRT | `run_wsirt` | CPU, CUDA | Weighted SIRT (Wolf et al. 2014): SIRT with the W-BP as back-projector. |
-| SART / OS-SART | `run_sart` | CPU, CUDA | Ordered-subset SART; `subset_size=1` is plain SART. |
+| SART / OS-SART | `run_sart` | CPU, CUDA | Ordered-subset SART; `subset_size=1` is plain SART; `view_order="golden"` visits the views in golden-ratio order. |
 | FISTA | `run_fista` | CPU, CUDA | Accelerated projected gradient on the least-squares data term. |
-| FISTA-TV | `run_fista_tv` | CPU, CUDA | FISTA with a TV-L2 proximal step (FGP or Chambolle); `tv_weight` is required. |
+| FISTA-TV | `run_fista_tv` | CPU, CUDA | FISTA with a TV-L2 proximal step (FGP or Chambolle, `tv_inner_iter` inner iterations; fused CUDA kernels); `tv_weight` is required. |
 | GENFIRE | `run_genfire` | CPU, CUDA | Fourier-gridding iterative reconstruction (Pryor et al. 2017). Frozen numerics. |
 | RESIRE | `run_resire` | CUDA | Real-space iterative reconstruction with the RESIRE supersampled projectors. Frozen numerics. |
 | MBIR | `run_mbir` | CPU, CUDA | Model-based MAP reconstruction (MBIR-AM-PE): qGGMRF prior, generalised-Huber likelihood, ICD sweeps, per-view offset and noise estimation, optional multi-resolution. |

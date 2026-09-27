@@ -12,10 +12,10 @@ Python package `fasttomo/`:
 |---|---|
 | `__init__.py` | Public API re-exports (pinned by a `dir(fasttomo)` test); torch >= 2.11 check; warns when a CPU-only build meets a CUDA machine or torch's CUDA is not 13.0. |
 | `algorithms/__init__.py` | Re-exports every name of the former `algorithms.py`; its docstring holds the shared conventions (shapes, call signature, dtypes, support, constraints order, `loss_callback`, `warm_start`, `progress`, `num_threads`). |
-| `algorithms/_common.py` | Named constants, `_prepare_recon` (validation, warm start, support resolution, `ConstraintConfig`), `_LossRecorder` (loss history, `loss_callback`, tqdm), deprecated-keyword helpers, `_build_fp_bp`. |
-| `algorithms/analytic.py` | `run_fbp`, `run_weighted_backprojection` (W-BP, `_bp_gather`, weighting filter). |
-| `algorithms/algebraic.py` | `run_sirt` (+ CUDA-graph path), `run_sart`, `run_wsirt`. |
-| `algorithms/fista.py` | `run_fista`, `run_fista_tv` (TV prox: FGP / Chambolle), Lipschitz estimate. |
+| `algorithms/_common.py` | Named constants, `_prepare_recon` (validation, warm start, support resolution, `ConstraintConfig`), `_LossRecorder` (loss history, `loss_callback`, tqdm) and `_DeviceLossRecorder` (losses kept on the device, no per-iteration sync without a callback; used by SIRT, SART, wSIRT, FISTA, AD), deprecated-keyword helpers, `_build_fp_bp`. |
+| `algorithms/analytic.py` | `run_fbp` (ramp filter, optional apodisation window), `run_weighted_backprojection` (W-BP, `_bp_gather`, weighting filter cached per geometry: up to 8 filters on their device, dropped by `release_cached_projectors()`). |
+| `algorithms/algebraic.py` | `run_sirt` (+ CUDA-graph path, also with a loss), `run_sart` (fused SIRT kernels, planar normalisers, `view_order`), `run_wsirt`. |
+| `algorithms/fista.py` | `run_fista`, `run_fista_tv` (TV prox: FGP / Chambolle, CUDA kernels with the PyTorch code as CPU path and reference), fused FISTA update, Lipschitz estimate (fp32 norms). |
 | `algorithms/ad.py` | `run_ad_recon` (setup, `_ad_step`, `_ad_project_constraints`), `run_grad_descent`. |
 | `algorithms/genfire.py` | `run_genfire`. **Frozen.** |
 | `algorithms/resire.py` | `run_resire`. **Frozen.** |
@@ -31,7 +31,7 @@ Python package `fasttomo/`:
 | `utilities.py` | `ramp_filter`, `estimate_shifts_xcorr`; re-exports `cylindrical_mask`, `tv_loss_3d`, `apply_shifts*` from their current homes. |
 | `configs.py` | `AdReconConfig` (`OptimConfig`, `RegularizerConfig`, `PoseRefinementConfig`, `ConstraintConfig`), `MbirConfig`. |
 
-Native code `csrc/`: `bindings.cpp` (module), `bindings_cpu.cpp`, `bindings_cuda.cpp` (the CUDA bindings compile to stubs in a CPU-only build); `cpu/` (`projection_parallel.c`, `projection_rotmat.c`, `genfire.c`, `mbir_icd.c`); `cuda/` (`projection_parallel.cu`, `projection_rotmat.cu`, `projection_resire.cu`, `genfire.cu`, `grad_angle.cu`, `tv_loss.cu`, `sirt_update.cu` (run_sirt's fused elementwise kernels), `texture_cache.cu` (cudaArray + texture caches; parallel caches pack 2 fp32 or 4 fp16 Y-slices per texel for Ny >= 2, zero-padded, `parallel_channels` in `projection_parallel.cu` is the layout rule), `mbir_icd.cu`, `scratch_pool.cuh` (header-only stream-ordered per-device scratch pool for the fixed-order two-pass reductions of `grad_rotmat` / `grad_angle`; it keeps up to 64 MiB per device reserved for the life of the process, invisible to `torch.cuda.memory_*` and not freed by `release_cached_projectors()`)).
+Native code `csrc/`: `bindings.cpp` (module), `bindings_cpu.cpp`, `bindings_cuda.cpp` (the CUDA bindings compile to stubs in a CPU-only build); `cpu/` (`projection_parallel.c`, `projection_rotmat.c`, `genfire.c`, `mbir_icd.c`); `cuda/` (`projection_parallel.cu`, `projection_rotmat.cu`, `projection_resire.cu`, `genfire.cu`, `grad_angle.cu`, `tv_loss.cu`, `sirt_update.cu` (run_sirt's and run_sart's fused elementwise kernels), `fista_update.cu` (fused FISTA step / constraints / momentum), `tv_prox.cu` (run_fista_tv's TV prox), `texture_cache.cu` (cudaArray + texture caches; parallel caches pack 2 fp32 or 4 fp16 Y-slices per texel for Ny >= 2, zero-padded, `parallel_channels` in `projection_parallel.cu` is the layout rule), `mbir_icd.cu`, `scratch_pool.cuh` (header-only stream-ordered per-device scratch pool for the fixed-order two-pass reductions of `grad_rotmat` / `grad_angle`; it keeps up to 64 MiB per device reserved for the life of the process, invisible to `torch.cuda.memory_*` and not freed by `release_cached_projectors()`)).
 
 ## Frozen algorithms
 
@@ -93,7 +93,7 @@ Layout, by topic:
 - Full suite on one GPU: `CUDA_VISIBLE_DEVICES=<idx> python -m pytest tests -q`. About 19 tests skip on one card (17 cross-device tests need 2 visible GPUs, 1 needs scikit-image, 1 needs `FASTTOMO_EXPECT_CUDA`).
 - CPU only: `CUDA_VISIBLE_DEVICES= python -m pytest tests -q` (the `gpu` tests skip themselves), or `pytest tests -m "not gpu"` to deselect them.
 - With a non-editable install, run the `pytest` entry point rather than `python -m pytest` from the repo root, otherwise the source tree (without a compiled `_core`) shadows the installed package.
-- `tests/sanitizer_sweep.py` (not collected) is the size sweep for `compute-sanitizer` memcheck/racecheck; run it on a free GPU after any CUDA kernel change (`tv` / `parallel` as argument run only those variants).
+- `tests/sanitizer_sweep.py` (not collected) is the size sweep for `compute-sanitizer` memcheck/racecheck; run it on a free GPU after any CUDA kernel change (`python tests/sanitizer_sweep.py tv` or `solvers` runs only the TV-loss or the SIRT / SART / FISTA / TV-prox kernels, `parallel` the parallel-beam FP/BP and texture-pool variants).
 
 ### Golden files and the arithmetic fingerprint
 

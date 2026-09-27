@@ -29,75 +29,10 @@ from fasttomo.configs import (
 from fasttomo.algorithms._common import (
     _S3IM_SEED,
     _assert_projector_output_shape,
-    _emit_loss,
     _prepare_recon,
+    _DeviceLossRecorder,
     _LossRecorder,
 )
-
-
-class _DeviceLossRecorder(_LossRecorder):
-    """`_LossRecorder` that keeps tensor losses on the device (A6-8).
-
-    Same values and callback contract, fewer host syncs per iteration:
-
-    * ``return_loss`` alone: each loss is copied into a device buffer (no
-      sync); `history` / `finish` move it to the host once, at the end.
-    * with a ``loss_callback``: the total and its components go to the host
-      in one transfer (one sync instead of one per value), and the callback
-      still gets plain floats for the true iteration index. The history is
-      then kept from those floats.
-
-    Values are the fp32 losses the base class records (``tolist`` and
-    ``item`` convert the same fp32 value to the same Python float). Non-tensor
-    values fall back to the base class.
-    """
-
-    def __init__(self, return_loss, loss_callback, progress, n_iter, *, desc=None) -> None:
-        super().__init__(return_loss, loss_callback, progress, n_iter, desc=desc)
-        self._n_iter = n_iter
-        self._buf: torch.Tensor | None = None
-        self._n = 0
-
-    def record(self, it, loss, components=None) -> None:
-        if not self.wants_loss:
-            return
-        values = [loss]
-        if self.send_components and components is not None:
-            values += list(components.values())
-        if not all(isinstance(v, torch.Tensor) and v.numel() == 1
-                   and v.dtype == torch.float32 for v in values):
-            super().record(it, loss, components)
-            return
-        if self.loss_callback is None:
-            if self._buf is None:
-                self._buf = torch.empty(self._n_iter, dtype=torch.float32,
-                                        device=loss.device)
-            self._buf[self._n].copy_(loss.detach().reshape(()))
-            self._n += 1
-            return
-        host = torch.stack([v.detach().reshape(()) for v in values]).tolist()
-        loss_val = host[0]
-        if self.return_loss:
-            self.losses.append(loss_val)
-        comps = None
-        if self.send_components:
-            comps = ({"fidelity": loss_val} if components is None
-                     else dict(zip(components.keys(), host[1:])))
-        _emit_loss(self.loss_callback, self.send_components, it, loss_val, comps)
-
-    def _flush(self) -> None:
-        if self._buf is not None:
-            self.losses.extend(self._buf[:self._n].tolist())
-            self._buf = None
-            self._n = 0
-
-    def history(self) -> torch.Tensor:
-        self._flush()
-        return super().history()
-
-    def finish(self, volume):
-        self._flush()
-        return super().finish(volume)
 
 
 def _ad_recon_step_schedule(

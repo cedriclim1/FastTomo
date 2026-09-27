@@ -234,7 +234,10 @@ __global__ static void sirt_residual_tex_packed_kernel(
  *                                        `vol.add_(update, alpha=omega)`
  * then the constraints in apply_constraints' order: support mask multiply,
  * positivity clamp, soft threshold sign(v) * clamp(|v| - thr, min=0).
- * `mask` is [1 | Ny, Nz, Nx] (mask_full selects the second), or null.
+ * `mask` is [1 | Ny, Nz, Nx] (mask_full selects the second), or null; so
+ * is `C` (C_full selects the second): the voxel normaliser 1 / BP(1) of a
+ * parallel-beam operator is the same in every Y-slice, bit for bit, so
+ * run_sirt / run_sart keep one plane of it (solver audit P2 / P6).
  * vol_out may alias vol_in (each element is read before it is written by
  * the same thread). Grid: x over the Nz*Nx plane, y over Y-slices. */
 template <typename T, bool EAGER>
@@ -268,6 +271,7 @@ __global__ static void sirt_update_kernel(
     T       *vol_out,
     const T *__restrict__ upd,
     const T *__restrict__ C,
+    int C_full,
     const T *__restrict__ mask,
     int mask_full,
     float omega,
@@ -285,7 +289,7 @@ __global__ static void sirt_update_kernel(
         /* vol_in null: the volume lives in the texture (read it there) */
         float v0 = vol_in ? ld(vol_in, i) : surf_get<T>(st, x, z, y);
         float v = sirt_update_one<T, EAGER>(
-            v0, ld(upd, i), ld(C, i), mask != nullptr, m,
+            v0, ld(upd, i), ld(C, C_full ? i : (size_t)p), mask != nullptr, m,
             omega, positivity, soft_thr);
         if (vol_out) vol_out[i] = float_to_t<T>(v);
         if (st.kind != SURF_NONE)
@@ -303,6 +307,7 @@ __global__ static void sirt_update_vec_kernel(
     T       *vol_out,
     const T *__restrict__ upd,
     const T *__restrict__ C,
+    int C_full,
     const T *__restrict__ mask,
     int mask_full,
     float omega,
@@ -315,7 +320,7 @@ __global__ static void sirt_update_vec_kernel(
     if (p >= plane) return;
     for (int y = blockIdx.y; y < Ny; y += gridDim.y) {
         size_t i = (size_t)y * plane + p;
-        Pack<T> v = ldp(vol_in, i), u = ldp(upd, i), c = ldp(C, i), m, o;
+        Pack<T> v = ldp(vol_in, i), u = ldp(upd, i), c = ldp(C, C_full ? i : (size_t)p), m, o;
         if (mask) m = ldp(mask, mask_full ? i : (size_t)p);
         #pragma unroll
         for (int e = 0; e < N; e++)
@@ -335,6 +340,7 @@ __global__ static void sirt_update_packed_kernel(
     T       *vol_out,
     const T *__restrict__ upd,
     const T *__restrict__ C,
+    int C_full,
     const T *__restrict__ mask,
     int mask_full,
     float omega,
@@ -361,7 +367,8 @@ __global__ static void sirt_update_packed_kernel(
             size_t i = (size_t)y * plane + p;
             float m = mask ? ld(mask, mask_full ? i : (size_t)p) : 1.0f;
             float v = sirt_update_one<T, EAGER>(
-                vol_in ? ld(vol_in, i) : ld(cur.v, k), ld(upd, i), ld(C, i),
+                vol_in ? ld(vol_in, i) : ld(cur.v, k), ld(upd, i),
+                ld(C, C_full ? i : (size_t)p),
                 mask != nullptr, m, omega, positivity, soft_thr);
             tmp.v[k] = float_to_t<T>(v);
             if (vol_out) vol_out[i] = tmp.v[k];
@@ -479,7 +486,8 @@ void sirt_update_cuda(
     float omega, int positivity, float soft_thr,
     int Ny, int Nz, int Nx,
     TextureCache *vol_tc,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int C_full
 ) {
     check_io_dtype(io_dtype, "sirt_update_cuda");
     if (Ny <= 0 || Nz <= 0 || Nx <= 0) return;
@@ -504,7 +512,7 @@ void sirt_update_cuda(
                       (unsigned)(Nyp < 65535 ? Nyp : 65535));
 #define SIRT_UPDATE_PACKED(T, CH, E)                                             \
     sirt_update_packed_kernel<T, CH, E><<<grid, block, 0, stream>>>(              \
-        (const T *)vol_in, (T *)vol_out, (const T *)upd, (const T *)C,            \
+        (const T *)vol_in, (T *)vol_out, (const T *)upd, (const T *)C, C_full,    \
         (const T *)mask, mask_full, omega, positivity, soft_thr, Ny, plane, Nx,  \
         vol_tc->surf)
             if (io_dtype == 0 && vol_tc->channels == 2) {
@@ -534,12 +542,13 @@ void sirt_update_cuda(
     if (use_vec)                                                                 \
         sirt_update_vec_kernel<T, E><<<grid, block, 0, stream>>>(                \
             (const T *)vol_in, (T *)vol_out, (const T *)upd, (const T *)C,       \
-            (const T *)mask, mask_full, omega, positivity, soft_thr, Ny, plane); \
+            C_full, (const T *)mask, mask_full, omega, positivity, soft_thr,     \
+            Ny, plane);                                                          \
     else                                                                         \
         sirt_update_kernel<T, E><<<grid, block, 0, stream>>>(                    \
             (const T *)vol_in, (T *)vol_out, (const T *)upd, (const T *)C,       \
-            (const T *)mask, mask_full, omega, positivity, soft_thr, Ny, plane,  \
-            Nx, st);                                                             \
+            C_full, (const T *)mask, mask_full, omega, positivity, soft_thr,     \
+            Ny, plane, Nx, st);                                                  \
 } while (0)
     if (io_dtype == 0) {
         if (eager_order) SIRT_UPDATE(float, true); else SIRT_UPDATE(float, false);

@@ -58,6 +58,87 @@ fp32 kernels 1.3-1.6x, fp16 with `Ny % 4 != 0` 2.1-2.9x, fp16 with
 `Ny % 4 == 0` 1.0-1.1x (FP clipping only). Script:
 `benchmarks/scripts/run_parallel_projection_bench.py`.
 
+### Classical solver loops: SIRT, SART, wSIRT, FISTA, FISTA-TV, FBP, W-BP (phase 1b, PR E)
+
+Measured on one RTX PRO 6000 Blackwell (sm_120), fp32, 61 views over +-60
+degrees, N_det = N, CUDA events, median of 20 calls; per iteration =
+(t(n2) - t(n1)) / (n2 - n1).
+
+- **fp16 `run_fista` / `run_fista_tv` no longer raise `ZeroDivisionError`
+  when `||A^T A||` exceeds 65504** (a 512-pixel detector with 180 views):
+  the Lipschitz power iteration takes its norms in fp32 and keeps L on the
+  device (one host sync instead of one per step). fp32 is unchanged bit
+  for bit; fp16 FISTA changes in the last bits of L (`fista_h` goldens
+  regenerated, max change 2 fp16 ulps).
+- **FISTA-TV: the TV proximal operator runs as two CUDA kernels per inner
+  iteration** (`csrc/cuda/tv_prox.cu`; the PyTorch FGP / Chambolle code
+  stays the CPU path and the reference). Bit-identical to the PyTorch prox
+  in fp32 and fp16 (goldens unchanged; the prox weight's reciprocal
+  `1 / lam` is rounded as CUDA ATen rounds a division by a Python float:
+  in double, then once to fp32); no Triton dependency. Per outer
+  iteration with 20 inner iterations: 68.7 -> 18.3 ms at 256^3 (3.75x),
+  4.45 -> 0.69 ms at 128^3 (6.5x); the prox alone 66.8 -> 16.8 ms and
+  4.12 -> 0.56 ms, peak 1.74 GiB -> 448 MiB at 256^3. 100 inner iterations
+  now cost 83 ms at 256^3, about what 20 did.
+- `run_fista_tv(tv_inner_iter=)` (default 20, unchanged) is documented
+  with the duality gap it leaves (1-3 % at prox weight `tv_weight / L` =
+  0.02, 13-24 % at 0.1) and validated early (integer >= 0), as is
+  `tv_inner`. The docstring also states how its `tv_weight` relates to
+  the TV weight of `run_grad_descent` / `run_ad_recon` (different TV and
+  data-term scales: `w_fista ~= w_ad * M / (2 Nc)`).
+- **`run_sart` is 1.3-1.9x faster and needs ~20x less memory**: every
+  subset step is run_sirt's fused residual and update kernels (writing the
+  sinogram and volume textures directly), subsets are slices (no host sync
+  per subset, also with CPU angles: was 60-183 per iteration), and in
+  parallel geometry the per-subset normalisers are one sinogram plus one
+  `[1, Nz, Nx]` plane per subset (they are the same in every Y-slice),
+  computed on a one-slice operator. 256^3: 30.6 -> 16.4 ms per iteration,
+  setup 29 -> 4.2 ms, peak 4.3 GiB -> 223 MiB; 128^3: 6.1 -> 4.3 ms,
+  setup 8.0 -> 4.2 ms.
+  Bit-identical (`sart*` goldens).
+- New `run_sart(view_order="golden")`: visits the views in the
+  golden-ratio order (view k at the rank of frac(k (sqrt(5) - 1) / 2)).
+  After one sweep of single-view SART (64^2, 1 % noise): relative error
+  0.096 vs 0.650 (180 views over 180 degrees), 0.31 vs 0.70 (61 views
+  over +-60 degrees). Default `"sequential"` (unchanged).
+- Recorded losses stay on the device (`_DeviceLossRecorder`, shared with
+  the AD solvers): with `return_loss` alone no solver syncs the host per
+  iteration any more (was 1); with a `loss_callback` one sync per
+  iteration (the frozen contract). `run_sirt` with a loss now runs on the
+  CUDA-graph path (the loss graph uses the eager rounding order, so the
+  result and the loss history are unchanged bit for bit): 256^3
+  1.525 -> 1.389 ms, 128^3 0.220 -> 0.189 ms per iteration.
+- `run_sirt` keeps one `[1, Nz, Nx]` plane of the voxel normaliser in
+  parallel geometry (`sirt_update_cuda(C_full=0)`): one volume less
+  streamed per iteration and kept by the graph cache (256^3: 1.417 ->
+  1.348 ms per iteration; kept 0.36 -> 0.30 GiB, 512^3 2.62 -> 2.12 GiB).
+  No zero-tensor fill per iteration in fp32 (H2). Bit-identical.
+- FISTA: the step, constraints and momentum are one fused kernel that also
+  writes the new momentum point into the volume texture
+  (`csrc/cuda/fista_update.cu`; FISTA-TV uses its step and momentum
+  halves around the prox). Bit-identical. 256^3: 1.677 -> 1.509 ms per
+  iteration (positivity + mask 1.768 -> 1.508), 128^3 0.208 -> 0.180 ms.
+  The residual is computed once when a loss is recorded (H3).
+- `run_weighted_backprojection` / `run_wbp` / `run_wsirt` cache the exact
+  weighting filter per geometry (bounded LRU of 8, keyed by the fp32 angle
+  values, sizes, `threshold_scale` and device): `run_wbp` 6.0 -> 0.41 ms
+  at 128^3 (14.8x), 7.2 -> 1.55 ms at 256^3; wSIRT setup 6 -> 0.4 ms.
+  Bit-identical. The filters stay on their device (up to 8 of
+  `[Pz, Px // 2 + 1]` fp32, Pz, Px ~ 1.125 N: ~85 MiB at 2048^2) until
+  `release_cached_projectors()`, which now also drops them.
+- New `run_fbp(window="none" | "hann" | "hamming")`: apodises the Ram-Lak
+  ramp (Hann 0.5 + 0.5 cos(2 pi f), Hamming 0.54 + 0.46 cos(2 pi f), f in
+  cycles per detector pixel on the zero-padded grid). Default `"none"`
+  is the former filter bit for bit.
+- Documentation of measured long-run behaviour (no algorithm change):
+  `run_wsirt` without positivity is slowly unstable (spectral radius of
+  `I - omega W A` 1.0013-1.008; error 0.24 at 200 iterations, 1.46 at
+  3000 on a 64^2 slice; stable with positivity) and CUDA `run_fista` /
+  `run_fista_tv` eventually diverge because the CUDA back-projection is
+  not the adjoint of the forward projection (0.185 at 200 iterations, 14.1
+  at 3000; CPU 0.131): keep `n_iter` at about 200-300 on CUDA. Tests pin
+  both.
+
 ### AD reconstruction and regularisers: speed and accuracy (phase 1b, PR D)
 
 - `run_ad_recon` with a staged pose schedule (`pose_warmup_iters`,
