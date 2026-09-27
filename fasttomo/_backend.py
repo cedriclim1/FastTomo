@@ -65,11 +65,11 @@ def _check_finite_geometry(t: torch.Tensor, what: str) -> None:
     projection, so the Python entry points refuse it. The check is one
     reduction over ``n_angles`` values on the host; CUDA-resident tensors are
     skipped, because reading the result back would add a stream sync to
-    every CUDA projection. The CUDA kernels do not crash on such angles, but
-    their results are wrong: the forward and back-projection sample the
-    texture at NaN coordinates and return finite wrong values for that view
-    (grad_angle returns NaN). The NaN-safe predicate for the CUDA kernels is
-    PR B's."""
+    every CUDA projection. The CUDA parallel kernels treat such a view like
+    the CPU kernels do: every sample fails the bounds test, so its forward
+    projection is 0 and it adds nothing to the back-projection (it used to
+    be finite garbage, the texture sampled at NaN coordinates); grad_angle
+    returns NaN for it."""
     if t.is_cuda:
         return
     if not bool(torch.isfinite(t).all()):

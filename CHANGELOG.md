@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+### Parallel-beam CUDA projections: packed textures, ray clipping, texture pool (phase 1b, PR B)
+
+Same results bit for bit (0 differing outputs over 3.7e8 values: FP/BP one-shot
+and cached, fp32/fp16, Ny = 1..13 and odd sizes, N_det != Nx, edge-case angles,
+and the CUDA SIRT/SART/wSIRT/FBP/FISTA outputs; the goldens are unchanged).
+
+- fp32 parallel textures hold 2 Y-slices per `float2` texel, fp16 ones 4 per
+  texel for every Ny >= 2 (the last texel zero-padded; fp16 used to fall back
+  to 1-channel textures when `Ny % 4 != 0`). The filter unit weights every
+  channel alike, so each slice gets the bits of a 1-channel fetch.
+  `_core.parallel_channels(io_dtype, Ny)` is the one layout rule; the cached
+  projectors and run_sirt's fused texture writes use it too
+  (`sirt_residual_tex_packed_kernel` / `sirt_update_packed_kernel` for both
+  formats). An fp32 volume may now have up to 4096 Y-slices and an fp16 one
+  8192 (2048 texture layers). `tc_create` accepts `channels=2` (fp32,
+  layered kinds) and now rejects packed `TC_VOL_3D` caches (unused; the old
+  4-channel 3-D path did not round-trip).
+- The forward projection walks only the steps where its ray can be inside
+  the volume, as one range per warp (32 x 8 blocks); the in-loop bounds test
+  is unchanged.
+- A NaN/Inf in CUDA-resident tilt angles (not checked on the host, see below)
+  now gives what the CPU kernels give: a zero forward-projection view, and no
+  contribution to the back-projection (it was finite garbage).
+- fp16 overflow check: the parallel CUDA kernels report non-finite stores
+  in a 4-byte word, so the check after a public fp16 call reads that word
+  instead of scanning the result (same OverflowError / FloatingPointError
+  contract); inside the fp16 algorithms the recorded flag is one tiny kernel
+  instead of a reduction over the result.
+- `forward_project`, `back_project`, the `*_3d` variants and `run_fbp` on CUDA
+  reuse up to 4 texture arrays of the most recently used shapes instead of
+  allocating one, synchronising and freeing it on every call: the host no
+  longer blocks per call (fp32; fp16 still reads the overflow word). Memory
+  retained: up to 4 texture arrays, outside PyTorch's allocator (a 512^3
+  fp32 volume texture is 512 MiB). `release_cached_projectors()` frees them;
+  an allocation failure empties the pool and retries once. Calls from
+  several threads or streams are safe (a stream switch waits for the
+  previous stream, like the cached projectors).
+
+Measured on an RTX PRO 6000 Blackwell (sm_120), torch 2.14.0+cu130, angles
+linspace(-70, 70, n), N^3 volumes, median of 20 CUDA-event timings, main ->
+this change (ms):
+
+| | 128^3 / 61 | 256^3 / 181 | 512^3 / 61 | 512^3 / 181 |
+|---|---|---|---|---|
+| fp32 FP kernel | 0.100 -> 0.076 | 1.92 -> 1.31 | 5.71 -> 3.59 | 15.7 -> 9.90 |
+| fp32 BP kernel | 0.084 -> 0.061 | 1.78 -> 1.25 | 4.91 -> 3.17 | 13.7 -> 9.46 |
+| fp32 `forward_project` call | 0.270 -> 0.117 | 2.31 -> 1.42 | 7.88 -> 4.47 | 17.4 -> 10.4 |
+| fp32 host time per call | 0.379 -> 0.040 | 2.40 -> 0.040 | 8.18 -> 0.041 | 17.2 -> 0.040 |
+| fp16 BP call (`ParallelProjector.back`) | 0.075 -> 0.069 | 0.753 -> 0.649 | 2.99 -> 1.67 | 6.13 -> 4.89 |
+| fp16 FP kernel, Ny = N-1 (A/B in one process) | 0.091 -> 0.042 | 1.79 -> 0.641 | 5.24 -> 1.90 | 14.9 -> 5.16 |
+| `run_fbp` fp32 | 0.358 -> 0.160 | | 6.79 -> 5.11 | |
+
+fp32 kernels 1.3-1.6x, fp16 with `Ny % 4 != 0` 2.1-2.9x, fp16 with
+`Ny % 4 == 0` 1.0-1.1x (FP clipping only). Script:
+`benchmarks/scripts/run_parallel_projection_bench.py`.
+
 ### AD reconstruction and regularisers: speed and accuracy (phase 1b, PR D)
 
 - `run_ad_recon` with a staged pose schedule (`pose_warmup_iters`,
@@ -137,8 +193,9 @@ A NaN or Inf tilt angle crashed the process on CPU (the parallel kernels
 indexed memory with `(int)NaN`). Host-side angles and rotation matrices
 holding NaN or Inf now raise ValueError at every entry point, on both
 backends (CUDA-resident angles are not checked, which would add a sync to
-every CUDA projection; the CUDA kernels do not crash), and the CPU kernels
-skip NaN samples instead of reading out of bounds.
+every CUDA projection; the CUDA parallel kernels skip such a view, see the
+PR B entry above), and the CPU kernels skip NaN samples instead of reading
+out of bounds.
 
 ### Build: `-ffp-contract=off` for the C kernels
 

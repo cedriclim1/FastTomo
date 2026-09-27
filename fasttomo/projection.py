@@ -193,7 +193,10 @@ def forward_project(
 
     The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in. Default
     is serial. Resolution order: kwarg → ``OMP_NUM_THREADS`` env → 1. The CUDA
-    path ignores ``num_threads`` (the kernel manages its own grid).
+    path ignores ``num_threads`` (the kernel manages its own grid); it reuses
+    a pooled texture of the call's shape (up to 4 are kept, freed by
+    :func:`fasttomo.release_cached_projectors`), so a call neither allocates
+    nor blocks the host.
 
     Differentiable w.r.t. ``volume`` and ``angles_deg``.  Volume gradient
     calls back_project (the discrete adjoint). Angle gradient uses
@@ -235,7 +238,8 @@ def back_project(
       smooth data, more on noise).
 
     The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in (default
-    serial; resolution order kwarg → ``OMP_NUM_THREADS`` env → 1).
+    serial; resolution order kwarg → ``OMP_NUM_THREADS`` env → 1). The CUDA
+    path reuses a pooled texture, as in :func:`forward_project`.
 
     Differentiable w.r.t. ``sinogram``: backward calls forward_project.
     """
