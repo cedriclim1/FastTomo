@@ -797,29 +797,32 @@ def test_fused_sirt_kernels_bit_identical_to_torch_chain(dtype, shape):
     assert torch.equal(_bits(raw), _bits(sino - fp))
     assert torch.equal(_bits(res), _bits((sino - fp) * R))
 
-    for mask_shape in (None, (1, Nz, Nx), (Ny, Nz, Nx)):
-        mask = None if mask_shape is None else rand(*mask_shape, scale=2.0, positive=True)
-        for omega in (1.0, 0.8, 0.37):
-            for positivity in (False, True):
-                for soft in (0.0, 1e-3, 0.5):
-                    cons = ConstraintConfig(positivity=positivity, support_mask=mask,
-                                            soft_threshold=soft)
-                    # run_sirt's eager loop
-                    want = cons.apply(vol + omega * C * upd)
-                    got = _fused_update(vol, upd, C, omega, cons, eager_order=True)
-                    assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
-                                                                   positivity, soft)
-                    # _sirt_iter_inplace (in place, as in the CUDA graph)
-                    want = vol.clone()
-                    u = upd.clone()
-                    u.mul_(C)
-                    want.add_(u, alpha=omega)
-                    cons.apply_inplace_(want)
-                    got = vol.clone()
-                    assert _fused_update(got, upd, C, omega, cons, eager_order=False,
-                                         out=got) is got
-                    assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
-                                                                   positivity, soft)
+    # C as a full volume, and as one [1, Nz, Nx] plane broadcast over Y
+    # (run_sirt / run_sart in parallel geometry, P2 / P6)
+    for C in (C, C[:1].contiguous()):
+        for mask_shape in (None, (1, Nz, Nx), (Ny, Nz, Nx)):
+            mask = None if mask_shape is None else rand(*mask_shape, scale=2.0, positive=True)
+            for omega in (1.0, 0.8, 0.37):
+                for positivity in (False, True):
+                    for soft in (0.0, 1e-3, 0.5):
+                        cons = ConstraintConfig(positivity=positivity, support_mask=mask,
+                                                soft_threshold=soft)
+                        # run_sirt's eager loop
+                        want = cons.apply(vol + omega * C * upd)
+                        got = _fused_update(vol, upd, C, omega, cons, eager_order=True)
+                        assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
+                                                                       positivity, soft)
+                        # _sirt_iter_inplace (in place, as in the CUDA graph)
+                        want = vol.clone()
+                        u = upd.clone()
+                        u.mul_(C)
+                        want.add_(u, alpha=omega)
+                        cons.apply_inplace_(want)
+                        got = vol.clone()
+                        assert _fused_update(got, upd, C, omega, cons, eager_order=False,
+                                             out=got) is got
+                        assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
+                                                                       positivity, soft)
 
 
 @needs_cuda
