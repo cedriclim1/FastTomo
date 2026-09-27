@@ -279,6 +279,65 @@ def test_sirt_projector_shape_mismatch_raises():
         )
 
 
+# ── RotmatProjector mats normalisation (#75) ──────────────────────────────
+
+def _bare_rotmat_projector(n_angles: int):
+    """RotmatProjector without __init__ (which needs CUDA): enough to test
+    the pure-PyTorch mats normalisation on CPU."""
+    proj = ft.RotmatProjector.__new__(ft.RotmatProjector)
+    proj.n_angles = n_angles
+    return proj
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float16, torch.bfloat16])
+def test_rotmat_projector_normalize_casts_mats_to_fp32(dtype):
+    """The rotmat kernels read mats as float32; other float dtypes must be
+    cast, not reinterpreted."""
+    n_angles = 5
+    proj = _bare_rotmat_projector(n_angles)
+    mats = torch.eye(3, dtype=dtype).unsqueeze(0).expand(n_angles, -1, -1).contiguous()
+    mats_flat = proj._normalize_and_validate_mats(mats)
+    assert mats_flat.shape == (n_angles, 9)
+    assert mats_flat.dtype == torch.float32
+    assert mats_flat.is_contiguous()
+
+
+def test_rotmat_projector_normalize_makes_mats_contiguous():
+    """Strided mats (expand, transpose views) must come out dense with the
+    same logical values."""
+    n_angles = 4
+    proj = _bare_rotmat_projector(n_angles)
+    ref = torch.randn(n_angles, 9)
+
+    strided_2d = ref.t().contiguous().t()          # [n, 9], strides (1, n)
+    assert not strided_2d.is_contiguous()
+    out = proj._normalize_and_validate_mats(strided_2d)
+    assert out.is_contiguous() and torch.equal(out, ref)
+
+    expanded = torch.eye(3).unsqueeze(0).expand(n_angles, -1, -1)
+    assert not expanded.is_contiguous()
+    out = proj._normalize_and_validate_mats(expanded)
+    assert out.is_contiguous()
+    assert torch.equal(out, torch.eye(3).reshape(1, 9).expand(n_angles, 9))
+
+
+def test_rotmat_projector_normalize_keeps_grad_path():
+    """Casting and densifying must not cut the autograd graph to the pose."""
+    n_angles = 3
+    proj = _bare_rotmat_projector(n_angles)
+    mats = torch.randn(n_angles, 3, 3, dtype=torch.float64, requires_grad=True)
+    proj._normalize_and_validate_mats(mats).sum().backward()
+    assert mats.grad is not None and mats.grad.dtype == torch.float64
+
+
+def test_rotmat_projector_normalize_rejects_non_floating_mats():
+    n_angles = 3
+    proj = _bare_rotmat_projector(n_angles)
+    mats_int = torch.zeros(n_angles, 3, 3, dtype=torch.int32)
+    with pytest.raises(TypeError, match="floating tensor"):
+        proj._normalize_and_validate_mats(mats_int)
+
+
 # ── FISTA / FISTA-TV ──────────────────────────────────────────────────────
 
 def test_fista_shape():

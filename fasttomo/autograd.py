@@ -424,10 +424,11 @@ def _grad_rotmat_raw(
             raise RuntimeError("fasttomo was compiled without CUDA support")
         vol  = volume.contiguous().float()
         gs   = grad_sino.contiguous().float()
+        mats = mats_flat.detach().contiguous().float()
         grad_mats = torch.zeros(n_angles, 9, dtype=torch.float32, device=vol.device)
         with _on_device(vol):
             _core.grad_rotmat_cuda(
-                vol.data_ptr(), gs.data_ptr(), mats_flat.data_ptr(), grad_mats.data_ptr(),
+                vol.data_ptr(), gs.data_ptr(), mats.data_ptr(), grad_mats.data_ptr(),
                 Ny, Nz, Nx, n_angles, N_det,
                 _stream_ptr(vol.device),
             )

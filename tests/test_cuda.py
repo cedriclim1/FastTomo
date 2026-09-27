@@ -1271,6 +1271,82 @@ def test_rotmat_cached_backward_stale_volume_falls_back_uncached():
     assert rel_b < 1e-5, f"latest branch gradient mismatch: rel_err={rel_b:.2e}"
 
 
+# ── RotmatProjector mats dtype / layout (#75) ─────────────────────────────
+
+def _rotmat_setup(N: int = 16, n_angles: int = 8, seed: int = 7):
+    from fasttomo.autograd import _euler_zyz_to_rotmat
+
+    torch.manual_seed(seed)
+    volume = torch.randn(N, N, N, device=DEVICE, dtype=torch.float32)
+    grad_sino = torch.randn(n_angles, N, N, device=DEVICE, dtype=torch.float32)
+    euler = torch.zeros(n_angles, 3, device=DEVICE)
+    euler[:, 0] = torch.linspace(-10.0, 10.0, n_angles, device=DEVICE)
+    euler[:, 1] = torch.linspace(-50.0, 50.0, n_angles, device=DEVICE)
+    mats_flat = _euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous().float()
+    return volume, grad_sino, mats_flat
+
+
+def test_rotmat_projector_fp64_mats_match_fp32():
+    """fp64 mats must be cast, not reinterpreted as a float32 buffer."""
+    N, n_angles = 16, 8
+    volume, _, mats32 = _rotmat_setup(N, n_angles)
+    proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+    sino32 = proj.forward(volume, mats32)
+    sino64 = proj.forward(volume, mats32.double())
+    torch.testing.assert_close(sino64, sino32, rtol=1e-5, atol=1e-5)
+
+    sino = torch.randn_like(sino32)
+    torch.testing.assert_close(
+        proj.back(sino, mats32.double()), proj.back(sino, mats32), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_rotmat_projector_strided_mats_forward_and_pose_grad():
+    """A non-contiguous mats view must give the same projection and the same
+    pose gradient as its dense copy, through RotmatProjector.forward."""
+    N, n_angles = 16, 8
+    volume, grad_sino, mats32 = _rotmat_setup(N, n_angles)
+    proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+
+    dense = mats32.clone().requires_grad_(True)
+    base_t = mats32.t().contiguous().requires_grad_(True)   # [9, n_angles]
+    strided = base_t.t()                                     # [n_angles, 9] view
+    assert not strided.is_contiguous()
+
+    sino_d = proj.forward(volume, dense)
+    (sino_d * grad_sino).sum().backward()
+    sino_s = proj.forward(volume, strided)
+    (sino_s * grad_sino).sum().backward()
+
+    torch.testing.assert_close(sino_s, sino_d, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(base_t.grad.t(), dense.grad, rtol=1e-4, atol=1e-4)
+
+
+def test_rotmat_grad_paths_accept_strided_mats():
+    """Both backward gradient kernels (cached _grad_mats_raw and uncached
+    _grad_rotmat_raw) must densify mats themselves: _FP3DCached.backward
+    passes the saved mats straight through."""
+    from fasttomo.autograd import _grad_rotmat_raw
+
+    N, n_angles = 16, 8
+    volume, grad_sino, mats32 = _rotmat_setup(N, n_angles)
+    strided = mats32.t().contiguous().t()
+    assert not strided.is_contiguous()
+
+    ref = _grad_rotmat_raw(volume, grad_sino, mats32)
+    torch.testing.assert_close(
+        _grad_rotmat_raw(volume, grad_sino, strided), ref, rtol=1e-5, atol=1e-5
+    )
+
+    proj = ft.RotmatProjector((N, N, N), n_angles=n_angles, device=DEVICE)
+    _ = proj.forward(volume, mats32)  # populates the cached volume texture
+    torch.testing.assert_close(
+        proj._grad_mats_raw(volume, grad_sino, strided),
+        proj._grad_mats_raw(volume, grad_sino, mats32),
+        rtol=1e-5, atol=1e-5,
+    )
+
+
 # ── Projector shape validation ────────────────────────────────────────────
 
 def test_parallel_projector_volume_shape_mismatch_raises():
