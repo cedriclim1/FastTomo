@@ -50,6 +50,29 @@ void back_project_parallel_cpu(
 );
 
 /*
+ * Voxel-driven (gather) parallel back-projection (CPU), the operator of the
+ * weighted back-projection (W-BP / wSIRT): for every voxel and view, the
+ * sinogram row linearly interpolated at u = x cos + z sin + (N_det-1)/2,
+ * zero outside the detector. Same operator as the CUDA
+ * back_project_parallel_kernel, with exact fp32 weights, and bit-for-bit
+ * the PyTorch reference `_bp_gather`. NOT the adjoint of
+ * forward_project_parallel_cpu (that is back_project_parallel_cpu).
+ *
+ * sino : [n_angles, Ny, N_det] float32; vol : [Ny, Nz, Nx], overwritten.
+ * Returns 0, or -1 if the scratch allocation (padded sinogram, x*cos table:
+ * (n_angles*Ny*(N_det+2) + n_angles*Nx) floats) fails.
+ */
+int back_project_gather_parallel_cpu(
+    const float *sino,
+    float       *vol,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+/*
  * GENFIRE Fourier gridding (CPU).
  *
  * Scatters 1D Fourier slices (fftshifted, DC at index bigN/2) onto a 2D

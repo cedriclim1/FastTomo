@@ -193,6 +193,14 @@ void grad_rotmat_cuda_cached(
 );
 
 /*
+ * Test hook: turn the ray clipping of forward_project_rotmat_kernel on (1,
+ * the default) or off (0, the full [-ray_len, ray_len] step loop). Returns
+ * the previous setting. Results are bit-identical either way; tests compare
+ * the two paths with torch.equal. Process-wide, not thread-safe: tests only.
+ */
+int _debug_set_rotmat_ray_clip(int on);
+
+/*
  * Gradient of forward projection w.r.t. tilt angles.
  * grad_angles must be zeroed by the caller; result is in radians.
  */
@@ -210,15 +218,22 @@ void grad_angle_cuda(
 /*
  * Fused 3-D isotropic Total-Variation loss.
  *   loss = mean( sqrt( dy² + dz² + dx² + eps ) )
- * over the (Ny-1)·(Nz-1)·(Nx-1) inner-corner grid. d_acc must be zeroed
- * by the caller; the kernel atomicAdds Σ s into it. The 1/N normalization
- * is applied by the Python caller. Backward expects `d_g_scaled[0]` to
- * already contain `grad_out · 1/N` (single-element device buffer).
- * d_grad_vol must be zeroed by the caller (kernel writes once per voxel).
+ * over the (Ny-1)·(Nz-1)·(Nx-1) inner-corner grid. The forward writes Σ s
+ * to d_acc[0] (deterministic two-pass reduction, fp64 above the per-lane
+ * sums, no atomics); d_acc is left untouched (so must be zeroed by the
+ * caller) when a dimension is < 2. d_partials is fp64 scratch of
+ * tv_loss_iso_3d_workspace(Ny, Nz, Nx) elements (0 when a dimension is < 2).
+ * The 1/N normalization is applied by the Python caller. Backward expects
+ * `d_g_scaled[0]` to already contain `grad_out · 1/N` (single-element
+ * device buffer). d_grad_vol must be zeroed by the caller (kernel writes
+ * once per voxel).
  */
+long long tv_loss_iso_3d_workspace(int Ny, int Nz, int Nx);
+
 void tv_loss_iso_3d_cuda(
     const float *d_vol,
     float       *d_acc,
+    double      *d_partials,
     int Ny, int Nz, int Nx,
     float eps,
     cudaStream_t stream

@@ -48,9 +48,12 @@ import fasttomo as ft
 # * CPU vs CUDA geometry gradients (grad_angle / grad_rotmat): no texture
 #   filtering, fp32 sums in different orders only: 5e-6 (max 1.2e-6) on the
 #   small shapes. The sums grow with the volume and some views' gradients
-#   are small differences of large terms: at 32x40x36 the CPU parallel
-#   gradient alone moves 1.9e-5 between 1 and 8 OpenMP threads and CPU vs
-#   CUDA is up to 2.7e-5 (rotmat), so that shape gets 5e-5.
+#   are small differences of large terms, so at 32x40x36 the summation
+#   order alone moves them: the CPU parallel gradient by 1.9e-5 between 1
+#   and 8 OpenMP threads (its per-thread partial sums), and CPU vs CUDA by
+#   up to 2.7e-5 for rotmat, whose CPU gradient is thread-invariant (the gap
+#   is the CPU loop order vs the CUDA block reduction and atomics, not
+#   thread-count variance). That shape gets 5e-5.
 
 
 def _smooth_volume(Ny, Nz, Nx):

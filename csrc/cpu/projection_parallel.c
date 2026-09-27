@@ -112,6 +112,105 @@ void back_project_parallel_cpu(
     }
 }
 
+/*
+ * Voxel-driven (gather) single-axis back-projection: the W-BP operator.
+ *
+ * Bit-for-bit the arithmetic of the PyTorch reference `_bp_gather`
+ * (fasttomo/algorithms/analytic.py), given the same cos/sin tables:
+ *   x = ix - 0.5(Nx-1), z = iz - 0.5(Nz-1)                 (fp32)
+ *   u = ((x*cos) + (z*sin)) + 0.5(N_det-1)                  (no FMA)
+ *   u0 = floor(u), w = u - u0
+ *   vol[iy, iz, ix] += (1-w) * r(u0) + w * r(u0+1)          (angles in order)
+ * with r(j) = sino[ia, iy, j] for 0 <= j < N_det and 0 outside, read from a
+ * zero-padded copy of the sinogram rows so the inner loop has no branch
+ * (the reference pads the same way and clamps the row index into the pad).
+ * vol is overwritten. OpenMP over (Y, Z) rows: each (iy, iz) output row is
+ * written by one thread, so there is no race and the result does not depend
+ * on num_threads.
+ */
+#if defined(__clang__)
+#define FT_NO_FP_CONTRACT
+#elif defined(__GNUC__)
+#define FT_NO_FP_CONTRACT __attribute__((optimize("fp-contract=off")))
+#else
+#define FT_NO_FP_CONTRACT
+#endif
+
+FT_NO_FP_CONTRACT
+int back_project_gather_parallel_cpu(
+    const float *sino,
+    float       *vol,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    if (num_threads < 1) num_threads = 1;
+    const int    Np     = N_det + 2;                 /* one zero on each side */
+    const float  half_x = (float)(0.5 * (Nx - 1));
+    const float  half_z = (float)(0.5 * (Nz - 1));
+    const float  half_d = (float)(0.5 * (N_det - 1));
+
+    /* padded rows [n_angles, Ny, N_det + 2] and x*cos [n_angles, Nx] */
+    float *pad = (float *)malloc((size_t)n_angles * Ny * Np * sizeof(float));
+    float *xc  = (float *)malloc((size_t)n_angles * Nx * sizeof(float));
+    if (!pad || !xc) { free(pad); free(xc); return -1; }
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        #pragma omp for schedule(static) collapse(2)
+        for (int ia = 0; ia < n_angles; ia++)
+            for (int iy = 0; iy < Ny; iy++) {
+                float *dst = pad + ((size_t)ia * Ny + iy) * Np;
+                dst[0] = 0.0f;
+                memcpy(dst + 1, sino + ((size_t)ia * Ny + iy) * N_det,
+                       (size_t)N_det * sizeof(float));
+                dst[Np - 1] = 0.0f;
+            }
+        #pragma omp for schedule(static)
+        for (int ia = 0; ia < n_angles; ia++)
+            for (int ix = 0; ix < Nx; ix++)
+                xc[(size_t)ia * Nx + ix] = ((float)ix - half_x) * cos_a[ia];
+        /* implicit barrier after each omp for */
+
+        #pragma omp for schedule(static) collapse(2)
+        for (int iy = 0; iy < Ny; iy++)
+            for (int iz = 0; iz < Nz; iz++) {
+                float *out = vol + ((size_t)iy * Nz + iz) * Nx;
+                const float z = (float)iz - half_z;
+                for (int ix = 0; ix < Nx; ix++) out[ix] = 0.0f;
+                for (int ia = 0; ia < n_angles; ia++) {
+                    const float *row = pad + ((size_t)ia * Ny + iy) * Np;
+                    const float *xca = xc + (size_t)ia * Nx;
+                    const float  zs  = z * sin_a[ia];
+                    for (int ix = 0; ix < Nx; ix++) {
+                        float u  = (xca[ix] + zs) + half_d;
+                        /* floorf(u) without the libm call (baseline x86-64
+                         * has no SSE4.1 roundss): exact for |u| < 2^31,
+                         * far beyond any detector coordinate. */
+                        int   i0 = (int)u;
+                        i0 -= ((float)i0 > u);
+                        float w  = u - (float)i0;
+                        int   j0 = i0 + 1;                    /* +1: the pad */
+                        int   j1 = j0 + 1;
+                        j0 = j0 < 0 ? 0 : (j0 > Np - 1 ? Np - 1 : j0);
+                        j1 = j1 < 0 ? 0 : (j1 > Np - 1 ? Np - 1 : j1);
+                        float t0 = (1.0f - w) * row[j0];
+                        float t1 = w * row[j1];
+                        out[ix] += t0 + t1;
+                    }
+                }
+            }
+    }
+    free(pad);
+    free(xc);
+    return 0;
+}
+
 void grad_angle_cpu(
     const float *vol,
     const float *grad_sino,

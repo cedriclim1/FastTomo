@@ -233,6 +233,30 @@ def _back_project_parallel_raw(
     return vol.to(sinogram.dtype)
 
 
+def _back_project_gather_parallel_raw(
+    sinogram: torch.Tensor,
+    angles_deg: torch.Tensor,
+    Nz: int,
+    Nx: int,
+    num_threads: int | None = None,
+) -> torch.Tensor:
+    """CPU voxel-driven (gather) single-axis BP -> fp32 ``[Ny, Nz, Nx]``: the
+    W-BP operator, bit-for-bit `fasttomo.algorithms.analytic._bp_gather`
+    (C/OpenMP over Y and Z rows). Not the adjoint of the CPU forward
+    projector; plain back-projection stays `_back_project_parallel_raw`."""
+    sino = _kernel_input(sinogram, "sinogram", fp32_only=True)
+    if sino.is_cuda:
+        raise RuntimeError("fasttomo internal error: back_project_gather_parallel is CPU-only")
+    n_angles, Ny, N_det = sino.shape
+    cos_a, sin_a = _trig_on_device(angles_deg, sino.device)
+    vol = sino.new_empty(Ny, Nz, Nx)
+    return _launch("back_project_gather_parallel", vol,
+                   sino, vol, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
+                   shapes=[("sinogram", (n_angles, Ny, N_det)), ("volume", (Ny, Nz, Nx)),
+                           ("angles", (n_angles,)), ("angles", (n_angles,))],
+                   num_threads=num_threads)
+
+
 def _forward_project_rotmat_raw(
     volume: torch.Tensor,
     mats_flat: torch.Tensor,   # [n_angles, 9]
@@ -545,10 +569,13 @@ def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
     vol = volume.contiguous()
     Ny, Nz, Nx = vol.shape
     acc = torch.zeros(1, dtype=torch.float32, device=vol.device)
+    # fp64 per-block partials of the deterministic two-pass reduction
+    partials = torch.empty(max(1, _core.tv_loss_iso_3d_workspace(Ny, Nz, Nx)),
+                           dtype=torch.float64, device=vol.device)
     stream = _stream_ptr(vol.device)
     with _on_device(vol):
         _core.tv_loss_iso_3d_cuda(
-            vol.data_ptr(), acc.data_ptr(),
+            vol.data_ptr(), acc.data_ptr(), partials.data_ptr(),
             Ny, Nz, Nx, float(eps), stream,
         )
     N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))

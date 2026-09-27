@@ -209,6 +209,24 @@ def test_tv_loss_iso_3d_forward_matches_pytorch():
 
 
 @needs_cuda
+@pytest.mark.parametrize("shape", [(40, 70, 67), (2, 2, 2), (2, 3, 40), (9, 2, 33), (3, 17, 2),
+                                   (5, 300, 7)])
+def test_tv_loss_iso_3d_forward_deterministic_and_close_to_fp64(shape):
+    """The forward is a fixed-order two-pass reduction (no atomics, fp64
+    above the per-lane fp32 sums): bit-identical run to run and within 1e-6
+    of an fp64 reference (the fp32 same-address atomicAdd it replaced drifted
+    run to run and reached 1e-3 relative on a 512^3 phantom). Shapes cover
+    several blocks, partial warps (Nx-1 not a multiple of 32), one corner
+    per row and a single row."""
+    g = torch.Generator().manual_seed(sum(shape))
+    vol = (torch.rand(*shape, generator=g) * 3.0).to(DEVICE)
+    vals = [ft.tv_loss_3d(vol, eps=1e-8) for _ in range(5)]
+    assert all(torch.equal(v, vals[0]) for v in vals)
+    ref = _tv_reference(vol.double(), 1e-8).item()
+    assert abs(vals[0].item() - ref) / ref < 1e-6, (vals[0].item(), ref)
+
+
+@needs_cuda
 def test_tv_loss_iso_3d_backward_matches_pytorch():
     """Fused TV backward matches PyTorch autograd on the closed-form expression."""
     torch.manual_seed(1)

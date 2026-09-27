@@ -35,6 +35,33 @@ before starting Python. CUDA runs are not affected.
   equally random order); a fixed `seed` is still bit-reproducible run to
   run. `_generate_permutation` is no longer used by `run_mbir`.
 
+### Faster 3D forward projection, deterministic TV loss, faster CPU wSIRT
+
+- `forward_project_3d` / `RotmatProjector.forward` (CUDA, fp32 and fp16)
+  march each ray only over the steps whose trilinear stencil can touch the
+  volume (slab test, united over the thread block); 43-47 % of the texture
+  fetches used to return border zeros. The sinogram is bit-identical.
+  Kernel time at 61 views: 128^3 1.43-1.49x, 256^3 1.67-1.69x faster. The
+  matrix gradient (`grad_rotmat`) is unchanged: its bounds test already
+  skipped those fetches and clipping measured 0.97-0.98x.
+- `tv_loss_3d` (CUDA forward) is a fixed-order two-pass reduction with fp64
+  partials instead of one fp32 `atomicAdd` per 128 voxels: **bit-reproducible
+  run to run** (it varied in the last digits) and closer to the exact value
+  (within 1e-7 of an fp64 reference, was up to 6e-6 on random volumes and
+  1.3e-3 on a 512^3 phantom), so the loss value can differ from earlier
+  versions in its last digits. 1.8x (128^3) to 4x (256^3, 512^3) faster.
+  The gradient is unchanged.
+- The CPU weighted back-projection (`run_weighted_backprojection`,
+  `run_wsirt`) runs its voxel-driven back-projection in C/OpenMP instead of
+  a per-view PyTorch loop; results are bit-identical. wSIRT at
+  8x128^2x61: 81.5 -> 52.2 ms/iter on 1 thread, 57.5 -> 8.9 ms/iter on 8.
+  `run_wsirt`'s `num_threads` now also drives this step, and
+  `run_weighted_backprojection` takes `num_threads` (keyword-only, see
+  Conventions; it used whatever threads PyTorch had).
+- `run_mbir`: an explicit voxel order passed to the CUDA sweep (test hook)
+  is validated (shape, range, each row a permutation); unused angle slots in
+  the sweep get defined values. Results are unchanged.
+
 ### Projection error messages and double backward
 
 - Zero-size errors from `forward_project`, `back_project`,

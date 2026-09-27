@@ -262,12 +262,13 @@ def test_dtype_accept_or_raise(name, device, dtype):
 # ── num_threads reaches the CPU kernels ───────────────────────────────────
 
 @pytest.mark.parametrize("name", [k for k, c in ALGOS.items() if not c.cuda_only
-                                  and k not in ("run_weighted_backprojection", "run_genfire")])
+                                  and k != "run_genfire"])
 def test_num_threads_honoured_on_cpu(name, monkeypatch):
     """Every CPU kernel call resolves the thread count from the kwarg (MBIR
-    used to hardcode 4). run_weighted_backprojection's CPU path is pure
-    PyTorch; GENFIRE's CPU gridding kernel (frozen) is serial and takes no
-    thread count."""
+    used to hardcode 4; the W-BP back-projection of run_weighted_backprojection
+    and run_wsirt is a C kernel since it replaced the PyTorch gather).
+    GENFIRE's CPU gridding kernel (frozen) is serial and takes no thread
+    count."""
     import fasttomo.autograd as ag
     seen = []
     real = ag._resolve_num_threads

@@ -81,9 +81,9 @@ def _golden():
     return torch.load(GOLDEN, weights_only=False)
 
 
-def test_genfire_cpu_identical_to_main(record_property):
+def test_genfire_cpu_identical_to_main():
     golden = _golden()
-    exact = exact_env(golden, "cpu", record_property, what=GOLDEN.name)
+    exact = exact_env(golden, "cpu", what=GOLDEN.name)
     sino, ang, _, _, N = _inputs("cpu")
     cb = _Calls()
     out = ft.run_genfire(sino, ang, n_iter=12, Nz=N, return_loss=True, loss_callback=cb,
@@ -128,9 +128,9 @@ def test_resire_matches_main():
 
 
 @needs_cuda
-def test_ad_recon_identical_to_main(record_property):
+def test_ad_recon_identical_to_main():
     golden = _golden()
-    exact = exact_env(golden, "cuda", record_property, what=GOLDEN.name)
+    exact = exact_env(golden, "cuda", what=GOLDEN.name)
     sino, ang, _, sm, N = _inputs("cuda")
     C, Opt, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
                      ft.ConstraintConfig, ft.PoseRefinementConfig)

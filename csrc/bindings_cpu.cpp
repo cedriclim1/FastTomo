@@ -14,6 +14,7 @@
 
 #include <pybind11/pybind11.h>
 #include <cstdint>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -57,6 +58,23 @@ void register_cpu(py::module_ &m) {
           }, gil_release(),
           "Single-axis (parallel) back-projection (CPU), exact ray-driven "
           "transpose of the forward. Overwrites vol [Ny, Nz, Nx].",
+          py::arg("sino_ptr"), py::arg("vol_ptr"),
+          py::arg("cos_ptr"), py::arg("sin_ptr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
+          py::arg("n_angles"), py::arg("N_det"), py::arg("num_threads") = 1);
+
+    m.def("back_project_gather_parallel_cpu",
+          [](std::intptr_t sino, std::intptr_t vol,
+             std::intptr_t cos_a, std::intptr_t sin_a,
+             int Ny, int Nz, int Nx, int n_angles, int N_det, int num_threads) {
+              if (back_project_gather_parallel_cpu(
+                      P<const float>(sino), P<float>(vol),
+                      P<const float>(cos_a), P<const float>(sin_a),
+                      Ny, Nz, Nx, n_angles, N_det, threads_or_one(num_threads)) != 0)
+                  throw std::bad_alloc();
+          }, gil_release(),
+          "Single-axis voxel-driven (gather) back-projection (CPU), the W-BP "
+          "operator: bit-for-bit _bp_gather. Overwrites vol [Ny, Nz, Nx].",
           py::arg("sino_ptr"), py::arg("vol_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),

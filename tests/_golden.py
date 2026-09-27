@@ -14,22 +14,26 @@ the environments its exact comparisons were verified in::
 ``fingerprint(device)`` runs a fixed small computation on ``device`` through
 the paths the goldens depend on (a float32 matmul, reductions, real and
 complex FFTs of the sizes the algorithms use, exp / log / sqrt / sin / cos /
-atan2, an Adam-style update, fp16 rounding and a trilinear
-``F.interpolate``) and hashes the result bytes together with the SIMD
+atan2, an Adam-style update, fp16 rounding, a trilinear ``F.interpolate``,
+the bilinear ``F.grid_sample`` of ``apply_shifts_2d`` (the ``fp3d_shift*``,
+``ad_pose`` and ``ad_staged`` goldens) and one autograd backward pass through
+it and a matmul chain) and hashes the result bytes together with the SIMD
 dispatch level and ``OMP_NUM_THREADS`` (CPU) or the compute capability and
-CUDA version (GPU, whose texture-unit interpolation no torch op reaches); a
-``grid_sample`` is not needed, no golden goes through it. ``exact_env``
-returns True only where the local fingerprint is one the golden lists; the
-tests then compare with ``torch.equal`` and otherwise fall back to their
-documented tolerance. A fallback is never silent: it is recorded as the
-``golden_exact`` / ``arith_fingerprint`` test properties (JUnit XML) and
-raised as a ``GoldenNotExactWarning`` (listed in pytest's warnings summary).
+CUDA version (GPU, whose texture-unit interpolation no torch op reaches).
+``exact_env`` returns True only where the local fingerprint is one the golden
+lists; the tests then compare with ``torch.equal`` and otherwise fall back to
+their documented tolerance. A fallback is never silent: it raises a
+``GoldenNotExactWarning`` (listed in pytest's warnings summary).
 
 To add the current environment to a golden after verifying that its exact
 comparison holds here (only the metadata changes; the tensors are checked to
 be byte-identical before the file is rewritten)::
 
     python tests/_golden.py stamp tests/data/<golden>.pt
+
+A torch upgrade (or any change to ``_probe``) changes the fingerprint: re-stamp
+every golden via its generator script in ``tests/data/*_gen.py`` (or the
+``stamp`` command above) after re-verifying its exact comparisons.
 """
 
 from __future__ import annotations
@@ -101,6 +105,26 @@ def _probe(device: str) -> list[torch.Tensor]:
         p.addcdiv_(m, v.sqrt().add_(1e-8), value=-0.05)
     out += [p]
     out += [F.interpolate(x[None], size=(4, 7, 13), mode="trilinear", align_corners=False)]
+    # apply_shifts_2d: bilinear grid_sample (zeros padding, align_corners),
+    # forward and backward. The backward w.r.t. the grid is per output
+    # sample; the input gradient is taken on the CPU only (CUDA accumulates
+    # it with atomics, whose order is not fixed, which would make the
+    # fingerprint itself flaky).
+    with torch.enable_grad():
+        sino = s[:, None].clone().requires_grad_(device == "cpu")     # [13, 1, 3, 20]
+        sh = (torch.rand(13, 2, generator=g) - 0.5).to(device).requires_grad_(True)
+        gy, gx = torch.meshgrid(torch.linspace(-1, 1, 3, device=device),
+                                torch.linspace(-1, 1, 20, device=device), indexing="ij")
+        grid = torch.stack((gx, gy), -1)[None] - (sh * torch.tensor([2 / 19, 1.0],
+                                                                     device=device))[:, None, None]
+        shifted = F.grid_sample(sino, grid, mode="bilinear", padding_mode="zeros",
+                                align_corners=True)
+        a2 = a.clone().requires_grad_(True)
+        loss = (shifted * shifted).sum() + torch.exp(0.01 * (a2 @ b)).sum()
+        loss.backward()
+    out += [shifted.detach(), sh.grad, a2.grad]
+    if device == "cpu":
+        out += [sino.grad]
     return out
 
 
@@ -119,17 +143,14 @@ def tensors(golden: dict) -> dict:
     return {k: v for k, v in golden.items() if k != FINGERPRINT_KEY}
 
 
-def exact_env(golden: dict, device: str, record_property=None, what: str = "") -> bool:
+def exact_env(golden: dict, device: str, what: str = "") -> bool:
     """True when this environment's ``device`` fingerprint is one the golden
     was verified in, so its deterministic entries must match bit for bit.
-    Otherwise warns (``GoldenNotExactWarning``) and records the fallback, so
-    that losing the exact check is visible rather than silent."""
+    Otherwise warns (``GoldenNotExactWarning``), so that losing the exact
+    check is visible rather than silent."""
     fp = fingerprint(device)
     known = golden.get(FINGERPRINT_KEY, {}).get(device, [])
     exact = fp in known
-    if record_property is not None:
-        record_property(f"golden_exact[{device}]", exact)
-        record_property(f"arith_fingerprint[{device}]", f"{_env_tag(device)} {fp}")
     if not exact:
         warnings.warn(GoldenNotExactWarning(
             f"{what or 'golden'}: {device} arithmetic fingerprint {fp} ({_env_tag(device)}) "
