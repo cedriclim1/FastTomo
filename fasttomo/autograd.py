@@ -589,7 +589,11 @@ def _tv_loss_iso_3d_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
     N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))
     g_scaled = (grad_out.detach().to(dtype=torch.float32, device=vol.device)
                 .reshape(1).contiguous() / float(N))
-    grad_vol = torch.zeros_like(vol)
+    # The kernel writes every voxel when each dimension is >= 2 (no memset
+    # needed, kernel audit F10); otherwise it writes nothing and the
+    # gradient is zero.
+    grad_vol = (torch.empty_like(vol) if min(Ny, Nz, Nx) >= 2
+                else torch.zeros_like(vol))
     stream = _stream_ptr(vol.device)
     with _on_device(vol):
         _core.tv_loss_iso_3d_grad_cuda(

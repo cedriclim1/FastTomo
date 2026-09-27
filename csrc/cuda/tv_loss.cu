@@ -210,7 +210,8 @@ void tv_loss_iso_3d_grad_cuda(
     cudaStream_t stream
 ) {
     if (Ny < 2 || Nz < 2 || Nx < 2) {
-        /* No corners — grad is zero everywhere; caller pre-zeroed. */
+        /* No corners — grad is zero everywhere; the caller zeroes it (only
+         * in this case: otherwise the kernel below writes every voxel). */
         return;
     }
 

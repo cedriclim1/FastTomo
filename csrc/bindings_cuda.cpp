@@ -648,7 +648,8 @@ void register_cuda(py::module_ &m) {
           py::call_guard<py::gil_scoped_release>(),
           "Backward of tv_loss_iso_3d. g_scaled_ptr: single-element fp32 "
           "buffer holding grad_out · 1/N. grad_vol_ptr: [Ny, Nz, Nx] fp32 "
-          "output (must be zeroed; kernel writes once per voxel).",
+          "output: the kernel writes every voxel when Ny, Nz, Nx >= 2, and "
+          "nothing otherwise (then the caller must zero it).",
           py::arg("vol_ptr"), py::arg("g_scaled_ptr"), py::arg("grad_vol_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("eps"),
