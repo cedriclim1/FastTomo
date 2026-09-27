@@ -128,7 +128,7 @@ never checked; a direct fp16 call on CUDA pays one flag read (0.06-0.07 ms measu
 - **Rotmat back-projection no longer slows down with many views**: the
   matrices are staged 64 views at a time instead of all at once, so the
   time per view stays at ~10.5 us (256^3) instead of rising to 17 us at
-  1441 views (24.9 -> 15.2 ms, 1.64x); bit-identical. The 2730-view shared
+  1441 views (24.9-25.3 -> 15.2 ms, 1.64-1.66x); bit-identical. The 2730-view shared
   memory cap is gone (the 2048-layer texture limit remains).
 - **`refine_angles` 2.0x / 4.1x faster** (single-axis / ZYZ, 128^3, 61
   views; 1.55x / 1.6-1.8x at 256^3): every view's candidates are projected
