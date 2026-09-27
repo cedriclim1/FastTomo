@@ -66,13 +66,14 @@ def test_non_finite_device_angle_view_is_skipped(bad, dtype, Ny, cached):
 
 @needs_cuda
 def test_parallel_channel_policy():
-    """fp32 packs 2 Y-slices per float2 texel from Ny = 2 on; fp16 packs 4
-    per texel when Ny % 4 == 0; one slice stays 1-channel. The cached
-    operator uses the same layout as the one-shot wrappers."""
+    """From Ny = 2 on, fp32 packs 2 Y-slices per float2 texel and fp16 4 per
+    texel (zero-padded when Ny is not a multiple); one slice stays
+    1-channel. The cached operator uses the same layout as the one-shot
+    wrappers."""
     import fasttomo._core as core
 
     assert [core.parallel_channels(0, ny) for ny in (1, 2, 3, 4, 5)] == [1, 2, 2, 2, 2]
-    assert [core.parallel_channels(1, ny) for ny in (1, 3, 4, 8)] == [1, 1, 4, 4]
+    assert [core.parallel_channels(1, ny) for ny in (1, 2, 3, 4, 5)] == [1, 4, 4, 4, 4]
     for dtype, code in ((torch.float32, 0), (torch.float16, 1)):
         for Ny in (1, 3, 4):
             p = ft.ParallelProjector((Ny, 8, 8), _angles(3), device=DEV)
@@ -118,8 +119,6 @@ def test_packed_tc_download_round_trip(dtype, channels, Ny):
     import fasttomo._core as core
     from fasttomo._backend import _stream_ptr
 
-    if dtype == torch.float16 and Ny % 4 and core.parallel_channels(1, Ny) != 4:
-        pytest.skip("fp16 caches with Ny % 4 != 0 are not packed in this build")
     src = torch.randn(Ny, 5, 7, device=DEV).to(dtype)
     dst = torch.empty_like(src)
     h = core.tc_create(0, 0 if dtype == torch.float32 else 1, channels, *src.shape)

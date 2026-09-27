@@ -861,15 +861,14 @@ def _sirt_cases(dtype, Ny):
 
 @needs_cuda
 @pytest.mark.parametrize("dtype, Ny", [(torch.float32, 1), (torch.float32, 3),
-                                       (torch.float32, 4), (torch.float16, 3),
-                                       (torch.float16, 4)])
+                                       (torch.float32, 4), (torch.float16, 1),
+                                       (torch.float16, 3), (torch.float16, 4)])
 def test_sirt_texture_writes_bit_identical(monkeypatch, caplog, dtype, Ny):
     """Writing the residual and the updated volume straight into the
     projector's textures (and, on the graph path, keeping the volume there)
-    gives exactly the bits of the upload path. fp32 with Ny >= 2 covers the
-    float2 packed textures (Ny = 3 with a zero-padded last texel), fp16 with
-    Ny % 4 == 0 the 4-channel ones, Ny = 1 and fp16 Ny = 3 the 1-channel
-    ones."""
+    gives exactly the bits of the upload path. Ny >= 2 covers the packed
+    textures (float2 for fp32, 4-channel for fp16; Ny = 3 with a zero-padded
+    last texel), Ny = 1 the 1-channel ones."""
     from fasttomo.algorithms import algebraic
 
     def run_all():

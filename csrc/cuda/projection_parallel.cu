@@ -288,15 +288,16 @@ static tc_dtype_t tc_dtype_of(int io_dtype) {
 }
 
 /* Y-slice packing of the parallel textures (texture_cache.h): 2 slices per
- * float2 texel for fp32 when Ny >= 2; 4 slices per fp16 texel when
- * Ny % 4 == 0. A single slice stays 1-channel: a packed fetch costs more
- * than a 1-channel one (the filter rate per texel drops), so packing only
- * pays when it saves fetches. Used by the one-shot wrappers and, through the
- * binding, by the cached operator (so both use the same layout). */
+ * float2 texel for fp32, 4 slices per fp16 texel, for any Ny >= 2 (the last
+ * texel is zero-padded when Ny is not a multiple). A single slice stays
+ * 1-channel: a packed fetch costs more than a 1-channel one (the filter
+ * rate per texel drops), so packing only pays when it saves fetches. Used
+ * by the one-shot wrappers and, through the binding, by the cached operator
+ * (so both use the same layout). */
 int parallel_channels(int io_dtype, int Ny) {
     check_io_dtype(io_dtype, "parallel_channels");
-    if (io_dtype == 0) return Ny >= 2 ? 2 : 1;
-    return Ny % 4 == 0 ? 4 : 1;
+    if (Ny < 2) return 1;
+    return io_dtype == 0 ? 2 : 4;
 }
 
 /* Upload `vol` into `vol_cache` (already validated) and launch the FP

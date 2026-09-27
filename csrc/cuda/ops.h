@@ -36,8 +36,8 @@
  * signatures. */
 
 /* Channel count (Y slices per texel) of the parallel FP/BP textures for
- * io_dtype and Ny: 2 for fp32 when Ny >= 2, 4 for fp16 when Ny % 4 == 0,
- * else 1 (texture_cache.h). The one-shot wrappers use it; a cached caller
+ * io_dtype and Ny: 2 for fp32 and 4 for fp16 when Ny >= 2, else 1
+ * (texture_cache.h). The one-shot wrappers use it; a cached caller
  * creates its caches with it so both paths share one layout. */
 int parallel_channels(int io_dtype, int Ny);
 
