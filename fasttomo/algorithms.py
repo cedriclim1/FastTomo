@@ -2890,6 +2890,27 @@ def _generate_permutation(Ny: int, Nvox: int, rng: np.random.Generator) -> np.nd
     return perm
 
 
+def _mbir_forward_project(
+    volume: torch.Tensor,
+    N_det: int,
+    cos_a: torch.Tensor,
+    sin_a: torch.Tensor,
+    num_threads: int = 1,
+) -> torch.Tensor:
+    """A_MBIR · f: the voxel-driven scatter FP that matches the column-A
+    model in the ICD kernel. Returns ``[n_angles, Ny, N_det]`` fp32."""
+    Ny, Nz, Nx = volume.shape
+    n_angles = cos_a.shape[0]
+    Af = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=volume.device)
+    vol = volume.detach().float().contiguous()
+    _launch("mbir_forward_project", Af,
+            vol, Af, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
+            shapes=[("volume", (Ny, Nz, Nx)), ("Af", (n_angles, Ny, N_det)),
+                    ("cos", (n_angles,)), ("sin", (n_angles,))],
+            num_threads=num_threads)
+    return Af
+
+
 def _mbir_initial_residual(
     volume: torch.Tensor,
     sinogram: torch.Tensor,
@@ -2897,23 +2918,13 @@ def _mbir_initial_residual(
     sin_a: torch.Tensor,
     num_threads: int = 1,
 ) -> torch.Tensor:
-    """e = g - A_MBIR · f at the start of an MBIR level. Uses the voxel-
-    driven scatter FP that matches the column-A model in the ICD kernel.
-    Falls back to `e = g` when `volume` is exactly zero (a common warm-start
-    case) to skip a kernel launch."""
+    """e = g - A_MBIR · f at the start of an MBIR level. Falls back to
+    `e = g` when `volume` is exactly zero (a common warm-start case) to
+    skip a kernel launch."""
     if volume.abs().sum().item() == 0.0:
         return sinogram.clone()
-    Ny, Nz, Nx = volume.shape
-    n_angles = sinogram.shape[0]
-    N_det = sinogram.shape[2]
-    Af = torch.empty(n_angles, Ny, N_det, dtype=torch.float32, device=sinogram.device)
-    vol = volume.detach().float().contiguous()
-    _launch("mbir_forward_project", Af,
-            vol, Af, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
-            shapes=[("volume", (Ny, Nz, Nx)), ("Af", (n_angles, Ny, N_det)),
-                    ("cos", (n_angles,)), ("sin", (n_angles,))],
-            num_threads=num_threads)
-    return sinogram - Af
+    return sinogram - _mbir_forward_project(volume, sinogram.shape[2], cos_a, sin_a,
+                                            num_threads)
 
 
 def _mbir_icd_sweep_cpu(
@@ -2993,6 +3004,7 @@ def _run_mbir_single_scale(
     rec: _LossRecorder,
     it_offset: int = 0,
     num_threads: int = 1,
+    support: torch.Tensor | None = None,
 ) -> tuple[_MbirState, list[float]]:
     """Inner loop for one resolution scale. The public `run_mbir` wraps
     this in a coarse-to-fine multiresolution loop.
@@ -3003,7 +3015,14 @@ def _run_mbir_single_scale(
 
     ``rec`` records, after every outer iteration, the data MSE
     ``mean(e²)`` of the residual ``e = g - A·f - d`` at this scale, under
-    the global iteration index ``it_offset + it``."""
+    the global iteration index ``it_offset + it``.
+
+    ``support`` (``[1|Ny, Nz, Nx]`` on this scale's grid) multiplies the
+    initial volume and the volume after every ICD sweep. The part it
+    removes, ``r = f·(1 - support)``, is forward-projected and added back
+    to the error sinogram (``e += A·r``), so the invariant
+    ``e = g - A·f - d`` holds for the masked volume before the offset and
+    variance updates and the next sweep read it."""
     device = sinogram.device
     n_angles, Ny, N_det = sinogram.shape
 
@@ -3017,6 +3036,8 @@ def _run_mbir_single_scale(
     else:
         volume = init_state.volume.clone().contiguous()
         d_offsets = init_state.d_offsets.clone().contiguous()
+    if support is not None:
+        volume.mul_(support)
 
     # Residual e = g - A·f - d. d is rolled into A·f via the offset
     # term (we maintain e ≡ g - A·f - d, so initial e adjusts for both).
@@ -3064,6 +3085,11 @@ def _run_mbir_single_scale(
                 sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
                 sigma=sigma_cur, num_threads=num_threads,
             )
+        if support is not None:
+            # Hard support after the sweep; keep e = g - A·f - d consistent.
+            removed = volume * (1.0 - support)
+            volume.sub_(removed)
+            e_sino.add_(_mbir_forward_project(removed, N_det, cos_a, sin_a, num_threads))
         # Closed-form updates for d_k and σ: one implementation, both backends.
         d_offsets, sigma_cur = _mbir_update_offset_variance(
             e_sino, d_offsets, sigma_cur, sigma_min,
@@ -3141,6 +3167,8 @@ def run_mbir(
     lambdas: torch.Tensor | None = None,
     sigma_f_per_scale: list[float] | None = None,
     config: MbirConfig | None = None,
+    mask: bool = False,
+    support_mask: torch.Tensor | None = None,
     warm_start: torch.Tensor | None = None,
     num_threads: int | None = None,
     return_loss: bool = False,
@@ -3236,8 +3264,9 @@ def run_mbir(
     # of being cast silently. The ICD kernels are fp32-only.
     setup = _prepare_recon(
         "run_mbir", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
-        init_volume=False, warm_start=warm_start,
+        init_volume=False, warm_start=warm_start, mask=mask, support_mask=support_mask,
     )
+    support = setup.constraints.support_mask     # [1|Ny, Nz, Nx] fp32 or None
     n_angles, Ny, N_det, Nz, Nx = (
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx)
     n_iter = setup.n_iter
@@ -3326,6 +3355,12 @@ def run_mbir(
 
         Nz_lvl = max(Nz // f, 1)
         Nx_lvl = max(Nx // f, 1)
+        # The support on this level's grid: a coarse voxel keeps the largest
+        # weight of the f x f fine voxels it covers (max-pool; f divides Nz
+        # and Nx, checked above), so a coarse level never cuts into the
+        # support. Exact at f = 1.
+        support_lvl = (support if support is None or f == 1
+                       else F.max_pool2d(support, kernel_size=f, stride=f))
 
         # First iteration at the coarsest scale: force T=inf so the
         # anomaly modelling is disabled until the next finer scale. This
@@ -3359,7 +3394,7 @@ def run_mbir(
             init_state=state,
             lambdas=lam_lvl,
             return_history=return_history,
-            rec=rec, it_offset=it_offset, num_threads=nt,
+            rec=rec, it_offset=it_offset, num_threads=nt, support=support_lvl,
         )
         history_all.append(hist)
         it_offset += state.n_done
