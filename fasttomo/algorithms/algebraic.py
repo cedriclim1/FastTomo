@@ -99,7 +99,7 @@ def run_sirt(
         CUDA graph path without ``projector`` only (default True): keep the
         internal projector and its captured graph after the call, so the
         next call with the same configuration replays it (one configuration
-        is kept, about 4 volumes plus 4 sinograms of GPU memory; see
+        is kept, 4 volumes plus 4 sinograms of GPU memory; see
         :func:`release_cached_projectors`). False neither uses nor keeps
         that cache: the call builds its own projector and graph and frees
         them on return, as before; a configuration kept by earlier calls
@@ -589,6 +589,16 @@ class _SirtOperatorCache:
     a call with any other configuration (shape, dtype, device or option)
     drops the kept operator *before* building its own, so two
     configurations never coexist in memory; ``clear()`` drops it too.
+
+    A graph capture that failed marks the key bad on the kept operator
+    (``_sirt_graph_bad_keys``), so repeated calls with that configuration
+    run the eager loop without re-trying a capture that fails every time.
+    That mark does not outlive the kept operator: a call with another
+    configuration and ``clear()`` (``release_cached_projectors``) drop the
+    operator and clear its marks, so the next call with the failed
+    configuration builds a new operator and tries the capture again (a
+    failure caused by a transient condition, such as an out-of-memory
+    error or another thread's capture, is not permanent).
     """
 
     def __init__(self, maxsize: int = 1) -> None:
@@ -603,6 +613,7 @@ class _SirtOperatorCache:
             op = self._ops.pop(key, None)
             stale = list(self._ops.values())
             self._ops.clear()
+        _forget_capture_failures(stale)
         del stale       # released outside the lock (texture frees sync the device)
         return op
 
@@ -619,12 +630,21 @@ class _SirtOperatorCache:
         with self._lock:
             ops = list(self._ops.values())
             self._ops.clear()
+        _forget_capture_failures(ops)
         n = len(ops)
         del ops
         return n
 
     def __len__(self) -> int:
         return len(self._ops)
+
+
+def _forget_capture_failures(ops) -> None:
+    """Clear the failed-capture marks of operators the cache drops."""
+    for op in ops:
+        bad = getattr(op, "_sirt_graph_bad_keys", None)
+        if bad is not None:
+            bad.clear()
 
 
 _SIRT_OPERATORS = _SirtOperatorCache()
@@ -639,13 +659,16 @@ def release_cached_projectors() -> int:
     dtype, device, ``omega``, constraints), so that call replays the captured
     CUDA graph instead of building a projector and capturing again. Only one
     configuration is kept, and a call with a different one drops it before
-    allocating its own. What is kept: the projector's two texture arrays, the
-    graph's static copies of the volume, sinogram, both normalisations and
-    the support mask, and the graph's memory pool (the forward-projection
-    and back-projection outputs): about 4 volumes plus 4 sinograms of
-    device memory, measured 0.36 GiB at 256^3 x 61 views and 2.6 GiB at
-    512^3 x 61 views in fp32. Pass ``run_sirt(..., reuse_graph=False)`` to not keep it in
-    the first place.
+    allocating its own. What is kept, 4 volumes plus 4 sinograms: the
+    projector's volume and sinogram texture arrays (1 + 1), the graph's
+    static volume and voxel normalisation (2 volumes), its static sinogram
+    and ray normalisation (2 sinograms), and the graph's memory pool with
+    the back-projection and forward-projection outputs (1 + 1); plus the
+    support mask when one is given (one more volume if it is full-size).
+    In fp32 at 61 views that is 0.31 GiB at 256^3 and 2.24 GiB at 512^3;
+    the device memory measured is 0.36 and 2.62 GiB, the rest being free
+    space inside the allocator segments of the static tensors. Pass
+    ``run_sirt(..., reuse_graph=False)`` to not keep it in the first place.
 
     This releases it. The texture arrays go straight back to the driver; the
     tensors and the graph pool go back to PyTorch's caching allocator, which
@@ -655,6 +678,11 @@ def release_cached_projectors() -> int:
     well, e.g. for another process or library. A call running concurrently
     on another thread keeps its projector until it returns (and then keeps
     it again).
+
+    It also forgets a failed graph capture: after one, the kept projector
+    runs the eager loop for that configuration (without re-trying the
+    capture on every call) until this is called or a call with another
+    configuration replaces it; the next call then captures again.
 
     Returns the number of configurations released (0 or 1). Safe to call at
     any time, also without CUDA.
@@ -785,7 +813,9 @@ def _run_sirt_cuda_graph(
             _log.warning(
                 "run_sirt: CUDA Graph capture failed for key %s (%s). "
                 "Falling back to eager loop for this and future calls "
-                "with this configuration and projector.",
+                "with this configuration and projector (for run_sirt's kept "
+                "internal projector: until release_cached_projectors() or a "
+                "call with another configuration).",
                 key, exc,
             )
             bad_keys.add(key)

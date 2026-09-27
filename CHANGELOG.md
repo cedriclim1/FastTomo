@@ -72,25 +72,44 @@ never checked; a direct fp16 call on CUDA pays one flag read (0.06-0.07 ms measu
   (alias of `tv_loss_xz`).
 - cp314 wheels (CPU and CUDA); `wheels.yml` uses cibuildwheel v3.4.1.
 
-### Faster CUDA `run_sirt` (bit-identical results; new `release_cached_projectors`, `reuse_graph=`)
+### Faster CUDA `run_sirt` (bit-identical results; new public `release_cached_projectors()` and `run_sirt(reuse_graph=)`)
 
+- **API additions** (the PR text said "no API change"; it adds two public
+  names): `fasttomo.release_cached_projectors()` (also in
+  `fasttomo.algorithms`) frees what `run_sirt` keeps between calls and
+  returns how many configurations it released (0 or 1); the new keyword
+  `run_sirt(..., reuse_graph=True)` controls whether that is kept. Existing
+  calls need no change, but a CUDA `run_sirt` without `projector=` now
+  keeps GPU memory after it returns (below).
 - Repeated `run_sirt` calls without `projector=` reuse the previous call's
   internal projector and CUDA graph when shapes, dtype, device and options
   match, instead of building a projector, running an eager warm-up iteration
   and capturing a new graph every call. New sinogram data, angles and
   support masks of the same shapes are copied into the graph's buffers.
 - **Memory kept after `run_sirt` returns** (CUDA graph path, no
-  `projector=`): exactly one configuration is kept, i.e. its two texture
-  arrays, the graph's static volume, sinogram, normalisations and support
-  mask, and the graph's memory pool, about 4 volumes plus 4 sinograms.
-  Measured in fp32 at 61 views: **0.36 GiB at 256^3, 2.6 GiB at 512^3**. A
-  call with a different shape, dtype, device or option drops the kept one
-  before allocating its own. New public `fasttomo.release_cached_projectors()`
+  `projector=`): exactly one configuration is kept, **4 volumes plus 4
+  sinograms**: the projector's volume and sinogram texture arrays (1 + 1),
+  the graph's static volume and voxel normalisation (2 volumes) and static
+  sinogram and ray normalisation (2 sinograms), and the graph's memory pool
+  holding the back-projection and forward-projection outputs (1 + 1), plus
+  the support mask when one is given (a `(1, Nz, Nx)` plane, or one more
+  volume for a full-size mask). In fp32 at 61 views that is 0.31 GiB at
+  256^3 and 2.24 GiB at 512^3 by count; the device memory actually taken,
+  measured, is **0.36 GiB at 256^3 and 2.62 GiB at 512^3**, the difference
+  being free space inside the caching allocator's segments that hold the
+  static tensors (PyTorch reuses it, `torch.cuda.empty_cache()` cannot
+  return it while the tensors live). A call with a different shape, dtype,
+  device or option drops the kept one before allocating its own. New public `fasttomo.release_cached_projectors()`
   frees it (the texture arrays go back to the driver at once, the rest to
   PyTorch's caching allocator; follow with `torch.cuda.empty_cache()` to
   hand that back to the driver too). New keyword `run_sirt(...,
   reuse_graph=False)` keeps nothing, for a single reconstruction that
   needs the memory back.
+- A graph capture that fails (e.g. out of memory, or several threads
+  capturing at once) makes that configuration run the eager loop, with the
+  same results. The failure is no longer remembered for the rest of the
+  process: `release_cached_projectors()` or a call with another
+  configuration clears it, and the next call captures again.
 - The iteration's elementwise work runs in two fused CUDA kernels (residual;
   update plus support, positivity and soft-threshold constraints) instead of
   up to seven PyTorch kernels, rounding exactly like the PyTorch chain.
