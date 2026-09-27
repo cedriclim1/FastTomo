@@ -107,7 +107,8 @@ def test_mbir_perfect_data_recovers_phantom():
     cube should recover the phantom to high accuracy. Validates the
     surrogate-MM ICD inner loop + qGGMRF prior + variance auto-tuning.
     300 iterations (80 before the prior fix, which made the prior
-    quadratic): rel. error 0.96 / 0.15 / 0.049 at 30 / 80 / 300."""
+    quadratic): rel. error 0.96 / 0.15 / 0.05 at 30 / 80 / 300, serial and
+    parallel sweep alike."""
     Ny = Nz = Nx = 32
     n_angles = 40
     phantom = torch.zeros(Ny, Nz, Nx, device=DEVICE)

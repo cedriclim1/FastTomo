@@ -194,11 +194,13 @@ about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
 
 - **Every MBIR output changes**, CPU and CUDA. On a 96^3 three-ellipsoid
   phantom (41 views +-60 degrees, 1 % noise, fixed sigma, 80 iterations) the
-  best RMSE over `sigma_f` goes from 0.0591 to 0.0463 (-22 %), at the same
-  best `sigma_f = 0.1`; at the default `sigma_f = 1`, 0.0985 -> 0.0766, and a
-  fully default call 0.131 -> 0.100. The BF-TEM demo
-  (`benchmarks/scripts/run_mbir_bftem_demo.py`, its `sigma_f = 0.1`):
-  conventional MBIR 0.0283 -> 0.0256, MBIR-AM 0.0210 -> 0.0187 (SIRT 0.0296).
+  best RMSE over `sigma_f` goes from 0.0591 to 0.0463 (-22 %; serial sweep,
+  as on CPU; 0.0477 with the new default parallel CUDA sweep, see below), at
+  the same best `sigma_f = 0.1`; at the default `sigma_f = 1`, 0.0985 ->
+  0.0766 (0.0783), and a fully default call 0.131 -> 0.100 (0.101). The
+  BF-TEM demo (`benchmarks/scripts/run_mbir_bftem_demo.py`, its
+  `sigma_f = 0.1`, CUDA default sweep): conventional MBIR 0.0283 -> 0.0260,
+  MBIR-AM 0.0210 -> 0.0186 (SIRT 0.0296).
   The default `sigma_f` stays 1.0: it was already 10x above the best value
   on these phantoms and improves as much as the best value does.
 - **`sigma_f` changes meaning near zero**: the prior is `1/c` = 1000x stiffer
