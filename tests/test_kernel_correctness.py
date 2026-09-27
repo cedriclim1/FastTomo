@@ -614,8 +614,8 @@ def _assert_no_leak(fail_once, array_bytes, n_calls=200, attempts=3):
                 f"(bound {bound // _MiB} MiB)")
 
 
-# grid.z = n_angles (rotmat FP / grad) and grid.y = ceil(n_angles / 16)
-# (parallel FP) exceed the 65535 launch limit: the launch fails *after* the
+# grid.z = n_angles (rotmat FP / grad) and grid.y = ceil(n_angles / 8)
+# (parallel FP, 32x8 blocks) exceed the 65535 launch limit: the launch fails *after* the
 # one-shot cudaArray was created and filled, which used to leak it (D5).
 _TOO_MANY_ROTMAT = 65536
 _TOO_MANY_PARALLEL = 65535 * 16 + 1
