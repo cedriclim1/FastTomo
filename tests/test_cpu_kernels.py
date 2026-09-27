@@ -221,3 +221,58 @@ def test_cpu_fp_is_the_scalar_loop_bit_for_bit(shape, threads):
     vol, _, ang = _yb_case(shape)
     out = _forward_project_parallel_raw(vol, ang, shape[3], num_threads=threads)
     assert torch.equal(out, _fp_scalar32(vol, ang, shape[3]))
+
+
+def _bp_scalar32(sino, ang, Nz, Nx):
+    """back_project_parallel_cpu's per-slice scatter in fp32: every voxel
+    receives its additions in (angle, detector, step, corner) order."""
+    sg = sino.numpy()
+    n, Ny, Nd = sg.shape
+    R, hd, hx, hz = _geom32(Nz, Nx, Nd)
+    cs, sn = _trig32(ang)
+    out = np.zeros((Ny, Nz * Nx), _F)
+    one = _F(1)
+    steps = np.arange(-R, R + 1)
+    for a in range(n):
+        for d in range(Nd):
+            t = _F(d) - hd
+            ok, ix0, iz0, wx, wz, _, _ = _samples32(np.full(steps.shape, t, _F), cs[a], sn[a],
+                                                    steps, hx, hz, Nz, Nx)
+            ix0, iz0, wx, wz = ix0[ok], iz0[ok], wx[ok], wz[ok]
+            idx = np.stack([iz0 * Nx + ix0, iz0 * Nx + ix0 + 1,
+                            (iz0 + 1) * Nx + ix0, (iz0 + 1) * Nx + ix0 + 1], 1).reshape(-1)
+            w = np.stack([(one - wz) * (one - wx), (one - wz) * wx,
+                          wz * (one - wx), wz * wx], 1).reshape(-1)
+            np.add.at(out, (slice(None), idx), w[None, :] * sg[a, :, d][:, None])
+    return torch.from_numpy(out.reshape(Ny, Nz, Nx))
+
+
+@pytest.mark.parametrize("shape", _YB_SHAPES)
+@pytest.mark.parametrize("threads", [1, 3, 8])
+def test_cpu_bp_is_the_scalar_scatter_bit_for_bit(shape, threads):
+    from fasttomo.autograd import _back_project_parallel_raw
+
+    _, sino, ang = _yb_case(shape)
+    Ny, Nz, Nx, Nd, n = shape
+    out = _back_project_parallel_raw(sino, ang, Nz, num_threads=threads, Nx=Nx)
+    assert torch.equal(out, _bp_scalar32(sino, ang, Nz, Nx))
+
+
+@pytest.mark.parametrize("op", ["fp", "bp"])
+def test_cpu_parallel_kernels_are_thread_invariant(op):
+    """Bigger than the ports above: several Y blocks, more threads than Z
+    rows per band; every thread count gives the same bits."""
+    from fasttomo.autograd import _back_project_parallel_raw, _forward_project_parallel_raw
+
+    g = torch.Generator().manual_seed(5)
+    Ny, Nz, Nx, Nd = 37, 21, 26, 30
+    ang = torch.linspace(-70, 70, 23)
+    if op == "fp":
+        x = torch.rand(Ny, Nz, Nx, generator=g)
+        run = lambda k: _forward_project_parallel_raw(x, ang, Nd, num_threads=k)  # noqa: E731
+    else:
+        x = torch.rand(23, Ny, Nd, generator=g)
+        run = lambda k: _back_project_parallel_raw(x, ang, Nz, num_threads=k, Nx=Nx)  # noqa: E731
+    ref = run(1)
+    for k in (2, 5, 16, 40):
+        assert torch.equal(run(k), ref), k

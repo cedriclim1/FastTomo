@@ -6,17 +6,24 @@
 #include <stdlib.h>
 #include <omp.h>
 
-/* Step range of the ray (t, angle) clipped to the samples whose bilinear
- * stencil can lie in [0, Nx-1) x [zlo, zhi) (see ft_clip_steps). */
-static inline void clip_ray_parallel(ProjGeomParallel g, float t, float ca, float sa,
-                                     double zlo, double zhi, int *lo, int *hi)
+/* Ray clipping for the parallel kernels (ft_clip_steps): narrow [*lo, *hi]
+ * to the steps at which the sample of the ray (t, angle) can be inside
+ * x in [0, Nx-1] (clip_ray_x) or z in [zlo, zhi] (clip_ray_z). The sample
+ * coordinates are fx = (t*ca - s*sa) + half_x, fz = (t*sa + s*ca) + half_z. */
+static inline double ray_mag(ProjGeomParallel g, float t)
 {
-    const double mag = fabs((double)t) + g.ray_len + fmax(g.half_x, g.half_z) + 1.0;
-    *lo = -g.ray_len;
-    *hi =  g.ray_len;
-    /* fx = (t*ca - s*sa) + half_x,  fz = (t*sa + s*ca) + half_z */
-    ft_clip_steps(-(double)sa, (double)t * ca + g.half_x, 0.0, g.Nx - 1, mag, lo, hi);
-    ft_clip_steps( (double)ca, (double)t * sa + g.half_z, zlo, zhi, mag, lo, hi);
+    return fabs((double)t) + g.ray_len + fmax(g.half_x, g.half_z) + 1.0;
+}
+
+static inline void clip_ray_x(ProjGeomParallel g, float t, float ca, float sa, int *lo, int *hi)
+{
+    ft_clip_steps(-(double)sa, (double)t * ca + g.half_x, 0.0, g.Nx - 1, ray_mag(g, t), lo, hi);
+}
+
+static inline void clip_ray_z(ProjGeomParallel g, float t, float ca, float sa,
+                              double zlo, double zhi, int *lo, int *hi)
+{
+    ft_clip_steps((double)ca, (double)t * sa + g.half_z, zlo, zhi, ray_mag(g, t), lo, hi);
 }
 
 /* One ray of the forward projection on `nl` Y lanes of a Y-innermost block
@@ -108,8 +115,9 @@ int forward_project_parallel_cpu(
                 float ca = cos_a[ia], sa = sin_a[ia];
                 float t  = id - g.half_det;
                 float acc[FT_YB];
-                int lo, hi;
-                clip_ray_parallel(g, t, ca, sa, 0.0, Nz - 1, &lo, &hi);
+                int lo = -g.ray_len, hi = g.ray_len;
+                clip_ray_x(g, t, ca, sa, &lo, &hi);
+                clip_ray_z(g, t, ca, sa, 0.0, Nz - 1, &lo, &hi);
                 if (nl == FT_YB) fp_ray_lanes(blk, acc, FT_YB, g, t, ca, sa, lo, hi);
                 else if (nl == 1) fp_ray_lanes(blk, acc, 1, g, t, ca, sa, lo, hi);
                 else             fp_ray_lanes(blk, acc, nl, g, t, ca, sa, lo, hi);
@@ -122,7 +130,99 @@ int forward_project_parallel_cpu(
     return 0;
 }
 
-void back_project_parallel_cpu(
+/* Expected work of voxel row iz of the back-projection, summed over the
+ * views: the length of the row inside the slice (x in [0, Nx-1]) and inside
+ * the strip the detector sees (|x cos + z sin| <= half_det + 1/2, centred
+ * coordinates), i.e. about its number of ray samples, plus one per view for
+ * the per-ray overhead. Only used to balance the Z bands: the corners of the
+ * slice outside the detector strip get fewer samples, so equal row counts
+ * left the central bands with up to 1.4x the work of the outer ones. */
+static double bp_row_work(ProjGeomParallel g, const float *cos_a, const float *sin_a, int iz)
+{
+    const double z = iz - (double)g.half_z, lim = g.half_det + 0.5;
+    double w = 0.0;
+    for (int ia = 0; ia < g.n_angles; ia++) {
+        const double c = cos_a[ia], s = sin_a[ia];
+        double lo = -(double)g.half_x, hi = g.half_x;
+        if (fabs(c) > 1e-9) {
+            double a = (-lim - z * s) / c, b = (lim - z * s) / c;
+            if (a > b) { double t = a; a = b; b = t; }
+            lo = fmax(lo, a);
+            hi = fmin(hi, b);
+        } else if (fabs(z * s) > lim) {
+            hi = lo;
+        }
+        if (hi > lo) w += hi - lo;
+        w += 1.0;
+    }
+    return w;
+}
+
+/* One ray of the back-projection, restricted to the rows [z0, z1) of a
+ * Y-innermost block vt[Nz][Nx][nl]: scatters sv[l] (the ray's value in
+ * lane l) into the rows of its samples' stencils that lie in the band.
+ * Per voxel and lane the additions are those of the per-slice loop
+ *   v[iz0][ix0] += (1-wz)*(1-wx)*sval, ... , v[iz1][ix1] += wz*wx*sval
+ * in the same order (the caller walks the rays in the original
+ * (angle, detector, step) order), so the result is bit-identical to it. */
+static inline __attribute__((always_inline))
+void bp_ray_band(float *restrict vt, const float *restrict sv, const int nl,
+                 ProjGeomParallel g, float t, float ca, float sa, int lo, int hi,
+                 int z0, int z1)
+{
+    const int Nx = g.Nx, Nz = g.Nz;
+    for (int step = lo; step <= hi; step++) {
+        float s  = (float)step;
+        float fx = (t * ca - s * sa) + g.half_x;
+        float fz = (t * sa + s * ca) + g.half_z;
+
+        /* negated conjunction: NaN samples are skipped (see the forward) */
+        if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
+              fz >= 0.0f && fz < (float)(Nz - 1)))
+            continue;
+
+        int ix0 = (int)fx, iz0 = (int)fz;
+        if (iz0 < z0 - 1 || iz0 >= z1) continue;     /* no row in the band */
+        float wx = fx - ix0, wz = fz - iz0;
+        if (iz0 >= z0) {
+            float w00 = (1.0f - wz) * (1.0f - wx), w01 = (1.0f - wz) * wx;
+            float *restrict p00 = vt + ((size_t)iz0 * Nx + ix0) * nl;
+            float *restrict p01 = p00 + nl;
+            #pragma omp simd
+            for (int l = 0; l < nl; l++) p00[l] += w00 * sv[l];
+            #pragma omp simd
+            for (int l = 0; l < nl; l++) p01[l] += w01 * sv[l];
+        }
+        if (iz0 + 1 < z1) {
+            float w10 = wz * (1.0f - wx), w11 = wz * wx;
+            float *restrict p10 = vt + ((size_t)(iz0 + 1) * Nx + ix0) * nl;
+            float *restrict p11 = p10 + nl;
+            #pragma omp simd
+            for (int l = 0; l < nl; l++) p10[l] += w10 * sv[l];
+            #pragma omp simd
+            for (int l = 0; l < nl; l++) p11[l] += w11 * sv[l];
+        }
+    }
+}
+
+/*
+ * Ray-driven scatter back-projection, the exact transpose of the forward.
+ *
+ * Y is processed in blocks of FT_YB slices on Y-innermost copies of the
+ * sinogram block ([n_angles][N_det][nl]) and of the output block
+ * ([Nz][Nx][nl]). Within a block every OpenMP thread owns a band of Z rows
+ * [z0, z1), walks every ray in the original (angle, detector, step) order
+ * over the steps that can reach its band, and scatters only into its own
+ * rows with a SIMD loop over the block's slices (bands of about equal
+ * work, bp_row_work). Each voxel therefore
+ * receives the same fp32 additions in the same order as the per-slice
+ * serial loop: the result is bit-identical to it and independent of
+ * num_threads, without atomics or private volumes, and all threads are used
+ * even for Ny = 1 (the old kernel parallelised over Y only). Scratch for
+ * Ny > 1: (Nz*Nx + n_angles*N_det) * min(Ny, FT_YB) floats (Ny = 1 works
+ * in place). Returns 0, or -1 if the scratch allocation fails.
+ */
+int back_project_parallel_cpu(
     const float *sino,
     float       *vol,
     const float *cos_a,
@@ -133,50 +233,98 @@ void back_project_parallel_cpu(
 ) {
     if (num_threads < 1) num_threads = 1;
     ProjGeomParallel g = proj_geom_parallel(Ny, Nz, Nx, n_angles, N_det);
+    const size_t plane = (size_t)Nz * Nx;
+    const size_t rays  = (size_t)n_angles * N_det;
+    const int    yb    = Ny < FT_YB ? Ny : FT_YB;
+    float  *vt = NULL, *st = NULL;
+    int    *zb = (int *)malloc(((size_t)num_threads + 1) * sizeof(int)); /* bands */
+    double *rw = (double *)malloc((size_t)Nz * sizeof(double));        /* row work */
+    if (Ny > 1) {
+        vt = (float *)malloc(plane * yb * sizeof(float));
+        st = (float *)malloc(rays * yb * sizeof(float));
+    }
+    if (!zb || !rw || (Ny > 1 && (!vt || !st))) {
+        free(zb); free(rw); free(vt); free(st);
+        return -1;
+    }
 
-    memset(vol, 0, (size_t)Ny * Nz * Nx * sizeof(float));
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int nth = omp_get_num_threads(), tid = omp_get_thread_num();
+        /* Z bands of about equal work (bp_row_work): the boundaries only
+         * decide which thread adds to a voxel, never the order of its
+         * additions, so they do not change the result */
+        #pragma omp for schedule(static)
+        for (int iz = 0; iz < Nz; iz++)
+            rw[iz] = bp_row_work(g, cos_a, sin_a, iz);
+        #pragma omp single
+        {
+            double total = 0.0, acc = 0.0;
+            for (int iz = 0; iz < Nz; iz++) total += rw[iz];
+            int k = 1;
+            zb[0] = 0;
+            for (int iz = 0; iz < Nz && k < nth; iz++) {
+                /* row iz starts band k once the work before its middle
+                 * reaches k/nth of the total */
+                while (k < nth && acc + 0.5 * rw[iz] >= total * k / nth) zb[k++] = iz;
+                acc += rw[iz];
+            }
+            while (k <= nth) zb[k++] = Nz;
+        }
+        /* implicit barrier: zb is complete */
+        const int z0 = zb[tid], z1 = zb[tid + 1];
 
-    /*
-     * Ray-driven scatter — strict adjoint of the forward pass. Different Y
-     * slices are disjoint memory regions, so parallelism is safe over `iy`.
-     * Within a slice, scatter across angles + detector + step would race, so
-     * the inner triple loop stays serial within each thread.
-     */
-    #pragma omp parallel for schedule(static) num_threads(num_threads)
-    for (int iy = 0; iy < Ny; iy++) {
-        float *slice = vol + (size_t)iy * Nz * Nx;
-
-        for (int ia = 0; ia < n_angles; ia++) {
-            float ca = cos_a[ia], sa = sin_a[ia];
-
-            for (int id = 0; id < N_det; id++) {
-                float t    = id - g.half_det;
-                float sval = sino[((size_t)ia * Ny + iy) * N_det + id];
-
-                for (int step = -g.ray_len; step <= g.ray_len; step++) {
-                    float s  = (float)step;
-                    float fx = (t * ca - s * sa) + g.half_x;
-                    float fz = (t * sa + s * ca) + g.half_z;
-
-                    /* negated conjunction: a NaN sample (NaN/Inf angle)
-                     * fails every comparison and is skipped, instead of
-                     * indexing with (int)NaN = INT_MIN */
-                    if (!(fx >= 0.0f && fx < (float)(Nx - 1) &&
-                          fz >= 0.0f && fz < (float)(Nz - 1)))
-                        continue;
-
-                    int ix0 = (int)fx, iz0 = (int)fz;
-                    int ix1 = ix0 + 1, iz1 = iz0 + 1;
-                    float wx = fx - ix0, wz = fz - iz0;
-
-                    slice[(size_t)iz0 * Nx + ix0] += (1.0f - wz) * (1.0f - wx) * sval;
-                    slice[(size_t)iz0 * Nx + ix1] += (1.0f - wz) *          wx  * sval;
-                    slice[(size_t)iz1 * Nx + ix0] +=          wz  * (1.0f - wx) * sval;
-                    slice[(size_t)iz1 * Nx + ix1] +=          wz  *          wx  * sval;
+        for (int y0 = 0; y0 < Ny; y0 += FT_YB) {
+            const int nl = Ny - y0 < FT_YB ? Ny - y0 : FT_YB;
+            const float *sblk = sino;       /* Ny == 1: [n][N_det][1] is sino */
+            float       *vblk = vol;        /*          [Nz][Nx][1] is vol   */
+            if (Ny > 1) {
+                #pragma omp for schedule(static)
+                for (size_t r = 0; r < rays; r++) {
+                    const size_t ia = r / N_det, id = r % N_det;
+                    for (int l = 0; l < nl; l++)
+                        st[r * nl + l] = sino[(ia * Ny + y0 + l) * N_det + id];
                 }
+                /* implicit barrier: st is complete */
+                sblk = st;
+                vblk = vt;
+            }
+            memset(vblk + (size_t)z0 * Nx * nl, 0, (size_t)(z1 - z0) * Nx * nl * sizeof(float));
+
+            if (z1 > z0)
+                for (int ia = 0; ia < n_angles; ia++) {
+                    float ca = cos_a[ia], sa = sin_a[ia];
+                    for (int id = 0; id < N_det; id++) {
+                        float t = id - g.half_det;
+                        const float *sv = sblk + ((size_t)ia * N_det + id) * nl;
+                        int lo = -g.ray_len, hi = g.ray_len;
+                        clip_ray_x(g, t, ca, sa, &lo, &hi);
+                        /* samples with iz0 in [z0-1, z1-1]: fz in [z0-1, z1) */
+                        clip_ray_z(g, t, ca, sa, z0 - 1, z1, &lo, &hi);
+                        if (nl == FT_YB) bp_ray_band(vblk, sv, FT_YB, g, t, ca, sa, lo, hi, z0, z1);
+                        else if (nl == 1) bp_ray_band(vblk, sv, 1, g, t, ca, sa, lo, hi, z0, z1);
+                        else             bp_ray_band(vblk, sv, nl, g, t, ca, sa, lo, hi, z0, z1);
+                    }
+                }
+
+            if (Ny > 1) {
+                /* own rows back to [Ny, Nz, Nx] */
+                for (int iz = z0; iz < z1; iz++)
+                    for (int ix = 0; ix < Nx; ix++) {
+                        const float *src = vt + ((size_t)iz * Nx + ix) * nl;
+                        for (int l = 0; l < nl; l++)
+                            vol[(size_t)(y0 + l) * plane + (size_t)iz * Nx + ix] = src[l];
+                    }
+                /* st and vt are refilled for the next block */
+                #pragma omp barrier
             }
         }
     }
+    free(zb);
+    free(rw);
+    free(vt);
+    free(st);
+    return 0;
 }
 
 /*

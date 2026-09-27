@@ -52,10 +52,11 @@ void register_cpu(py::module_ &m) {
           [](std::intptr_t sino, std::intptr_t vol,
              std::intptr_t cos_a, std::intptr_t sin_a,
              int Ny, int Nz, int Nx, int n_angles, int N_det, int num_threads) {
-              back_project_parallel_cpu(
-                  P<const float>(sino), P<float>(vol),
-                  P<const float>(cos_a), P<const float>(sin_a),
-                  Ny, Nz, Nx, n_angles, N_det, threads_or_one(num_threads));
+              if (back_project_parallel_cpu(
+                      P<const float>(sino), P<float>(vol),
+                      P<const float>(cos_a), P<const float>(sin_a),
+                      Ny, Nz, Nx, n_angles, N_det, threads_or_one(num_threads)) != 0)
+                  throw std::bad_alloc();
           }, gil_release(),
           "Single-axis (parallel) back-projection (CPU), exact ray-driven "
           "transpose of the forward. Overwrites vol [Ny, Nz, Nx].",

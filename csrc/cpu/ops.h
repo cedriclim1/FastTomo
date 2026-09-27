@@ -35,15 +35,19 @@ int forward_project_parallel_cpu(
 );
 
 /*
- * Parallel-beam back-projection (CPU).
+ * Parallel-beam back-projection (CPU): the ray-driven scatter that is the
+ * exact transpose of forward_project_parallel_cpu (every ray sample adds its
+ * sinogram value, bilinearly weighted, to its 2x2 voxel stencil).
  *
  * sinogram : [n_angles, Ny, N_det]  float32
  * volume   : [Ny, Nz, Nx]  float32, caller-allocated — overwritten, NOT accumulated
  * cos_a / sin_a : [n_angles] precomputed trig values
  *
- * For each voxel, accumulates linearly-interpolated sinogram values over all angles.
+ * Y-batched, OpenMP over Z bands; the result does not depend on
+ * num_threads. Returns 0, or -1 if the scratch allocation
+ * ((Nz*Nx + n_angles*N_det) * min(Ny, FT_YB) floats, none for Ny = 1) fails.
  */
-void back_project_parallel_cpu(
+int back_project_parallel_cpu(
     const float *sino,
     float       *vol,
     const float *cos_a,
