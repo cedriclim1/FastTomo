@@ -106,9 +106,10 @@ def _fd_grad_mats(vol: np.ndarray, mats: np.ndarray, w: np.ndarray,
     return fd
 
 
-# Generic (non-special) Euler angles: with angles like 0 or 90 deg every
-# sample lands exactly on a trilinear kink and the derivative is one-sided,
-# so finite differences and the analytic gradient legitimately disagree.
+# Generic (non-special) Euler angles. (At grid-aligned poses, 0 / 90 deg or a
+# pure tilt, the samples lie on trilinear kinks; since phase 1b PR G the
+# kernels average the two one-sided derivatives there, which is the central
+# FD: test_sampling_boundary.py covers those poses.)
 _EULER = torch.tensor([[12.3, 27.1, -7.9], [41.7, -33.2, 16.4], [3.3, 61.9, -2.2]])
 
 
@@ -319,11 +320,13 @@ def _grad_rotmat_ref(vol: np.ndarray, mats: np.ndarray, w: np.ndarray) -> np.nda
 
 def _grad_angle_ref(vol: np.ndarray, angles_deg: np.ndarray, w: np.ndarray) -> np.ndarray:
     """fp64 analytic dL/dtheta (per degree) of L = <w, FP(vol, theta)> for the
-    tight single-axis forward (same model as _fp_parallel_ref)."""
+    loose single-axis forward (same model as _fp_parallel_ref), at views
+    without samples on grid lines (the analytic derivative is unique there)."""
     Ny, Nz, Nx = vol.shape
     N_det = w.shape[-1]
     ray_len = int(math.ceil(0.5 * math.sqrt(Nx * Nx + Nz * Nz))) + 1
     hd, hx, hz = 0.5 * (N_det - 1), 0.5 * (Nx - 1), 0.5 * (Nz - 1)
+    pad = np.pad(vol, ((0, 0), (1, 1), (1, 1)))
     T, S = np.meshgrid(np.arange(N_det) - hd,
                        np.arange(-ray_len, ray_len + 1, dtype=np.float64), indexing="ij")
     out = np.zeros(len(angles_deg))
@@ -331,13 +334,13 @@ def _grad_angle_ref(vol: np.ndarray, angles_deg: np.ndarray, w: np.ndarray) -> n
         x = T * math.cos(th) - S * math.sin(th)
         z = T * math.sin(th) + S * math.cos(th)
         fx, fz = x + hx, z + hz
-        inside = (fx >= 0) & (fx < Nx - 1) & (fz >= 0) & (fz < Nz - 1)
+        inside = (fx > -1) & (fx < Nx) & (fz > -1) & (fz < Nz)
         fx, fz = np.where(inside, fx, 0.0), np.where(inside, fz, 0.0)
         x0, z0 = np.floor(fx).astype(int), np.floor(fz).astype(int)
         wx, wz = fx - x0, fz - z0
-        x1, z1 = np.minimum(x0 + 1, Nx - 1), np.minimum(z0 + 1, Nz - 1)
-        v00, v01 = vol[:, z0, x0], vol[:, z0, x1]
-        v10, v11 = vol[:, z1, x0], vol[:, z1, x1]
+        x0, z0 = x0 + 1, z0 + 1
+        v00, v01 = pad[:, z0, x0], pad[:, z0, x0 + 1]
+        v10, v11 = pad[:, z0 + 1, x0], pad[:, z0 + 1, x0 + 1]
         dvx = (1 - wz) * (v01 - v00) + wz * (v11 - v10)
         dvz = (1 - wx) * (v10 - v00) + wx * (v11 - v01)
         d = np.where(inside[None], dvx * (-z) + dvz * x, 0.0).sum(-1)   # [Ny, N_det]
@@ -1070,38 +1073,41 @@ def test_mbir_cpu_sweep_rejects_mismatched_sizes(bad):
                            "perm", "cos_a", "sin_a")), **hyper)   # valid call runs
 
 
-# ── Parallel-beam path: tight bounds are consistent end to end ─────────────
+# ── Parallel-beam path: loose bounds are consistent end to end ─────────────
 #
-# Unlike the rotmat path (D2), the single-axis operators use *tight* bounds
-# on every backend: a sample contributes only if its whole bilinear stencil
-# lies inside the slice, fx in [0, Nx-1), fz in [0, Nz-1). The CUDA forward
-# skips out-of-stencil samples explicitly before its (border-mode) texture
-# fetch, the CPU forward does the same, and grad_angle (CPU and CUDA) is the
+# Like the rotmat path (D2), the single-axis operators use *loose* bounds on
+# every backend since phase 1b PR G: the slice is a sum of bilinear tent
+# functions, zero outside, so a sample contributes while any corner of its
+# stencil is inside, fx in (-1, Nx), fz in (-1, Nz). The CUDA forward gets
+# that from its border-mode texture, the CPU forward and its exact transpose
+# from a zero-padded scratch, and grad_angle (CPU and CUDA) is the
 # derivative of exactly that forward. These tests pin that consistency on
 # volumes that touch every face, with the D2 methodology: an independent fp64
-# reference, central finite differences, generic angles.
+# reference, central finite differences, generic angles. (The grid-aligned
+# views, degenerate shapes and symmetries are in test_sampling_boundary.py.)
 
 def _fp_parallel_ref(vol: np.ndarray, angles_deg: np.ndarray, N_det: int) -> np.ndarray:
-    """fp64 single-axis forward: unit steps, bilinear, tight stencil bounds."""
+    """fp64 single-axis forward: unit steps, bilinear, loose bounds (-1, N),
+    corners outside the slice read 0."""
     Ny, Nz, Nx = vol.shape
     ray_len = int(math.ceil(0.5 * math.sqrt(Nx * Nx + Nz * Nz))) + 1
     hd, hx, hz = 0.5 * (N_det - 1), 0.5 * (Nx - 1), 0.5 * (Nz - 1)
+    pad = np.pad(vol, ((0, 0), (1, 1), (1, 1)))
     T, S = np.meshgrid(np.arange(N_det) - hd,
                        np.arange(-ray_len, ray_len + 1, dtype=np.float64), indexing="ij")
     out = np.zeros((len(angles_deg), Ny, N_det))
     for a, th in enumerate(np.deg2rad(angles_deg)):
         fx = T * math.cos(th) - S * math.sin(th) + hx
         fz = T * math.sin(th) + S * math.cos(th) + hz
-        inside = (fx >= 0) & (fx < Nx - 1) & (fz >= 0) & (fz < Nz - 1)
+        inside = (fx > -1) & (fx < Nx) & (fz > -1) & (fz < Nz)
         fx = np.where(inside, fx, 0.0)
         fz = np.where(inside, fz, 0.0)
         x0 = np.floor(fx).astype(int)
         z0 = np.floor(fz).astype(int)
         wx, wz = fx - x0, fz - z0
-        x1 = np.minimum(x0 + 1, Nx - 1)
-        z1 = np.minimum(z0 + 1, Nz - 1)
-        val = ((1 - wz) * ((1 - wx) * vol[:, z0, x0] + wx * vol[:, z0, x1])
-               + wz * ((1 - wx) * vol[:, z1, x0] + wx * vol[:, z1, x1]))
+        x0, z0 = x0 + 1, z0 + 1
+        val = ((1 - wz) * ((1 - wx) * pad[:, z0, x0] + wx * pad[:, z0, x0 + 1])
+               + wz * ((1 - wx) * pad[:, z0 + 1, x0] + wx * pad[:, z0 + 1, x0 + 1]))
         out[a] = np.where(inside[None], val, 0.0).sum(-1)
     return out
 

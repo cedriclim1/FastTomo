@@ -20,9 +20,11 @@ extern "C" {
  * Detector bins are centred: id=0 ↔ t=-(N_det-1)/2.
  *
  * Integration uses 1-pixel steps along the ray with bilinear interpolation;
- * a sample counts only if its whole 2x2 stencil is inside the slice.
+ * loose sampling rule (as the rotmat kernels and the CUDA border texture):
+ * a sample counts while any corner of its 2x2 stencil is inside the slice,
+ * fx in (-1, Nx), fz in (-1, Nz), and corners outside read 0.
  * Y-batched (FT_YB slices per SIMD loop, common.h). Returns 0, or -1 if the
- * scratch allocation (Nz*Nx*min(Ny, FT_YB) floats, none for Ny = 1) fails.
+ * scratch allocation ((Nz+2)*(Nx+2)*min(Ny, FT_YB) floats) fails.
  */
 int forward_project_parallel_cpu(
     const float *vol,
@@ -37,7 +39,8 @@ int forward_project_parallel_cpu(
 /*
  * Parallel-beam back-projection (CPU): the ray-driven scatter that is the
  * exact transpose of forward_project_parallel_cpu (every ray sample adds its
- * sinogram value, bilinearly weighted, to its 2x2 voxel stencil).
+ * sinogram value, bilinearly weighted, to the corners of its 2x2 voxel
+ * stencil that are inside the slice).
  *
  * sinogram : [n_angles, Ny, N_det]  float32
  * volume   : [Ny, Nz, Nx]  float32, caller-allocated — overwritten, NOT accumulated
@@ -45,7 +48,8 @@ int forward_project_parallel_cpu(
  *
  * Y-batched, OpenMP over Z bands; the result does not depend on
  * num_threads. Returns 0, or -1 if the scratch allocation
- * ((Nz*Nx + n_angles*N_det) * min(Ny, FT_YB) floats, none for Ny = 1) fails.
+ * ((Nz*(Nx+2) + n_angles*N_det) * min(Ny, FT_YB) floats, no sinogram copy
+ * for Ny = 1) fails.
  */
 int back_project_parallel_cpu(
     const float *sino,
@@ -87,13 +91,15 @@ int back_project_gather_parallel_cpu(
  *
  * Computes ∂L/∂θ_ia for each angle, given the upstream gradient on the
  * sinogram.  Uses the identity ∂x/∂θ = −z, ∂z/∂θ = x at each ray step,
- * combined with bilinear-weighted finite differences for ∂vol/∂x and ∂vol/∂z.
+ * combined with bilinear-weighted finite differences for ∂vol/∂x and ∂vol/∂z
+ * (the forward's loose rule; at a sample on a grid line the average of the
+ * two one-sided differences, i.e. the central derivative).
  *
  * grad_angles : [n_angles] — overwritten; per radian
  *
  * Y-batched; fp64 accumulation in an order fixed by the geometry, so the
  * result does not depend on num_threads. Returns 0, or -1 if the scratch
- * allocation (Nz*Nx*min(Ny, FT_YB) floats for Ny > 1, plus
+ * allocation ((Nz+4)*(Nx+4)*min(Ny, FT_YB) floats, plus
  * n_angles*(ceil(N_det/32)*16 + 1) doubles) fails.
  */
 int grad_angle_cpu(

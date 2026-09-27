@@ -39,7 +39,7 @@
  *
  * grad_rotmat_kernel uses the same block-uniform clipping. A dropped step
  * is one its loose bounds test would skip (the slab [-2, N+1] contains the
- * contributing band (-1, N)), so no accumulator changes and the gradient is
+ * contributing band [-1, N]), so no accumulator changes and the gradient is
  * bit-identical to the full loop (tests compare both via the hook below).
  * The gain is small because an outside step costs ~20 instructions against
  * ~86 for an inside one: 0.97-0.98x with the old 9 KB smem-tree kernel
@@ -393,7 +393,8 @@ void back_project_rotmat_cuda_cached(
  *
  * ∂tx/∂M[{0,3,6}] = {u, v, s}, ∂ty/∂M[{1,4,7}] = {u, v, s},
  * ∂tz/∂M[{2,5,8}] = {u, v, s}. Spatial derivatives ∂vol/∂{x,y,z}
- * computed analytically from trilinear interpolation weights.
+ * computed analytically from trilinear interpolation weights; on a grid
+ * plane (a trilinear kink) the average of the two one-sided derivatives.
  *
  * T is the volume dtype (float or __half). The 8 corner reads are done with
  * tex3D<float> and cudaFilterModePoint so the result is bit-exact equivalent
@@ -465,11 +466,15 @@ __global__ static void grad_rotmat_kernel(
                  * texture, so the samples within one voxel of a face carry
                  * the (large) derivative of the fall-off to zero. A tight
                  * [0, N-1) test drops them and is not the gradient of the
-                 * forward. floorf, not (int) truncation, because fx can be
-                 * negative here. */
-                if (fx <= -1.0f || fx >= (float)Nx ||
-                    fy <= -1.0f || fy >= (float)Ny ||
-                    fz <= -1.0f || fz >= (float)Nz)
+                 * forward. The test is inclusive, [-1, N]: a sample on the
+                 * outer end of a tent adds 0 to the forward but has a
+                 * one-sided slope (the kink rule below averages it in);
+                 * rotmat_ray_steps' slab [-2, N+1] keeps those samples.
+                 * Negated conjunction: a NaN sample is skipped. floorf, not
+                 * (int) truncation, because fx can be negative here. */
+                if (!(fx >= -1.0f && fx <= (float)Nx &&
+                      fy >= -1.0f && fy <= (float)Ny &&
+                      fz >= -1.0f && fz <= (float)Nz))
                     continue;
 
                 /* Corner indices stay floats (exact: |x0| < 2^24), so the
@@ -509,6 +514,47 @@ __global__ static void grad_rotmat_kernel(
                 float dfy = fmaf(wz, by1 - by0, by0);
                 float bz0 = e01 - e00, bz1 = e11 - e10;
                 float dfz = fmaf(wy, bz1 - bz0, bz0);
+
+                /* Kinks: on a grid plane (w == 0; every sample of a pure
+                 * tilt has wy == 0) the derivative across it is the average
+                 * of the forward and the backward difference, the latter
+                 * from the plane x0-1 / y0-1 / z0-1 (4 point fetches, border
+                 * 0), i.e. the central derivative, as in grad_rotmat_cpu and
+                 * grad_angle. With w == 0 the lerps along that axis are
+                 * exact (e.. == v.. for wx == 0). Off the kinks nothing
+                 * changes. */
+                if (wx == 0.0f || wy == 0.0f || wz == 0.0f) {
+                    if (wx == 0.0f) {
+                        const float cxm = x0 - 0.5f;
+                        float m00 = tex3D<float>(vol_tex, cxm, cz0, cy0);
+                        float m01 = tex3D<float>(vol_tex, cxm, cz1, cy0);
+                        float m10 = tex3D<float>(vol_tex, cxm, cz0, cy1);
+                        float m11 = tex3D<float>(vol_tex, cxm, cz1, cy1);
+                        float b0 = fmaf(wz, (v010 - m01) - (v000 - m00), v000 - m00);
+                        float b1 = fmaf(wz, (v110 - m11) - (v100 - m10), v100 - m10);
+                        dfx = 0.5f * (dfx + fmaf(wy, b1 - b0, b0));
+                    }
+                    if (wy == 0.0f) {
+                        const float cym = y0 - 0.5f;
+                        float m0 = tex3D<float>(vol_tex, cx0, cz0, cym);
+                        float m1 = tex3D<float>(vol_tex, cx1, cz0, cym);
+                        float m2 = tex3D<float>(vol_tex, cx0, cz1, cym);
+                        float m3 = tex3D<float>(vol_tex, cx1, cz1, cym);
+                        float f0 = fmaf(wx, m1 - m0, m0), f1 = fmaf(wx, m3 - m2, m2);
+                        float b0 = e00 - f0, b1 = e01 - f1;
+                        dfy = 0.5f * (dfy + fmaf(wz, b1 - b0, b0));
+                    }
+                    if (wz == 0.0f) {
+                        const float czm = z0 - 0.5f;
+                        float m0 = tex3D<float>(vol_tex, cx0, czm, cy0);
+                        float m1 = tex3D<float>(vol_tex, cx1, czm, cy0);
+                        float m2 = tex3D<float>(vol_tex, cx0, czm, cy1);
+                        float m3 = tex3D<float>(vol_tex, cx1, czm, cy1);
+                        float f0 = fmaf(wx, m1 - m0, m0), f1 = fmaf(wx, m3 - m2, m2);
+                        float b0 = e00 - f0, b1 = e10 - f1;
+                        dfz = 0.5f * (dfz + fmaf(wy, b1 - b0, b0));
+                    }
+                }
 
                 Sx += dfx;  Sy += dfy;  Sz += dfz;
                 Tx = fmaf(dfx, s, Tx);  Ty = fmaf(dfy, s, Ty);  Tz = fmaf(dfz, s, Tz);

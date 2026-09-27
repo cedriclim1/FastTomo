@@ -6,13 +6,16 @@
 
 For ``algorithm_golden_main.pt`` the new values come from
 ``tests/test_algorithm_identity.py::_cases`` (the device is the key's
-prefix). For ``frozen_golden_main.pt`` only the run_ad_recon keys can be
+prefix); every other key of the same device is recomputed as well and must
+be reproduced (byte-identical, or within 2e-6 for ``ATOMIC_KEYS``), or the
+script stops without writing. For ``frozen_golden_main.pt`` only the run_ad_recon keys can be
 regenerated, with the calls of ``test_frozen_identity.py::ad_cases`` (the
 same definition the test uses); the GENFIRE / RESIRE keys are frozen.
 
 Keys naming GENFIRE or RESIRE outputs (``genfire*`` / ``resire*``, e.g.
 ``cuda/gd_resire``) are refused in any file unless ``--allow-frozen`` is
-passed. Every other key must stay byte-identical: the script checks that, prints the
+passed, and so are the stored test inputs (``_input/<device>/sino``, see
+``tests/data/freeze_golden_inputs.py``). Every other key must stay byte-identical: the script checks that, prints the
 max abs / rel change of each replaced key, then re-saves the file with its
 arithmetic fingerprints (tests/_golden.py) unchanged. It refuses to run
 unless this environment's fingerprint for the keys' device is already
@@ -97,6 +100,10 @@ def main(path: str, keys: list[str], allow_frozen: bool = False) -> None:
         raise SystemExit(f"{path}: no such keys {missing}")
     _check_fingerprints(raw, keys, path)
     print("fasttomo from", fasttomo.__file__, "torch", torch.__version__)
+    inputs = [k for k in keys if k.startswith("_")]
+    if inputs:
+        raise SystemExit(f"refusing {inputs}: metadata and frozen test inputs "
+                         "(tests/data/freeze_golden_inputs.py) are not regenerated")
     frozen = [k for k in keys if any(f in k.lower() for f in FROZEN)]
     if frozen and not allow_frozen:
         raise SystemExit(f"refusing frozen keys {frozen} (GENFIRE/RESIRE outputs are frozen; "
@@ -109,11 +116,29 @@ def main(path: str, keys: list[str], allow_frozen: bool = False) -> None:
             raise SystemExit(f"only the run_ad_recon keys {sorted(cases)} can be regenerated, not {bad}")
         new = {k: _to_cpu(cases[k]()) for k in keys}
     else:
-        from test_algorithm_identity import _cases
-        new = {}
+        from test_algorithm_identity import ATOMIC_KEYS, _cases
+        new, stale = {}, []
         for dev in sorted({k.split("/", 1)[0] for k in keys}):
             now = _cases(dev)
             new.update({k: now[k] for k in keys if k.startswith(dev + "/")})
+            # every key of this device that is NOT regenerated must still be
+            # reproduced by the build under test: byte-identical, or within
+            # the test's 2e-6 for the fp32-atomics keys. A key that changes
+            # without being named is a bug, not something to re-stamp.
+            for k, v in now.items():
+                if k in keys:
+                    continue
+                old = raw[k]
+                if k.split("#")[0] in ATOMIC_KEYS:
+                    ok = torch.allclose(v, old, rtol=2e-6, atol=2e-6)
+                else:
+                    ok = (v.dtype == old.dtype and v.shape == old.shape
+                          and v.numpy().tobytes() == old.numpy().tobytes())
+                if not ok:
+                    stale.append(f"{k}: {_change(old, v)}")
+        if stale:
+            raise SystemExit("keys that change but were not named (nothing written):\n  "
+                             + "\n  ".join(stale))
     for k in keys:
         print(f"{k}: {_change(raw[k], new[k])}")
     before = {k: v for k, v in raw.items() if k not in keys}

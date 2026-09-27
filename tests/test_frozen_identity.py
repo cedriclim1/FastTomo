@@ -10,8 +10,13 @@ origin/main 0bf45d6 (generator: `tests/data/frozen_golden_main_gen.py`, old
 keyword names), except the five run_ad_recon keys, regenerated for later
 deliberate AD changes by `tests/data/regenerate_golden_keys.py` (phase 1b:
 deterministic grad_rotmat, fused Adam, the antisymmetric_z total
-derivative). Here the same calls use the new names and pass every new
-option at its no-op value, and must reproduce the golden:
+derivative; PR G: the loose sampling boundary of the parallel operator for
+ad, ad_reg, ad_staged, and the kink average of grad_rotmat at ad_pose's
+pure-tilt start, tests/data/regen_boundary_goldens.py). Here the same calls use the new names and pass every new
+option at its no-op value, and must reproduce the golden. The input
+sinogram is stored in the golden too (``_input/<device>/sino``, main
+7fdaac2's forward projection, tests/data/freeze_golden_inputs.py), so these
+keys keep pinning GENFIRE / RESIRE when the parallel-beam projector changes:
 
 * GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal,
   but only where the machine's arithmetic fingerprint (``tests/_golden.py``)
@@ -52,7 +57,12 @@ def _inputs(device):
     sm = torch.zeros(1, N, N)
     sm[:, 3:17, 3:17] = 1.0
     vol, ang, sm = vol.to(device), ang.to(device), sm.to(device)
-    return ft.forward_project(vol, ang), ang, eul, sm, N
+    # The sinogram is the stored ft.forward_project(vol, ang) of main 7fdaac2
+    # (tests/data/freeze_golden_inputs.py), not recomputed: the projector's
+    # sampling-boundary change would otherwise change the frozen GENFIRE /
+    # RESIRE outputs through their input although their code did not change.
+    sino = _golden()[f"_input/{torch.device(device).type}/sino"].to(device)
+    return sino, ang, eul, sm, N
 
 
 class _Calls:
@@ -178,9 +188,10 @@ def ad_cases() -> dict:
 
 @needs_cuda
 def test_ad_recon_identical_to_main():
-    """The five AD keys were regenerated for deliberate changes (phase 1b:
+    """The AD keys were regenerated for deliberate changes (phase 1b:
     deterministic grad_rotmat for ad_pose; fused Adam for all five and the
-    antisymmetric_z total derivative for ad_pose) with
+    antisymmetric_z total derivative for ad_pose; PR G's sampling boundary
+    and kink rule for all but ad_support) with
     tests/data/regenerate_golden_keys.py; they pin that behaviour bit for
     bit where the fingerprint matches."""
     golden = _golden()

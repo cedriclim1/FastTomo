@@ -191,6 +191,14 @@ def forward_project(
     Returns [n_angles, Ny, N_det] float32 on the same device as volume.
     N_det defaults to Nx.
 
+    Model: unit steps along each ray, bilinear interpolation, and the loose
+    sampling rule of ``forward_project_3d``: every slice is a sum of
+    bilinear tent functions, zero outside, so a sample contributes while any
+    corner of its stencil is inside (x index in (-1, Nx), z in (-1, Nz)).
+    ``forward_project(v, a)`` equals ``forward_project_3d(v, (0, a, 0))``.
+    (Before phase 1b PR G a sample needed its whole stencil inside, which
+    zeroed the last detector column at 0 degrees.)
+
     The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in. Default
     is serial. Resolution order: kwarg → ``OMP_NUM_THREADS`` env → 1. The CUDA
     path ignores ``num_threads`` (the kernel manages its own grid); it reuses
@@ -200,7 +208,13 @@ def forward_project(
 
     Differentiable w.r.t. ``volume`` and ``angles_deg``.  Volume gradient
     calls back_project (the discrete adjoint). Angle gradient uses
-    ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x at each ray step (CPU + CUDA).
+    ∂sino/∂θ = ∂vol/∂x·(−z) + ∂vol/∂z·x at each ray step (CPU + CUDA); at a
+    sample exactly on a grid line (every sample of a 0 degree view) the
+    average of the two one-sided differences, so it is the central
+    derivative of the forward there. (On CUDA, FMA contraction of the sample
+    position can move a sample 1e-8 off a grid line the CPU puts it on, e.g.
+    Nz = 1 slices with odd Nx at 45 degrees; there the CUDA gradient is the
+    one-sided one.)
     """
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
@@ -234,8 +248,11 @@ def back_project(
     * CUDA: voxel-driven gather; every voxel linearly interpolates each
       view's sinogram row at its detector position (texture unit, 8-bit
       interpolation weights). Shift-invariant, but only an approximate
-      adjoint of the CUDA ``forward_project`` (~1 % inner-product error on
-      smooth data, more on noise).
+      adjoint of the CUDA ``forward_project``: ``||B - A^T||_F / ||A||_F``
+      = 0.077 at 32^2 and 64^2 with 61 views (the ray-driven vs
+      voxel-driven interior difference; the edge ring matched when both
+      took the loose sampling rule, phase 1b PR G), inner-product gap
+      1e-4 on positive random data, more on zero-mean noise.
 
     The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in (default
     serial; resolution order kwarg → ``OMP_NUM_THREADS`` env → 1). The CUDA
@@ -285,7 +302,10 @@ def forward_project_3d(
 
     Differentiable w.r.t. ``volume``, ``euler_zyz_deg``, and ``shifts`` on
     both devices: backward calls back_project_3d for the volume gradient and
-    a dedicated grad_rotmat kernel for the rotation-matrix gradient. The
+    a dedicated grad_rotmat kernel for the rotation-matrix gradient (at a
+    sample exactly on a grid plane, e.g. every sample of a pure tilt
+    ``(0, theta, 0)`` or of the identity pose, the average of the two
+    one-sided differences: the central derivative). The
     euler→rotmat conversion lives in pure PyTorch so autograd chains ∂L/∂M
     into ∂L/∂euler; ``grid_sample`` handles ∂L/∂shifts.
     """

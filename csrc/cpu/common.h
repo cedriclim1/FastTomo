@@ -16,9 +16,10 @@
 /* Y lanes per block of the Y-batched parallel-beam kernels. The geometry of
  * a ray sample (position, stencil, weights) does not depend on the Y slice,
  * so it is computed once per sample and applied to FT_YB slices with a SIMD
- * loop over a Y-innermost copy of the block ([Nz][Nx][FT_YB] or
- * [n_angles][N_det][FT_YB]). 16 lanes = one AVX-512 or four SSE2 vectors;
- * the scratch per block is Nz * Nx * FT_YB floats (4 MiB at 256^2). Every
+ * loop over a Y-innermost copy of the block ([Nz+2p][Nx+2p][FT_YB] with a
+ * zero border p voxels wide, or [n_angles][N_det][FT_YB]). 16 lanes = one
+ * AVX-512 or four SSE2 vectors; the scratch per block is about
+ * Nz * Nx * FT_YB floats (4 MiB at 256^2). Every
  * lane performs exactly the scalar kernel's operations in the same order,
  * so the result is bit-identical to the per-slice loop. */
 #define FT_YB 16

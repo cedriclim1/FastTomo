@@ -9,10 +9,21 @@
 #include "../include/proj_geom.h"
 #include "ops.h"
 #include "scratch_pool.cuh"
+#include "parallel_clip.cuh"
 
 /* ── gradient of forward projection w.r.t. tilt angles ───────────────────────
  * Grid:  (ceil(N_det/16), ceil(n_angles/16), Ny)   Block: (16, 16, 1)
  * Same detector-driven layout as forward_project_parallel_kernel.
+ *
+ * Sampling rule: the forward's (loose, fx in (-1, Nx), fz in (-1, Nz), floor
+ * corners, corners outside the slice read 0). ga_load returns 0 outside;
+ * samples whose whole stencil is inside (almost all) load their 4 corners
+ * directly. At a grid-line kink (wx == 0 or wz == 0) the derivative across
+ * the line is the average of the forward and the backward difference
+ * (column ix0-1 / row iz0-1), i.e. the central one, as in grad_angle_cpu
+ * and grad_rotmat; the bounds test is inclusive, [-1, N], so a sample on
+ * the outer end of a tent (value 0, one-sided slope) is kept. Off the
+ * kinks the arithmetic is the previous kernel's.
  *
  * Reduction strategy: each (ia, ty) row of 16 threads sits inside a single
  * warp (block is 16×16 = 256 threads = 8 warps; for ty even, those 16
@@ -23,6 +34,12 @@
  * sums the Ny*gridDim.x partials of each view in a fixed order. No atomics:
  * the gradient is bit-reproducible run to run (phase1b audit R5).
  */
+__device__ __forceinline__ float ga_load(const float *__restrict__ slice,
+                                         int iz, int ix, int Nz, int Nx) {
+    return ((unsigned)ix < (unsigned)Nx && (unsigned)iz < (unsigned)Nz)
+           ? __ldg(slice + (size_t)iz * Nx + ix) : 0.0f;
+}
+
 __global__ static void grad_angle_kernel(
     const float *__restrict__ vol,     /* [Ny, Nz, Nx] */
     const float *__restrict__ grad_sino,  /* [n_angles, Ny, N_det] */
@@ -38,43 +55,72 @@ __global__ static void grad_angle_kernel(
     int iy = (int)blockIdx.z;
 
     float local_g = 0.0f;
-
+    float ca = 0.0f, sa = 0.0f, gs = 0.0f;
+    float t = id - half_det;
+    int lo = INT_MAX, hi = INT_MIN;        /* empty: the warp union's identity */
     if (id < N_det && ia < n_angles) {
-        float ca = cos_a[ia], sa = sin_a[ia];
-        float t   = id - half_det;
-        float gs  = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
+        ca = cos_a[ia];
+        sa = sin_a[ia];
+        gs = grad_sino[((size_t)ia * Ny + iy) * N_det + id];
+        if (gs != 0.0f)
+            fp_step_range(t, ca, sa, Nx, Nz, half_x, half_z, ray_len, lo, hi);
+    }
+    /* Clipped step range (parallel_clip.cuh), united over the warp (its two
+     * 16-lane rows are two views): the lanes march the same steps, as in the
+     * forward. A lane's extra steps fail its bounds test, and clipping only
+     * drops steps that test rejects, so the result bits are those of the
+     * full [-ray_len, ray_len] loop. Every lane reaches the shuffles. */
+    warp_uniform_range(lo, hi);
 
-        if (gs != 0.0f) {
-            const float *slice = vol + (size_t)iy * Nz * Nx;
-            float acc = 0.0f;   /* gs is factored out of the step sum */
+    if (gs != 0.0f) {
+        const float *slice = vol + (size_t)iy * Nz * Nx;
+        float acc = 0.0f;   /* gs is factored out of the step sum */
 
-            for (int step = -ray_len; step <= ray_len; step++) {
-                float s  = (float)step;
-                float x  = t * ca - s * sa;
-                float z  = t * sa + s * ca;
-                float fx = x + half_x;
-                float fz = z + half_z;
+        for (int step = lo; step <= hi; step++) {
+            float s  = (float)step;
+            float x  = t * ca - s * sa;
+            float z  = t * sa + s * ca;
+            float fx = x + half_x;
+            float fz = z + half_z;
 
-                if (fx < 0.0f || fx >= (float)(Nx - 1) ||
-                    fz < 0.0f || fz >= (float)(Nz - 1))
-                    continue;
+            /* inclusive loose bounds; negated conjunction: a NaN
+             * sample (NaN/Inf angle) fails it and is skipped */
+            if (!(fx >= -1.0f && fx <= (float)Nx &&
+                  fz >= -1.0f && fz <= (float)Nz))
+                continue;
 
-                int ix0 = (int)fx, iz0 = (int)fz;
-                int ix1 = ix0 + 1, iz1 = iz0 + 1;
-                float wx = fx - ix0, wz = fz - iz0;
+            float x0 = floorf(fx), z0 = floorf(fz);
+            int ix0 = (int)x0, iz0 = (int)z0;
+            float wx = fx - x0, wz = fz - z0;
 
-                float v00 = slice[(size_t)iz0 * Nx + ix0];
-                float v01 = slice[(size_t)iz0 * Nx + ix1];
-                float v10 = slice[(size_t)iz1 * Nx + ix0];
-                float v11 = slice[(size_t)iz1 * Nx + ix1];
-
-                float dvol_dx = (1.0f - wz) * (v01 - v00) + wz * (v11 - v10);
-                float dvol_dz = (1.0f - wx) * (v10 - v00) + wx * (v11 - v01);
-
-                acc += dvol_dx * (-z) + dvol_dz * x;
+            float v00, v01, v10, v11;
+            if ((unsigned)ix0 < (unsigned)(Nx - 1) && (unsigned)iz0 < (unsigned)(Nz - 1)) {
+                const float *p = slice + (size_t)iz0 * Nx + ix0;
+                v00 = __ldg(p);      v01 = __ldg(p + 1);
+                v10 = __ldg(p + Nx); v11 = __ldg(p + Nx + 1);
+            } else {                 /* stencil crosses the border */
+                v00 = ga_load(slice, iz0,     ix0,     Nz, Nx);
+                v01 = ga_load(slice, iz0,     ix0 + 1, Nz, Nx);
+                v10 = ga_load(slice, iz0 + 1, ix0,     Nz, Nx);
+                v11 = ga_load(slice, iz0 + 1, ix0 + 1, Nz, Nx);
             }
-            local_g = gs * acc;
+
+            float dvol_dx = (1.0f - wz) * (v01 - v00) + wz * (v11 - v10);
+            float dvol_dz = (1.0f - wx) * (v10 - v00) + wx * (v11 - v01);
+            if (wx == 0.0f || wz == 0.0f) {    /* on a grid line */
+                if (wx == 0.0f)
+                    dvol_dx = 0.5f * (dvol_dx
+                        + ((1.0f - wz) * (v00 - ga_load(slice, iz0, ix0 - 1, Nz, Nx))
+                           + wz * (v10 - ga_load(slice, iz0 + 1, ix0 - 1, Nz, Nx))));
+                if (wz == 0.0f)
+                    dvol_dz = 0.5f * (dvol_dz
+                        + ((1.0f - wx) * (v00 - ga_load(slice, iz0 - 1, ix0, Nz, Nx))
+                           + wx * (v01 - ga_load(slice, iz0 - 1, ix0 + 1, Nz, Nx))));
+            }
+
+            acc += dvol_dx * (-z) + dvol_dz * x;
         }
+        local_g = gs * acc;
     }
 
     /* Half-warp shuffle reduction over threadIdx.x (16 lanes share each ia row).

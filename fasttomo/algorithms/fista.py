@@ -431,15 +431,19 @@ def run_fista(
 
     Long runs on CUDA: the CUDA back-projection (voxel-driven texture
     gather) is not the exact adjoint of the CUDA forward projection
-    (ray-marching): ``||B - A^T||_F / ||A||_F = 0.24`` (the CPU pair is
-    exact), so ``B A`` has eigenvalues with small negative real parts and
-    FISTA's momentum eventually amplifies them (solver audit A2). Relative
-    error to the phantom, 64^2 slice, 61 views over +-60 degrees, after
-    20 / 200 / 1000 / 3000 iterations: CUDA noise-free 0.24 / 0.185 / 0.21
-    / 14.1, CPU 0.23 / 0.176 / 0.149 / 0.131; with 1 % noise CUDA 0.25 /
-    0.31 / 2.2 / 384 (CPU 0.24 / 0.34 / 1.3 / 3.0, the noise amplification
-    of unregularised least squares). ``positivity=True`` delays it (CUDA
-    noise-free 0.051 at 1000, 0.35 at 3000) but does not prevent it. SIRT
+    (ray-marching): ``||B - A^T||_F / ||A||_F = 0.077`` at 32^2 and 64^2
+    with 61 views over +-60 degrees (0.16-0.24 before both used the same
+    sampling boundary, phase 1b PR G; the CPU pair is exact), so ``B A``
+    has eigenvalues with small negative real parts and FISTA's momentum
+    eventually amplifies them (solver audit A2). Relative error to the
+    phantom, 64^2 slice, 61 views over +-60 degrees, after 50 / 200 / 1000
+    / 3000 iterations: CUDA noise-free 0.196 / 0.181 / 0.158 / 0.77 (it was
+    0.20 / 0.185 / 0.21 / 14.1 before PR G), CPU 0.197 / 0.181 / 0.149 /
+    0.130; with 1 % noise CUDA 0.22 / 0.28 / 1.5 / 24 (was 0.23 / 0.31 /
+    2.2 / 384), CPU 0.22 / 0.32 / 1.3 / 3.0 (the noise amplification of
+    unregularised least squares). ``positivity=True`` delays it (CUDA
+    noise-free 0.051 at 1000, 0.35 at 3000, before PR G) but does not
+    prevent it. SIRT
     is not affected at these lengths. On CUDA keep ``n_iter`` at about 200
     to 300 (with noise the error is lowest well before that anyway), or
     regularise (:func:`run_fista_tv`) and watch the loss for longer runs.

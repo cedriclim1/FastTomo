@@ -151,7 +151,9 @@ def test_cpu_kernels_survive_non_finite_trig_tables(bad, tmp_path):
 # elementwise in the same order (NumPy float32 ufuncs are IEEE single
 # operations, no contraction), so ``torch.equal`` against them pins every
 # lane of every Y block, for Ny across the block size (FT_YB = 16) and for
-# several thread counts.
+# several thread counts. The scalar loops use the loose sampling rule
+# (phase 1b PR G): samples fx in (-1, Nx), fz in (-1, Nz), floor corners,
+# corners outside the slice read 0 (the ports read a zero-padded copy).
 
 _F = np.float32
 
@@ -180,24 +182,35 @@ def _geom32(Nz, Nx, Nd):
     return ray_len, _F(0.5) * _F(Nd - 1), _F(0.5) * _F(Nx - 1), _F(0.5) * _F(Nz - 1)
 
 
-def _samples32(t, ca, sa, step, hx, hz, Nz, Nx):
-    """fp32 sample geometry of the scalar loop, exactly as the C code."""
+def _floor32(f):
+    """ft_floor_loose: floor for f >= -1, as the C select (the index of a
+    rejected NaN sample is never used)."""
+    with np.errstate(invalid="ignore"):
+        return np.where(f < 0, -1, np.nan_to_num(f).astype(np.int64))
+
+
+def _samples32(t, ca, sa, step, hx, hz, Nz, Nx, inclusive=False):
+    """fp32 sample geometry of the scalar loop, exactly as the C code: loose
+    bounds (-1, N) (inclusive [-1, N] for grad_angle), floor corners."""
     s = _F(step)
     x = t * ca - s * sa
     z = t * sa + s * ca
     fx = x + hx
     fz = z + hz
-    ok = (fx >= 0) & (fx < _F(Nx - 1)) & (fz >= 0) & (fz < _F(Nz - 1))
+    if inclusive:
+        ok = (fx >= -1) & (fx <= _F(Nx)) & (fz >= -1) & (fz <= _F(Nz))
+    else:
+        ok = (fx > -1) & (fx < _F(Nx)) & (fz > -1) & (fz < _F(Nz))
     fxs, fzs = np.where(ok, fx, _F(0)), np.where(ok, fz, _F(0))
-    ix0, iz0 = fxs.astype(np.int64), fzs.astype(np.int64)
+    ix0, iz0 = _floor32(fxs), _floor32(fzs)
     wx, wz = fxs - ix0.astype(_F), fzs - iz0.astype(_F)
     return ok, ix0, iz0, wx, wz, x, z
 
 
 def _fp_scalar32(vol, ang, Nd):
     """forward_project_parallel_cpu's per-slice loop in fp32."""
-    v = vol.numpy()
-    Ny, Nz, Nx = v.shape
+    v = np.pad(vol.numpy(), ((0, 0), (1, 1), (1, 1)))       # corners outside read 0
+    Ny, Nz, Nx = vol.shape
     R, hd, hx, hz = _geom32(Nz, Nx, Nd)
     cs, sn = _trig32(ang)
     t = np.arange(Nd).astype(_F) - hd
@@ -206,6 +219,7 @@ def _fp_scalar32(vol, ang, Nd):
         acc = np.zeros((Ny, Nd), _F)
         for step in range(-R, R + 1):
             ok, ix0, iz0, wx, wz, _, _ = _samples32(t, cs[a], sn[a], step, hx, hz, Nz, Nx)
+            ix0, iz0 = ix0 + 1, iz0 + 1
             one = _F(1)
             term = ((one - wz) * (one - wx) * v[:, iz0, ix0]
                     + (one - wz) * wx * v[:, iz0, ix0 + 1]
@@ -228,12 +242,14 @@ def test_cpu_fp_is_the_scalar_loop_bit_for_bit(shape, threads):
 
 def _bp_scalar32(sino, ang, Nz, Nx):
     """back_project_parallel_cpu's per-slice scatter in fp32: every voxel
-    receives its additions in (angle, detector, step, corner) order."""
+    receives its additions in (angle, detector, step, corner) order; the
+    corners outside the slice go to a pad that is dropped."""
     sg = sino.numpy()
     n, Ny, Nd = sg.shape
     R, hd, hx, hz = _geom32(Nz, Nx, Nd)
     cs, sn = _trig32(ang)
-    out = np.zeros((Ny, Nz * Nx), _F)
+    Pz, Px = Nz + 2, Nx + 2
+    out = np.zeros((Ny, Pz * Px), _F)
     one = _F(1)
     steps = np.arange(-R, R + 1)
     for a in range(n):
@@ -241,13 +257,13 @@ def _bp_scalar32(sino, ang, Nz, Nx):
             t = _F(d) - hd
             ok, ix0, iz0, wx, wz, _, _ = _samples32(np.full(steps.shape, t, _F), cs[a], sn[a],
                                                     steps, hx, hz, Nz, Nx)
-            ix0, iz0, wx, wz = ix0[ok], iz0[ok], wx[ok], wz[ok]
-            idx = np.stack([iz0 * Nx + ix0, iz0 * Nx + ix0 + 1,
-                            (iz0 + 1) * Nx + ix0, (iz0 + 1) * Nx + ix0 + 1], 1).reshape(-1)
+            ix0, iz0, wx, wz = ix0[ok] + 1, iz0[ok] + 1, wx[ok], wz[ok]
+            idx = np.stack([iz0 * Px + ix0, iz0 * Px + ix0 + 1,
+                            (iz0 + 1) * Px + ix0, (iz0 + 1) * Px + ix0 + 1], 1).reshape(-1)
             w = np.stack([(one - wz) * (one - wx), (one - wz) * wx,
                           wz * (one - wx), wz * wx], 1).reshape(-1)
             np.add.at(out, (slice(None), idx), w[None, :] * sg[a, :, d][:, None])
-    return torch.from_numpy(out.reshape(Ny, Nz, Nx))
+    return torch.from_numpy(out.reshape(Ny, Pz, Px)[:, 1:-1, 1:-1].copy())
 
 
 @pytest.mark.parametrize("shape", _YB_SHAPES)
@@ -361,10 +377,12 @@ def test_cpu_rotmat_kernels_are_thread_invariant():
 
 def _grad_angle_fp64(vol, gs, ang):
     """grad_angle_cpu's formula with every sum in fp64, on the same fp32
-    sample geometry (so the same samples and stencils as the kernel)."""
-    v = vol.double().numpy()
+    sample geometry (so the same samples and stencils as the kernel):
+    inclusive loose bounds [-1, N], corners outside read 0, and at a grid
+    line (w == 0) the average of the forward and backward differences."""
+    v = np.pad(vol.double().numpy(), ((0, 0), (2, 2), (2, 2)))
     g = gs.double().numpy()
-    Ny, Nz, Nx = v.shape
+    Ny, Nz, Nx = vol.shape
     n, _, Nd = g.shape
     R, hd, hx, hz = _geom32(Nz, Nx, Nd)
     cs, sn = _trig32(ang)
@@ -372,12 +390,19 @@ def _grad_angle_fp64(vol, gs, ang):
     out = np.zeros(n)
     for a in range(n):
         for step in range(-R, R + 1):
-            ok, ix0, iz0, wx, wz, x, z = _samples32(t, cs[a], sn[a], step, hx, hz, Nz, Nx)
+            ok, ix0, iz0, wx, wz, x, z = _samples32(t, cs[a], sn[a], step, hx, hz, Nz, Nx,
+                                                    inclusive=True)
+            kx, kz = wx == 0, wz == 0
             wx, wz = wx.astype(np.float64), wz.astype(np.float64)
+            ix0, iz0 = ix0 + 2, iz0 + 2
             v00, v01 = v[:, iz0, ix0], v[:, iz0, ix0 + 1]
             v10, v11 = v[:, iz0 + 1, ix0], v[:, iz0 + 1, ix0 + 1]
             dx = (1 - wz) * (v01 - v00) + wz * (v11 - v10)
             dz = (1 - wx) * (v10 - v00) + wx * (v11 - v01)
+            bx = (1 - wz) * (v00 - v[:, iz0, ix0 - 1]) + wz * (v10 - v[:, iz0 + 1, ix0 - 1])
+            bz = (1 - wx) * (v00 - v[:, iz0 - 1, ix0]) + wx * (v01 - v[:, iz0 - 1, ix0 + 1])
+            dx = np.where(kx[None], 0.5 * (dx + bx), dx)
+            dz = np.where(kz[None], 0.5 * (dz + bz), dz)
             term = g[a] * (dx * -z.astype(np.float64) + dz * x.astype(np.float64))
             out[a] += np.where(ok[None], term, 0.0).sum()
     return torch.from_numpy(out) * (math.pi / 180.0)
@@ -389,7 +414,8 @@ def _grad_angle_case(Ny, N, n, seed):
     blob = torch.exp(-((c[None, :] / (0.25 * N)) ** 2 + (c[:, None] / (0.2 * N)) ** 2))
     vol = (blob.float().expand(Ny, N, N) + 0.05 * torch.rand(Ny, N, N, generator=g)).contiguous()
     gs = torch.randn(n, Ny, N, generator=g)
-    return vol, gs, torch.linspace(-61.3, 58.7, n)
+    # generic views plus 0 and 90 degrees (samples on grid lines: the kink rule)
+    return vol, gs, torch.cat([torch.linspace(-61.3, 58.7, n - 2), torch.tensor([0.0, 90.0])])
 
 
 @pytest.mark.parametrize("Ny,N,n", [(17, 48, 13), (1, 40, 9), (6, 33, 11)])

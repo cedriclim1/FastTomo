@@ -190,12 +190,62 @@ void back_project_rotmat_cpu(
     }
 }
 
+/* The kink correction of grad_rotmat_cpu at a sample with wx, wy or wz == 0:
+ * on each such axis, average the derivative across the grid plane with the
+ * backward difference (the plane ix0-1 / iy0-1 / iz0-1, zero outside the
+ * volume). v holds the 8 corners in LOAD_CORNERS order (v<y><z><x>). Out of
+ * line: it runs on every sample of a pure tilt but on almost no sample of
+ * a generic pose, and inlined it slowed the generic loop by ~10 %. */
+static __attribute__((noinline)) void rot_kink(
+    const float *vol, int Ny, int Nz, int Nx, int ix0, int iy0, int iz0,
+    float wx, float wy, float wz, const float v[8],
+    float *dfx, float *dfy, float *dfz)
+{
+    const int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
+    const float ux = 1.0f - wx, uy = 1.0f - wy, uz = 1.0f - wz;
+    const float v000 = v[0], v001 = v[1], v010 = v[2], v011 = v[3];
+    const float v100 = v[4], v101 = v[5], v110 = v[6];
+    if (wx == 0.0f) {
+        const int xm = ix0 - 1;
+        float bdx = uy * uz * (v000 - SAMP3(xm, iy0, iz0))
+                  + wy * uz * (v100 - SAMP3(xm, iy1, iz0))
+                  + uy * wz * (v010 - SAMP3(xm, iy0, iz1))
+                  + wy * wz * (v110 - SAMP3(xm, iy1, iz1));
+        *dfx = 0.5f * (*dfx + bdx);
+    }
+    if (wy == 0.0f) {
+        const int ym = iy0 - 1;
+        float bdy = ux * uz * (v000 - SAMP3(ix0, ym, iz0))
+                  + wx * uz * (v001 - SAMP3(ix1, ym, iz0))
+                  + ux * wz * (v010 - SAMP3(ix0, ym, iz1))
+                  + wx * wz * (v011 - SAMP3(ix1, ym, iz1));
+        *dfy = 0.5f * (*dfy + bdy);
+    }
+    if (wz == 0.0f) {
+        const int zm = iz0 - 1;
+        float bdz = ux * uy * (v000 - SAMP3(ix0, iy0, zm))
+                  + wx * uy * (v001 - SAMP3(ix1, iy0, zm))
+                  + ux * wy * (v100 - SAMP3(ix0, iy1, zm))
+                  + wx * wy * (v101 - SAMP3(ix1, iy1, zm));
+        *dfz = 0.5f * (*dfz + bdz);
+    }
+}
+
 /* ── gradient of 3D rotmat FP w.r.t. rotation matrix (CPU) ─────────────────
- * Same sampling, loose bounds (-1, N) and border-zero corners as
- * grad_rotmat_kernel (CUDA) and forward_project_rotmat_cpu, so it is the exact
- * gradient of the forward away from trilinear kinks; the two backends differ
- * only in fp32 summation order. Detector-driven loop accumulates per-ray
- * partials of all 9 matrix entries, no reduction needed (pure serial).
+ * Same sampling, loose bounds and border-zero corners as grad_rotmat_kernel
+ * (CUDA) and forward_project_rotmat_cpu, so it is the exact gradient of the
+ * forward away from trilinear kinks; the two backends differ only in fp32
+ * summation order. Detector-driven loop accumulates per-ray partials of all
+ * 9 matrix entries, no reduction needed (pure serial).
+ *
+ * Kinks: on a grid plane (wx, wy or wz == 0; every sample of a pure tilt
+ * (0, theta, 0) has wy == 0) the derivative across the plane is the average
+ * of the forward and the backward difference (plane ix0-1 / iy0-1 / iz0-1),
+ * i.e. the derivative of the central finite difference, not the one-sided
+ * forward difference of the floor stencil. The bounds test is inclusive,
+ * [-1, N]: a sample on the outer end of a tent adds 0 to the forward but
+ * has a one-sided slope on one side. Off the kinks the arithmetic is
+ * unchanged.
  *
  * Per ray step (s = step):
  *   ∂tx/∂M[{0,3,6}] = (u, v, s)
@@ -242,9 +292,11 @@ void grad_rotmat_cpu(
                     float fy = oy + s * dys + g.half_y;
                     float fz = oz + s * dzs + g.half_z;
 
-                    if (fx <= -1.0f || fx >= (float)Nx ||
-                        fy <= -1.0f || fy >= (float)Ny ||
-                        fz <= -1.0f || fz >= (float)Nz)
+                    /* inclusive loose bounds [-1, N] (see above); negated
+                     * conjunction, so a NaN sample is skipped */
+                    if (!(fx >= -1.0f && fx <= (float)Nx &&
+                          fy >= -1.0f && fy <= (float)Ny &&
+                          fz >= -1.0f && fz <= (float)Nz))
                         continue;
 
                     int ix0 = (int)floorf(fx);
@@ -264,6 +316,12 @@ void grad_rotmat_cpu(
                               + ux * wz * (v110 - v010) + wx * wz * (v111 - v011);
                     float dfz = ux * uy * (v010 - v000) + wx * uy * (v011 - v001)
                               + ux * wy * (v110 - v100) + wx * wy * (v111 - v101);
+                    /* on a grid plane: average with the backward difference
+                     * (rot_kink, out of line: rare off the grid-aligned poses) */
+                    if (wx == 0.0f || wy == 0.0f || wz == 0.0f) {
+                        const float v[8] = {v000, v001, v010, v011, v100, v101, v110, v111};
+                        rot_kink(vol, Ny, Nz, Nx, ix0, iy0, iz0, wx, wy, wz, v, &dfx, &dfy, &dfz);
+                    }
 
                     float gdfx = gs * dfx, gdfy = gs * dfy, gdfz = gs * dfz;
                     gM[0] += gdfx * u;  gM[1] += gdfy * u;  gM[2] += gdfz * u;
