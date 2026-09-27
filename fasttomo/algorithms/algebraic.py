@@ -54,6 +54,7 @@ def run_sirt(
     return_loss: bool = False,
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
     progress: bool = False,
+    reuse_graph: bool = True,                   # keep the internal CUDA graph for the next call
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Simultaneous Iterative Reconstruction Technique.
@@ -67,10 +68,11 @@ def run_sirt(
     On CUDA the projections go through a cached projector (built internally
     unless ``projector`` is given) and, when no loss is needed, ``n_iter > 1``
     and ``euler_zyz_deg`` is None, the iteration body runs as a captured
-    CUDA graph cached on the projector. Without ``projector`` the internal
-    projector and its graph are kept for the next call with the same
-    shapes, dtype, device and options (one configuration is kept; see
-    ``_SirtOperatorCache``), so repeated calls skip the capture.
+    CUDA graph cached on the projector. Without ``projector`` (and with
+    ``reuse_graph=True``) the internal projector and its graph are kept for
+    the next call with the same shapes, dtype, device and options, so
+    repeated calls skip the capture; see :func:`release_cached_projectors`
+    for the memory this keeps and how to free it.
 
     Parameters
     ----------
@@ -91,6 +93,16 @@ def run_sirt(
         Reuse its texture cache (and, on CUDA, CUDA graphs) across calls. Must
         be sized for this volume and sinogram; its angles replace
         ``angles_deg``, and a RotmatProjector needs ``euler_zyz_deg``.
+    reuse_graph : bool
+        CUDA graph path without ``projector`` only (default True): keep the
+        internal projector and its captured graph after the call, so the
+        next call with the same configuration replays it (one configuration
+        is kept, about 4 volumes plus 4 sinograms of GPU memory; see
+        :func:`release_cached_projectors`). False neither uses nor keeps
+        that cache: the call builds its own projector and graph and frees
+        them on return, as before; a configuration kept by earlier calls
+        stays until released. With ``projector`` the graph lives on that
+        projector, whatever this flag says.
 
     Returns
     -------
@@ -124,7 +136,7 @@ def run_sirt(
                      tuple(constraints.support_mask.shape)
                      if constraints.support_mask is not None else None,
                      euler_zyz_deg is not None)
-        if projector is None:
+        if projector is None and reuse_graph:
             # Reuse the internal operator (and the graph captured on it) of
             # the previous call with this configuration.
             cache_key = (device, *graph_key)
@@ -555,9 +567,10 @@ def run_wsirt(
 # ---------------------------------------------------------------------------
 
 class _SirtOperatorCache:
-    """The internal projection operators of run_sirt's CUDA-graph path, kept
+    """The internal projection operator of run_sirt's CUDA-graph path, kept
     between calls so a repeated call replays the graph captured by the
-    previous one instead of capturing again (kernel audit F8).
+    previous one instead of capturing again (kernel audit F8). Public
+    handle: :func:`release_cached_projectors`.
 
     Keyed by device plus the graph key (volume and sinogram shapes, dtype,
     omega, positivity, soft threshold, support-mask shape). Each operator
@@ -569,10 +582,10 @@ class _SirtOperatorCache:
 
     An operator is taken out while a call uses it (``checkout``) and put
     back afterwards (``checkin``), so concurrent calls from several threads
-    never share static buffers. At most ``maxsize`` operators are kept
-    (least recently used evicted); the kept one pins its textures, static
-    buffers and graph memory pool (about 5 volumes plus 5 sinograms) until
-    it is evicted or ``clear()`` runs.
+    never share static buffers. One configuration is kept (``maxsize=1``):
+    a call with any other configuration (shape, dtype, device or option)
+    drops the kept operator *before* building its own, so two
+    configurations never coexist in memory; ``clear()`` drops it too.
     """
 
     def __init__(self, maxsize: int = 1) -> None:
@@ -581,8 +594,14 @@ class _SirtOperatorCache:
         self._lock = threading.Lock()
 
     def checkout(self, key: tuple) -> CudaCachedOperator | None:
+        """Take the operator for ``key`` (None if not kept). Any operator
+        kept for another configuration is dropped first."""
         with self._lock:
-            return self._ops.pop(key, None)
+            op = self._ops.pop(key, None)
+            stale = list(self._ops.values())
+            self._ops.clear()
+        del stale       # released outside the lock (texture frees sync the device)
+        return op
 
     def checkin(self, key: tuple, op: CudaCachedOperator) -> None:
         with self._lock:
@@ -593,17 +612,56 @@ class _SirtOperatorCache:
                 evicted.append(self._ops.popitem(last=False)[1])
         del evicted     # released outside the lock (texture frees sync the device)
 
-    def clear(self) -> None:
+    def clear(self) -> int:
         with self._lock:
             ops = list(self._ops.values())
             self._ops.clear()
+        n = len(ops)
         del ops
+        return n
 
     def __len__(self) -> int:
         return len(self._ops)
 
 
 _SIRT_OPERATORS = _SirtOperatorCache()
+
+
+def release_cached_projectors() -> int:
+    """Free the projector and CUDA graph that :func:`run_sirt` keeps between
+    calls.
+
+    Without ``projector=``, a CUDA ``run_sirt`` on the graph path keeps its
+    internal projector for the next call with the same configuration (shapes,
+    dtype, device, ``omega``, constraints), so that call replays the captured
+    CUDA graph instead of building a projector and capturing again. Only one
+    configuration is kept, and a call with a different one drops it before
+    allocating its own. What is kept: the projector's two texture arrays, the
+    graph's static copies of the volume, sinogram, both normalisations and
+    the support mask, and the graph's memory pool (the forward-projection
+    and back-projection outputs): about 4 volumes plus 4 sinograms of
+    device memory, measured 0.36 GiB at 256^3 x 61 views and 2.6 GiB at
+    512^3 x 61 views in fp32. Pass ``run_sirt(..., reuse_graph=False)`` to not keep it in
+    the first place.
+
+    This releases it. The texture arrays go straight back to the driver; the
+    tensors and the graph pool go back to PyTorch's caching allocator, which
+    reuses them for later tensors but still holds them as reserved memory
+    (``torch.cuda.memory_reserved``, visible in ``nvidia-smi``). Call
+    ``torch.cuda.empty_cache()`` afterwards to return that to the driver as
+    well, e.g. for another process or library. A call running concurrently
+    on another thread keeps its projector until it returns (and then keeps
+    it again).
+
+    Returns the number of configurations released (0 or 1). Safe to call at
+    any time, also without CUDA.
+    """
+    n = _SIRT_OPERATORS.clear()
+    if n and torch.cuda.is_available():
+        # the textures were freed by the operators' finalizers; release any
+        # handle whose free was deferred by a capture on this thread
+        _drain_deferred_handles()
+    return n
 
 # Number of CUDA graphs run_sirt has captured in this process (tests use it
 # to tell a replayed graph from a fresh capture).

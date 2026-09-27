@@ -9,10 +9,18 @@
   match, instead of building a projector, running an eager warm-up iteration
   and capturing a new graph every call. New sinogram data, angles and
   support masks of the same shapes are copied into the graph's buffers.
-  One configuration is kept: its textures, static buffers and graph memory
-  pool (about 5 volumes plus 5 sinograms) stay allocated after the call
-  until another configuration replaces them
-  (`fasttomo.algorithms.algebraic._SIRT_OPERATORS.clear()` releases them).
+- **Memory kept after `run_sirt` returns** (CUDA graph path, no
+  `projector=`): exactly one configuration is kept, i.e. its two texture
+  arrays, the graph's static volume, sinogram, normalisations and support
+  mask, and the graph's memory pool, about 4 volumes plus 4 sinograms.
+  Measured in fp32 at 61 views: **0.36 GiB at 256^3, 2.6 GiB at 512^3**. A
+  call with a different shape, dtype, device or option drops the kept one
+  before allocating its own. New public `fasttomo.release_cached_projectors()`
+  frees it (the texture arrays go back to the driver at once, the rest to
+  PyTorch's caching allocator; follow with `torch.cuda.empty_cache()` to
+  hand that back to the driver too). New keyword `run_sirt(...,
+  reuse_graph=False)` keeps nothing, for a single reconstruction that
+  needs the memory back.
 - The iteration's elementwise work runs in two fused CUDA kernels (residual;
   update plus support, positivity and soft-threshold constraints) instead of
   up to seven PyTorch kernels, rounding exactly like the PyTorch chain.

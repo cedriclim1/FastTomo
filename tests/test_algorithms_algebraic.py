@@ -510,6 +510,94 @@ class TestRunSirtCudaGraph:
         assert algebraic._sirt_graph_captures == captures0 + 2
         algebraic._SIRT_OPERATORS.clear()
 
+    def test_release_cached_projectors_returns_memory(self):
+        """What run_sirt keeps between calls (projector textures, graph
+        buffers and pool) is freed by the public release call: the allocated
+        tensors go back to baseline at once, and after
+        torch.cuda.empty_cache() the device's free memory does too."""
+        import gc
+
+        from fasttomo.algorithms import algebraic
+
+        N, n_angles, Ny = 96, 31, 64
+        angles = make_angles(n_angles, device=DEVICE)
+        sino = torch.rand(n_angles, Ny, N, device=DEVICE)
+        ft.release_cached_projectors()
+        # load the kernels and graph machinery once (lazy module loading
+        # takes device memory for good), keeping nothing
+        ft.run_sirt(sino, angles, n_iter=3, Nz=N, reuse_graph=False)
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        alloc0 = torch.cuda.memory_allocated()
+        free0 = torch.cuda.mem_get_info()[0]
+
+        rec = ft.run_sirt(sino, angles, n_iter=3, Nz=N)
+        del rec
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        vol_bytes = Ny * N * N * 4
+        # kept: live tensors (static volume and C, >= 2 volumes), plus the
+        # graph pool's reserved blocks (BP output) and the volume texture
+        # array outside torch's allocator: >= 4 volumes of device memory
+        assert torch.cuda.memory_allocated() - alloc0 >= 2 * vol_bytes
+        assert free0 - torch.cuda.mem_get_info()[0] >= 4 * vol_bytes
+        assert len(algebraic._SIRT_OPERATORS) == 1
+
+        assert ft.release_cached_projectors() == 1
+        assert ft.release_cached_projectors() == 0
+        assert len(algebraic._SIRT_OPERATORS) == 0
+        assert torch.cuda.memory_allocated() == alloc0
+        torch.cuda.empty_cache()
+        # within 2 MiB (driver-side bookkeeping granularity)
+        assert abs(torch.cuda.mem_get_info()[0] - free0) <= 2 << 20
+
+    def test_reuse_graph_false_keeps_nothing(self):
+        """reuse_graph=False: same result, nothing kept, and a configuration
+        kept by an earlier call is left alone."""
+        from fasttomo.algorithms import algebraic
+
+        sino, angles = self._make_inputs(N=32, n_angles=20)
+        ft.release_cached_projectors()
+        a = ft.run_sirt(sino, angles, n_iter=5, Nz=32, reuse_graph=False)
+        assert len(algebraic._SIRT_OPERATORS) == 0
+        b = ft.run_sirt(sino, angles, n_iter=5, Nz=32)
+        assert len(algebraic._SIRT_OPERATORS) == 1
+        kept = next(iter(algebraic._SIRT_OPERATORS._ops.values()))
+        c = ft.run_sirt(sino, angles, n_iter=5, Nz=32, reuse_graph=False)
+        assert next(iter(algebraic._SIRT_OPERATORS._ops.values())) is kept
+        assert torch.equal(a, b) and torch.equal(a, c)
+        ft.release_cached_projectors()
+
+    def test_other_configuration_drops_kept_one_first(self):
+        """A call with another shape / dtype drops the kept projector before
+        building its own, so two configurations never coexist."""
+        from fasttomo.algorithms import algebraic
+
+        sino, angles = self._make_inputs(N=32, n_angles=20)
+        ft.release_cached_projectors()
+        ft.run_sirt(sino, angles, n_iter=3, Nz=32)
+        (key_a,) = algebraic._SIRT_OPERATORS._ops
+
+        seen = []
+        orig = algebraic._build_fp_bp
+
+        def spy(*args, **kw):
+            seen.append(len(algebraic._SIRT_OPERATORS))
+            return orig(*args, **kw)
+
+        algebraic._build_fp_bp = spy
+        try:
+            ft.run_sirt(sino.half(), angles, n_iter=3, Nz=32)           # dtype
+            ft.run_sirt(sino[:, :, :30].contiguous(), angles, n_iter=3)  # shape
+        finally:
+            algebraic._build_fp_bp = orig
+        assert seen == [0, 0]            # nothing kept while building the new one
+        (key_c,) = algebraic._SIRT_OPERATORS._ops
+        assert key_c != key_a
+        ft.release_cached_projectors()
+
     @pytest.mark.skipif(
         torch.cuda.device_count() < 2,
         reason="cross-device graph capture needs >=2 GPUs",

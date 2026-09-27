@@ -545,6 +545,11 @@ FASTTOMO_PUBLIC_BEFORE_SPLIT = [
     "tilt_ssim_loss", "torch", "tv_loss_3d", "tv_loss_xz", "utilities",
 ]
 
+# Public names added deliberately since the split (each with its PR).
+FASTTOMO_PUBLIC_ADDED = [
+    "release_cached_projectors",   # run_sirt's kept projector/graph (kernel audit F8)
+]
+
 # Every name ``fasttomo.algorithms`` exposed as a module at 2a58dc8, except
 # the stdlib / third-party module aliases it happened to import (torch, np,
 # F, math, typing helpers, ...). Tests, benchmarks and the desktop app may
@@ -587,9 +592,10 @@ ALGORITHMS_NAMES_BEFORE_SPLIT = [
 
 
 def test_fasttomo_public_names_unchanged():
+    expected = FASTTOMO_PUBLIC_BEFORE_SPLIT + FASTTOMO_PUBLIC_ADDED
     public = sorted(n for n in dir(ft) if not n.startswith("_"))
-    assert public == sorted(FASTTOMO_PUBLIC_BEFORE_SPLIT)
-    assert sorted(ft.__all__) == sorted(n for n in FASTTOMO_PUBLIC_BEFORE_SPLIT
+    assert public == sorted(expected)
+    assert sorted(ft.__all__) == sorted(n for n in expected
                                         if n not in ("algorithms", "autograd", "configs",
                                                      "constraints", "projection", "projector",
                                                      "regularizers", "torch", "utilities"))
@@ -616,6 +622,7 @@ def test_algorithms_public_objects_live_in_submodules():
         "run_fista": fista, "run_fista_tv": fista, "run_genfire": genfire,
         "run_resire": resire, "run_grad_descent": ad, "run_ad_recon": ad,
         "run_mbir": mbir, "refine_angles": alignment,
+        "release_cached_projectors": algebraic,
     }
     assert sorted(owners) == sorted(algo.__all__)
     for name, mod in owners.items():
