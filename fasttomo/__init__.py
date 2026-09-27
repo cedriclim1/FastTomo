@@ -4,7 +4,9 @@
 # — this is what lets one wheel work across PyTorch's CUDA versions.
 import torch  # noqa: F401
 
+import sys as _sys
 import warnings as _warnings
+from pathlib import Path as _Path
 from packaging.version import Version as _Version
 from fasttomo import _core as _core_mod
 
@@ -45,6 +47,37 @@ if getattr(_core_mod, "cuda_available", False) and torch.version.cuda is not Non
     del _parts, _cu_major, _cu_minor
 
 del _warnings, _Version, _torch_ver, _core_mod
+
+def _repair_stale_editable_algorithms_mapping() -> None:
+    """Patch stale scikit-build editable maps from pre-ARCH-P8 installs.
+
+    Before the split, ``fasttomo.algorithms`` was a module file
+    ``fasttomo/algorithms.py``. After the split it is a package at
+    ``fasttomo/algorithms/__init__.py``. A user who updates the source tree
+    without reinstalling the editable package can keep an old redirect entry
+    that points at the deleted file, making ``import fasttomo`` fail with
+    FileNotFoundError.
+    """
+    pkg_dir = _Path(__file__).resolve().parent
+    old_algorithms_py = str(pkg_dir / "algorithms.py")
+    new_algorithms_init = str(pkg_dir / "algorithms" / "__init__.py")
+    new_algorithms_pkg = str(pkg_dir / "algorithms")
+    if not _Path(new_algorithms_init).exists():
+        return
+    for finder in _sys.meta_path:
+        if finder.__class__.__name__ != "ScikitBuildRedirectingFinder":
+            continue
+        mapping = getattr(finder, "known_source_files", None)
+        if not isinstance(mapping, dict):
+            continue
+        if mapping.get("fasttomo.algorithms") != old_algorithms_py:
+            continue
+        mapping["fasttomo.algorithms"] = new_algorithms_init
+        locations = getattr(finder, "submodule_search_locations", None)
+        if isinstance(locations, dict):
+            locations["fasttomo.algorithms"] = [new_algorithms_pkg]
+
+_repair_stale_editable_algorithms_mapping()
 
 from fasttomo.projection import (
     forward_project,
