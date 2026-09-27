@@ -195,6 +195,82 @@ def _mbir_permutation(Ny: int, Nvox: int, key: int) -> np.ndarray:
     return y.astype(np.int32)
 
 
+_SWEEP_KERNELS = ("auto", "serial", "parallel")
+
+
+def _mbir_group_spacing(cos_a: torch.Tensor, Nz: int, Nx: int, N_det: int) -> int:
+    """Row spacing ``S`` of the parallel sweep's conflict-free voxel groups
+    for the views ``cos_a`` (the fp32 values the kernels use), or 0 when
+    there is none (a view at 90 degrees, or ``S > Nx // 2`` so groups would
+    have fewer than two members).
+
+    Voxels of one row ``m * S`` apart project to detector coordinates
+    ``m * S * cos`` apart; with ``S * min|cos| >= 2 + eps`` the floors differ
+    by at least 2, so their two-pixel footprints are disjoint in every view.
+    ``eps`` bounds the fp32 rounding of the two coordinates (three rounded
+    operations each on values up to ``umax``): ``2**-20 * umax``, at least
+    1e-3. One host synchronisation (the minimum)."""
+    if cos_a.numel() == 0 or Nx < 2:
+        return 0
+    cmin = float(cos_a.detach().abs().min().double())
+    if cmin <= 0.0:
+        return 0
+    umax = 0.5 * (Nx - 1) + 0.5 * (Nz - 1) + 0.5 * (N_det - 1) + 1.0
+    eps = max(1e-3, umax * 2.0 ** -20)
+    S = math.ceil((2.0 + eps) / cmin)
+    return S if S <= Nx // 2 else 0
+
+
+def _mbir_group_permutation(Ny: int, Nz: int, Nx: int, S: int, key: int) -> np.ndarray:
+    """The parallel sweep's visiting order, flattened to one voxel order per
+    Y-slice (int32 ``[Ny, Nz*Nx]``), for the serial sweeps: the ``Nz * S``
+    groups ``g = iz * S + r`` of a slice in the keyed Feistel order of
+    `_mbir_permutation` over ``range(Nz * S)``, each group's members
+    ``ix = r, r + S, ...`` of row ``iz`` in increasing order. The members of
+    a group are independent (``S`` from `_mbir_group_spacing`), so the
+    serial CUDA sweep given this order reproduces the parallel sweep bit for
+    bit, and the CPU sweep given it visits the voxels as CUDA does."""
+    groups = _mbir_permutation(Ny, Nz * S, key)             # [Ny, Nz*S]
+    iz, r = groups // S, groups % S
+    m = np.arange(-(-Nx // S), dtype=np.int32)             # members 0 .. ceil(Nx/S)-1
+    ix = r[:, :, None] + S * m[None, None, :]              # [Ny, Nz*S, G]
+    lin = iz[:, :, None] * Nx + ix
+    out = np.empty((Ny, Nz * Nx), dtype=np.int32)
+    for iy in range(Ny):
+        out[iy] = lin[iy][ix[iy] < Nx]
+    return out
+
+
+def _mbir_resolve_sweep(sweep_kernel: str, device: torch.device, cos_a: torch.Tensor,
+                        Nz: int, Nx: int, N_det: int) -> int:
+    """The group spacing to sweep with at one level: 0 for the serial sweep,
+    ``S > 0`` for the parallel one (CUDA) or its visiting order (CPU).
+    ``"auto"`` takes the parallel sweep on CUDA when it applies (a group
+    spacing exists and the slice's error sinogram fits in shared memory)
+    and the serial one on CPU; ``"parallel"`` raises when it does not
+    apply."""
+    if sweep_kernel == "serial":
+        return 0
+    if sweep_kernel == "auto" and device.type != "cuda":
+        return 0
+    n_angles = cos_a.numel()
+    S = _mbir_group_spacing(cos_a, Nz, Nx, N_det)
+    fits = True
+    if device.type == "cuda":
+        with torch.cuda.device(device):    # the shared-memory limit of the data's GPU
+            fits = bool(_core.mbir_group_sweep_supported(n_angles=n_angles, N_det=N_det))
+    if S > 0 and fits:
+        return S
+    if sweep_kernel == "auto":
+        return 0
+    why = ("no view may be at 90 degrees and the volume must be at least 2 * S voxels "
+           f"wide (Nx={Nx})" if S == 0 else
+           f"n_angles <= 256 and n_angles * (N_det + 1) * 4 bytes of shared memory "
+           f"(n_angles={n_angles}, N_det={N_det})")
+    raise ValueError(f"run_mbir: sweep_kernel='parallel' does not apply here: {why}; "
+                     "use 'auto' or 'serial'")
+
+
 def _generate_permutation(Ny: int, Nvox: int, rng: np.random.Generator) -> np.ndarray:
     """Legacy NumPy voxel order (independent ``rng.permutation`` per Y-slice,
     int32 ``[Ny, Nvox]``). ``run_mbir`` no longer uses it (see
@@ -318,7 +394,7 @@ def _mbir_icd_sweep_cuda(
     e_sino: torch.Tensor,             # [n_angles, Ny, N_det] fp32, updated in place
     lambdas: torch.Tensor | None,     # [n_angles, Ny, N_det] fp32
     vol_snap: torch.Tensor,           # [Ny, Nz, Nx] fp32
-    work: torch.Tensor,               # [Ny * Nz * Nx * 4] fp32 scratch
+    work: torch.Tensor,               # [Ny * Nz * Nx * 2] fp32 scratch
     cos_a: torch.Tensor,
     sin_a: torch.Tensor,
     *,
@@ -326,12 +402,20 @@ def _mbir_icd_sweep_cuda(
     perm: torch.Tensor | None = None,  # [Ny, Nz*Nx] int32: explicit order (tests)
     qggmrf_p: float, qggmrf_q: float, qggmrf_c: float, sigma_f: float,
     huber_T: float, huber_delta: float, sigma: float,
+    sweep_kernel: str = "serial",
+    group_spacing: int | None = None,
 ) -> None:
     """One CUDA ICD sweep (voxel updates only), on ``volume``'s device and
     current stream. The voxel order is built in the kernel from
     ``perm_key`` unless ``perm`` gives it explicitly (validated by
     `_check_mbir_perm`). Every buffer is checked like the CPU sweep's: the
-    kernels get raw pointers plus dims."""
+    kernels get raw pointers plus dims.
+
+    ``sweep_kernel`` is resolved by `_mbir_resolve_sweep` (default here:
+    the serial sweep) unless ``group_spacing`` gives the resolved value
+    (0 = serial, ``S > 0`` = parallel groups of spacing ``S``, which the
+    caller must have taken from `_mbir_group_spacing`). The parallel sweep
+    builds its own (group) order, so it takes no ``perm``."""
     op = "_mbir_icd_sweep_cuda"
     if volume.ndim != 3 or e_sino.ndim != 3:
         raise ValueError(f"{op}: volume and e_sino must be 3-D")
@@ -352,13 +436,22 @@ def _mbir_icd_sweep_cuda(
         ("volume", volume, (Ny, Nz, Nx)),
         ("e_sino", e_sino, (n_angles, Ny, N_det)),
         ("volume_snapshot", vol_snap, (Ny, Nz, Nx)),
-        ("work", work, (Ny * Nz * Nx * 4,)),
+        ("work", work, (Ny * Nz * Nx * 2,)),
         ("lambdas", lambdas, (n_angles, Ny, N_det)),
         ("cos_a (angles)", cos_a, (n_angles,)),
         ("sin_a (angles)", sin_a, (n_angles,)),
     ])
     if perm is not None:
         _check_mbir_perm(op, perm, Ny, Nz * Nx)
+    if group_spacing is None:
+        if sweep_kernel not in _SWEEP_KERNELS:
+            raise ValueError(f"{op}: sweep_kernel must be one of {_SWEEP_KERNELS}, "
+                             f"got {sweep_kernel!r}")
+        group_spacing = 0 if perm is not None and sweep_kernel == "auto" else \
+            _mbir_resolve_sweep(sweep_kernel, dev, cos_a, Nz, Nx, N_det)
+    if group_spacing and perm is not None:
+        raise ValueError(f"{op}: the parallel sweep builds its own order; an explicit perm "
+                         "needs sweep_kernel='serial'")
     with torch.cuda.device(dev):   # D7: launch on the data's device
         _core.mbir_icd_sweep_cuda(
             vol_ptr=_data_ptr(volume, "volume"),
@@ -372,6 +465,7 @@ def _mbir_icd_sweep_cuda(
             qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c, sigma_f=sigma_f,
             huber_T=huber_T, huber_delta=huber_delta, sigma=sigma,
             stream_ptr=torch.cuda.current_stream(dev).cuda_stream,
+            group_spacing=int(group_spacing),
         )
 
 
@@ -401,6 +495,7 @@ def _run_mbir_single_scale(
     it_offset: int = 0,
     num_threads: int = 1,
     support: torch.Tensor | None = None,
+    sweep_kernel: str = "auto",
 ) -> tuple[_MbirState, list[float]]:
     """Inner loop for one resolution scale. The public `run_mbir` wraps
     this in a coarse-to-fine multiresolution loop.
@@ -442,9 +537,12 @@ def _run_mbir_single_scale(
         e_sino.sub_(d_offsets.view(n_angles, 1, 1))
 
     Nvox = Nz * Nx
-    # CUDA sweep scratch (per voxel: order index, pre-sweep value, prior
-    # sums; 16 bytes), allocated once per level and reused every iteration.
-    work = (torch.empty(Ny * Nvox * 4, dtype=torch.float32, device=device)
+    # 0: serial sweep in the Feistel voxel order; S > 0: parallel sweep over
+    # voxel groups of spacing S (CUDA), or its visiting order (CPU).
+    group_S = _mbir_resolve_sweep(sweep_kernel, device, cos_a, Nz, Nx, N_det)
+    # CUDA sweep scratch (per voxel: its two prior sums; 8 bytes),
+    # allocated once per level and reused every iteration.
+    work = (torch.empty(Ny * Nvox * 2, dtype=torch.float32, device=device)
             if device.type == "cuda" else None)
     history: list[float] = []
     sigma_cur = float(sigma)
@@ -464,13 +562,15 @@ def _run_mbir_single_scale(
                 vol_snap, work, cos_a, sin_a, perm_key=perm_key,
                 qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
                 sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
-                sigma=sigma_cur,
+                sigma=sigma_cur, group_spacing=group_S,
             )
         else:
+            order = (_mbir_group_permutation(Ny, Nz, Nx, group_S, perm_key) if group_S
+                     else _mbir_permutation(Ny, Nvox, perm_key))
             _mbir_icd_sweep_cpu(
                 volume, e_sino,
                 lambdas.contiguous() if lambdas is not None else None,
-                vol_snap, torch.from_numpy(_mbir_permutation(Ny, Nvox, perm_key)),
+                vol_snap, torch.from_numpy(order),
                 cos_a, sin_a,
                 qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c,
                 sigma_f=sigma_f, huber_T=huber_T, huber_delta=huber_delta,
@@ -507,6 +607,36 @@ def _run_mbir_single_scale(
     state = _MbirState(volume=volume, d_offsets=d_offsets, sigma=sigma_cur,
                        e_sino=e_sino, n_done=n_done)
     return state, history
+
+
+def _check_qggmrf(p: float, q: float, c: float, sigma_f: float,
+                  sigma_f_per_scale: list[float] | None) -> None:
+    """The qGGMRF potential ``|D/sigma_f|^q / (c + |D/sigma_f|^(q-p))`` is a
+    valid (majorizable, edge-preserving) prior only for ``1 <= p <= q <= 2``
+    and ``c > 0``; ``sigma_f`` divides. ``p`` and ``q`` used to have swapped
+    roles in the kernels (see CHANGELOG), so the old workaround ``qggmrf_p=2, qggmrf_q=1.2``
+    now raises instead of silently meaning something else."""
+    vals = dict(qggmrf_p=p, qggmrf_q=q, qggmrf_c=c, sigma_f=sigma_f)
+    for name, v in vals.items():
+        if not math.isfinite(float(v)):
+            raise ValueError(f"run_mbir: {name} must be finite, got {v}")
+    if not 1.0 <= float(p) <= float(q) <= 2.0:
+        raise ValueError(
+            "run_mbir: the qGGMRF exponents need 1 <= qggmrf_p <= qggmrf_q <= 2 "
+            f"(p: exponent for large differences, q: near zero), got p={p}, q={q}")
+    if float(c) <= 0.0:
+        raise ValueError(f"run_mbir: qggmrf_c must be > 0, got {c}")
+    sfs = [sigma_f] if sigma_f_per_scale is None else [sigma_f, *sigma_f_per_scale]
+    for v in sfs:
+        if not (math.isfinite(float(v)) and float(v) > 0.0):
+            raise ValueError(f"run_mbir: sigma_f must be finite and > 0, got {v}")
+        # The prior's curvature at D = 0 is 2 / (c sigma_f^2) in fp32: keep it
+        # (and 1/sigma_f^2) far from overflow, which would turn every update
+        # into NaN and clamp it silently to 0 (sigma_f below ~1e-19 at c = 1e-3).
+        if float(c) * float(v) ** 2 < 1e-30:
+            raise ValueError(
+                f"run_mbir: qggmrf_c * sigma_f**2 must be >= 1e-30 (fp32 overflow of the "
+                f"prior's curvature 2 / (c sigma_f^2)), got c={c}, sigma_f={v}")
 
 
 def _downsample_sino_det(sino: torch.Tensor, factor: int) -> torch.Tensor:
@@ -576,6 +706,7 @@ def run_mbir(
     seed: int = 0,
     lambdas: torch.Tensor | None = None,
     sigma_f_per_scale: list[float] | None = None,
+    sweep_kernel: str = "auto",
     config: MbirConfig | None = None,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
@@ -597,8 +728,8 @@ def run_mbir(
     the residual ``e = g - A f - d`` after each outer iteration; indices run
     across multires levels. Stops a level early when the relative volume
     change falls below ``convergence_tol``. On CUDA each level allocates a
-    sweep scratch buffer of 16 bytes per voxel of that level (256 MiB at
-    256^3, 2 GiB at 512^3), released when the level returns.
+    sweep scratch buffer of 8 bytes per voxel of that level (128 MiB at
+    256^3, 1 GiB at 512^3), released when the level returns.
 
     Parameters
     ----------
@@ -609,8 +740,27 @@ def run_mbir(
         Maximum outer iterations per level (default 100; formerly
         ``outer_iters``, still accepted with a DeprecationWarning).
     sigma_f, qggmrf_p, qggmrf_q, qggmrf_c : float
-        qGGMRF prior; ``p=1.2, q=2, c=1e-3`` follow the paper, ``sigma_f`` sets
-        its strength.
+        qGGMRF prior of the paper (its eq. after (9)): the potential
+        ``rho(D) = |D/sigma_f|^q / (c + |D/sigma_f|^(q-p))`` on the
+        differences ``D`` to the 26 neighbours (weights 1/distance, summing
+        to 1). ``q=2`` is the exponent near ``D = 0`` (quadratic, smooth),
+        ``p=1.2`` the one for large differences (edge preserving), and
+        ``c=1e-3`` puts the transition at ``|D| ~ c^(1/(q-p)) sigma_f``
+        (1.8e-4 ``sigma_f`` at the defaults); ``1 <= p <= q <= 2``,
+        ``c > 0`` and ``c * sigma_f**2 >= 1e-30`` (so the prior's fp32
+        curvature ``2 / (c sigma_f^2)`` cannot overflow; ``sigma_f >= 3e-14``
+        at ``c = 1e-3``) are required (ValueError otherwise). ``sigma_f`` sets the
+        strength: smaller is smoother. A good start is about a tenth of the
+        expected contrast between neighbouring regions (0.1 for a
+        0.5-2.2 phantom with 1 % noise: RMSE 0.046). Near ``D = 0`` the prior
+        is ``1/c`` stiffer than ``(D/sigma_f)^2``, so ICD needs more
+        iterations than with a quadratic prior, and a small ``sigma_f`` on a
+        zero start with ``estimate_variance=True`` can barely move for tens of
+        iterations (the prior's curvature dominates the data term until
+        ``sigma`` falls). Until this release the kernels had ``p`` and ``q``
+        in swapped roles, which made the prior quadratic up to ~1e4
+        ``sigma_f``; results and good ``sigma_f`` values differ from earlier
+        versions (see CHANGELOG).
     huber_T, huber_delta : float
         Generalised-Huber threshold (``inf``, the default, is conventional
         MBIR; 3 is the paper's choice for BF-TEM with Bragg scatter) and tail
@@ -647,14 +797,47 @@ def run_mbir(
     convergence_tol : float
         Per-level stop on the relative L2 volume change (default 1e-4).
     seed : int
-        Seed of the voxel permutation. Since the order moved into the CUDA
-        kernel (a keyed Feistel permutation per Y-slice and iteration, the
-        CPU sweep uses the same order), a given ``seed`` gives a different
-        order, hence slightly different volumes, than before that change.
+        Seed of the voxel order (a keyed Feistel permutation per Y-slice and
+        iteration, of the voxels for the serial sweep and of the voxel
+        groups for the parallel one). A fixed ``seed`` is bit-reproducible
+        for a given backend and ``sweep_kernel``, except with a
+        ``support_mask`` on CUDA (see there). Different sweeps visit the
+        voxels in different
+        orders, so their volumes differ slightly along the way and agree at
+        convergence.
     lambdas : Tensor ``[n_angles, Ny, N_det]``, optional
         Per-pixel data weights (default 1), the sinogram's dtype.
     sigma_f_per_scale : list of float, optional
         ``sigma_f`` per level, coarse to fine (default ``sigma_f * 2**level``).
+    sweep_kernel : {"auto", "serial", "parallel"}
+        The CUDA ICD sweep. ``"serial"``: one warp per Y-slice updates the
+        voxels one at a time. ``"parallel"``: the voxels of a row that are
+        ``S`` apart, ``S = ceil((2 + eps) / min|cos theta|)`` (5 at +-60
+        degrees, 6 at +-70, 12 at +-80), have disjoint detector footprints
+        in every view, so each such group is updated at once, with the
+        slice's error sinogram in shared memory. Still exact Gauss-Seidel
+        ICD: the result equals the serial sweep run on the parallel sweep's
+        visiting order, bit for bit; the group order converges a little more
+        slowly than the voxel order. Measured (61 views, +-60 degrees, fp32,
+        RTX PRO 6000 Blackwell): 9.7 -> 1.25 ms per iteration at 128^3 and
+        40.2 -> 8.8 ms at 256^3, 1.2-1.3x more iterations to the same
+        ``convergence_tol``, 6.1x / 3.5-3.9x faster end to end. It needs a
+        spacing ``S <= Nx // 2`` (no view at or near 90 degrees),
+        ``n_angles <= 256``, and ``n_angles * (N_det + 1) * 4`` bytes of
+        shared memory per block (99 KB on sm_120: 256^3 at 61 views fits,
+        512^3 does not). ``"auto"`` (default) takes ``"parallel"`` on CUDA
+        where it applies (per multires level) and ``"serial"`` otherwise;
+        ``"parallel"`` raises ValueError where it does not apply. Whether it
+        applies depends on the GPU's opt-in shared-memory limit (64 KB on
+        sm_75, 99 KB on sm_120), so with ``"auto"`` the same problem and
+        ``seed`` can run different sweeps, hence give slightly different
+        volumes, on different GPU models; pass ``"serial"`` (or
+        ``"parallel"`` where it fits everywhere) to pin it. On CPU,
+        ``"auto"`` and ``"serial"`` run the C sweep in the voxel order and
+        ``"parallel"`` runs it in the parallel sweep's visiting order, so it
+        matches a CUDA ``"parallel"`` run up to rounding; with the defaults
+        CPU and CUDA visit the voxels in different orders and agree at
+        convergence (the same MAP estimate), not iteration by iteration.
     config : MbirConfig, optional
         The tuning keywords above as one object; mixing it with a non-default
         keyword raises TypeError.
@@ -663,7 +846,16 @@ def run_mbir(
         after every outer ICD sweep, not inside the voxel update. The removed
         part is forward-projected into the error sinogram, so
         ``e = g - A f - d`` stays exact. Coarse levels use the support
-        max-pooled to their grid.
+        max-pooled to their grid. On CUDA that forward projection
+        accumulates with fp32 atomics, so a run with a support mask is not
+        bit-reproducible for a fixed ``seed``: two identical runs differ in
+        the last bits of the error sinogram whenever the sweep put mass
+        outside the support, and the ICD iterations amplify that (measured
+        on a 4 x 32^2 cylinder, 8 runs of 20 iterations: max volume
+        difference 3e-6 with the quadratic prior, 1e-3 with the default
+        prior, 0.2 with ``huber_T=2``, where the anomaly classification
+        flips). CPU runs, and CUDA runs without a support mask, are
+        bit-reproducible.
     warm_start : Tensor, optional
         Initial volume on the full grid (resized to the coarsest level and
         scaled to its voxel size, see `_to_level`); offsets start at 0.
@@ -709,7 +901,7 @@ def run_mbir(
             estimate_variance=estimate_variance, sigma_init=sigma_init,
             sigma_min=sigma_min, multires_levels=multires_levels,
             convergence_tol=convergence_tol, seed=seed,
-            sigma_f_per_scale=sigma_f_per_scale,
+            sigma_f_per_scale=sigma_f_per_scale, sweep_kernel=sweep_kernel,
         )
         defaults = MbirConfig()
         clash = [k for k, v in tuning.items() if not _is_default(v, getattr(defaults, k))]
@@ -720,10 +912,14 @@ def run_mbir(
             )
         (sigma_f, qggmrf_p, qggmrf_q, qggmrf_c, huber_T, huber_delta,
          estimate_offset, estimate_variance, sigma_init, sigma_min,
-         multires_levels, convergence_tol, seed, sigma_f_per_scale) = (
+         multires_levels, convergence_tol, seed, sigma_f_per_scale, sweep_kernel) = (
             getattr(config, k) for k in tuning)
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
+    _check_qggmrf(qggmrf_p, qggmrf_q, qggmrf_c, sigma_f, sigma_f_per_scale)
+    if sweep_kernel not in _SWEEP_KERNELS:
+        raise ValueError(f"run_mbir: sweep_kernel must be one of {_SWEEP_KERNELS}, "
+                         f"got {sweep_kernel!r}")
     # fp32 only, like every other fp32 algorithm: other dtypes raise instead
     # of being cast silently. The ICD kernels are fp32-only.
     setup = _prepare_recon(
@@ -859,6 +1055,7 @@ def run_mbir(
             lambdas=lam_lvl,
             return_history=return_history,
             rec=rec, it_offset=it_offset, num_threads=nt, support=support_lvl,
+            sweep_kernel=sweep_kernel,
         )
         history_all.append(hist)
         it_offset += state.n_done

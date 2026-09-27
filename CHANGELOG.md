@@ -181,6 +181,108 @@ is also faster (5x at 8x128^2, 61 views, with the Y-batched gather above).
 Only
 the `cpu/fbp`, `cpu/fbp_h` and `cpu/fbp_mask` golden keys were regenerated.
 
+### ⚠ `run_mbir`: the qGGMRF prior is now the paper's (all MBIR results change)
+
+The kernels computed the surrogate of `|D|^p / (c sigma_f^p + |D|^(p-q) sigma_f^q)`
+with `p=1.2, q=2`, i.e. `(D/sigma_f)^2 / (1 + c |D/sigma_f|^0.8)`: `p` and `q`
+had swapped roles, so the prior stayed quadratic (Gaussian MRF) for
+differences up to ~1e4 `sigma_f` and did not preserve edges. Both backends now
+implement the potential of Venkatakrishnan et al. 2015 (and OpenMBIR-TEM),
+`rho(D) = |D/sigma_f|^q / (c + |D/sigma_f|^(q-p))`: quadratic (`q=2`) below
+about `c^(1/(q-p)) sigma_f` (1.8e-4 `sigma_f` at the defaults), `|D|^p`
+(`p=1.2`) above. The keyword names and defaults (`qggmrf_p=1.2`,
+`qggmrf_q=2`, `qggmrf_c=1e-3`, `sigma_f=1.0`) are unchanged.
+
+- **Every MBIR output changes**, CPU and CUDA. On a 96^3 three-ellipsoid
+  phantom (41 views +-60 degrees, 1 % noise, fixed sigma, 80 iterations) the
+  best RMSE over `sigma_f` goes from 0.0591 to 0.0463 (-22 %; serial sweep,
+  as on CPU; 0.0477 with the new default parallel CUDA sweep, see below), at
+  the same best `sigma_f = 0.1`; at the default `sigma_f = 1`, 0.0985 ->
+  0.0766 (0.0783), and a fully default call 0.131 -> 0.100 (0.101). The
+  BF-TEM demo (`benchmarks/scripts/run_mbir_bftem_demo.py`, its
+  `sigma_f = 0.1`, CUDA default sweep): conventional MBIR 0.0283 -> 0.0260,
+  MBIR-AM 0.0210 -> 0.0186 (SIRT 0.0296).
+  The default `sigma_f` stays 1.0: it was already 10x above the best value
+  on these phantoms and improves as much as the best value does.
+- **`sigma_f` changes meaning near zero**: the prior is `1/c` = 1000x stiffer
+  than `(D/sigma_f)^2` there. Re-tune values chosen for the old prior (a
+  tenth of the expected contrast between neighbouring regions is a good
+  start). ICD needs more iterations than with the old, quadratic prior: a
+  noise-free 32^3 cube (`sigma_f=0.1`, `estimate_variance=True`) reaches a
+  relative error of 0.15 / 0.049 at 80 / 300 iterations (0.086 at 80
+  before), 2 multires levels meet the single-level estimate to 6.5e-5 after
+  3000 iterations per level (5e-4 after 60 before), and a zero start with a
+  small `sigma_f` and `estimate_variance=True` can barely move for tens of
+  iterations.
+- `qggmrf_p`, `qggmrf_q` must satisfy `1 <= p <= q <= 2`, `qggmrf_c`,
+  `sigma_f` (and `sigma_f_per_scale`) must be positive, and
+  `qggmrf_c * sigma_f**2 >= 1e-30` (below that the prior's fp32 curvature
+  overflowed and every update became NaN, silently clamped to 0; also on
+  main): `ValueError` otherwise. The old workaround for the paper's prior,
+  `qggmrf_p=2, qggmrf_q=1.2`, now raises instead of meaning something else.
+- The 26-neighbour weights are exact to 9 digits (the corner weight read
+  0.030219 instead of 0.0302213, so they summed to 0.99999).
+- Golden keys `cpu/mbir`, `cuda/mbir` and every key of
+  `tests/data/mbir_sweep_golden.pt` were regenerated.
+
+### ⚠ `run_mbir` on CUDA: parallel ICD sweep by default (new visiting order), `sweep_kernel=`
+
+- New keyword-only `sweep_kernel="auto" | "serial" | "parallel"` on
+  `run_mbir` and `MbirConfig`. The parallel sweep updates voxels of a row
+  that are `S = ceil((2 + eps) / min|cos theta|)` apart (5 at +-60 degrees,
+  6 at +-70, 12 at +-80) at the same time: their detector footprints are
+  disjoint in every view, so this is still exact Gauss-Seidel ICD (it equals
+  the serial sweep run on the same visiting order, bit for bit; tested). One
+  block per Y-slice, the slice's error sinogram in shared memory. `"auto"`
+  (the default) uses it on CUDA where it applies (a spacing `S <= Nx // 2`,
+  i.e. no view near 90 degrees; at most 256 views; `n_angles * (N_det + 1)
+  * 4` bytes of shared memory per block, 99 KB on sm_120) and the serial
+  sweep otherwise (e.g. 512^3 at 61 views); `"parallel"` raises where it
+  does not apply.
+- **CUDA results for a given `seed` change** (groups visited in a keyed
+  order instead of single voxels), and the group order needs 1.2-1.3x more
+  iterations to the same `convergence_tol`. Measured (61 views +-60
+  degrees, fp32, RTX PRO 6000 Blackwell, `sigma_f=0.1`, fixed sigma):
+
+  | | serial | parallel |
+  |---|---|---|
+  | 128^3 per iteration | 9.72 ms | 1.25 ms |
+  | 128^3 to tol 1e-3 / 1e-4 | 54 / 201 it, 525 / 1945 ms | 69 / 255 it, 86 / 318 ms |
+  | 256^3 per iteration | 40.2 ms | 8.80 ms |
+  | 256^3 to tol 1e-3 / 1e-4 | 33 / 151 it, 1326 / 6017 ms | 39 / 195 it, 343 / 1707 ms |
+
+- **CPU and CUDA no longer visit the voxels in the same order by default**
+  (the CPU keeps the serial voxel order); they agree at convergence (the
+  same MAP estimate, tested through the MAP cost), not iteration by
+  iteration. `sweep_kernel="parallel"` on CPU runs the C sweep in the
+  parallel sweep's order, which matches a CUDA `"parallel"` run up to
+  rounding; `"serial"` on both backends matches as before.
+- The prepare kernel computes the prior sums in natural voxel order (3.0 ->
+  1.5 ms at 256^3, 26 -> 12 ms at 512^3; bit-identical) and the CUDA sweep
+  scratch is 8 instead of 16 bytes per voxel (128 MiB at 256^3, 1 GiB at
+  512^3).
+- The per-voxel arithmetic of every CUDA sweep and of the MBIR forward
+  projection is rounded op by op (no FMA contraction, as in the C code), and
+  each lane adds its even- and odd-slot sums before one warp reduction
+  (instead of reducing them separately): serial CUDA results change at the
+  ulp level too. The serial sweep, now the fallback, is slower than on
+  main per iteration: +8.5 % at 128^3 (8.88 -> 9.64 ms), +2.9 % at 256^3,
+  about equal at 512^3 (the natural-order prepare pays for it there).
+- `sweep_kernel="auto"` decides from the GPU's opt-in shared-memory limit
+  (64 KB on sm_75, 99 KB on sm_120), so the same problem and `seed` can run
+  different sweeps, and give slightly different volumes, on different GPU
+  models; `sweep_kernel="serial"` pins it.
+
+### `run_mbir`: CUDA runs with a `support_mask` are not bit-reproducible (documented)
+
+The part a support mask removes after each sweep is forward-projected with
+fp32 atomics on CUDA, so two identical runs differ in the last bits, and
+the ICD iterations amplify that (4 x 32^2 cylinder, 20 iterations: max
+volume difference 3e-6 with the quadratic prior, 1e-3 with the default
+prior, 0.2 with `huber_T=2`). CPU runs and CUDA runs without a mask stay
+bit-reproducible for a fixed `seed`. Documented in `run_mbir` and tested
+(bitwise on CPU, within 1e-4 on CUDA for the quadratic prior).
+
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
 `ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes

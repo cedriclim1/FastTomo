@@ -1,17 +1,20 @@
 """Generate tests/data/mbir_sweep_golden.pt (read by
-tests/test_algorithms_mbir.py::test_mbir_cuda_sweep_matches_pre_restructure_golden).
+tests/test_algorithms_mbir.py::test_mbir_cuda_sweep_matches_golden).
 
-The golden holds the CUDA ICD sweep's output (volume and error sinogram
-after three outer sweeps) for every sweep variant: 9, 61, 100, 140 and 260
-angles (1, 2, 4 and 8 angle slots per lane, and the generic kernel), with
-and without lambdas, with and without the Huber weight. It was made with the
-64-thread block-reduction kernel of commit fd981d6 (the in-kernel voxel
-order, before the one-warp restructure), so the test pins that the
-restructured kernel reproduces the previous one bit for bit. Run with that
-commit's ``_core`` built and importable (needs a CUDA GPU):
+The golden holds the CUDA ICD sweeps' output (volume and error sinogram
+after three outer sweeps) for every sweep variant: the serial kernel at 9,
+61, 100, 140 and 260 angles (1, 2, 4 and 8 angle slots per lane, and the
+generic kernel) and the parallel group kernel at the first four, each with
+and without lambdas and the Huber weight. It was first made with the
+64-thread block-reduction kernel of commit fd981d6 (to pin the one-warp
+restructure) and regenerated in phase 1b (the paper's qGGMRF prior, pinned
+rounding, one butterfly per sum, the parallel kernel) from that branch's
+own code. Needs a CUDA GPU:
 
     python tests/data/mbir_sweep_golden_gen.py tests/data/mbir_sweep_golden.pt
 
+(tests/data/regen_mbir_goldens.py does this and the MBIR keys of the
+algorithm golden in one go, reporting the change against the old values.)
 ``_golden.stamp`` then records this environment's arithmetic fingerprints
 (tests/_golden.py) under ``_arith_fingerprint``: the exact comparisons are
 only made where the fingerprint matches.
@@ -26,5 +29,5 @@ from _golden import stamp  # noqa: E402
 from test_algorithms_mbir import _sweep_golden_cases  # noqa: E402
 
 if __name__ == "__main__":
-    torch.save(_sweep_golden_cases(pre_restructure=True), sys.argv[1])
+    torch.save(_sweep_golden_cases(), sys.argv[1])
     stamp(sys.argv[1])

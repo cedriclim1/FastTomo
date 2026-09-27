@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 from conftest import (
@@ -319,12 +320,15 @@ def _mbir_sino_cpu(phantom: torch.Tensor, angles_deg: torch.Tensor) -> torch.Ten
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA GPU")
-def test_mbir_cpu_cuda_consistency():
+@pytest.mark.parametrize("sweep_kernel", ["serial", "parallel"])
+def test_mbir_cpu_cuda_consistency(sweep_kernel):
     """CPU and CUDA paths use identical math and an identical (seeded)
-    permutation. Differences come from float summation order across the
-    GPU's parallel reductions — bounded but non-zero. We assert max
-    absolute deviation < 1e-2 and mean < 1e-3 on a small problem after
-    a modest number of iterations. """
+    visiting order: the serial sweep's, or the parallel sweep's group order
+    (which the CPU then walks sequentially; ``"auto"`` would give CPU and
+    CUDA different orders). Differences come from float summation order
+    across the GPU's parallel reductions — bounded but non-zero. We assert
+    max absolute deviation < 1e-4 and mean < 1e-5 (measured 8e-7 and 4e-8)
+    after a modest number of iterations. """
     Ny = Nz = Nx = 12
     n_angles = 16
     phantom = torch.zeros(Ny, Nz, Nx)
@@ -333,26 +337,29 @@ def test_mbir_cpu_cuda_consistency():
     sino_cpu = _mbir_sino_cpu(phantom, angles)
     sino_cuda = sino_cpu.cuda()
 
+    # Quadratic prior (p = q = 2): see the variant test below for why the
+    # edge-preserving default is compared at its fixed point instead.
     kw = dict(
-        sigma_f=0.1, huber_T=float("inf"),
+        sigma_f=0.1, qggmrf_p=2.0, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=False,
         sigma_init=0.1,
-        n_iter=20, multires_levels=1, seed=7,
+        n_iter=20, multires_levels=1, seed=7, sweep_kernel=sweep_kernel,
     )
     v_cpu = ft.run_mbir(sino_cpu, angles, **kw)
     v_cu  = ft.run_mbir(sino_cuda, angles.cuda(), **kw).cpu()
 
     diff = (v_cu - v_cpu).abs()
-    assert diff.max().item() < 1e-2, (
-        f"CPU/CUDA max diff {diff.max().item():.5f} > 1e-2"
+    assert diff.max().item() < 1e-4, (
+        f"CPU/CUDA max diff {diff.max().item():.2e} > 1e-4"
     )
-    assert diff.mean().item() < 1e-3, (
-        f"CPU/CUDA mean diff {diff.mean().item():.6f} > 1e-3"
+    assert diff.mean().item() < 1e-5, (
+        f"CPU/CUDA mean diff {diff.mean().item():.2e} > 1e-5"
     )
 
 
 @needs_cuda
-def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
+@pytest.mark.parametrize("sweep_kernel", ["serial", "parallel"])
+def test_mbir_cpu_cuda_consistency_with_offset_and_variance(sweep_kernel):
     """test_mbir_cpu_cuda_consistency runs with estimation off; this one
     turns on the offset and variance updates, Huber weights and lambdas, so
     the shared update is exercised on both backends. The residual
@@ -368,8 +375,9 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     sino = sino + 0.3 * torch.linspace(-1, 1, n).view(n, 1, 1) + 0.05 * torch.randn(n, Ny, N, generator=g)
     sino[3, 2, 5] += 8.0
     lam = torch.rand(n, Ny, N, generator=g) + 0.5
-    kw = dict(sigma_f=0.1, n_iter=8, multires_levels=1, seed=5, return_state=True,
-              estimate_offset=True, estimate_variance=True, huber_T=3.0)
+    kw = dict(sigma_f=0.1, qggmrf_p=2.0, n_iter=8, multires_levels=1, seed=5, return_state=True,
+              estimate_offset=True, estimate_variance=True, huber_T=3.0,
+              sweep_kernel=sweep_kernel)
     vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
     vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
     assert (dc.abs() > 0.1).any()                        # offsets were estimated
@@ -382,26 +390,72 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
 @pytest.mark.parametrize("n_angles", [9, 61, 100, 200, 300])
 @pytest.mark.parametrize("use_lam,huber_T", [(False, float("inf")), (True, float("inf")),
                                              (False, 3.0), (True, 3.0)])
-def test_mbir_cpu_cuda_consistency_every_sweep_variant(n_angles, use_lam, huber_T):
-    """The CUDA sweep has one kernel per angle-slot count (1, 2, 4, 8 slots
-    of 32 angles per lane, then a generic kernel) and per lambdas / Huber
-    combination; each must agree with the CPU sweep (same voxel order,
-    different summation order)."""
+@pytest.mark.parametrize("sweep_kernel", ["serial", "parallel"])
+def test_mbir_cpu_cuda_consistency_every_sweep_variant(n_angles, use_lam, huber_T, sweep_kernel):
+    """The CUDA sweeps have one kernel per angle-slot count (1, 2, 4, 8 slots
+    of 32 angles per lane, then a generic serial kernel beyond 256 views)
+    and per lambdas / Huber combination, serial and parallel; each must
+    agree with the CPU sweep (same voxel order, different summation order;
+    the CPU walks the parallel sweep's group order for
+    ``sweep_kernel="parallel"``). With the quadratic prior (p = q = 2): the
+    first iterations with the edge-preserving prior (p = 1.2) are too
+    sensitive for an elementwise check (a 1-ulp perturbation of the
+    sinogram moves this 4-iteration volume by up to 2e-2, CPU vs CUDA
+    3e-2), so that prior is compared at its fixed point
+    (test_mbir_cpu_cuda_reach_the_same_map_estimate) and through its
+    formula on both backends (test_algorithms_mbir.py)."""
+    if sweep_kernel == "parallel" and n_angles > 256:
+        pytest.skip("the parallel sweep takes at most 256 views")
     g = torch.Generator().manual_seed(n_angles)
-    Ny, N = 3, 10
+    Ny, N = 3, 12                    # 12: group spacing 6 at +-70 degrees fits
     ph = torch.zeros(Ny, N, N)
-    ph[:, 3:7, 2:8] = 1.0
+    ph[:, 3:8, 2:9] = 1.0
     ang = torch.linspace(-70, 70, n_angles)
     sino = _mbir_sino_cpu(ph, ang) + 0.02 * torch.randn(n_angles, Ny, N, generator=g)
     lam = torch.rand(n_angles, Ny, N, generator=g) + 0.5 if use_lam else None
-    kw = dict(sigma_f=0.2, n_iter=4, multires_levels=1, seed=2, huber_T=huber_T,
-              return_state=True)
+    kw = dict(sigma_f=0.2, qggmrf_p=2.0, n_iter=4, multires_levels=1, seed=2, huber_T=huber_T,
+              return_state=True, sweep_kernel=sweep_kernel)
     vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
     vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(),
                              lambdas=lam.cuda() if use_lam else None, **kw)
     torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
     torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)
     assert sg == pytest.approx(sc, rel=1e-5)
+
+
+@needs_cuda
+@pytest.mark.parametrize("p,T,sf", [(1.2, float("inf"), 0.5), (1.2, 1.5, 0.3)])
+def test_mbir_cpu_cuda_reach_the_same_map_estimate(p, T, sf):
+    """CPU and CUDA converge to the same MAP estimate with the default
+    edge-preserving prior. Compared through the MAP cost (fp64, dense
+    forward model and the paper's rho, see test_algorithms_mbir.py) and the
+    volume, not elementwise along the way: the first iterations of that
+    prior amplify rounding differences (see the variant test above), and the
+    two backends need not visit the voxels in the same order. Measured
+    (1500 iterations): relative cost difference 4e-12 / 1.5e-11, relative
+    volume difference 9e-7 / 1.4e-6 (at 300 iterations: 9e-9 / 1.3e-5 and
+    4e-6 / 1e-3)."""
+    from test_algorithms_mbir import _dense_mbir_problem, _qggmrf_rho
+    A, g, ang, (Ny, Nz, Nx, Nd, nA), J, K, W = _dense_mbir_problem()
+    c, sig, delta = 1e-3, 1.0, 0.5
+
+    def cost(f):
+        r = np.abs((g - A @ f) / sig)
+        beta = r ** 2 if not math.isfinite(T) else np.where(
+            r < T, r ** 2, 2 * delta * T * r + T * T * (1 - 2 * delta))
+        return 0.5 * beta.sum() + np.sum(W * _qggmrf_rho(f[J] - f[K], p, 2.0, c, sf))
+
+    out = []
+    for dev in ("cpu", "cuda"):
+        sino = torch.tensor(g.reshape(nA, Ny, Nd), dtype=torch.float32, device=dev)
+        f = ft.run_mbir(sino, torch.tensor(ang, dtype=torch.float32, device=dev), n_iter=1500, Nz=Nz,
+                        sigma_f=sf, qggmrf_p=p, qggmrf_c=c, huber_T=T, huber_delta=delta,
+                        estimate_offset=False, estimate_variance=False, sigma_init=sig,
+                        convergence_tol=0.0, seed=1, num_threads=4)
+        out.append(f.double().cpu().numpy().ravel())
+    (fc, fg), (cc, cg) = out, (cost(out[0]), cost(out[1]))
+    assert abs(cg - cc) / abs(cc) < 1e-8, (cc, cg)
+    assert np.linalg.norm(fg - fc) / np.linalg.norm(fc) < 1e-4
 
 
 # ── cached projector <-> functional API ───────────────────────────────────────
