@@ -53,6 +53,7 @@ from fasttomo.projection import (
     back_project_3d,
     forward_project_resire,
     back_project_resire,
+    euler_zyz_to_rotmat,
 )
 from fasttomo.utilities import (
     apply_shifts,
@@ -82,6 +83,7 @@ from fasttomo.regularizers import tilt_ssim_loss, s3im_loss, logsum_sparsity, tv
 from fasttomo.configs import (
     AdReconConfig,
     ConstraintConfig,
+    MbirConfig,
     OptimConfig,
     PoseRefinementConfig,
     RegularizerConfig,
@@ -94,6 +96,7 @@ __all__ = [
     "back_project_3d",
     "forward_project_resire",
     "back_project_resire",
+    "euler_zyz_to_rotmat",
     "apply_shifts",
     "apply_shifts_2d",
     "estimate_shifts_xcorr",
@@ -121,6 +124,7 @@ __all__ = [
     "tv_loss_xz",
     "AdReconConfig",
     "ConstraintConfig",
+    "MbirConfig",
     "OptimConfig",
     "PoseRefinementConfig",
     "RegularizerConfig",

@@ -1,40 +1,28 @@
 """
-Utility functions for FastTomo: masks, filters, and shift helpers.
+Utility functions for FastTomo: the ramp filter, the 3-D TV loss, and
+shift estimation and correction.
 
-All public functions accept and return torch.Tensor (float32).
+``cylindrical_mask`` lives in :mod:`fasttomo.constraints` and is
+re-exported here, its historical home.
 """
 
 from __future__ import annotations
 
 import math
-import numpy as np
+
 import torch
 
+# Moved to fasttomo.constraints (ARCH P10); re-exported here, its historical home.
+from fasttomo.constraints import cylindrical_mask
 
-# ── cylindrical support mask ──────────────────────────────────────────────
-
-def cylindrical_mask(
-    Nz: int,
-    Nx: int,
-    radius: float | None = None,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """
-    Inscribed-cylinder support mask for the XZ reconstruction plane.
-
-    Returns [Nz, Nx] float32 tensor — 1.0 inside the cylinder, 0.0 outside.
-    Multiply a volume [Ny, Nz, Nx] by ``mask.unsqueeze(0)`` to apply.
-
-    Default radius = min(Nz, Nx) / 2, which inscribes the cylinder in the
-    smaller dimension.  Uses the same centering as the projection kernels:
-    pixel index ``i`` maps to coordinate ``i - (N-1)/2``.
-    """
-    r = float(min(Nz, Nx)) / 2.0 if radius is None else radius
-    iz = np.linspace(-(Nz - 1) / 2.0, (Nz - 1) / 2.0, Nz, dtype=np.float32)
-    ix = np.linspace(-(Nx - 1) / 2.0, (Nx - 1) / 2.0, Nx, dtype=np.float32)
-    mask_np = (iz[:, None] ** 2 + ix[None, :] ** 2 <= r ** 2).astype(np.float32)
-    mask = torch.Tensor(mask_np)  # CPU float32; torch.Tensor is a class, not a factory
-    return mask.to(device) if device is not None else mask
+__all__ = [
+    "cylindrical_mask",
+    "ramp_filter",
+    "tv_loss_3d",
+    "apply_shifts",
+    "apply_shifts_2d",
+    "estimate_shifts_xcorr",
+]
 
 
 # ── ramp filter (PyTorch, runs on same device as input) ───────────────────
@@ -199,10 +187,10 @@ def estimate_shifts_xcorr(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
     *,
-    upsample_factor: int = 10,                  # reserved; parabolic fit used today
     max_shift: float | None = None,
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — CUDA only
-    num_threads: int | None = None,             # CPU 3D path only
+    num_threads: int | None = None,             # CPU paths
+    **removed: object,
 ) -> torch.Tensor:                              # [n_angles] float32, CPU
     """
     Estimate the translational shift of each projection (along the detector
@@ -217,8 +205,8 @@ def estimate_shifts_xcorr(
     call site).
 
     Sub-pixel precision is achieved via 3-point parabolic interpolation around
-    the cross-correlation peak.  upsample_factor is accepted for API
-    compatibility but currently unused.
+    the cross-correlation peak. (The former ``upsample_factor`` argument never
+    had an effect and was removed; passing it raises TypeError.)
 
     Typical outer-loop usage::
 
@@ -231,12 +219,24 @@ def estimate_shifts_xcorr(
     # so utilities must not import from projection at module level.
     from fasttomo.projection import forward_project, forward_project_3d
 
+    if "upsample_factor" in removed:
+        raise TypeError(
+            "estimate_shifts_xcorr: upsample_factor was removed. It never had an "
+            "effect: the sub-pixel shift comes from a 3-point parabolic fit of "
+            "the correlation peak, and no upsampled-DFT refinement exists. "
+            "Drop the argument; the result is unchanged."
+        )
+    if removed:
+        raise TypeError(
+            "estimate_shifts_xcorr() got an unexpected keyword argument "
+            f"'{next(iter(removed))}'"
+        )
     N_det = sinogram.shape[-1]
 
     if euler_zyz_deg is not None:
         pred = forward_project_3d(volume, euler_zyz_deg, num_threads=num_threads)
     else:
-        pred = forward_project(volume, angles_deg)
+        pred = forward_project(volume, angles_deg, num_threads=num_threads)
 
     F_pred = torch.fft.rfft(pred.float(),      n=N_det, dim=-1)  # [n_a, Ny, N_freq]
     F_meas = torch.fft.rfft(sinogram.float(),  n=N_det, dim=-1)

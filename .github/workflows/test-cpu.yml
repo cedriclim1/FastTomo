@@ -53,7 +53,6 @@ jobs:
           FASTTOMO_EXPECT_CUDA: "0"
         run: pytest tests -q
 
-      # Non-blocking until the existing warnings are cleaned up.
-      - name: Ruff (non-blocking)
-        continue-on-error: true
+      # Rule set pinned in pyproject.toml ([tool.ruff.lint]).
+      - name: Ruff
         run: ruff check fasttomo tests

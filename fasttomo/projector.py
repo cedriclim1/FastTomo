@@ -37,7 +37,7 @@ Usage (AD loop, with pose):
     proj = RotmatProjector((Ny, Nz, Nx), N_det=Nx, device=vol.device,
                            n_angles=n_angles)
     for _ in range(n_iter):
-        mats = _euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous()
+        mats = euler_zyz_to_rotmat(euler).reshape(n_angles, 9).contiguous()
         pred = proj.forward(vol, mats)
         ...
 
@@ -53,7 +53,6 @@ import torch
 import fasttomo._core as _core
 from fasttomo.autograd import (
     _FPParallelCached, _BPParallelCached, _FPRotmatCached, _BPRotmatCached, _io_dtype_code,
-    _on_device,
 )
 
 
@@ -123,6 +122,12 @@ class _ProjectorBase:
         self.dtype: torch.dtype | None = dtype
         self._vol_handle:  int | None = None
         self._sino_handle: int | None = None
+        # run_sirt's CUDA-graph cache for this projector: configuration key
+        # -> captured graph and its static buffers, and the keys whose
+        # capture failed (so they are not retried with this projector).
+        # Owned here so the graphs die with the projector's textures.
+        self._sirt_graph_cache: dict = {}
+        self._sirt_graph_bad_keys: set = set()
 
     def _lock_dtype(self, t: torch.Tensor) -> int:
         """Return the io_dtype int. Locks self.dtype on first call; raises
@@ -252,9 +257,9 @@ class ParallelProjector(_ProjectorBase):
     one-shot calls and for differentiable-angle optimisation. Use this class
     when angles are fixed and FP/BP run many times on the same volume shape.
 
-    ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
-    configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
-    by ``run_sirt`` for constant-time replay of the SIRT iteration body.
+    ``_sirt_graph_cache`` (declared on the base class) holds the CUDA graphs
+    ``run_sirt`` captures with this projector, keyed by reconstruction
+    configuration, for constant-time replay of the SIRT iteration body.
     """
 
     def __init__(
@@ -358,11 +363,15 @@ class ParallelProjector(_ProjectorBase):
 
     # ── public differentiable API ──
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        """Forward-project ``volume [Ny, Nz, Nx]`` to ``[n_angles, Ny, N_det]``
+        (differentiable w.r.t. ``volume``). The first call locks the dtype."""
         self._check_device(volume, "volume")
         self._check_volume_shape(volume)
         return _FPParallelCached.apply(volume, self)
 
     def back(self, sinogram: torch.Tensor) -> torch.Tensor:
+        """Back-project ``sinogram [n_angles, Ny, N_det]`` to ``[Ny, Nz, Nx]``
+        (differentiable w.r.t. ``sinogram``)."""
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
         return _BPParallelCached.apply(sinogram, self)
@@ -379,9 +388,8 @@ class RotmatProjector(_ProjectorBase):
     view of the forward's texture cache, falling back to a one-shot texture
     if the cache has been overwritten by a later forward.
 
-    ``_sirt_graph_cache``: lazily-initialised ``dict`` keyed by reconstruction
-    configuration tuples; holds captured ``torch.cuda.CUDAGraph`` objects used
-    by ``run_sirt`` for constant-time replay of the SIRT iteration body.
+    ``run_sirt`` never captures a CUDA graph with this projector (rotation
+    matrices are a per-call input), so its ``_sirt_graph_cache`` stays empty.
     """
 
     def __init__(
@@ -527,6 +535,10 @@ class RotmatProjector(_ProjectorBase):
         )
 
     def forward(self, volume: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
+        """Forward-project ``volume [Ny, Nz, Nx]`` with rotation matrices
+        ``mats [n_angles, 3, 3]`` (or ``[n_angles, 9]``, e.g. from
+        :func:`fasttomo.euler_zyz_to_rotmat`). Differentiable w.r.t.
+        ``volume`` and ``mats``."""
         self._check_device(volume, "volume")
         self._check_volume_shape(volume)
         self._check_device(mats, "mats")
@@ -534,6 +546,8 @@ class RotmatProjector(_ProjectorBase):
         return _FPRotmatCached.apply(volume, mats_flat, self)
 
     def back(self, sinogram: torch.Tensor, mats: torch.Tensor) -> torch.Tensor:
+        """Back-project ``sinogram [n_angles, Ny, N_det]`` with ``mats`` to
+        ``[Ny, Nz, Nx]`` (differentiable w.r.t. ``sinogram``)."""
         self._check_device(sinogram, "sinogram")
         self._check_sinogram_shape(sinogram)
         self._check_device(mats, "mats")

@@ -13,7 +13,7 @@ Caveats:
 - Single-axis tilt-angle gradient: `_FPParallel` computes ∂L/∂θ via `_grad_angle_raw`
   (CPU + CUDA).
 - 3D rotation-matrix gradient: `_FPRotmat` takes the [n_angles, 3, 3] rotation
-  matrix tensor directly so PyTorch can trace through `_euler_zyz_to_rotmat`
+  matrix tensor directly so PyTorch can trace through `euler_zyz_to_rotmat`
   outside the Function boundary. Backward calls `_grad_rotmat_raw` for ∂L/∂M
   and lets autograd chain to ∂L/∂euler_zyz_deg automatically (CPU + CUDA).
   RESIRE's rotation-matrix gradient is intentionally not exposed — angular
@@ -65,61 +65,6 @@ def _assert_dtype_match(a: torch.Tensor, b: torch.Tensor,
             f"{op_name}: {a_name} ({a.dtype}) and {b_name} ({b.dtype}) "
             "must have the same dtype. Cast one to match the other."
         )
-
-
-def _check_inputs(
-    sinogram: torch.Tensor,
-    angles_deg: torch.Tensor | None,
-    Nz: int,
-    *,
-    allowed_dtypes: tuple[torch.dtype, ...],
-    op_name: str,
-    require_cuda: bool = False,
-) -> tuple[int, int, int, int, torch.device]:
-    """Validate and resolve sinogram/angles inputs for reconstruction algorithms.
-
-    Returns (n_angles, Ny, N_det, Nz_resolved, device). Never coerces.
-
-    Raises:
-        RuntimeError  if require_cuda and sinogram is not on CUDA.
-        TypeError     if sinogram.dtype not in allowed_dtypes.
-        ValueError    if sinogram is not 3-D, angles_deg is not 1-D,
-                      or sinogram.shape[0] != len(angles_deg).
-    """
-    if require_cuda and not sinogram.is_cuda:
-        raise RuntimeError(
-            f"{op_name} requires a CUDA tensor; got {sinogram.device}"
-        )
-
-    if sinogram.dtype not in allowed_dtypes:
-        names = " or ".join(str(d) for d in allowed_dtypes)
-        raise TypeError(
-            f"{op_name} requires {names} sinogram (got {sinogram.dtype}). "
-            "Cast with .float() or .half() first."
-        )
-
-    if sinogram.ndim != 3:
-        raise ValueError(
-            f"{op_name}: sinogram must be 3-D [n_angles, Ny, N_det], "
-            f"got shape {tuple(sinogram.shape)}"
-        )
-
-    n_angles, Ny, N_det = sinogram.shape
-
-    if angles_deg is not None:
-        if angles_deg.ndim != 1:
-            raise ValueError(
-                f"{op_name}: angles_deg must be 1-D [n_angles], "
-                f"got shape {tuple(angles_deg.shape)}"
-            )
-        if len(angles_deg) != n_angles:
-            raise ValueError(
-                f"{op_name}: sinogram has {n_angles} projections but "
-                f"angles_deg has {len(angles_deg)} entries."
-            )
-
-    Nz_resolved = N_det if Nz < 0 else Nz
-    return n_angles, Ny, N_det, Nz_resolved, sinogram.device
 
 
 # ── thread-count resolution ──────────────────────────────────────────────────
@@ -176,12 +121,22 @@ def _io_dtype_code(t: torch.Tensor) -> int:
 
 # ── ZYZ Euler → rotation matrix ──────────────────────────────────────────────
 
-def _euler_zyz_to_rotmat(euler_zyz_deg: torch.Tensor) -> torch.Tensor:
-    """
-    Convert ZYZ Euler angles to 3×3 rotation matrices (row-major).
+def euler_zyz_to_rotmat(euler_zyz_deg: torch.Tensor) -> torch.Tensor:
+    """Convert ZYZ Euler angles to 3×3 rotation matrices.
 
-    euler_zyz_deg: [n_angles, 3]  — columns are (φ, θ, ψ) in degrees.
-    Convention: R = R_Z(ψ) · R_Y(θ) · R_Z(φ)  (RESIRE convention).
+    Parameters
+    ----------
+    euler_zyz_deg : Tensor, shape ``[n_angles, 3]``
+        Columns are ``(phi, theta, psi)`` in degrees. ``theta`` is the tilt
+        angle; a single-axis tilt series is ``(0, angle, 0)``.
+
+    Returns
+    -------
+    Tensor, shape ``[n_angles, 3, 3]``, float32, on the input's device.
+        Row-major ``R = R_Z(psi) · R_Y(theta) · R_Z(phi)`` (the RESIRE
+        convention used by ``forward_project_3d``, ``RotmatProjector`` and
+        ``run_ad_recon``'s pose refinement). Differentiable: autograd traces
+        through it, which is how pose refinement gets ∂L/∂euler.
     """
     r   = math.pi / 180.0
     phi   = euler_zyz_deg[:, 0].float() * r
@@ -192,14 +147,18 @@ def _euler_zyz_to_rotmat(euler_zyz_deg: torch.Tensor) -> torch.Tensor:
     ct, st = torch.cos(theta), torch.sin(theta)
     cu, su = torch.cos(psi),   torch.sin(psi)
 
-    r00 =  cu*ct*cp - su*sp;  r01 = -cu*ct*sp - su*cp;  r02 = cu*st
-    r10 =  su*ct*cp + cu*sp;  r11 = -su*ct*sp + cu*cp;  r12 = su*st
-    r20 = -st*cp;             r21 =  st*sp;              r22 = ct
+    r00, r01, r02 = cu*ct*cp - su*sp, -cu*ct*sp - su*cp, cu*st
+    r10, r11, r12 = su*ct*cp + cu*sp, -su*ct*sp + cu*cp, su*st
+    r20, r21, r22 = -st*cp, st*sp, ct
 
     row0 = torch.stack([r00, r01, r02], dim=1)
     row1 = torch.stack([r10, r11, r12], dim=1)
     row2 = torch.stack([r20, r21, r22], dim=1)
     return torch.stack([row0, row1, row2], dim=1)
+
+
+# Private name kept for existing imports (benchmark scripts, tests).
+_euler_zyz_to_rotmat = euler_zyz_to_rotmat
 
 
 # ── plain (non-autograd) projection helpers ─────────────────────────────────
@@ -367,7 +326,7 @@ def _forward_project_euler_raw(
     N_det: int = -1,
     num_threads: int | None = None,
 ) -> torch.Tensor:
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
+    mats = euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
     return _forward_project_rotmat_raw(volume, mats, N_det, num_threads)
 
 
@@ -379,7 +338,7 @@ def _back_project_euler_raw(
     *,
     Nx: int = -1,
 ) -> torch.Tensor:
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
+    mats = euler_zyz_to_rotmat(euler_zyz_deg).reshape(-1, 9)
     return _back_project_rotmat_raw(sinogram, mats, Nz, num_threads, Nx=Nx)
 
 
@@ -441,7 +400,7 @@ def _grad_rotmat_raw(
     """
     Returns [n_angles, 9] gradient of the loss w.r.t. the rotation-matrix
     entries used by forward_project_3d. PyTorch autograd then chains this
-    through `_euler_zyz_to_rotmat` to give ∂L/∂euler_zyz_deg. ``num_threads``
+    through `euler_zyz_to_rotmat` to give ∂L/∂euler_zyz_deg. ``num_threads``
     only applies to the CPU path.
 
     Always runs in fp32 (gradient kernels stay at full precision); fp16
@@ -509,7 +468,7 @@ def _forward_project_resire_raw(
     vol  = volume.contiguous().float()
     sino = torch.zeros(n_angles, Ny, N_det, dtype=torch.float32, device=vol.device)
 
-    mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=vol.device)
+    mats      = euler_zyz_to_rotmat(euler_zyz_deg).to(device=vol.device)
     mats_flat = mats.reshape(n_angles, 9).contiguous()
 
     with _on_device(vol):
@@ -546,7 +505,7 @@ def _back_project_resire_raw(
     sino = sinogram.contiguous().float()
     vol  = torch.zeros(Ny, Nz, Nx, dtype=torch.float32, device=sino.device)
 
-    mats      = _euler_zyz_to_rotmat(euler_zyz_deg).to(device=sino.device)
+    mats      = euler_zyz_to_rotmat(euler_zyz_deg).to(device=sino.device)
     mats_flat = mats.reshape(n_angles, 9).contiguous()
 
     with _on_device(sino):
@@ -637,7 +596,7 @@ class _FPRotmat(torch.autograd.Function):
     """
     Texture-based 3D rotmat forward projection, differentiable w.r.t. both
     `volume` and the rotation matrix `mats` ([n_angles, 3, 3]). The Euler →
-    rotmat conversion lives in pure PyTorch (`_euler_zyz_to_rotmat`) outside
+    rotmat conversion lives in pure PyTorch (`euler_zyz_to_rotmat`) outside
     this Function, so autograd chains ∂L/∂M into ∂L/∂euler_zyz_deg.
 
     ``num_threads`` is the resolved CPU OpenMP thread count; CUDA path ignores

@@ -176,7 +176,7 @@ def test_forward_project_3d_autograd_nx_ne_ndet(backend, Nx, N_det):
     torch.testing.assert_close(small, big, rtol=0, atol=0)
 
 
-# ── ConstraintConfig.sparsity honoured by run_ad_recon ─────────────────────
+# ── ConstraintConfig.soft_threshold (formerly sparsity) honoured by run_ad_recon ─────────────────────
 
 class _MeanZProjector:
     """CPU stand-in for ParallelProjector: every view is the Z-mean of the
@@ -215,7 +215,7 @@ def test_ad_recon_constraint_sparsity_soft_thresholds(monkeypatch, lam, expected
     sino = torch.full((4, 2, 6), 3.0)           # target above the start: v grows
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=1, lr_volume=0.2, cosine_schedule=False),
-        constraints=ft.ConstraintConfig(sparsity=lam),
+        constraints=ft.ConstraintConfig(soft_threshold=lam),
     )
     rec = ft.run_ad_recon(sino, torch.linspace(-30, 30, 4), Nz=6,
                           projector=proj, config=cfg)
@@ -237,7 +237,7 @@ def test_ad_recon_constraint_order_mask_then_threshold(monkeypatch):
     mask[:, 4:] = 0.0                       # outside the support
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=1, lr_volume=0.2, cosine_schedule=False),
-        constraints=ft.ConstraintConfig(positivity=True, sparsity=0.05),
+        constraints=ft.ConstraintConfig(positivity=True, soft_threshold=0.05),
     )
     rec = ft.run_ad_recon(torch.full((4, 2, 6), 3.0), torch.linspace(-30, 30, 4),
                           Nz=6, projector=proj, config=cfg, support_mask=mask)
@@ -245,7 +245,7 @@ def test_ad_recon_constraint_order_mask_then_threshold(monkeypatch):
     torch.testing.assert_close(rec[:, :, 2:4], torch.full((2, 6, 2), 0.15), rtol=0, atol=1e-6)
     assert torch.equal(rec[:, :, 4:], torch.zeros(2, 6, 2))
     # and ConstraintConfig.apply uses the same order on the same input
-    applied = ft.ConstraintConfig(positivity=True, mask=mask.unsqueeze(0), sparsity=0.05).apply(
+    applied = ft.ConstraintConfig(positivity=True, support_mask=mask.unsqueeze(0), soft_threshold=0.05).apply(
         torch.full((2, 6, 6), 0.2))
     torch.testing.assert_close(rec, applied, rtol=0, atol=1e-6)
 
@@ -256,7 +256,7 @@ def test_ad_recon_constraint_sparsity_matches_config_apply(monkeypatch):
     proj = _cpu_ad_recon(monkeypatch)
     g = torch.Generator().manual_seed(5)
     sino = torch.rand(4, 2, 6, generator=g) * 2 - 0.5
-    cons = ft.ConstraintConfig(positivity=False, sparsity=0.02)
+    cons = ft.ConstraintConfig(positivity=False, soft_threshold=0.02)
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=6, lr_volume=0.1, cosine_schedule=False),
         constraints=cons,
@@ -295,11 +295,11 @@ def test_ad_recon_constraint_sparsity_cuda():
     rec0 = ft.run_ad_recon(sino, ang, Nz=N, config=base)
     rec0b = ft.run_ad_recon(sino, ang, Nz=N, config=ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=40, lr_volume=0.05),
-        constraints=ft.ConstraintConfig(sparsity=0.0)))
+        constraints=ft.ConstraintConfig(soft_threshold=0.0)))
     assert torch.equal(rec0, rec0b)
     rec = ft.run_ad_recon(sino, ang, Nz=N, config=ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=40, lr_volume=0.05),
-        constraints=ft.ConstraintConfig(sparsity=0.01)))
+        constraints=ft.ConstraintConfig(soft_threshold=0.01)))
     bg = vol == 0
     assert (rec[bg] == 0).float().mean() > 0.5 > (rec0[bg] == 0).float().mean()
     assert _rel(rec, vol) < 1.0
@@ -524,6 +524,19 @@ def test_logsum_sparsity_value_and_grad(backend, dtype):
 RESIRE_GOLDEN = __import__("pathlib").Path(__file__).parent / "data" / "resire_golden_main.pt"
 RESIRE_EXACT = ("bp", "bp_nz", "bp_default", "fp_grad", "fp_exact", "fp_exact_ndet")
 RESIRE_NOISY = ("fp", "fp_ndet", "bp_grad_sq", "run", "run_loss", "run_euler")
+# The golden file was made on an RTX PRO 6000 Blackwell (sm_120) with torch
+# 2.12.1+cu130 and nvcc 13.0. Another GPU architecture, compiler or torch
+# version may round the rotation matrices or contract FMAs differently, so
+# the torch.equal comparison of the RESIRE_EXACT keys only holds in that
+# environment; elsewhere they are compared at the RESIRE_NOISY tolerance.
+# To regenerate: check out origin/main's fasttomo/ at 98fa473 and save
+# `_resire_cases()` with torch.save.
+RESIRE_GOLDEN_ENV = {"capability": (12, 0), "torch": "2.12."}
+
+
+def _resire_golden_env_matches() -> bool:
+    return (torch.cuda.get_device_capability() == RESIRE_GOLDEN_ENV["capability"]
+            and torch.__version__.startswith(RESIRE_GOLDEN_ENV["torch"]))
 
 
 def _resire_cases() -> dict[str, torch.Tensor]:
@@ -563,8 +576,12 @@ def test_resire_outputs_identical_to_main():
     golden = torch.load(RESIRE_GOLDEN)
     now = _resire_cases()
     assert set(golden) == set(RESIRE_EXACT) | set(RESIRE_NOISY) == set(now)
+    exact_env = _resire_golden_env_matches()
     for k in RESIRE_EXACT:
-        assert torch.equal(now[k], golden[k]), k
+        if exact_env:
+            assert torch.equal(now[k], golden[k]), k
+        else:
+            torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)
     for k in RESIRE_NOISY:
         assert now[k].shape == golden[k].shape
         torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)
@@ -709,7 +726,7 @@ def test_mbir_rejects_non_finite_sinogram(backend, bad, sigma_init):
     sino[2, 1, 3] = bad
     with pytest.raises(ValueError, match="sinogram contains NaN or inf"):
         ft.run_mbir(sino, torch.linspace(-40, 40, 6, device=backend),
-                    outer_iters=1, multires_levels=1, sigma_init=sigma_init)
+                    n_iter=1, multires_levels=1, sigma_init=sigma_init)
 
 
 # ── ARCH P12: one MBIR offset/variance implementation ──────────────────────
@@ -783,7 +800,7 @@ def test_mbir_cpu_uses_the_python_offset_variance_update(monkeypatch):
 
     monkeypatch.setattr(algo, "_mbir_update_offset_variance", counting)
     sino = torch.rand(6, 2, 8, generator=torch.Generator().manual_seed(14))
-    ft.run_mbir(sino, torch.linspace(-40, 40, 6), outer_iters=3, multires_levels=1,
+    ft.run_mbir(sino, torch.linspace(-40, 40, 6), n_iter=3, multires_levels=1,
                 convergence_tol=0.0, estimate_offset=True, estimate_variance=True)
     assert calls == [(True, True)] * 3
 
@@ -805,10 +822,10 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     sino = sino + 0.3 * torch.linspace(-1, 1, n).view(n, 1, 1) + 0.05 * torch.randn(n, Ny, N, generator=g)
     sino[3, 2, 5] += 8.0
     lam = torch.rand(n, Ny, N, generator=g) + 0.5
-    kw = dict(sigma_f=0.1, outer_iters=8, multires_levels=1, seed=5, return_history=True,
+    kw = dict(sigma_f=0.1, n_iter=8, multires_levels=1, seed=5, return_state=True,
               estimate_offset=True, estimate_variance=True, huber_T=3.0)
-    vc, dc, sc, _ = ft.run_mbir(sino, ang, lambdas=lam, **kw)
-    vg, dg, sg, _ = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
+    vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
+    vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
     assert (dc.abs() > 0.1).any()                        # offsets were estimated
     torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
     torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)

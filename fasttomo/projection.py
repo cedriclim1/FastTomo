@@ -19,8 +19,18 @@ import torch
 
 from fasttomo.autograd import (
     _FPParallel, _BPParallel, _FPRotmat, _BPRotmat, _FPResire, _BPResire,
-    _euler_zyz_to_rotmat, _resolve_num_threads,
+    euler_zyz_to_rotmat, _resolve_num_threads,
 )
+
+__all__ = [
+    "forward_project",
+    "back_project",
+    "forward_project_3d",
+    "back_project_3d",
+    "forward_project_resire",
+    "back_project_resire",
+    "euler_zyz_to_rotmat",
+]
 from fasttomo.utilities import apply_shifts_2d
 
 
@@ -131,7 +141,7 @@ def forward_project_3d(
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
     nt = _resolve_num_threads(num_threads)
-    mats = _euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
+    mats = euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
     sino = _FPRotmat.apply(volume, mats, N_det, nt)
     if shifts is not None:
         sino = apply_shifts_2d(sino, shifts)

@@ -324,7 +324,7 @@ def test_fista_warm_start_continues_cuda():
     sino   = ft.forward_project(vol, angles)
 
     converged = ft.run_fista(sino, angles, n_iter=50, Nz=N)
-    one_more  = ft.run_fista(sino, angles, n_iter=1, Nz=N, volume=converged)
+    one_more  = ft.run_fista(sino, angles, n_iter=1, Nz=N, warm_start=converged)
 
     # Should still be a near-optimum reconstruction
     final_err = (one_more - vol).pow(2).mean().item()
@@ -498,7 +498,7 @@ def test_resire_custom_support_cuda():
     vol     = phantom_2d(N).unsqueeze(0)
     sino    = ft.forward_project(vol, angles)
     support = ft.cylindrical_mask(N, N, device=DEVICE).unsqueeze(0)
-    rec     = ft.run_resire(sino, angles, n_iter=5, Nz=N, support=support)
+    rec     = ft.run_resire(sino, angles, n_iter=5, Nz=N, support_mask=support)
     corners = torch.stack([rec[0, 0, 0], rec[0, 0, -1], rec[0, -1, 0], rec[0, -1, -1]])
     assert corners.abs().max().item() < 1e-6
 
@@ -1033,15 +1033,15 @@ def test_run_sirt_warm_start_volume_controls_dtype():
     sino     = ft.forward_project(vol, angles)
     warm     = torch.zeros(1, N, N, device=DEVICE)               # fp32
 
-    rec = ft.run_sirt(sino, angles, n_iter=4, Nz=N, volume=warm)
+    rec = ft.run_sirt(sino, angles, n_iter=4, Nz=N, warm_start=warm)
     assert rec.dtype == torch.float32
 
     warm_half = torch.zeros(1, N, N, device=DEVICE, dtype=torch.float16)
-    rec_half  = ft.run_sirt(sino.half(), angles, n_iter=4, Nz=N, volume=warm_half)
+    rec_half  = ft.run_sirt(sino.half(), angles, n_iter=4, Nz=N, warm_start=warm_half)
     assert rec_half.dtype == torch.float16
 
     with pytest.raises(TypeError, match="must have the same dtype"):
-        ft.run_sirt(sino, angles, n_iter=4, Nz=N, volume=warm_half)
+        ft.run_sirt(sino, angles, n_iter=4, Nz=N, warm_start=warm_half)
 
 
 def test_run_sart_fp16_matches_fp32():
@@ -1597,7 +1597,7 @@ class TestRunAdRecon:
         mask_3d = torch.ones(1, N, N, device=DEVICE)
         cfg = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=5),
-            constraints=ft.ConstraintConfig(mask=mask_3d),
+            constraints=ft.ConstraintConfig(support_mask=mask_3d),
         )
         vol = ft.run_ad_recon(sino, angles, config=cfg)
         assert vol.shape == (1, N, N)
@@ -1611,7 +1611,7 @@ class TestRunAdRecon:
         mask_3d = torch.ones(Ny, N, N, device=DEVICE)
         cfg = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=5),
-            constraints=ft.ConstraintConfig(mask=mask_3d),
+            constraints=ft.ConstraintConfig(support_mask=mask_3d),
         )
         vol = ft.run_ad_recon(sino, angles, config=cfg)
         assert vol.shape == (Ny, N, N)
@@ -1624,7 +1624,7 @@ class TestRunAdRecon:
         bad_mask = torch.ones(3, N, N, device=DEVICE)  # Ny=3 but sino has Ny=1
         cfg = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=1),
-            constraints=ft.ConstraintConfig(mask=bad_mask),
+            constraints=ft.ConstraintConfig(support_mask=bad_mask),
         )
         with pytest.raises(ValueError, match="3-D"):
             ft.run_ad_recon(sino, angles, config=cfg)
@@ -1971,7 +1971,7 @@ def test_mbir_perfect_data_recovers_phantom():
         huber_T=float("inf"),
         estimate_offset=False,
         estimate_variance=True,
-        outer_iters=80,
+        n_iter=80,
         multires_levels=1,
     )
     rel_err = (vol - phantom).norm().item() / phantom.norm().item()
@@ -2007,7 +2007,7 @@ def test_mbir_pe_rejects_bragg_streak():
         sino_corrupt, angles,
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=True,
-        outer_iters=80, multires_levels=1,
+        n_iter=80, multires_levels=1,
     )
     err_conv = (vol_conv - phantom).norm().item()
 
@@ -2016,7 +2016,7 @@ def test_mbir_pe_rejects_bragg_streak():
         sino_corrupt, angles,
         sigma_f=0.1, huber_T=3.0, huber_delta=0.5,
         estimate_offset=False, estimate_variance=True,
-        outer_iters=80, multires_levels=1,
+        n_iter=80, multires_levels=1,
     )
     err_am = (vol_am - phantom).norm().item()
 
@@ -2039,7 +2039,7 @@ def test_mbir_seed_reproducibility():
     kw = dict(
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=False,
-        outer_iters=20, multires_levels=1, sigma_init=0.1,
+        n_iter=20, multires_levels=1, sigma_init=0.1,
     )
     v1 = ft.run_mbir(sino, angles, seed=42, **kw)
     v2 = ft.run_mbir(sino, angles, seed=42, **kw)
@@ -2075,7 +2075,7 @@ def test_mbir_noncontiguous_lambdas_matches_contiguous_cuda():
     kw = dict(
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=False,
-        outer_iters=10, multires_levels=1, sigma_init=0.1, seed=3,
+        n_iter=10, multires_levels=1, sigma_init=0.1, seed=3,
     )
     v_contig = ft.run_mbir(sino, angles, lambdas=lam_contig, **kw)
     v_expand = ft.run_mbir(sino, angles, lambdas=lam_expand, **kw)
@@ -2092,12 +2092,12 @@ def test_mbir_estimate_offset_disabled_keeps_d_zero():
     phantom[4:12, 4:12, 4:12] = 1.0
     sino = _mbir_sino_self(phantom, angles)
 
-    _, d_offsets, _, _ = ft.run_mbir(
+    _, d_offsets, _ = ft.run_mbir(
         sino, angles,
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=False,
-        outer_iters=10, multires_levels=1, sigma_init=0.1,
-        return_history=True,
+        n_iter=10, multires_levels=1, sigma_init=0.1,
+        return_state=True,
     )
     assert torch.all(d_offsets == 0.0), (
         f"d_offsets non-zero when estimate_offset=False: {d_offsets}"
@@ -2110,9 +2110,7 @@ def test_mbir_fp_matches_standard_fp_off_axis_voxel_cuda():
     standard ft.forward_project must agree on detector hit positions for a
     single off-Z-centre voxel. Placing the voxel at iz=8 (well off the
     iz=Nz//2 centre) makes a z-sign error visible as a shifted COM."""
-    import math
     import numpy as np
-    import fasttomo._core as _core
     Ny, Nz, Nx = 4, 32, 32
     N_det = Nx
     n_angles = 12
@@ -2157,7 +2155,7 @@ def test_mbir_reconstruction_from_standard_fp_sinogram():
         sino, angles,
         sigma_f=0.1, huber_T=float("inf"),
         estimate_offset=False, estimate_variance=True,
-        outer_iters=60, multires_levels=1,
+        n_iter=60, multires_levels=1,
     )
     rel_err = (vol - phantom).norm().item() / phantom.norm().item()
     assert rel_err < 0.25, (
@@ -2278,14 +2276,14 @@ class TestAdReconSupportMask:
 
         cfg_true = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=1),
-            constraints=ft.ConstraintConfig(mask=True),
+            constraints=ft.ConstraintConfig(cylinder=True),
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
             ft.run_ad_recon(sino, angles, config=cfg_true, support_mask=M)
 
         cfg_tensor = ft.AdReconConfig(
             optim=ft.OptimConfig(n_iter=1),
-            constraints=ft.ConstraintConfig(mask=M),
+            constraints=ft.ConstraintConfig(support_mask=M),
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
             ft.run_ad_recon(sino, angles, config=cfg_tensor, support_mask=M)
