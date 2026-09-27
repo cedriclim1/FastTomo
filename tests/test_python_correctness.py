@@ -273,3 +273,203 @@ def test_ad_recon_constraint_sparsity_cuda():
     bg = vol == 0
     assert (rec[bg] == 0).float().mean() > 0.5 > (rec0[bg] == 0).float().mean()
     assert _rel(rec, vol) < 1.0
+
+
+# ── wSIRT: functional recovery ─────────────────────────────────────────────
+
+def _wsirt_phantom(device, N=48):
+    vol = torch.zeros(2, N, N, device=device)
+    vol[:, 12:36, 14:30] = 1.0
+    vol[1, 20:28, 20:26] = 2.0
+    ang = torch.linspace(-70, 70, 41, device=device)
+    return vol, ang, ft.forward_project(vol, ang)
+
+
+def test_wsirt_recovers_phantom(backend):
+    """wSIRT on a +-70 deg, 41-view phantom: the data residual falls by more
+    than 100x within 5 iterations, and the volume error after 20 iterations
+    is below 35 % (limited-angle floor: SIRT reaches ~29 %). Output has the
+    [Ny, Nz, Nx] shape, fp32 dtype and the input device."""
+    vol, ang, sino = _wsirt_phantom(backend)
+    rec, loss = ft.run_wsirt(sino, ang, n_iter=20, Nz=48, return_loss=True)
+    assert rec.shape == vol.shape and rec.dtype == torch.float32
+    assert rec.device.type == backend.type
+    assert loss.shape == (20,) and torch.isfinite(loss).all()
+    assert loss[5] < loss[0] / 100
+    assert _rel(rec, vol) < 0.35
+
+
+@needs_cuda
+def test_wsirt_converges_faster_than_sirt_cuda():
+    """The point of wSIRT (Wolf et al. 2014): the exact-filter W-BP step gets
+    close in a handful of iterations where plain SIRT is still far away."""
+    vol, ang, sino = _wsirt_phantom(torch.device("cuda"))
+    w = ft.run_wsirt(sino, ang, n_iter=5, Nz=48)
+    s = ft.run_sirt(sino, ang, n_iter=5, Nz=48)
+    assert _rel(w, vol) < 0.8 * _rel(s, vol)
+
+
+def test_wsirt_constraints(backend):
+    """positivity, mask (cylinder) and the sparsity soft-threshold are
+    honoured on every backend."""
+    vol, ang, sino = _wsirt_phantom(backend)
+    rec = ft.run_wsirt(sino, ang, n_iter=5, Nz=48, positivity=True, mask=True)
+    assert rec.min() >= 0
+    outside = ft.cylindrical_mask(48, 48, device=backend) == 0
+    assert (rec[:, outside] == 0).all()
+    plain = ft.run_wsirt(sino, ang, n_iter=5, Nz=48)
+    sparse = ft.run_wsirt(sino, ang, n_iter=5, Nz=48, sparsity=0.05)
+    assert (sparse == 0).sum() > (plain == 0).sum()
+
+
+# ── apply_shifts_2d ────────────────────────────────────────────────────────
+
+def _shift_ref(img: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    """fp64 reference: out[y, x] = bilinear sample of img at (y - sy, x - sx)
+    with zeros outside [0, N-1] (grid_sample align_corners=True, padding
+    zeros). Positive shifts move content toward larger indices."""
+    Ny, Nx = img.shape
+    out = np.zeros_like(img, dtype=np.float64)
+    for y in range(Ny):
+        for x in range(Nx):
+            fy, fx = y - sy, x - sx
+            y0, x0 = math.floor(fy), math.floor(fx)
+            wy, wx = fy - y0, fx - x0
+            acc = 0.0
+            for dy, wyy in ((0, 1 - wy), (1, wy)):
+                for dx, wxx in ((0, 1 - wx), (1, wx)):
+                    yy, xx = y0 + dy, x0 + dx
+                    if 0 <= yy < Ny and 0 <= xx < Nx:
+                        acc += wyy * wxx * img[yy, xx]
+            out[y, x] = acc
+    return out
+
+
+@pytest.mark.parametrize("shifts", [
+    [(3.0, 0.0), (-2.0, 0.0)],        # integer, detector axis
+    [(0.0, 2.0), (0.0, -1.0)],        # integer, tilt axis
+    [(0.25, 0.0), (-1.75, 0.0)],      # sub-pixel, detector axis
+    [(0.0, 0.5), (0.0, -0.3)],        # sub-pixel, tilt axis
+    [(1.4, -0.6), (-0.2, 2.7)],       # both axes
+])
+def test_apply_shifts_2d_matches_reference(backend, shifts):
+    g = torch.Generator().manual_seed(6)
+    sino = torch.rand(2, 7, 11, generator=g)
+    sh = torch.tensor(shifts, dtype=torch.float32)
+    out = ft.apply_shifts_2d(sino.to(backend), sh.to(backend))
+    assert out.shape == sino.shape and out.dtype == torch.float32
+    ref = np.stack([_shift_ref(sino[i].double().numpy(), *shifts[i]) for i in range(2)])
+    torch.testing.assert_close(out.cpu().double(), torch.from_numpy(ref), rtol=1e-5, atol=1e-5)
+
+
+def test_apply_shifts_2d_integer_is_roll_with_zero_fill(backend):
+    """Integer shifts are an exact translation with zero fill."""
+    sino = torch.arange(2 * 5 * 9, dtype=torch.float32).reshape(2, 5, 9).to(backend)
+    out = ft.apply_shifts_2d(sino, torch.tensor([[2.0, 1.0], [-3.0, 0.0]], device=backend))
+    exp = torch.zeros_like(sino)
+    exp[0, 1:, 2:] = sino[0, :-1, :-2]
+    exp[1, :, :-3] = sino[1, :, 3:]
+    torch.testing.assert_close(out, exp, rtol=0, atol=1e-4)
+
+
+def test_apply_shifts_2d_zero_is_identity_and_grad(backend):
+    """Zero shift is the identity; the shifts gradient matches central
+    finite differences at a sub-pixel point (grid_sample autograd)."""
+    g = torch.Generator().manual_seed(7)
+    sino = torch.rand(3, 6, 10, generator=g, dtype=torch.float64).float().to(backend)
+    torch.testing.assert_close(ft.apply_shifts_2d(sino, torch.zeros(3, 2, device=backend)),
+                               sino, rtol=0, atol=1e-6)
+    w = torch.rand(3, 6, 10, generator=g).to(backend)
+    sh = torch.tensor([[0.3, -0.4], [1.2, 0.6], [-0.7, 0.2]], device=backend, requires_grad=True)
+    (ft.apply_shifts_2d(sino, sh) * w).sum().backward()
+    h = 1e-2
+    fd = torch.zeros(3, 2)
+    for i in range(3):
+        for j in range(2):
+            p = sh.detach().clone(); p[i, j] += h
+            m = sh.detach().clone(); m[i, j] -= h
+            fd[i, j] = ((ft.apply_shifts_2d(sino, p) - ft.apply_shifts_2d(sino, m)) * w).double().sum() / (2 * h)
+    assert _rel(sh.grad, fd) < 1e-3
+
+
+def test_apply_shifts_2d_rejects_bad_shapes():
+    sino = torch.zeros(3, 4, 5)
+    with pytest.raises(ValueError, match=r"\[n_angles, 2\]"):
+        ft.apply_shifts_2d(sino, torch.zeros(3))
+    with pytest.raises(ValueError, match="3 angles"):
+        ft.apply_shifts_2d(sino, torch.zeros(2, 2))
+
+
+# ── tv_loss_xz and logsum_sparsity vs NumPy fp64 references ────────────────
+
+def _tv_xz_ref(v: np.ndarray, eps: float) -> float:
+    dz = v[:, 1:, :-1] - v[:, :-1, :-1]
+    dx = v[:, :-1, 1:] - v[:, :-1, :-1]
+    return float(np.sqrt(dz ** 2 + dx ** 2 + eps).mean())
+
+
+def _fd_grad(f, v: np.ndarray, h: float = 1e-6) -> np.ndarray:
+    g = np.zeros_like(v)
+    it = np.nditer(v, flags=["multi_index"])
+    for _ in it:
+        i = it.multi_index
+        vp = v.copy(); vp[i] += h
+        vm = v.copy(); vm[i] -= h
+        g[i] = (f(vp) - f(vm)) / (2 * h)
+    return g
+
+
+@pytest.mark.parametrize("shape", [(1, 5, 7), (3, 4, 6), (2, 2, 2)])
+def test_tv_loss_xz_value_and_grad(backend, shape):
+    """Value and gradient against an fp64 NumPy reference (gradient by
+    central finite differences). The Y axis is never differenced: a volume
+    that varies only along Y has zero TV-xz and zero gradient."""
+    eps = 1e-3
+    rng = np.random.default_rng(8)
+    v = rng.standard_normal(shape)
+    t = torch.tensor(v, dtype=torch.float32, device=backend, requires_grad=True)
+    loss = ft.tv_loss_xz(t, eps=eps)
+    assert loss.shape == () and loss.dtype == torch.float32
+    assert loss.item() == pytest.approx(_tv_xz_ref(v, eps), rel=1e-5)
+    loss.backward()
+    ref = _fd_grad(lambda a: _tv_xz_ref(a, eps), v)
+    torch.testing.assert_close(t.grad.cpu().double(), torch.from_numpy(ref), rtol=1e-3, atol=1e-5)
+
+    y_only = torch.arange(shape[0], dtype=torch.float32, device=backend)[:, None, None]
+    y_only = y_only.expand(shape).clone().requires_grad_(True)
+    val = ft.tv_loss_xz(y_only, eps=0.0)
+    val.backward()
+    assert val.item() == 0.0
+
+
+def test_tv_loss_xz_rejects_bad_input():
+    with pytest.raises(TypeError):
+        ft.tv_loss_xz(torch.zeros(2, 3, 3, dtype=torch.float64))
+    with pytest.raises(ValueError):
+        ft.tv_loss_xz(torch.zeros(3, 3))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_logsum_sparsity_value_and_grad(backend, dtype):
+    """mean(log(1 + |v| / eps)) and its gradient sign(v) / (eps + |v|) / N,
+    checked against NumPy fp64; the gradient at v == 0 is 0."""
+    eps = 0.05
+    v = np.array([[-2.0, -0.3, 0.0], [1e-4, 0.7, 5.0]])
+    t = torch.tensor(v, dtype=dtype, device=backend, requires_grad=True)
+    loss = ft.logsum_sparsity(t, eps=eps)
+    assert loss.shape == () and loss.dtype == dtype
+    ref = np.log1p(np.abs(v) / eps).mean()
+    tol = 1e-6 if dtype == torch.float32 else 1e-12
+    assert loss.item() == pytest.approx(ref, rel=tol)
+    loss.backward()
+    gref = np.sign(v) / (eps + np.abs(v)) / v.size
+    torch.testing.assert_close(t.grad.cpu().double(), torch.from_numpy(gref), rtol=tol * 10, atol=tol)
+    assert t.grad[0, 2].item() == 0.0
+
+    # random volume: gradient also matches finite differences of the reference
+    rng = np.random.default_rng(9)
+    v = rng.standard_normal((2, 3, 4))
+    t = torch.tensor(v, dtype=torch.float64, device=backend, requires_grad=True)
+    ft.logsum_sparsity(t, eps=eps).backward()
+    fd = _fd_grad(lambda a: float(np.log1p(np.abs(a) / eps).mean()), v)
+    torch.testing.assert_close(t.grad.cpu(), torch.from_numpy(fd), rtol=1e-5, atol=1e-8)

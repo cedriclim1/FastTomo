@@ -36,9 +36,13 @@ import torch.nn.functional as F
 # ── XZ-plane 2-D isotropic TV (no Y-coupling) ────────────────────────────
 
 def tv_loss_xz(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Isotropic 2-D total-variation in the XZ plane, summed over Y-slices.
+    """Isotropic 2-D total-variation in the XZ plane of every Y-slice.
 
         loss = mean( sqrt( dz² + dx² + eps ) )
+
+    The mean runs over all ``Ny * (Nz-1) * (Nx-1)`` forward-difference sites
+    (forward differences at ``[:, :-1, :-1]``), so the value is an average,
+    not a sum over slices.
 
     Only penalises X and Z gradients — Y-gradients are **never** touched.
     This is the physically appropriate TV for single-axis tilt tomography:
