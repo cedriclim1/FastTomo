@@ -48,9 +48,11 @@ def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     shape (Ny-1) × (Nz-1) × (Nx-1).
 
     Differentiable w.r.t. ``volume`` — drop into any autograd loop in
-    place of the pure-PyTorch expression. On CUDA, dispatches to a single
-    fused kernel (one read-pass over the volume, one atomic-reduction to
-    a scalar) and a voxel-driven gather kernel for the backward. On CPU,
+    place of the pure-PyTorch expression. On CUDA, dispatches to a fused
+    kernel (one read-pass over the volume and a deterministic fixed-order
+    two-pass reduction with fp64 partials, no atomics, so the value is
+    bit-reproducible run to run) and a voxel-driven gather kernel for the
+    backward. On CPU,
     falls back to the equivalent pure-PyTorch expression so the same
     public function works on either device.
 
