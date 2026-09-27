@@ -253,7 +253,7 @@ def test_num_threads_honoured_on_cpu(name, monkeypatch):
         return real(n)
 
     monkeypatch.setattr(ag, "_resolve_num_threads", spy)
-    monkeypatch.setattr(algo, "_resolve_num_threads", spy)
+    monkeypatch.setattr(algo.mbir, "_resolve_num_threads", spy)
     monkeypatch.setattr(ft.projection, "_resolve_num_threads", spy)
     sino, ang = _data("cpu")
     seen.clear()

@@ -74,8 +74,8 @@ def test_ad_recon_sparsity_does_not_drift_without_positivity(monkeypatch):
         n_angles, Ny, N_det = sinogram.shape
         return n_angles, Ny, N_det, (N_det if Nz < 0 else Nz), sinogram.device
 
-    monkeypatch.setattr(algo, "ParallelProjector", DummyParallelProjector)
-    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    monkeypatch.setattr(algo.ad, "ParallelProjector", DummyParallelProjector)
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
 
     n_angles, Ny, N = 5, 1, 8
     sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
@@ -110,8 +110,8 @@ def test_ad_recon_rejects_projector_with_wrong_output_shape(monkeypatch):
         n_angles, Ny, N_det = sinogram.shape
         return n_angles, Ny, N_det, (N_det if Nz < 0 else Nz), sinogram.device
 
-    monkeypatch.setattr(algo, "ParallelProjector", WrongGeometryProjector)
-    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    monkeypatch.setattr(algo.ad, "ParallelProjector", WrongGeometryProjector)
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
 
     sino = torch.zeros(5, 1, 8)
     angles = torch.linspace(-20.0, 20.0, 5)

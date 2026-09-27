@@ -160,8 +160,8 @@ def _run_cpu(monkeypatch, cfg, **kwargs):
         n, ny, nd = sinogram.shape
         return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
 
-    monkeypatch.setattr(algo, "ParallelProjector", _ZMeanProjector)
-    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    monkeypatch.setattr(algo.ad, "ParallelProjector", _ZMeanProjector)
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
     sino = torch.rand(5, 2, 6, generator=torch.Generator().manual_seed(0))
     return ft.run_ad_recon(sino, torch.linspace(-30, 30, 5), Nz=6,
                            projector=_ZMeanProjector(), config=cfg, **kwargs)
@@ -280,13 +280,13 @@ def _staged_run(monkeypatch, n_iter, warmup, period):
     sino = ft.forward_project_3d(vol, euler_true, shifts=shifts_true)
 
     shift_log = []
-    real_shift = algo.apply_shifts_2d
+    real_shift = algo.ad.apply_shifts_2d
 
     def recording_shift(pred, shifts):
         shift_log.append(shifts.detach().clone())
         return real_shift(pred, shifts)
 
-    monkeypatch.setattr(algo, "apply_shifts_2d", recording_shift)
+    monkeypatch.setattr(algo.ad, "apply_shifts_2d", recording_shift)
     proj = _RecordingRotmatProjector((Ny, N, N), n_angles=n, device=dev)
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=n_iter, lr_volume=0.05),
@@ -363,8 +363,8 @@ def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:
         n, ny, nd = sinogram.shape
         return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
 
-    monkeypatch.setattr(algo, "ParallelProjector", _Recording)
-    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    monkeypatch.setattr(algo.ad, "ParallelProjector", _Recording)
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
     cfg = ft.AdReconConfig(
         optim=ft.OptimConfig(n_iter=6, lr_volume=0.2, cosine_schedule=False),
         constraints=ft.ConstraintConfig(soft_threshold=0.01),

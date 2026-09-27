@@ -200,8 +200,8 @@ def _cpu_ad_recon(monkeypatch, *, n_angles=4, Ny=2, N=6, projector=None):
         n, ny, nd = sinogram.shape
         return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
 
-    monkeypatch.setattr(algo, "ParallelProjector", type(proj))
-    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+    monkeypatch.setattr(algo.ad, "ParallelProjector", type(proj))
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
     return proj
 
 
@@ -798,7 +798,7 @@ def test_mbir_cpu_uses_the_python_offset_variance_update(monkeypatch):
         calls.append(args[-2:])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(algo, "_mbir_update_offset_variance", counting)
+    monkeypatch.setattr(algo.mbir, "_mbir_update_offset_variance", counting)
     sino = torch.rand(6, 2, 8, generator=torch.Generator().manual_seed(14))
     ft.run_mbir(sino, torch.linspace(-40, 40, 6), n_iter=3, multires_levels=1,
                 convergence_tol=0.0, estimate_offset=True, estimate_variance=True)
