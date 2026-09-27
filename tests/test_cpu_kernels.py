@@ -134,8 +134,11 @@ _KERNEL_NAN_SCRIPT = textwrap.dedent("""
 
 
 @pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
-def test_cpu_kernels_survive_non_finite_trig_tables(bad):
-    r = subprocess.run([sys.executable, "-c", _KERNEL_NAN_SCRIPT, bad],
+def test_cpu_kernels_survive_non_finite_trig_tables(bad, tmp_path):
+    # cwd=tmp_path: `python -c` puts the cwd first on sys.path, and from the
+    # repository root the source tree would shadow a non-editable install
+    # (CI) with a package that has no built `_core`.
+    r = subprocess.run([sys.executable, "-c", _KERNEL_NAN_SCRIPT, bad], cwd=tmp_path,
                        capture_output=True, text=True, timeout=300)
     assert r.returncode == 0 and r.stdout.strip() == "ok", (r.returncode, r.stdout, r.stderr)
 
