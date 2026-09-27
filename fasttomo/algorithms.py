@@ -22,7 +22,7 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm.auto import tqdm  # noqa: F401 — kept for downstream scripts that import from here
+from tqdm.auto import tqdm
 
 import fasttomo._core as _core
 from fasttomo.autograd import (
@@ -484,6 +484,101 @@ def _emit_loss(
         )
 
 
+def _loss_float(value: object) -> float:
+    """A loss value as a plain CPU float (``.item()`` on a tensor)."""
+    return value.item() if isinstance(value, torch.Tensor) else float(value)
+
+
+class _LossRecorder:
+    """Per-iteration loss bookkeeping shared by every iterative algorithm
+    (ARCH P6). The 2026-06 ``loss_callback`` contract lives here only.
+
+    ``wants_loss`` is True when the loss is needed at all (``return_loss``
+    or a callback); algorithms compute the loss, and pay the ``.item()``
+    host sync, only then. ``record(it, loss, components)`` stores the value
+    for ``loss_history`` and invokes the callback as ``loss_callback(it,
+    loss)``, adding ``components=`` for callbacks that declare it (signature
+    probed once). Values are converted to plain floats; NaN/Inf pass
+    through; a raising callback is logged and still called on the next
+    iteration. ``components`` defaults to ``{"fidelity": loss}``, for
+    algorithms whose recorded loss is the data term alone.
+
+    ``progress=True`` shows a tqdm bar of ``n_iter`` steps, advanced by
+    `iterate` (or `tick`). ``finish(volume)`` closes it and returns
+    ``volume`` or ``(volume, loss_history)`` with ``loss_history`` a float32
+    CPU tensor.
+    """
+
+    def __init__(
+        self,
+        return_loss: bool,
+        loss_callback: Callable | None,
+        progress: bool,
+        n_iter: int,
+        *,
+        desc: str | None = None,
+    ) -> None:
+        if loss_callback is not None and not callable(loss_callback):
+            raise TypeError(
+                f"loss_callback must be callable, got {type(loss_callback).__name__}"
+            )
+        self.return_loss = bool(return_loss)
+        self.loss_callback = loss_callback
+        self.send_components = (
+            loss_callback is not None and _callback_accepts_components(loss_callback)
+        )
+        self.wants_loss = self.return_loss or loss_callback is not None
+        self.losses: list[float] = []
+        self._bar = tqdm(total=n_iter, desc=desc) if progress else None
+
+    def iterate(self, n: int):
+        """``range(n)``, advancing the progress bar after each step."""
+        for it in range(n):
+            yield it
+            self.tick()
+
+    def tick(self) -> None:
+        """Advance the progress bar by one iteration (no-op without one)."""
+        if self._bar is not None:
+            self._bar.update(1)
+
+    def record(
+        self,
+        it: int,
+        loss: float | torch.Tensor,
+        components: dict[str, float | torch.Tensor] | None = None,
+    ) -> None:
+        """Record iteration ``it``'s total loss (and its components)."""
+        if not self.wants_loss:
+            return
+        loss_val = _loss_float(loss)
+        if self.return_loss:
+            self.losses.append(loss_val)
+        if self.loss_callback is not None:
+            comps = None
+            if self.send_components:
+                comps = (
+                    {"fidelity": loss_val} if components is None
+                    else {k: _loss_float(v) for k, v in components.items()}
+                )
+            _emit_loss(self.loss_callback, self.send_components, it, loss_val, comps)
+
+    def history(self) -> torch.Tensor:
+        """The recorded losses as a float32 CPU tensor."""
+        return torch.tensor(self.losses, dtype=torch.float32)
+
+    def close(self) -> None:
+        """Close the progress bar (idempotent)."""
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+
+    def finish(self, volume: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Close the bar; return ``volume`` or ``(volume, loss_history)``."""
+        self.close()
+        return _finish_iters(volume, self.losses, self.return_loss)
+
+
 def _ad_sparsity_term(volume: torch.Tensor, weight: float) -> torch.Tensor:
     """L1 sparsity penalty for ``run_ad_recon``: ``weight * mean(|volume|)``.
 
@@ -685,6 +780,7 @@ def run_sirt(
     volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
     support_mask: torch.Tensor | None = None,   # precomputed support, enforced each iteration
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
@@ -767,11 +863,7 @@ def run_sirt(
     _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
     R_sino    = torch.where(R_sino > 0, 1.0 / R_sino, torch.zeros_like(R_sino))
 
-    losses: list[float] = []
-    track_loss = return_loss or loss_callback is not None
-    send_components = (
-        loss_callback is not None and _callback_accepts_components(loss_callback)
-    )
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
 
     # --- CUDA Graph capture path ----------------------------------------
     # Gate: CUDA input, no per-iteration loss tracking (which calls .item()).
@@ -779,7 +871,7 @@ def run_sirt(
     # matrix tensor can vary, while cached graphs assume fixed captured inputs.
     # If capture fails, fall back to the eager loop below.
     _active_proj = projector if projector is not None else _internal_proj
-    if sinogram.is_cuda and not track_loss and n_iter > 1 and euler_zyz_deg is None:
+    if sinogram.is_cuda and not rec.wants_loss and n_iter > 1 and euler_zyz_deg is None:
         graph_result = _run_sirt_cuda_graph(
             volume=volume,
             sinogram=sinogram,
@@ -799,27 +891,23 @@ def run_sirt(
                  tuple(constraints.mask.shape)
                  if isinstance(constraints.mask, torch.Tensor) else None,
                  euler_zyz_deg is not None),
+            on_replay=rec.tick,
         )
         if graph_result is not None:
-            return graph_result
+            return rec.finish(graph_result)
 
     # --- eager iteration loop (fallback / CPU / loss-tracking path) ------
-    for it in range(n_iter):
+    # The loss is the data MSE before the update (SIRT's loss is pure
+    # fidelity; sparsity acts as a proximal constraint, not a loss term).
+    for it in rec.iterate(n_iter):
         raw_res  = sinogram - _fp(volume)
-        if track_loss:
-            loss_val = raw_res.pow(2).mean().item()
-            if return_loss:
-                losses.append(loss_val)
-            if loss_callback is not None:
-                _emit_loss(
-                    loss_callback, send_components, it, loss_val,
-                    {"fidelity": loss_val} if send_components else None,
-                )
+        if rec.wants_loss:
+            rec.record(it, raw_res.pow(2).mean())
         residual = raw_res * R_sino
         volume   = volume + omega * C_vol * _bp(residual)
         volume   = constraints.apply(volume)
 
-    return _finish_iters(volume, losses, return_loss)
+    return rec.finish(volume)
 
 
 # ── FISTA helpers (Beck & Teboulle 2009) ──────────────────────────────────
@@ -981,8 +1069,7 @@ def _fista_loop(
     n_iter: int,
     L: float,
     prox_fn,
-    return_loss: bool,
-    loss_callback: Callable | None = None,
+    rec: _LossRecorder,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Shared Beck-Teboulle FISTA outer loop.
 
@@ -990,32 +1077,19 @@ def _fista_loop(
     and must return the next iterate ``x_{k+1}``. For pure FISTA it's just the
     constraint projection; for FISTA-TV it's the TV+constraint prox.
 
-    ``return_loss`` records ``||b − A·y_k||²`` (data-fit MSE at the momentum
+    The recorded loss is ``||b − A·y_k||²`` (data-fit MSE at the momentum
     point, which is free) at each iteration — a tight surrogate for the loss
-    at ``x_k``. ``loss_callback`` streams the same value per iteration
-    (components: ``{"fidelity": loss}`` — the recorded loss is the data-fit
-    term only, regardless of prox regularisation).
+    at ``x_k`` — and it is the data-fit term only (components
+    ``{"fidelity": loss}``), regardless of prox regularisation.
     """
     inv_L = 1.0 / L
     t = 1.0
     x_prev = volume.clone()
     y = volume.clone()
-    losses: list[float] = []
-    track_loss = return_loss or loss_callback is not None
-    send_components = (
-        loss_callback is not None and _callback_accepts_components(loss_callback)
-    )
-    for it in range(n_iter):
+    for it in rec.iterate(n_iter):
         fp_y = _fp(y)
-        if track_loss:
-            loss_val = (sinogram - fp_y).pow(2).mean().item()
-            if return_loss:
-                losses.append(loss_val)
-            if loss_callback is not None:
-                _emit_loss(
-                    loss_callback, send_components, it, loss_val,
-                    {"fidelity": loss_val} if send_components else None,
-                )
+        if rec.wants_loss:
+            rec.record(it, (sinogram - fp_y).pow(2).mean())
         grad = _bp(fp_y - sinogram)
         x_new = prox_fn(y - inv_L * grad)
         t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
@@ -1023,7 +1097,7 @@ def _fista_loop(
         y = x_new + beta * (x_new - x_prev)
         x_prev = x_new
         t = t_new
-    return _finish_iters(x_prev, losses, return_loss)
+    return rec.finish(x_prev)
 
 
 def _build_fp_bp(
@@ -1090,6 +1164,7 @@ def run_fista(
     projector: object | None = None,
     volume: torch.Tensor | None = None,
     loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA (Beck & Teboulle 2009) on the smooth least-squares problem
@@ -1150,9 +1225,9 @@ def run_fista(
         else _estimate_lipschitz(_fp, _bp, (Ny, Nz, Nx), device, compute_dtype, n_power_iter)
     )
 
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista")
     return _fista_loop(
-        volume, sinogram, _fp, _bp, n_iter, L_eff, setup.constraints.apply,
-        return_loss, loss_callback,
+        volume, sinogram, _fp, _bp, n_iter, L_eff, setup.constraints.apply, rec,
     )
 
 
@@ -1174,6 +1249,7 @@ def run_fista_tv(
     projector: object | None = None,
     volume: torch.Tensor | None = None,
     loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA-TV (Beck & Teboulle 2009 + 2009b) on the composite problem
@@ -1229,10 +1305,8 @@ def run_fista_tv(
     lam = tv_weight / L_eff
     prox = lambda u: _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
-    return _fista_loop(
-        volume, sinogram, _fp, _bp, n_iter, L_eff, prox,
-        return_loss, loss_callback,
-    )
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
+    return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec)
 
 
 def run_sart(
@@ -1249,6 +1323,8 @@ def run_sart(
     sparsity: float = 0.0,
     num_threads: int | None = None,             # CPU 3D path only
     volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
+    loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
@@ -1344,10 +1420,10 @@ def run_sart(
         C_s = torch.where(C_s > 0, 1.0 / C_s, torch.zeros_like(C_s))
         C_list.append(C_s)
 
-    losses: list[float] = []
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")
 
     # --- outer iteration loop ---
-    for _ in range(n_iter):
+    for it in rec.iterate(n_iter):
         # --- inner subset loop ---
         for idx, R_s, C_s in zip(subsets, R_list, C_list):
             sino_s = sinogram[idx]                   # [|S|, Ny, N_det]
@@ -1355,14 +1431,16 @@ def run_sart(
             r_s    = sino_s - pred_s                 # [|S|, Ny, N_det]
             volume = volume + omega * C_s * _bp_subset(r_s * R_s, idx)
 
-        if return_loss:
+        # Loss over the full sinogram after the subset sweep, before the
+        # constraints (costs one extra full forward projection).
+        if rec.wants_loss:
             with torch.no_grad():
                 raw_res = sinogram - _fp_full(volume)
-                losses.append(raw_res.pow(2).mean().item())
+                rec.record(it, raw_res.pow(2).mean())
 
         volume = constraints.apply(volume)
 
-    return _finish_iters(volume, losses, return_loss)
+    return rec.finish(volume)
 
 
 def run_ad_recon(
@@ -1376,6 +1454,7 @@ def run_ad_recon(
     return_loss: bool = False,
     return_pose: bool = False,
     loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -1616,12 +1695,9 @@ def run_ad_recon(
         _s3im_gen = torch.Generator(device=device).manual_seed(42)
 
     # ── iteration ─────────────────────────────────────────────────────────
-    losses: list[float] = []
-    send_components = (
-        loss_callback is not None and _callback_accepts_components(loss_callback)
-    )
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_ad_recon")
 
-    for it in tqdm(range(n_iter)):
+    for it in rec.iterate(n_iter):
         for opt in optimisers:
             opt.zero_grad()
 
@@ -1674,14 +1750,9 @@ def run_ad_recon(
             if key != "fidelity":
                 loss = loss + term
 
-        loss_val = loss.item()
-        losses.append(loss_val)
-        if loss_callback is not None:
-            _emit_loss(
-                loss_callback, send_components, it, loss_val,
-                {key: term.item() for key, term in terms.items()}
-                if send_components else None,
-            )
+        # .item() (a host sync) only when the loss is returned or streamed
+        if rec.wants_loss:
+            rec.record(it, loss, terms)
         loss.backward()
 
         if ref_idx is not None:
@@ -1748,7 +1819,7 @@ def run_ad_recon(
 
     result: list = [out]
     if return_loss:
-        result.append(torch.tensor(losses, dtype=torch.float32))
+        result.append(rec.history())
     if return_pose:
         refined_euler = tilt_angle_opt.detach().cpu() if tilt_angle_opt is not None else None
         refined_shifts = shifts.detach().cpu() if shifts is not None else None
@@ -1778,6 +1849,7 @@ def _run_sirt_cuda_graph(
     constraints: ConstraintConfig,
     projector,
     key: tuple,
+    on_replay: Callable[[], None] | None = None,
 ) -> torch.Tensor | None:
     """
     Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
@@ -1893,6 +1965,8 @@ def _run_sirt_cuda_graph(
     with torch.cuda.device(target_device):
         for _ in range(n_iter):
             g.replay()
+            if on_replay is not None:
+                on_replay()
         torch.cuda.synchronize(target_device)
 
     return vol_static.clone()
@@ -1968,6 +2042,8 @@ def run_genfire(
     resolution_extension: bool = True,
     return_loss: bool = False,
     sparsity: float = 0.0,
+    loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     GENFIRE reconstruction (Pryor et al. 2017).
@@ -2111,9 +2187,9 @@ def run_genfire(
     current_F = measured_K.clone()
     best_F = current_F
     best_err = float("inf")
-    losses: list[float] = []
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_genfire")
 
-    for i_iter in range(n_iter):
+    for i_iter in rec.iterate(n_iter):
         # build enforce mask for this iteration
         if resolution_extension:
             thresh = float(cutoffs[i_iter])
@@ -2136,7 +2212,7 @@ def run_genfire(
 
         # track best-error iterate (L1 on all known voxels, not just enforce_us)
         err = (F_cur[:, known_us] - measured_K[:, known_us]).abs().mean().item()
-        losses.append(err)
+        rec.record(i_iter, err)
         if err < best_err:
             best_err = err
             best_F = F_cur.clone()
@@ -2153,7 +2229,7 @@ def run_genfire(
 
     # crop to [Ny, Nz, Nx]
     vol = vol[:, z0:z1, x0:x1]
-    return _finish_iters(vol, losses, return_loss)
+    return rec.finish(vol)
 
 
 def run_wsirt(
@@ -2167,6 +2243,8 @@ def run_wsirt(
     mask: bool = False,
     return_loss: bool = False,
     sparsity: float = 0.0,
+    loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Weighted SIRT (Wolf et al. 2014).
@@ -2213,17 +2291,17 @@ def run_wsirt(
             out[iy] = torch.fft.irfft2(ph * (F.abs() * WF_amp), s=(Nz, Nx))
         return out
 
-    losses: list[float] = []
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_wsirt")
 
-    for _ in range(n_iter):
+    for it in rec.iterate(n_iter):
         proj     = forward_project(volume, angles_deg, N_det=N_det)
         residual = sinogram - proj
-        if return_loss:
-            losses.append(residual.pow(2).mean().item())
+        if rec.wants_loss:
+            rec.record(it, residual.pow(2).mean())
         volume   = volume + omega * _wbp(residual)
         volume   = constraints.apply(volume)
 
-    return _finish_iters(volume, losses, return_loss)
+    return rec.finish(volume)
 
 
 def refine_angles(
@@ -2336,6 +2414,8 @@ def run_resire(
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — overrides angles_deg
     return_loss: bool = False,
     sparsity: float = 0.0,
+    loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     REal Space Iterative REconstruction (RESIRE, Miao group).  CUDA only.
@@ -2394,16 +2474,16 @@ def run_resire(
     _fp = lambda v: forward_project_resire(v, euler_zyz_deg, N_det=N_det)
     _bp = lambda s: back_project_resire(s, euler_zyz_deg, Nz=Nz)
 
-    losses: list[float] = []
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_resire")
 
-    for _ in range(n_iter):
+    for it in rec.iterate(n_iter):
         residual = sinogram - _fp(volume)
-        if return_loss:
-            losses.append(residual.pow(2).mean().item())
+        if rec.wants_loss:
+            rec.record(it, residual.pow(2).mean())
         volume   = volume + alpha * _bp(residual)
         volume   = constraints.apply(volume)
 
-    return _finish_iters(volume, losses, return_loss)
+    return rec.finish(volume)
 
 
 # ── autograd-based reference reconstruction ──────────────────────────────
@@ -2423,6 +2503,8 @@ def run_grad_descent(
     return_loss: bool = False,
     num_threads: int | None = None,             # CPU 3D path only
     tv_eps: float = 1e-8,
+    loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Reference autograd-based reconstruction.
@@ -2499,31 +2581,42 @@ def run_grad_descent(
     else:
         _fp = lambda v: forward_project(v, angles_deg, N_det=N_det)
 
-    losses: list[float] = []
-
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
+    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_grad_descent")
+
+    # Loss terms of the first closure evaluation of each step: the loss
+    # LBFGS.step returns is that evaluation's (it may evaluate several times).
+    terms: dict[str, torch.Tensor] = {}
 
     def closure():
         opt.zero_grad()
         sino_pred = _fp(volume)
-        loss = ((sino_pred - sinogram) ** 2).mean()
+        fidelity = ((sino_pred - sinogram) ** 2).mean()
+        loss = fidelity
+        tv = None
         if tv_weight > 0.0:
-            loss = loss + tv_weight * tv_loss_3d(volume, eps=tv_eps)
+            tv = tv_weight * tv_loss_3d(volume, eps=tv_eps)
+            loss = loss + tv
+        if not terms:
+            terms["fidelity"] = fidelity.detach()
+            if tv is not None:
+                terms["tv"] = tv.detach()
         loss.backward()
         return loss
 
-    for _ in range(n_iter):
+    for it in rec.iterate(n_iter):
+        terms.clear()
         if is_lbfgs:
             loss_val = opt.step(closure)
         else:
             loss_val = closure()
             opt.step()
-        losses.append(float(loss_val.detach()))
+        if rec.wants_loss:
+            rec.record(it, loss_val.detach(), terms)
         with torch.no_grad():
             constraints.apply_inplace_(volume)
 
-    out = volume.detach()
-    return _finish_iters(out, losses, return_loss)
+    return rec.finish(volume.detach())
 
 
 # ── MBIR ───────────────────────────────────────────────────────────────────
@@ -2545,6 +2638,7 @@ class _MbirState:
     d_offsets: torch.Tensor       # [n_angles] float32
     sigma: float
     e_sino: torch.Tensor          # [n_angles, Ny, N_det] float32 — residual
+    n_done: int = 0               # outer iterations run at this scale
 
 
 def _huber_surr_weight(r_abs: torch.Tensor, T: float, delta: float) -> torch.Tensor:
@@ -2731,13 +2825,19 @@ def _run_mbir_single_scale(
     init_state: _MbirState | None,
     lambdas: torch.Tensor | None,
     return_history: bool,
+    rec: _LossRecorder,
+    it_offset: int = 0,
 ) -> tuple[_MbirState, list[float]]:
     """Inner loop for one resolution scale. The public `run_mbir` wraps
     this in a coarse-to-fine multiresolution loop.
 
     Convergence is measured by the relative L2 change in the volume
     between successive outer iterations. The check uses every-N-th voxel
-    sampling to keep the comparison cheap relative to the kernel."""
+    sampling to keep the comparison cheap relative to the kernel.
+
+    ``rec`` records, after every outer iteration, the data MSE
+    ``mean(e²)`` of the residual ``e = g - A·f - d`` at this scale, under
+    the global iteration index ``it_offset + it``."""
     device = sinogram.device
     n_angles, Ny, N_det = sinogram.shape
 
@@ -2762,8 +2862,10 @@ def _run_mbir_single_scale(
     Nvox = Nz * Nx
     history: list[float] = []
     sigma_cur = float(sigma)
+    n_done = 0
 
     for it in range(outer_iters):
+        n_done = it + 1
         vol_snap = volume.clone().contiguous()
         perm = _generate_permutation(Ny, Nvox, rng)
 
@@ -2802,6 +2904,9 @@ def _run_mbir_single_scale(
             huber_T, huber_delta, lambdas,
             estimate_offset, estimate_variance,
         )
+        if rec.wants_loss:
+            rec.record(it_offset + it, e_sino.pow(2).mean())
+        rec.tick()
 
         # Convergence check: relative L2 change on a strided sample so it
         # scales as O(Nvox / 8). Cheap vs the per-iter compute.
@@ -2816,7 +2921,8 @@ def _run_mbir_single_scale(
         if rel_change < convergence_tol:
             break
 
-    state = _MbirState(volume=volume, d_offsets=d_offsets, sigma=sigma_cur, e_sino=e_sino)
+    state = _MbirState(volume=volume, d_offsets=d_offsets, sigma=sigma_cur,
+                       e_sino=e_sino, n_done=n_done)
     return state, history
 
 
@@ -2869,6 +2975,8 @@ def run_mbir(
     lambdas: torch.Tensor | None = None,
     sigma_f_per_scale: list[float] | None = None,
     return_history: bool = False,
+    loss_callback: Callable | None = None,
+    progress: bool = False,
 ) -> torch.Tensor | tuple:
     """Classical MBIR (Model-Based Iterative Reconstruction) for single-axis
     parallel-beam tomography.
@@ -2984,6 +3092,9 @@ def run_mbir(
 
     history_all: list[list[float]] = []
     state: _MbirState | None = None
+    rec = _LossRecorder(False, loss_callback, progress,
+                        outer_iters * multires_levels, desc="run_mbir")
+    it_offset = 0
 
     for lvl, f in enumerate(factors):
         sino_lvl = _downsample_sino_det(sinogram, f)
@@ -3028,8 +3139,10 @@ def run_mbir(
             init_state=state,
             lambdas=lam_lvl,
             return_history=return_history,
+            rec=rec, it_offset=it_offset,
         )
         history_all.append(hist)
+        it_offset += state.n_done
 
         # Carry the current solution to the next scale with an exact resize.
         # Using a fixed ×2 upsample breaks odd detector sizes (e.g. 65 → 32 → 64),
@@ -3040,6 +3153,7 @@ def run_mbir(
             next_nx = max(Nx // next_f, 1)
             state.volume = _resize_volume_zx(state.volume, next_nz, next_nx)
 
+    rec.close()
     if return_history:
         return state.volume, state.d_offsets, state.sigma, history_all
     return state.volume
