@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _golden import exact_env, tensors
 from conftest import (
     make_angles,
     needs_cuda,
@@ -248,18 +249,14 @@ RESIRE_NOISY = ("fp", "fp_ndet", "bp_grad_sq", "run", "run_loss", "run_euler")
 
 # The golden file was made on an RTX PRO 6000 Blackwell (sm_120) with torch
 # 2.12.1+cu130 and nvcc 13.0 (torch.equal re-verified with torch
-# 2.14.0+cu130). Another GPU architecture, compiler or torch version may
+# 2.14.0+cu130). Another GPU architecture, compiler or math library may
 # round the rotation matrices or contract FMAs differently, so the
-# torch.equal comparison of the RESIRE_EXACT keys only holds in those
-# environments; elsewhere they are compared at the RESIRE_NOISY tolerance.
-# To regenerate: check out origin/main's fasttomo/ at 98fa473 and save
-# `_resire_cases()` with torch.save.
-RESIRE_GOLDEN_ENV = {"capability": (12, 0), "torch": ("2.12.", "2.14.")}
-
-
-def _resire_golden_env_matches() -> bool:
-    return (torch.cuda.get_device_capability() == RESIRE_GOLDEN_ENV["capability"]
-            and torch.__version__.startswith(RESIRE_GOLDEN_ENV["torch"]))
+# torch.equal comparison of the RESIRE_EXACT keys only holds where the CUDA
+# arithmetic fingerprint (tests/_golden.py) is one the golden stores;
+# elsewhere they are compared at the RESIRE_NOISY tolerance and a
+# GoldenNotExactWarning reports it. To regenerate: check out origin/main's
+# fasttomo/ at 98fa473, save `_resire_cases()` with torch.save, then
+# `python tests/_golden.py stamp tests/data/resire_golden_main.pt`.
 
 
 def _resire_cases() -> dict[str, torch.Tensor]:
@@ -295,13 +292,14 @@ def _resire_cases() -> dict[str, torch.Tensor]:
 
 
 @needs_cuda
-def test_resire_outputs_identical_to_main():
-    golden = torch.load(RESIRE_GOLDEN)
+def test_resire_outputs_identical_to_main(record_property):
+    raw = torch.load(RESIRE_GOLDEN)
+    golden = tensors(raw)
     now = _resire_cases()
     assert set(golden) == set(RESIRE_EXACT) | set(RESIRE_NOISY) == set(now)
-    exact_env = _resire_golden_env_matches()
+    exact = exact_env(raw, "cuda", record_property, what=RESIRE_GOLDEN.name)
     for k in RESIRE_EXACT:
-        if exact_env:
+        if exact:
             assert torch.equal(now[k], golden[k]), k
         else:
             torch.testing.assert_close(now[k], golden[k], rtol=1e-5, atol=1e-5, msg=k)

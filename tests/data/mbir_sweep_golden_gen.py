@@ -11,6 +11,10 @@ restructured kernel reproduces the previous one bit for bit. Run with that
 commit's ``_core`` built and importable (needs a CUDA GPU):
 
     python tests/data/mbir_sweep_golden_gen.py tests/data/mbir_sweep_golden.pt
+
+``_golden.stamp`` then records this environment's arithmetic fingerprints
+(tests/_golden.py) under ``_arith_fingerprint``: the exact comparisons are
+only made where the fingerprint matches.
 """
 import sys
 from pathlib import Path
@@ -18,7 +22,9 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _golden import stamp  # noqa: E402
 from test_algorithms_mbir import _sweep_golden_cases  # noqa: E402
 
 if __name__ == "__main__":
     torch.save(_sweep_golden_cases(pre_restructure=True), sys.argv[1])
+    stamp(sys.argv[1])

@@ -17,6 +17,10 @@ The ``cpu/mbir`` and ``cuda/mbir`` keys were later regenerated on the
 branch that moved the MBIR voxel order into the CUDA kernel (see
 test_algorithm_identity.py). The cases live in ``tests/test_algorithm_identity.py::_cases`` (public API
 only), so generator and test cannot drift apart.
+
+``_golden.stamp`` then records this environment's arithmetic fingerprints
+(tests/_golden.py) under ``_arith_fingerprint``: the exact comparisons are
+only made where the fingerprint matches.
 """
 import sys
 from pathlib import Path
@@ -25,8 +29,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fasttomo  # noqa: E402
+from _golden import stamp  # noqa: E402
 from test_algorithm_identity import all_cases  # noqa: E402
 
 if __name__ == "__main__":
     print("fasttomo from", fasttomo.__file__, "torch", torch.__version__, file=sys.stderr)
     torch.save(all_cases(), sys.argv[1])
+    stamp(sys.argv[1])
