@@ -2,7 +2,7 @@
 
 ## Project overview
 
-FastTomo is a C/CUDA + Python CT reconstruction library. The native extension (`_core`) is built with scikit-build-core + CMake + pybind11. `FASTTOMO_USE_CUDA` selects the backend: `AUTO` (default, uses CUDA if an nvcc 13.0 toolchain is found), `ON` (require CUDA) or `OFF` (CPU-only).
+FastTomo is a C/CUDA + Python CT reconstruction library. The native extension (`_core`) is built with scikit-build-core + CMake + pybind11. `FASTTOMO_USE_CUDA` selects the backend: `AUTO` (default), `ON` (require CUDA) or `OFF` (CPU-only). `AUTO` builds CPU-only only when no nvcc is found at all. If it finds any nvcc, it enables CUDA and then aborts at configure time unless that nvcc is exactly 13.0; it does not fall back to CPU (for example, `/usr/local/cuda-13.2/bin` on `PATH` is a fatal error). Pass `FASTTOMO_USE_CUDA=OFF` to force a CPU build.
 
 ## Building
 
@@ -28,9 +28,10 @@ CUDACXX=$C/bin/nvcc uv pip install --python .venv/bin/python -e . \
   -Ccmake.define.CUDAToolkit_ROOT=$C
 ```
 
-- `CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++` is required when the conda env ships its own GCC 14: nvcc 13.0 cannot parse GCC 14's libstdc++ headers, and the conda nvcc puts the env's `bin/` first on `PATH`.
-- The default architecture list is `80;86;89;90;120`. To build for one GPU only (faster), add `-Ccmake.define.CMAKE_CUDA_ARCHITECTURES=120` (or set the `CUDAARCHS` environment variable).
+- `CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++` is needed when the conda env ships its own GCC (conda-forge GCC 14.3 here) and is not activated. CUDA 13.0 supports GCC 6-15 (CMakeLists requires >= 10), so GCC 14 itself is fine. The failure comes from mixing two GCCs: the conda nvcc's `nvcc.profile` puts the env's `bin/` first on `PATH`, so the host headers are conda's GCC 14.3 libstdc++, while the front end is told the version of the system `gcc` found on the caller's `PATH` (`--gnu_version=130300`). The result is `identifier "__is_array" is undefined` / `__type_pack_element is not a template` in CMake's compiler-id step. Pinning the host compiler to the system g++ keeps the headers and version consistent.
+- The default architecture list is `75;80;86;89;90;120`. To build for one GPU only (faster), add `-Ccmake.define.CMAKE_CUDA_ARCHITECTURES=120` or set the `CUDAARCHS` environment variable (an empty `CUDAARCHS` counts as unset). The value is cached in the build directory: wipe the build dir when changing architectures.
 - C sources are compiled with `-O3` and no `-march=native`, so binaries are portable. For a local build tuned to this CPU, add `-Ccmake.define.FASTTOMO_MARCH_NATIVE=ON`.
+- CPU benchmarks must record whether the build used `FASTTOMO_MARCH_NATIVE=ON`. The flag changes CPU kernel speed (AVX2/FMA auto-vectorization). Builds before PR #76 always compiled C sources with `-march=native`, so older CPU results in `benchmarks/results/` are not comparable with a default build.
 - After modifying C/C++/CUDA source in `csrc/`, re-run the install command to recompile.
 
 ## Testing
@@ -41,7 +42,7 @@ CUDACXX=$C/bin/nvcc uv pip install --python .venv/bin/python -e . \
 
 ## CI
 
-- `.github/workflows/test-cpu.yml`: on every pull request and push to `main`, builds CPU-only on Python 3.12 and runs `pytest tests`. `ruff check fasttomo tests` runs as a non-blocking step.
+- `.github/workflows/test-cpu.yml`: on every pull request and push to `main`, builds CPU-only on Python 3.10 and 3.12 and runs `pytest tests`. Superseded pull-request runs are cancelled; runs on `main` are not. `ruff check fasttomo tests` runs as a non-blocking step.
 - `.github/workflows/wheels.yml`: on `v*` tags and manual dispatch, builds CPU and CUDA 13.0 manylinux wheels for cp310-cp313.
 
 ## Linting

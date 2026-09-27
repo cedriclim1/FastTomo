@@ -147,13 +147,19 @@ endif()
 # CUDA language: once CUDA is enabled, CMake (policy CMP0104) initialises
 # CMAKE_CUDA_ARCHITECTURES to nvcc's own default (sm_75 for CUDA 13), and a
 # later `if(NOT DEFINED ...)` never fires. sm_70 is not listed because CUDA 13
-# dropped offline compilation for architectures below sm_75.
+# dropped offline compilation for architectures below sm_75. sm_75 (Turing,
+# e.g. T4 / RTX 20xx) stays in the list: its compute_75 PTX is the only code
+# in the binary that can run there.
 # Override with -DCMAKE_CUDA_ARCHITECTURES="..." (pip/uv:
 # --config-settings=cmake.define.CMAKE_CUDA_ARCHITECTURES=...) or the
-# CUDAARCHS environment variable.
+# CUDAARCHS environment variable. An empty CUDAARCHS counts as unset, matching
+# CMake, which ignores an empty CUDAARCHS and would otherwise fall back to
+# nvcc's sm_75-only default.
+# The value is cached: when changing architectures, wipe the build directory
+# (or pass CMAKE_CUDA_ARCHITECTURES explicitly) so a stale value is not reused.
 if(FASTTOMO_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES
-   AND NOT DEFINED ENV{CUDAARCHS})
-    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120" CACHE STRING
+   AND "$ENV{CUDAARCHS}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;120" CACHE STRING
         "CUDA architectures to build for")
 endif()
 
@@ -169,7 +175,11 @@ find_package(OpenMP REQUIRED)
 
 # Host C++ compiler floor: GCC >= 10 (NVIDIA's CUDA 13 install guide
 # supports GCC 6-15, but FastTomo standardises on GCC >= 10 — older
-# toolchains miss C++17 polish and aren't tested).
+# toolchains miss C++17 polish and aren't tested). Known pitfall: a conda
+# nvcc 13.0 prepends its env's bin/ to PATH, so with an un-activated env it
+# mixes the system GCC's version with conda-forge GCC 14.3's libstdc++ headers
+# and fails (`__is_array` / `__type_pack_element` errors). Passing
+# -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ avoids that (see AGENTS.md).
 if(FASTTOMO_CUDA AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
     message(FATAL_ERROR
