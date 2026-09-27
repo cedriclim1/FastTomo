@@ -2477,6 +2477,10 @@ def run_genfire(
         torch.fft.ifftn(best_F, dim=(-2, -1)), dim=(-2, -1),
     ).real                                                      # [Ny, bigN, bigN]
     vol = ConstraintConfig(positivity=positivity).apply(vol)
+    if support_mask is not None:
+        # The best iterate is support-constrained only up to FFT round-off;
+        # a user support is a hard constraint, so it is exact in the output.
+        vol = vol * support
 
     # crop to [Ny, Nz, Nx]
     vol = vol[:, z0:z1, x0:x1]
