@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from fasttomo._operator import Geometry, _make_operator
+from fasttomo.autograd import _back_project_gather_parallel_raw
 from fasttomo.constraints import (
     _maybe_cylindrical_mask,
     _resolve_support_mask,
@@ -50,10 +51,12 @@ from fasttomo.algorithms._common import (
 #   ~40x (CPU W-BP: 83 % error vs 30 % on CUDA). W-BP therefore uses the
 #   voxel-driven gather back-projection on both backends: the CUDA
 #   `back_project` kernel already is one, and `_bp_gather` is the same
-#   operator on CPU with exact fp32 interpolation weights. The CUDA texture
-#   unit interpolates with 8-bit fractional weights, so the two differ by
-#   ~2e-4 (the same texture floor the forward projector has at ~1.3e-4);
-#   the CPU path is the exact reference.
+#   operator on CPU with exact fp32 interpolation weights (the CPU W-BP runs
+#   it as the C/OpenMP kernel `back_project_gather_parallel_cpu`, bit for bit
+#   `_bp_gather`, which stays as the device-generic reference and builds the
+#   PSF). The CUDA texture unit interpolates with 8-bit fractional weights,
+#   so the two differ by ~2e-4 (the same texture floor the forward projector
+#   has at ~1.3e-4); the CPU path is the exact reference.
 
 _WBP_CHUNK_VOXELS = 1 << 24     # padded layergram elements per Y-chunk (64 MiB fp32)
 
@@ -98,10 +101,13 @@ def _bp_gather(
 
 
 def _wbp_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor,
-                     Nz: int, Nx: int, ops: dict | None = None) -> torch.Tensor:
+                     Nz: int, Nx: int, ops: dict | None = None,
+                     num_threads: int | None = None) -> torch.Tensor:
     """The shift-invariant back-projection W-BP needs: the CUDA kernel, or
-    the same gather operator on CPU. ``ops`` (CUDA) caches one projection
-    operator per chunk height, so repeated calls (wSIRT) reuse textures."""
+    the same gather operator on CPU (the C/OpenMP kernel, bit for bit
+    `_bp_gather`; ``num_threads`` as in the Conventions). ``ops`` (CUDA)
+    caches one projection operator per chunk height, so repeated calls
+    (wSIRT) reuse textures."""
     if sinogram.is_cuda:
         n_angles, ny, N_det = sinogram.shape
         ops = {} if ops is None else ops
@@ -111,7 +117,7 @@ def _wbp_backproject(sinogram: torch.Tensor, angles_deg: torch.Tensor,
                 Geometry("parallel", (ny, Nz, Nx), N_det, n_angles, angles_deg),
                 sinogram.device, sinogram.dtype)
         return op.backproject(sinogram)
-    return _bp_gather(sinogram, angles_deg, Nz, Nx)
+    return _back_project_gather_parallel_raw(sinogram, angles_deg, Nz, Nx, num_threads)
 
 
 def _compute_exact_wf(
@@ -158,10 +164,12 @@ def _make_wbp(
     Nz: int, Nx: int, N_det: int,
     device: torch.device,
     threshold_scale: float = 1.0,
+    num_threads: int | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return ``wbp(sinogram) -> [Ny, Nz, Nx]``: the exact weighted
     back-projection shared by `run_weighted_backprojection` and `run_wsirt`
-    (the filter is built once per geometry)."""
+    (the filter is built once per geometry). ``num_threads`` drives the CPU
+    back-projection."""
     WF = _compute_exact_wf(angles_deg, Nz, Nx, N_det, device, threshold_scale)
     oz, ox = _wbp_margin(Nz), _wbp_margin(Nx)
     Pz, Px = Nz + 2 * oz, Nx + 2 * ox       # symmetric margin: the crop is centred for odd N too
@@ -178,7 +186,8 @@ def _make_wbp(
         out = torch.empty(Ny, Nz, Nx, dtype=torch.float32, device=sinogram.device)
         for y0 in range(0, Ny, y_chunk):
             sl = sinogram[:, y0:y0 + y_chunk]
-            spec = torch.fft.rfft2(_wbp_backproject(sl, angles_deg, Pz, Px, ops))   # [ny, Pz, Px//2+1]
+            spec = torch.fft.rfft2(
+                _wbp_backproject(sl, angles_deg, Pz, Px, ops, num_threads))   # [ny, Pz, Px//2+1]
             spec.mul_(WF)
             filtered = torch.fft.irfft2(spec, s=(Pz, Px))
             del spec
@@ -278,6 +287,7 @@ def run_weighted_backprojection(
     threshold_scale: float = 1.0,
     mask: bool = False,
     support_mask: torch.Tensor | None = None,
+    num_threads: int | None = None,
 ) -> torch.Tensor:
     """Exact weighted back-projection (W-BP, Wolf et al. 2014).
 
@@ -296,9 +306,9 @@ def run_weighted_backprojection(
     ----------
     sinogram, angles_deg
         ``[n_angles, Ny, N_det]`` fp32 and ``[n_angles]`` degrees.
-    Nz, positivity, mask, support_mask
+    Nz, positivity, mask, support_mask, num_threads
         See Conventions of :mod:`fasttomo.algorithms` (support applied once,
-        to the final volume).
+        to the final volume; ``num_threads`` drives the CPU back-projection).
     threshold_scale : float
         Missing-wedge threshold of the filter (default 1.0).
 
@@ -312,6 +322,7 @@ def run_weighted_backprojection(
     )
     N_det, Nz, Nx, device = setup.N_det, setup.Nz, setup.Nx, setup.device
 
-    volume = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale)(sinogram)
+    volume = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale,
+                       num_threads)(sinogram)
 
     return setup.constraints.apply(volume)

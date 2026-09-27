@@ -50,6 +50,33 @@ def sweep(sizes=(1, 15, 17, 33, 37), extra_ny=(4, 8)) -> None:
             torch.cuda.synchronize()
             print(f"ok n={n} Ny={Ny}", flush=True)
     mbir_sweep_variants(g)
+    clip_and_tv_variants(g)
+
+
+def clip_and_tv_variants(g) -> None:
+    """The ray-clipped rotmat forward on its edge cases (axis-aligned rays,
+    a detector wider than the volume so rays miss it, a narrower one,
+    scaled matrices, partial 16x16 tiles) and the two-pass TV forward over
+    several blocks with partial warps."""
+    dev = torch.device("cuda")
+    euler = torch.tensor([[0.0, 0.0, 0.0], [0.0, 90.0, 0.0], [90.0, 90.0, 0.0],
+                          [12.3, 27.1, -7.9], [41.7, -33.2, 16.4]], device=dev)
+    mats = _euler_zyz_to_rotmat(euler).reshape(-1, 9)
+    mats = torch.cat([mats, mats[:1] * 0.37, mats[-1:] * 1.9]).contiguous()
+    for (Ny, Nz, Nx), N_det in (((9, 5, 12), 29), ((12, 11, 9), 5), ((37, 30, 41), 45)):
+        vol = torch.rand(Ny, Nz, Nx, generator=g).to(dev)
+        for dtype in (torch.float32, torch.float16):
+            rp = ft.RotmatProjector((Ny, Nz, Nx), n_angles=mats.shape[0], device=dev,
+                                    N_det=N_det)
+            m = mats.clone().requires_grad_(True)
+            rp.forward(vol.to(dtype), m).float().sum().backward()
+            del rp
+        torch.cuda.synchronize()
+        print(f"ok clip shape={(Ny, Nz, Nx)} N_det={N_det}", flush=True)
+    for shape in ((40, 70, 67), (2, 2, 2), (5, 300, 7), (3, 17, 2)):
+        ft.tv_loss_3d(torch.rand(*shape, generator=g).to(dev).requires_grad_(True)).backward()
+        torch.cuda.synchronize()
+        print(f"ok tv shape={shape}", flush=True)
 
 
 def mbir_sweep_variants(g) -> None:

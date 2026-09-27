@@ -292,12 +292,12 @@ def _resire_cases() -> dict[str, torch.Tensor]:
 
 
 @needs_cuda
-def test_resire_outputs_identical_to_main(record_property):
+def test_resire_outputs_identical_to_main():
     raw = torch.load(RESIRE_GOLDEN)
     golden = tensors(raw)
     now = _resire_cases()
     assert set(golden) == set(RESIRE_EXACT) | set(RESIRE_NOISY) == set(now)
-    exact = exact_env(raw, "cuda", record_property, what=RESIRE_GOLDEN.name)
+    exact = exact_env(raw, "cuda", what=RESIRE_GOLDEN.name)
     for k in RESIRE_EXACT:
         if exact:
             assert torch.equal(now[k], golden[k]), k

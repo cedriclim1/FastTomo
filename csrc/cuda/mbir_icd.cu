@@ -367,7 +367,15 @@ __device__ __forceinline__ void mbir_load_slots(
     #pragma unroll
     for (int k = 0; k < K; k++) {
         const int ia = lane + k * MBIR_WARP;
-        if (ia >= n_angles) continue;
+        if (ia >= n_angles) {
+            /* Inactive slot: never used (the data term and the store skip
+             * it), but the patch and pe0/pe1 code read it before that
+             * check, so give it defined values (#89 review). */
+            S[k].u0 = 0;
+            S[k].wu = S[k].e0 = S[k].e1 = 0.0f;
+            S[k].l0 = S[k].l1 = 1.0f;
+            continue;
+        }
         float u  = x * ca[k] + z * sa[k] + H.half_det;
         int u0 = (int)floorf(u);
         S[k].u0 = u0;
