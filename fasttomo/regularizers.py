@@ -163,13 +163,6 @@ def _gaussian_1d(win_size: int, sigma: float,
     return g / g.sum()
 
 
-def _gaussian_window(win_size: int, sigma: float,
-                     device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Separable 2-D Gaussian kernel of shape [1, 1, win, win], summing to 1."""
-    g = _gaussian_1d(win_size, sigma, device, dtype)
-    return (g[:, None] * g[None, :])[None, None, :, :]
-
-
 class _Blur(torch.autograd.Function):
     """Separable Gaussian filter of every channel, as a Function that saves
     nothing but the kernel: the input gradient of a convolution needs only
@@ -208,8 +201,9 @@ def _blur(maps: torch.Tensor, g: torch.Tensor, stride: int = 1) -> torch.Tensor:
     """Separable Gaussian filter of every channel of ``maps`` ``[B, C, H, W]``
     ("valid" region, no padding): a depthwise 1 x K pass along W, then a
     K x 1 pass along H, each with ``stride`` along its own axis. Equal to
-    one 2-D pass with ``_gaussian_window`` at stride ``stride``, in 2K
-    instead of K^2 multiply-adds per output. Depthwise convolutions do not
+    one 2-D pass with the K x K window at stride ``stride``, in 2K
+    instead of K^2 multiply-adds per output (the 2-D window is the outer
+    product ``g[:, None] * g[None, :]``). Depthwise convolutions do not
     take cuDNN's TF32 tensor-core path (the dense single-channel 11 x 11
     convolution did, A6-1), and their input gradient avoids the slow dense
     one (A6-2)."""
@@ -308,32 +302,6 @@ def _ssim_from_moments(E, ey, eyy, c, C1, C2) -> torch.Tensor:
     ``E[x^2] - mu^2`` loses about ``mean^2 / variance`` of relative precision
     (1e4 at sinogram scale), which in TF32 was a 1-6 % error (A6-1)."""
     return _SSIMMean.apply(E, ey, eyy, c, C1, C2)
-
-
-def _ssim_map(x: torch.Tensor, y: torch.Tensor,
-              window: torch.Tensor, *,
-              C1: float, C2: float,
-              stride: int = 1, padding: int = 0) -> torch.Tensor:
-    """Standard Wang-2004 SSIM map for ``[B, 1, H, W]`` inputs.
-
-    ``window`` is a normalised ``[1, 1, K, K]`` kernel. ``stride`` and
-    ``padding`` are forwarded to the conv2d calls verbatim, so the caller
-    chooses whether windows overlap (stride 1, padding K//2 with reflect-pad
-    upstream) or tile (stride=K, padding=0).
-    """
-    mu_x  = F.conv2d(x,     window, stride=stride, padding=padding)
-    mu_y  = F.conv2d(y,     window, stride=stride, padding=padding)
-    mu_xx = F.conv2d(x * x, window, stride=stride, padding=padding)
-    mu_yy = F.conv2d(y * y, window, stride=stride, padding=padding)
-    mu_xy = F.conv2d(x * y, window, stride=stride, padding=padding)
-
-    sigma_xx = mu_xx - mu_x * mu_x
-    sigma_yy = mu_yy - mu_y * mu_y
-    sigma_xy = mu_xy - mu_x * mu_y
-
-    num = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
-    den = (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_xx + sigma_yy + C2)
-    return num / den
 
 
 class _TiltSSIMTarget:
@@ -472,7 +440,12 @@ def s3im_loss(
             uses ``target.max() - target.min()`` (skimage convention; matches
             ``tilt_ssim_loss``).
         generator: optional ``torch.Generator`` for reproducible index
-            sampling. If ``None``, uses the global RNG.
+            sampling. If ``None``, uses the global RNG. The entries of a
+            patch are the ``B`` largest of ``pred.numel()`` uniform random
+            numbers, in decreasing order (``rand(n).topk(B)``, a uniformly
+            random ordered subset, 3x cheaper than the ``randperm(n)[:B]``
+            used before 2026-09, which drew a different subset for the same
+            seed).
 
     Returns:
         Scalar tensor on the same device as ``pred``. ``0`` for identical
@@ -484,43 +457,62 @@ def s3im_loss(
     if pred.dtype != torch.float32 or target.dtype != torch.float32:
         raise TypeError("s3im_loss is fp32-only "
                         f"(got pred={pred.dtype}, target={target.dtype}).")
-    side = int(round(math.sqrt(patch_pixels)))
-    if side * side != patch_pixels:
-        raise ValueError(f"patch_pixels must be a perfect square (got "
-                         f"{patch_pixels}); √{patch_pixels} = {math.sqrt(patch_pixels):.4f}")
-    if side % kernel_size != 0:
-        raise ValueError(f"√patch_pixels ({side}) must be divisible by "
-                         f"kernel_size ({kernel_size})")
-    if n_patches < 1:
-        raise ValueError(f"n_patches must be ≥ 1, got {n_patches}")
+    return _S3IMTarget(target, patch_pixels=patch_pixels, kernel_size=kernel_size,
+                       n_patches=n_patches, data_range=data_range)(pred, generator)
 
-    n_total = pred.numel()
-    if patch_pixels > n_total:
-        raise ValueError(f"patch_pixels ({patch_pixels}) exceeds total sinogram "
-                         f"size ({n_total})")
 
-    C1, C2 = _ssim_constants(target, data_range)
+class _S3IMTarget:
+    """`s3im_loss` against a fixed target: the constants ``C1``, ``C2`` (a
+    reduction over the whole target) and the window are computed once;
+    ``run_ad_recon`` keeps one per run, ``s3im_loss`` builds one per call.
 
-    pred_flat = pred.reshape(-1)
-    target_flat = target.reshape(-1)
-    # Gaussian window with σ matched to kernel size — uniform-ish at K=4.
-    window = _gaussian_window(kernel_size, kernel_size / 2.0,
-                              pred.device, pred.dtype)
+    Each call draws ``n_patches`` index sets without replacement: the
+    ``patch_pixels`` largest of ``n_total`` uniform random numbers, in
+    decreasing order (``rand(n).topk(k)``: a uniformly random ordered
+    subset, like ``randperm(n)[:k]`` but without sorting all ``n``). The
+    patches go through the SSIM as one batch; their mean equals the average
+    of the per-patch means. The statistics use data centred on each target
+    patch's mean (see ``_ssim_from_moments``)."""
 
-    accum = pred.new_zeros(())
-    for _ in range(n_patches):
-        # Random indices without replacement, shared between pred and target.
-        if generator is None:
-            idx = torch.randperm(n_total, device=pred.device)[:patch_pixels]
-        else:
-            idx = torch.randperm(n_total, device=pred.device,
-                                 generator=generator)[:patch_pixels]
+    def __init__(self, target: torch.Tensor, *, patch_pixels: int = 4096,
+                 kernel_size: int = 4, n_patches: int = 1,
+                 data_range: float | None = None) -> None:
+        side = int(round(math.sqrt(patch_pixels)))
+        if side * side != patch_pixels:
+            raise ValueError(f"patch_pixels must be a perfect square (got "
+                             f"{patch_pixels}); √{patch_pixels} = {math.sqrt(patch_pixels):.4f}")
+        if side % kernel_size != 0:
+            raise ValueError(f"√patch_pixels ({side}) must be divisible by "
+                             f"kernel_size ({kernel_size})")
+        if n_patches < 1:
+            raise ValueError(f"n_patches must be ≥ 1, got {n_patches}")
+        if patch_pixels > target.numel():
+            raise ValueError(f"patch_pixels ({patch_pixels}) exceeds total sinogram "
+                             f"size ({target.numel()})")
+        self.shape = tuple(target.shape)
+        self.target_flat = target.reshape(-1)
+        self.side, self.k, self.m, self.kernel = side, patch_pixels, n_patches, kernel_size
+        self.C1, self.C2 = _ssim_constants(target, data_range)
+        # Gaussian window with σ matched to kernel size — uniform-ish at K=4.
+        self.g = _gaussian_1d(kernel_size, kernel_size / 2.0, target.device, target.dtype)
 
-        x = pred_flat.gather(0, idx).reshape(1, 1, side, side)
-        y = target_flat.gather(0, idx).reshape(1, 1, side, side)
+    def _indices(self, generator: torch.Generator | None) -> torch.Tensor:
+        n = self.target_flat.numel()
+        dev = self.target_flat.device
+        draws = [torch.rand(n, device=dev, generator=generator).topk(self.k).indices
+                 for _ in range(self.m)]
+        return draws[0].unsqueeze(0) if self.m == 1 else torch.stack(draws)
 
-        ssim_map = _ssim_map(x, y, window, C1=C1, C2=C2,
-                             stride=kernel_size, padding=0)
-        accum = accum + ssim_map.mean()
-
-    return 1.0 - accum / n_patches
+    def __call__(self, pred: torch.Tensor,
+                 generator: torch.Generator | None = None) -> torch.Tensor:
+        idx = self._indices(generator)                       # [M, B]
+        shape = (self.m, 1, self.side, self.side)
+        flat = idx.view(-1)
+        x = pred.reshape(-1).gather(0, flat).view(shape)
+        y = self.target_flat.gather(0, flat).view(shape)
+        c = y.detach().mean(dim=(-2, -1), keepdim=True)
+        xc, yc, d = x - c, y - c, x - y
+        mom = _blur(torch.cat([xc, xc * xc, d * d, yc, yc * yc], 1), self.g,
+                    stride=self.kernel)
+        return 1.0 - _ssim_from_moments(mom[:, :3], mom[:, 3:4], mom[:, 4:5], c,
+                                        self.C1, self.C2)

@@ -42,6 +42,14 @@
   at 128^3).
 - The scikit-image SSIM cross-check test now runs without scikit-image
   (an inline fp64 reference, anchored to a hard-coded scikit-image value).
+- **`s3im_loss` draws different patches for the same seed.** Each patch
+  is now the `B` largest of `n` uniform random numbers (`rand(n).topk(B)`,
+  still without replacement and uniformly random) instead of
+  `randperm(n)[:B]`, which sorted all `n` entries (0.40 -> 0.16 ms at
+  61 x 256^2). The `M` patches go through the SSIM as one batch, with the
+  same centred, separable statistics as `tilt_ssim_loss`; `run_ad_recon`
+  computes the constants once per run. `run_ad_recon` with `s3im_weight`
+  at 256^3: 2.39 -> 2.24 ms per iteration, peak 408 -> 352 MiB.
 
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 

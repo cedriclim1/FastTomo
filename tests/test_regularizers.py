@@ -227,6 +227,61 @@ class TestTiltSSIM:
 
 
 class TestS3IM:
+    @pytest.mark.parametrize("device,tf32", [
+        ("cpu", False),
+        pytest.param("cuda", True, marks=needs_cuda),
+        pytest.param("cuda", False, marks=needs_cuda)])
+    def test_matches_fp64_reference_with_the_same_indices(self, device, tf32):
+        """A6-1 / A6-9: value and gradient against an fp64 textbook SSIM
+        (dense K x K Gaussian window, sigma K/2, stride K) of the same
+        patches, at sinogram scale; each patch is drawn without replacement."""
+        import torch.nn.functional as F
+        from fasttomo.regularizers import _S3IMTarget
+
+        g = torch.Generator().manual_seed(11)
+        y = 100.0 + 5.0 * torch.randn(9, 40, 40, generator=g)
+        x = y + torch.randn(9, 40, 40, generator=g)
+        M, K, side = 3, 4, 32
+        gen = torch.Generator(device=device).manual_seed(5)
+        idx = _S3IMTarget(y.to(device), patch_pixels=side * side, kernel_size=K,
+                          n_patches=M)._indices(gen).cpu()
+        assert idx.shape == (M, side * side)
+        assert all(row.unique().numel() == side * side for row in idx)
+
+        x64 = x.double().requires_grad_(True)
+        L = float(y.max() - y.min())
+        C1, C2 = (0.01 * L) ** 2, (0.03 * L) ** 2
+        c = torch.arange(K, dtype=torch.float64) - (K - 1) / 2
+        w1 = torch.exp(-c ** 2 / (2 * (K / 2.0) ** 2))
+        w1 = w1 / w1.sum()
+        w = (w1[:, None] * w1[None, :])[None, None]
+        px = x64.reshape(-1)[idx].view(M, 1, side, side)
+        py = y.double().reshape(-1)[idx].view(M, 1, side, side)
+
+        def lm(v):
+            return F.conv2d(v, w, stride=K)
+
+        mx, my = lm(px), lm(py)
+        sxx, syy, sxy = lm(px * px) - mx ** 2, lm(py * py) - my ** 2, lm(px * py) - mx * my
+        ssim = ((2 * mx * my + C1) * (2 * sxy + C2)
+                / ((mx ** 2 + my ** 2 + C1) * (sxx + syy + C2)))
+        ref = 1.0 - ssim.mean()
+        ref.backward()
+
+        prev = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = tf32
+        try:
+            xd = x.to(device).requires_grad_(True)
+            gen = torch.Generator(device=device).manual_seed(5)
+            loss = ft.s3im_loss(xd, y.to(device), patch_pixels=side * side, kernel_size=K,
+                                n_patches=M, generator=gen)
+            loss.backward()
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev
+        assert abs(loss.item() - ref.item()) <= 1e-5 * abs(ref.item())
+        gerr = (xd.grad.cpu().double() - x64.grad).norm() / x64.grad.norm()
+        assert gerr <= 1e-5
+
     def test_zero_for_identity(self):
         torch.manual_seed(0)
         x = torch.rand(29, 200, 200, dtype=torch.float32)
