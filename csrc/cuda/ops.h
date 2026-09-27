@@ -7,13 +7,12 @@
 /*
  * All CUDA entry points launch on a caller-supplied stream. Synchronisation:
  *   - The *_cached entry points and the texture-free kernels (grad_angle,
- *     TV, GENFIRE, RESIRE, MBIR forward) never synchronize; PyTorch orders
- *     the work through the stream.
+ *     TV, GENFIRE, RESIRE, MBIR forward and ICD sweep) never synchronize;
+ *     PyTorch orders the work through the stream.
  *   - The one-shot entry points that build their own texture
  *     (forward/back_project_parallel_cuda, forward/back_project_rotmat_cuda,
- *     grad_rotmat_cuda, mbir_icd_sweep_cuda) call cudaStreamSynchronize on
- *     their stream before releasing it (ScopedTextureCache,
- *     texture_cache.h). cudaFreeArray would synchronize anyway.
+ *     grad_rotmat_cuda) call cudaStreamSynchronize on their stream before
+ *     releasing it (ScopedTextureCache, texture_cache.h). cudaFreeArray would synchronize anyway.
  *   - The Python-side `tc_destroy` binding synchronizes the device.
  *
  * Every host-callable function may throw: std::runtime_error on a CUDA error,
@@ -267,12 +266,18 @@ void mbir_forward_project_cuda(
  * One outer iteration of MBIR-AM-PE (CUDA). In-place mutates d_volume and
  * d_e_sino. Per-tilt offset d_k and noise variance σ are updated host-side
  * in PyTorch by the Python wrapper — the kernel only does the ICD sweep.
+ * Asynchronous on `stream` (no host synchronisation).
  *
- *   d_volume_snapshot : start-of-outer-iter copy of volume, bound to a
- *                       tex3D for the qGGMRF 26-neighbour reads. Caller
- *                       guarantees this is a valid snapshot.
+ *   d_volume_snapshot : start-of-outer-iter copy of volume; the qGGMRF
+ *                       26-neighbour values are read from it.
  *   d_lambdas         : per-pixel data weights or nullptr → uniform 1.
- *   d_perm            : [Ny, Nz*Nx] int32 host-generated permutation.
+ *   d_perm            : [Ny, Nz*Nx] int32 explicit voxel order (each row a
+ *                       permutation), or nullptr (the normal case): the
+ *                       order is generated on the device from perm_key
+ *                       (see mbir_perm_* in mbir_icd.cu).
+ *   perm_key          : 64-bit key of this outer iteration's order.
+ *   d_work            : scratch of Ny*Nz*Nx float4 (16 bytes per voxel,
+ *                       16-byte aligned), reusable across calls.
  *   sigma             : current noise std for the Huber surrogate.
  */
 void mbir_icd_sweep_cuda(
@@ -281,12 +286,23 @@ void mbir_icd_sweep_cuda(
     const float *d_volume_snapshot,
     const float *d_lambdas,
     const int   *d_perm,
+    unsigned long long perm_key,
+    float       *d_work,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
     float huber_T, float huber_delta, float sigma,
     cudaStream_t stream
+);
+
+/*
+ * Test hook: the voxel order mbir_icd_sweep_cuda uses when d_perm is null,
+ * written to d_out as [Ny, nvox] int32. Mirrors
+ * fasttomo.algorithms.mbir._mbir_permutation bit for bit.
+ */
+void mbir_permutation_cuda(
+    int *d_out, int Ny, int nvox, unsigned long long perm_key, cudaStream_t stream
 );
 
 #endif /* FASTTOMO_CUDA_OPS_H */

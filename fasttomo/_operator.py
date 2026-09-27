@@ -128,9 +128,11 @@ class ProjectionOperator:
         dims = dict(Ny=self.Ny, Nz=self.Nz, Nx=self.Nx, N_det=self.N_det,
                     n_angles=self.n_angles)
         if 0 in dims.values():
+            # -1 ("from the input") dims are not known yet: leave them out
+            known = {k: v for k, v in dims.items() if v != -1}
             raise ValueError(
                 f"{self._name}: every dimension must be at least 1; got a "
-                f"zero-size dimension in {dims}")
+                f"zero-size dimension in {known}")
         device = torch.device(device)
         if device.type == "cuda" and device.index is None:
             # torch.device("cuda") -> "cuda:N": unambiguous device checks, and
@@ -248,20 +250,23 @@ class UncachedOperator(ProjectionOperator):
             raise ValueError("use ResireOperator for the RESIRE geometry")
         super().__init__(geometry, device, dtype, name)
         self.num_threads = num_threads
+        # an explicit name (a public function) also heads the raw layer's
+        # zero-size errors; otherwise they name the kernel
+        self._label = name
 
     def fp(self, volume, geom=None):
         if self.kind == "parallel":
             return _forward_project_parallel_raw(volume, self._angles(geom), self.N_det,
-                                                 self.num_threads)
+                                                 self.num_threads, label=self._label)
         return _forward_project_rotmat_raw(volume, self._rotmat_geom(geom), self.N_det,
-                                           self.num_threads)
+                                           self.num_threads, label=self._label)
 
     def bp(self, sinogram, geom=None):
         if self.kind == "parallel":
             return _back_project_parallel_raw(sinogram, self._angles(geom), self.Nz,
-                                              self.num_threads, Nx=self.Nx)
+                                              self.num_threads, Nx=self.Nx, label=self._label)
         return _back_project_rotmat_raw(sinogram, self._rotmat_geom(geom), self.Nz,
-                                        self.num_threads, Nx=self.Nx)
+                                        self.num_threads, Nx=self.Nx, label=self._label)
 
     def grad_geom(self, volume, grad_sino, geom=None, token=None):
         if self.kind == "parallel":

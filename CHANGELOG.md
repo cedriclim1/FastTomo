@@ -11,6 +11,43 @@ call is up to ~4x slower than before**. Results are unchanged. To restore
 the old speed pass `num_threads=4` (or more), or set `OMP_NUM_THREADS`
 before starting Python. CUDA runs are not affected.
 
+### ⚠ `run_mbir`: faster outer iterations, different voxel order per `seed`
+
+- The random per-slice voxel order of the ICD sweep is now generated on the
+  GPU (a keyed Feistel permutation per Y-slice and outer
+  iteration) instead of by NumPy on the host and copied to the GPU every
+  outer iteration (`Ny*Nz*Nx*4` bytes: 67 MB at 256^3, 537 MB at 512^3).
+  The CPU sweep uses a bit-identical NumPy mirror of the same order, so CPU and
+  CUDA still visit the voxels in the same order.
+- The CUDA ICD sweep was restructured: a fully parallel prepare kernel
+  computes the voxel order, pre-sweep values and qGGMRF prior sums of every
+  step, and the sequential sweep runs one warp per Y-slice with a fused
+  warp-shuffle reduction and no block barriers (it had about 11 per voxel),
+  keeping each lane's error-sinogram values in registers. The sweep no
+  longer builds a texture or synchronises the stream. Same Gauss-Seidel
+  order and arithmetic: bit-identical to the previous kernel for the same
+  voxel order. One CUDA outer iteration at 61 views: 128^3 52 -> 9.6 ms,
+  256^3 300 -> 41 ms (default settings; 1.9-2.5x on the sweep with lambdas
+  and/or a finite `huber_T`). It needs a scratch buffer of 16 bytes per
+  voxel for the duration of `run_mbir` (the host permutation it replaces
+  was 4 bytes per voxel on the host plus 4 on the GPU).
+- **Results for a given `seed` differ from earlier versions** (a different,
+  equally random order); a fixed `seed` is still bit-reproducible run to
+  run. `_generate_permutation` is no longer used by `run_mbir`.
+
+### Projection error messages and double backward
+
+- Zero-size errors from `forward_project`, `back_project`,
+  `forward_project_3d`, `back_project_3d` and `refine_angles` name that
+  function (they named an internal operator class, with `-1` placeholders
+  for the sizes still to be taken from the input). Still `ValueError`.
+- `refine_angles(n_steps < 1)` raises `ValueError` on both backends (a
+  negative value raised `RuntimeError` on the CPU).
+- A second-order gradient through a projection (`create_graph=True`, then
+  a backward through the gradient) raises `RuntimeError` instead of
+  silently dropping the projection's second-order term; the adjoint
+  kernels are not themselves differentiable.
+
 ### Projection-operator seam (internal; outputs unchanged)
 
 - Every forward/back projection now goes through one internal interface,

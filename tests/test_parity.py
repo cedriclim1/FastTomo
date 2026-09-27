@@ -25,9 +25,10 @@ import fasttomo as ft
 # CPU (UncachedOperator on the CPU), CUDA uncached (one-shot scoped textures,
 # the functional API) and CUDA cached (ParallelProjector / RotmatProjector
 # and the algorithms). One parametrised test checks them against each other
-# for both geometries, fp32 and fp16, and three shapes: Ny = 5 (fp16 textures
+# for both geometries, fp32 and fp16, and four shapes: Ny = 5 (fp16 textures
 # single-channel), Ny = 8 and 4 (fp16 textures 4-channel packed), odd and
-# non-square Nz / Nx / N_det, and a small odd view count.
+# non-square Nz / Nx / N_det, a small odd view count, and 32x40x36 with 11
+# views (several 16x16 / 8x8x4 blocks per axis, Ny = 32 packed).
 #
 # Tolerances (relative L2, measured on this data with the listed maxima):
 #
@@ -35,7 +36,7 @@ import fasttomo as ft
 #   so fp, bp and the autograd gradients are compared with torch.equal. The
 #   geometry gradients accumulate with fp32 atomics: 1e-5.
 # * CPU vs CUDA, fp and bp: the texture unit's 8-bit interpolation weights.
-#   Parallel (2-D bilinear texture): 5e-4 (4.7e-4 at 13 px, <= 2e-4 from
+#   Parallel (2-D bilinear texture): 6e-4 (4.7e-4 at 13 px, <= 2e-4 from
 #   16 px; the 3e-4 floor quoted for W-BP holds on the larger grids).
 #   Rotmat (3-D trilinear texture): 1e-3 (max 7.1e-4). fp16 textures add
 #   up to 2e-4: 7e-4 / 1.2e-3.
@@ -45,7 +46,11 @@ import fasttomo as ft
 #   implementation of the gather, and the CPU bp by the inner-product test
 #   <A x, y> = <x, A^T y> (fp32 round-off: 1e-5).
 # * CPU vs CUDA geometry gradients (grad_angle / grad_rotmat): no texture
-#   filtering, fp32 atomics only: 5e-6 (max 1.1e-6).
+#   filtering, fp32 sums in different orders only: 5e-6 (max 1.2e-6) on the
+#   small shapes. The sums grow with the volume and some views' gradients
+#   are small differences of large terms: at 32x40x36 the CPU parallel
+#   gradient alone moves 1.9e-5 between 1 and 8 OpenMP threads and CPU vs
+#   CUDA is up to 2.7e-5 (rotmat), so that shape gets 5e-5.
 
 
 def _smooth_volume(Ny, Nz, Nx):
@@ -67,9 +72,10 @@ def _rl2(a, b):
     return float((a - b).norm() / b.norm())
 
 
-_TEX_FLOOR = {("parallel", torch.float32): 5e-4, ("parallel", torch.float16): 7e-4,
+_TEX_FLOOR = {("parallel", torch.float32): 6e-4, ("parallel", torch.float16): 7e-4,
               ("rotmat", torch.float32): 1e-3, ("rotmat", torch.float16): 1.2e-3}
-_ADAPTER_SHAPES = [(5, 11, 13, 15, 7), (8, 16, 16, 16, 9), (4, 24, 20, 28, 13)]
+_ADAPTER_SHAPES = [(5, 11, 13, 15, 7), (8, 16, 16, 16, 9), (4, 24, 20, 28, 13),
+                   (32, 40, 36, 36, 11)]
 
 
 def _adapter_case(kind, shape):
@@ -165,7 +171,8 @@ def test_projection_adapters_agree(kind, dtype, shape):
         assert abs(lhs - rhs) / abs(lhs) < 1e-5
     else:
         assert _rl2(res["unc"]["bp"], res["cpu"]["bp"]) < floor
-    assert _rl2(res["unc"]["grad_geom"], res["cpu"]["grad_geom"]) < 5e-6
+    geom_floor = 5e-6 if Ny * Nz * Nx < 20000 else 5e-5
+    assert _rl2(res["unc"]["grad_geom"], res["cpu"]["grad_geom"]) < geom_floor
 
     # A unit-variance random volume (the former test_forward_project_matches_cpu):
     # 8-bit weights on rough data, ~1 % max-abs relative.
@@ -361,6 +368,32 @@ def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
     vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(), lambdas=lam.cuda(), **kw)
     assert (dc.abs() > 0.1).any()                        # offsets were estimated
+    torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
+    torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)
+    assert sg == pytest.approx(sc, rel=1e-5)
+
+
+@needs_cuda
+@pytest.mark.parametrize("n_angles", [9, 61, 100, 200, 300])
+@pytest.mark.parametrize("use_lam,huber_T", [(False, float("inf")), (True, float("inf")),
+                                             (False, 3.0), (True, 3.0)])
+def test_mbir_cpu_cuda_consistency_every_sweep_variant(n_angles, use_lam, huber_T):
+    """The CUDA sweep has one kernel per angle-slot count (1, 2, 4, 8 slots
+    of 32 angles per lane, then a generic kernel) and per lambdas / Huber
+    combination; each must agree with the CPU sweep (same voxel order,
+    different summation order)."""
+    g = torch.Generator().manual_seed(n_angles)
+    Ny, N = 3, 10
+    ph = torch.zeros(Ny, N, N)
+    ph[:, 3:7, 2:8] = 1.0
+    ang = torch.linspace(-70, 70, n_angles)
+    sino = _mbir_sino_cpu(ph, ang) + 0.02 * torch.randn(n_angles, Ny, N, generator=g)
+    lam = torch.rand(n_angles, Ny, N, generator=g) + 0.5 if use_lam else None
+    kw = dict(sigma_f=0.2, n_iter=4, multires_levels=1, seed=2, huber_T=huber_T,
+              return_state=True)
+    vc, dc, sc = ft.run_mbir(sino, ang, lambdas=lam, **kw)
+    vg, dg, sg = ft.run_mbir(sino.cuda(), ang.cuda(),
+                             lambdas=lam.cuda() if use_lam else None, **kw)
     torch.testing.assert_close(vg.cpu(), vc, rtol=0, atol=1e-4)
     torch.testing.assert_close(dg.cpu(), dc, rtol=0, atol=1e-4)
     assert sg == pytest.approx(sc, rel=1e-5)

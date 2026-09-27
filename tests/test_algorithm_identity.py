@@ -7,6 +7,12 @@ on origin/main 5362a6b (generator: `tests/data/algorithm_golden_main_gen.py`,
 run against a checkout of that commit's ``fasttomo/``). Only the public API
 is called, so the same function runs before and after the refactor.
 
+Exception: ``cpu/mbir`` and ``cuda/mbir`` were regenerated when the MBIR
+voxel order moved from a host NumPy ``rng.permutation`` per slice to a keyed
+Feistel permutation built in the CUDA kernel (and mirrored in NumPy for the
+CPU sweep). With the old order injected, the new code reproduced the old
+golden bit for bit on both backends; only the order changed.
+
 GENFIRE, RESIRE and run_ad_recon have their own goldens
 (test_frozen_identity.py, test_algorithms_genfire_resire.py).
 

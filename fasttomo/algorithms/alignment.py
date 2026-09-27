@@ -66,6 +66,8 @@ def refine_angles(
             euler = ft.refine_angles(vol, sino, euler_zyz_deg=euler)
     """
     _assert_dtype_match(sinogram, volume, "sinogram", "volume", "refine_angles")
+    if int(n_steps) < 1:
+        raise ValueError(f"refine_angles: n_steps must be at least 1, got {n_steps}")
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
 
@@ -74,7 +76,7 @@ def refine_angles(
         # is allocated once (it is still uploaded per batch)
         return _make_operator(
             Geometry(kind, tuple(volume.shape), sinogram.shape[-1], n_steps),
-            volume.device, volume.dtype, num_threads=num_threads)
+            volume.device, volume.dtype, num_threads=num_threads, name="refine_angles")
 
     if angles_deg is not None and euler_zyz_deg is None:
         # ── single-axis mode ──────────────────────────────────────────────
