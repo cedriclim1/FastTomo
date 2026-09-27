@@ -545,10 +545,13 @@ def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
     vol = volume.contiguous()
     Ny, Nz, Nx = vol.shape
     acc = torch.zeros(1, dtype=torch.float32, device=vol.device)
+    # fp64 per-block partials of the deterministic two-pass reduction
+    partials = torch.empty(max(1, _core.tv_loss_iso_3d_workspace(Ny, Nz, Nx)),
+                           dtype=torch.float64, device=vol.device)
     stream = _stream_ptr(vol.device)
     with _on_device(vol):
         _core.tv_loss_iso_3d_cuda(
-            vol.data_ptr(), acc.data_ptr(),
+            vol.data_ptr(), acc.data_ptr(), partials.data_ptr(),
             Ny, Nz, Nx, float(eps), stream,
         )
     N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))

@@ -274,7 +274,7 @@ static void py_back_project_rotmat_cuda_cached(
 }
 
 static void py_tv_loss_iso_3d_cuda(
-    long vol_ptr, long acc_ptr,
+    long vol_ptr, long acc_ptr, long partials_ptr,
     int Ny, int Nz, int Nx,
     float eps,
     long stream_ptr
@@ -282,6 +282,7 @@ static void py_tv_loss_iso_3d_cuda(
     tv_loss_iso_3d_cuda(
         reinterpret_cast<const float *>(vol_ptr),
         reinterpret_cast<float *>(acc_ptr),
+        reinterpret_cast<double *>(partials_ptr),
         Ny, Nz, Nx, eps,
         to_stream(stream_ptr)
     );
@@ -548,13 +549,20 @@ void register_cuda(py::module_ &m) {
 
     m.def("tv_loss_iso_3d_cuda", &py_tv_loss_iso_3d_cuda,
           py::call_guard<py::gil_scoped_release>(),
-          "Fused 3-D isotropic TV loss (CUDA). Forward: atomicAdd Σ s into "
-          "acc_ptr (single-element fp32 buffer, must be zeroed). Caller "
+          "Fused 3-D isotropic TV loss (CUDA). Forward: writes Σ s to "
+          "acc_ptr (single-element fp32 buffer; zero it: left untouched when "
+          "a dimension is < 2), deterministic. partials_ptr: fp64 scratch of "
+          "tv_loss_iso_3d_workspace(Ny, Nz, Nx) elements. Caller "
           "post-divides by N=(Ny-1)(Nz-1)(Nx-1) to obtain mean(s).",
-          py::arg("vol_ptr"), py::arg("acc_ptr"),
+          py::arg("vol_ptr"), py::arg("acc_ptr"), py::arg("partials_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("eps"),
           py::arg("stream_ptr") = 0L);
+
+    m.def("tv_loss_iso_3d_workspace", &tv_loss_iso_3d_workspace,
+          "fp64 elements of scratch tv_loss_iso_3d_cuda needs for a "
+          "[Ny, Nz, Nx] volume (0 when a dimension is < 2).",
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"));
 
     m.def("tv_loss_iso_3d_grad_cuda", &py_tv_loss_iso_3d_grad_cuda,
           py::call_guard<py::gil_scoped_release>(),
