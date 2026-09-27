@@ -25,6 +25,77 @@ def phantom_2d(N: int) -> torch.Tensor:
     return vol
 
 
+# ── AD recon sparsity term (#71) ───────────────────────────────────────────
+
+def test_ad_sparsity_term_is_l1_with_signed_gradients():
+    """AD sparsity penalty must be λ·mean(|f|), not a signed mean bias."""
+    from fasttomo.algorithms import _ad_sparsity_term
+
+    vol = torch.tensor(
+        [[[-2.0, -0.5], [0.0, 1.5]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    lam = 0.3
+
+    loss = _ad_sparsity_term(vol, lam)
+    assert loss.item() == pytest.approx((lam * vol.detach().abs().mean()).item())
+
+    loss.backward()
+    expected_grad = lam * torch.sign(vol.detach()) / vol.numel()
+    assert torch.allclose(vol.grad, expected_grad)
+
+
+def test_ad_recon_sparsity_does_not_drift_without_positivity(monkeypatch):
+    """End-to-end (#73): with zero data and positivity=False, the L1 sparsity
+    term must leave a zero volume at zero.
+
+    run_ad_recon is CUDA-only in production, so the input check and the
+    projector are replaced by CPU stand-ins; the dummy projector always
+    returns zeros, so only the sparsity gradient can move the volume. The
+    old signed mean gave every voxel the same +λ/N gradient and Adam drove
+    the volume to about -n_iter * lr (≈ -1 here).
+    """
+    import fasttomo.algorithms as algo
+
+    class DummyParallelProjector:
+        def __init__(self, n_angles: int, Ny: int, N_det: int):
+            self.n_angles = n_angles
+            self.Ny = Ny
+            self.N_det = N_det
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                self.n_angles, self.Ny, self.N_det,
+                dtype=volume.dtype, device=volume.device,
+            )
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kwargs):
+        n_angles, Ny, N_det = sinogram.shape
+        return n_angles, Ny, N_det, (N_det if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo, "ParallelProjector", DummyParallelProjector)
+    monkeypatch.setattr(algo, "_check_inputs", fake_check_inputs)
+
+    n_angles, Ny, N = 5, 1, 8
+    sino = torch.zeros(n_angles, Ny, N, dtype=torch.float32)
+    angles = torch.linspace(-20.0, 20.0, n_angles)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=5, lr_volume=0.2, cosine_schedule=False),
+        reg=ft.RegularizerConfig(sparsity=1.0),
+        constraints=ft.ConstraintConfig(positivity=False),
+    )
+
+    rec = ft.run_ad_recon(
+        sino, angles, Nz=N,
+        projector=DummyParallelProjector(n_angles, Ny, N),
+        config=cfg,
+    )
+    assert rec.abs().max().item() == 0.0, (
+        "L1 sparsity should leave a zero volume unchanged when fidelity is zero"
+    )
+
+
 # ── adjoint test ───────────────────────────────────────────────────────────
 
 def test_adjoint_cpu():

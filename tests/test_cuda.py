@@ -1443,6 +1443,21 @@ class TestRunAdRecon:
             f"error_before={error_before:.3f}°, error_after={error_after:.3f}°"
         )
 
+    def test_sparsity_does_not_drift_without_positivity(self):
+        """Regression (#71/#73): the sparsity term is λ·mean(|f|). With zero
+        data and positivity=False a zero volume must stay exactly zero; the
+        old signed mean drove every voxel to about -n_iter * lr."""
+        N = 16
+        angles = make_angles(10)
+        sino = torch.zeros(10, 1, N, device=DEVICE)
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=5, lr_volume=0.2, cosine_schedule=False),
+            reg=ft.RegularizerConfig(sparsity=1.0),
+            constraints=ft.ConstraintConfig(positivity=False),
+        )
+        rec = ft.run_ad_recon(sino, angles, config=cfg)
+        assert rec.abs().max().item() == 0.0
+
     def test_projector_mismatch_raises(self):
         """Passing a RotmatProjector with refine_pose=False raises ValueError."""
         N = 16
