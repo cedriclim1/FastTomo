@@ -570,8 +570,9 @@ class CudaCachedOperator(ProjectionOperator):
         this view count (``_mark_sino_written``), without an upload."""
         if self.dtype is None:
             raise RuntimeError(f"{self._name}: bp_from_texture before any upload")
-        probe = torch.empty(0, dtype=self.dtype, device=self.device)
-        word = self._nonfinite_word(probe)
+        word = None
+        if self.dtype == torch.float16:     # fp32: nothing is checked
+            word = self._nonfinite_word(torch.empty(0, dtype=self.dtype, device=self.device))
         vol = self._bp(0 if self.dtype == torch.float32 else 1, None, geom, word)
         # the fp16 overflow check `backproject` runs (inside an fp16
         # run_sirt: a device-side flag); the input sinogram is the texture,
