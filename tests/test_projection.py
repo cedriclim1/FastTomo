@@ -404,6 +404,48 @@ def test_zero_size_raises_value_error(backend, case):
         _zero_size_cases(backend)[case]()
 
 
+_PUBLIC_NAME = {"fp3d": "forward_project_3d", "bp3d": "back_project_3d",
+                "fp": "forward_project", "bp": "back_project"}
+
+
+@pytest.mark.parametrize("case", [c for c in _zero_size_cases("cpu") if not c.startswith("grad")])
+def test_zero_size_error_names_the_public_function(backend, case):
+    """The functional API's zero-size errors are headed by the public
+    function, not an internal operator class or kernel, and list no
+    placeholder (-1) sizes (#88 review)."""
+    with pytest.raises(ValueError) as info:
+        _zero_size_cases(backend)[case]()
+    msg = str(info.value)
+    assert msg.startswith(_PUBLIC_NAME[case.split()[0]] + ":"), msg
+    assert "Operator" not in msg and "-1" not in msg, msg
+
+
+@pytest.mark.parametrize("n_steps", [0, -3])
+def test_refine_angles_rejects_non_positive_n_steps(backend, n_steps):
+    v = torch.rand(2, 6, 6, device=backend)
+    a = torch.linspace(-30, 30, 5, device=backend)
+    with pytest.raises(ValueError, match="refine_angles: n_steps must be at least 1"):
+        ft.refine_angles(v, ft.forward_project(v, a), a, n_steps=n_steps)
+
+
+@pytest.mark.parametrize("which", ["fp", "bp", "fp3d", "bp3d"])
+def test_double_backward_raises(backend, which):
+    """The projection Functions' backward is not differentiable (it calls
+    the adjoint kernels): a second-order gradient raises instead of silently
+    dropping the projection's term (#88 review)."""
+    a = torch.linspace(-30, 30, 5, device=backend)
+    e = torch.stack([torch.zeros(5), a.cpu(), torch.zeros(5)], 1).to(backend)
+    x = torch.rand((2, 6, 6) if which.startswith("fp") else (5, 2, 6), device=backend,
+                   requires_grad=True)
+    fn = {"fp": lambda t: ft.forward_project(t, a), "bp": lambda t: ft.back_project(t, a),
+          "fp3d": lambda t: ft.forward_project_3d(t, e),
+          "bp3d": lambda t: ft.back_project_3d(t, e)}[which]
+    y = fn(x)
+    (g,) = torch.autograd.grad((y * y).sum(), x, create_graph=True)
+    with pytest.raises(RuntimeError, match="once_differentiable"):
+        g.sum().backward()
+
+
 # ── autograd ──────────────────────────────────────────────────────────────────
 
 

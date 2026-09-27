@@ -110,14 +110,14 @@ def apply_shifts_2d(
 
 # ── projection ops ─────────────────────────────────────────────────────────
 
-def _transient(kind, shape, N_det, device, num_threads, angles_deg=None):
-    """The one-shot operator behind a functional call: uncached, with the
-    volume dims the call knows (``-1``: the raw kernels derive them from the
-    input, as they always did)."""
+def _transient(kind, shape, N_det, device, num_threads, angles_deg=None, *, name):
+    """The one-shot operator behind the public function ``name``: uncached,
+    with the volume dims the call knows (``-1``: the raw kernels derive them
+    from the input, as they always did). ``name`` heads its error messages."""
     Nz, Nx = int(shape[-2]), int(shape[-1])
     return _make_operator(
         Geometry(kind, (-1, Nz, Nx), int(N_det), -1, angles_deg),
-        device, cached=False, num_threads=_resolve_num_threads(num_threads))
+        device, cached=False, num_threads=_resolve_num_threads(num_threads), name=name)
 
 
 def forward_project(
@@ -143,7 +143,7 @@ def forward_project(
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
     op = _transient("parallel", volume.shape, N_det, volume.device, num_threads,
-                    angles_deg=angles_deg)
+                    angles_deg=angles_deg, name="forward_project")
     return op.project(volume, angles_deg)
 
 
@@ -183,7 +183,7 @@ def back_project(
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
     op = _transient("parallel", (-1, Nz, Nx), sinogram.shape[-1], sinogram.device,
-                    num_threads, angles_deg=angles_deg)
+                    num_threads, angles_deg=angles_deg, name="back_project")
     return op.backproject(sinogram, angles_deg)
 
 
@@ -229,7 +229,8 @@ def forward_project_3d(
     if volume.ndim == 2:
         volume = volume.unsqueeze(0)
     mats = euler_zyz_to_rotmat(euler_zyz_deg)   # [n_angles, 3, 3]; autograd traces through
-    op = _transient("rotmat", volume.shape, N_det, volume.device, num_threads)
+    op = _transient("rotmat", volume.shape, N_det, volume.device, num_threads,
+                    name="forward_project_3d")
     sino = op.project(volume, mats)
     if shifts is not None:
         sino = apply_shifts_2d(sino, shifts)
@@ -262,7 +263,7 @@ def back_project_3d(
     # no gradient w.r.t. the angles through a back-projection
     mats = euler_zyz_to_rotmat(euler_zyz_deg.detach())
     op = _transient("rotmat", (-1, Nz, Nx), sinogram.shape[-1], sinogram.device,
-                    num_threads)
+                    num_threads, name="back_project_3d")
     return op.backproject(sinogram, mats)
 
 

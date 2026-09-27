@@ -35,6 +35,19 @@ before starting Python. CUDA runs are not affected.
   equally random order); a fixed `seed` is still bit-reproducible run to
   run. `_generate_permutation` is no longer used by `run_mbir`.
 
+### Projection error messages and double backward
+
+- Zero-size errors from `forward_project`, `back_project`,
+  `forward_project_3d`, `back_project_3d` and `refine_angles` name that
+  function (they named an internal operator class, with `-1` placeholders
+  for the sizes still to be taken from the input). Still `ValueError`.
+- `refine_angles(n_steps < 1)` raises `ValueError` on both backends (a
+  negative value raised `RuntimeError` on the CPU).
+- A second-order gradient through a projection (`create_graph=True`, then
+  a backward through the gradient) raises `RuntimeError` instead of
+  silently dropping the projection's second-order term; the adjoint
+  kernels are not themselves differentiable.
+
 ### Projection-operator seam (internal; outputs unchanged)
 
 - Every forward/back projection now goes through one internal interface,

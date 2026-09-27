@@ -37,6 +37,7 @@ from __future__ import annotations
 import math
 
 import torch
+from torch.autograd.function import once_differentiable
 
 import fasttomo._core as _core
 # Moved to fasttomo._backend (ARCH P8); imported here so the raw layer below
@@ -139,7 +140,7 @@ def _mats_input(mats_flat: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = None,
-            num_threads: int | None = None) -> torch.Tensor:
+            num_threads: int | None = None, label: str | None = None) -> torch.Tensor:
     """Run ``_core.<op>_cuda`` or ``_core.<op>_cpu`` on ``out``'s device.
 
     ``shapes`` lists ``(name, expected_shape)`` for every tensor argument, in
@@ -154,7 +155,8 @@ def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = No
     ``N_det`` of 0) raise ValueError on both backends. The CUDA kernels
     cannot launch an empty grid or build an empty texture, and the CPU
     kernels used to return empty tensors instead; one backend-independent
-    error is the chosen contract.
+    error is the chosen contract. ``label`` (default ``op``) heads that
+    error: the public function a one-shot call came from.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
     if len(shapes) != len(tensors):
@@ -164,7 +166,7 @@ def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = No
     for name, shape in shapes:
         if 0 in tuple(shape):
             raise ValueError(
-                f"{op}: {name} has a zero-size dimension {tuple(shape)}; every "
+                f"{label or op}: {name} has a zero-size dimension {tuple(shape)}; every "
                 "dimension (n_angles, Ny, Nz, Nx, N_det) must be at least 1")
     names = iter(n for n, _ in shapes)
     ptrs = [_data_ptr(a, f"{op}: {next(names)}", out.device)
@@ -187,6 +189,8 @@ def _forward_project_parallel_raw(
     angles_deg: torch.Tensor,
     N_det: int = -1,
     num_threads: int | None = None,
+    *,
+    label: str | None = None,
 ) -> torch.Tensor:
     """Single-axis FP. Output dtype = volume dtype (CPU computes in fp32)."""
     vol = _kernel_input(volume, "volume")
@@ -199,7 +203,7 @@ def _forward_project_parallel_raw(
             vol, sino, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("volume", (Ny, Nz, Nx)), ("sinogram", (n_angles, Ny, N_det)),
                     ("cos", (n_angles,)), ("sin", (n_angles,))],
-            io_dtype=_io_dtype_code(vol), num_threads=num_threads)
+            io_dtype=_io_dtype_code(vol), num_threads=num_threads, label=label)
     return sino.to(volume.dtype)
 
 
@@ -210,6 +214,7 @@ def _back_project_parallel_raw(
     num_threads: int | None = None,
     *,
     Nx: int = -1,
+    label: str | None = None,
 ) -> torch.Tensor:
     """Single-axis BP. Output dtype = sinogram dtype (CPU computes in fp32).
     ``Nx`` and ``Nz`` default to N_det; pass the volume's Nx when the
@@ -224,7 +229,7 @@ def _back_project_parallel_raw(
             sino, vol, cos_a, sin_a, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("sinogram", (n_angles, Ny, N_det)), ("volume", (Ny, Nz, Nx)),
                     ("angles", (n_angles,)), ("angles", (n_angles,))],
-            io_dtype=_io_dtype_code(sino), num_threads=num_threads)
+            io_dtype=_io_dtype_code(sino), num_threads=num_threads, label=label)
     return vol.to(sinogram.dtype)
 
 
@@ -233,6 +238,8 @@ def _forward_project_rotmat_raw(
     mats_flat: torch.Tensor,   # [n_angles, 9]
     N_det: int = -1,
     num_threads: int | None = None,
+    *,
+    label: str | None = None,
 ) -> torch.Tensor:
     """Rotmat FP from rotation matrices (the euler→rotmat conversion lives in
     PyTorch, outside the autograd Function, so ∂L/∂euler chains through it).
@@ -248,7 +255,7 @@ def _forward_project_rotmat_raw(
             vol, sino, mats, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("volume", (Ny, Nz, Nx)), ("sinogram", (n_angles, Ny, N_det)),
                     ("matrices", (n_angles, 9))],
-            io_dtype=_io_dtype_code(vol), num_threads=num_threads)
+            io_dtype=_io_dtype_code(vol), num_threads=num_threads, label=label)
     return sino.to(volume.dtype)
 
 
@@ -259,6 +266,7 @@ def _back_project_rotmat_raw(
     num_threads: int | None = None,
     *,
     Nx: int = -1,
+    label: str | None = None,
 ) -> torch.Tensor:
     """Adjoint partner of _forward_project_rotmat_raw. Output dtype =
     sinogram dtype. ``Nx`` and ``Nz``
@@ -273,7 +281,7 @@ def _back_project_rotmat_raw(
             sino, vol, mats, Ny, Nz, Nx, n_angles, N_det,
             shapes=[("sinogram", (n_angles, Ny, N_det)), ("volume", (Ny, Nz, Nx)),
                     ("matrices", (n_angles, 9))],
-            io_dtype=_io_dtype_code(sino), num_threads=num_threads)
+            io_dtype=_io_dtype_code(sino), num_threads=num_threads, label=label)
     return vol.to(sinogram.dtype)
 
 
@@ -491,7 +499,11 @@ class _Project(torch.autograd.Function):
         return sino
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_sino):
+        # The adjoint kernels are not themselves differentiable: a double
+        # backward (create_graph=True) raises instead of silently dropping
+        # the second-order term.
         volume, geom = ctx.saved_tensors
         op = ctx.op
         grad_sino = grad_sino.contiguous()
@@ -516,6 +528,7 @@ class _BackProject(torch.autograd.Function):
         return op.bp(sinogram, geom)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_vol):
         (geom,) = ctx.saved_tensors
         return ctx.op.fp(grad_vol.contiguous(), geom), None, None
