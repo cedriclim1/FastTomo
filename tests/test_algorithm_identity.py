@@ -43,8 +43,10 @@ Comparison:
   CPU SIMD / BLAS / FFT paths and on the GPU's texture unit, not on the torch
   version (two CI runners with the same torch differ by a few ulp).
   Elsewhere they fall back to 1e-6 (CPU keys) or 1e-5 (CUDA keys), and fp16
-  outputs to one fp16 ulp (2**-10 relative / absolute); the fallback is
-  reported as a ``GoldenNotExactWarning``. The ``_fft_ramp`` / ``_fft_rfft2`` keys (the two torch.fft uses
+  outputs to one fp16 ulp (2**-10 relative / absolute); for the keys in
+  ``FFT_KEYS`` the absolute part of that tolerance is scaled by the tensor's
+  largest value (FFT round-off follows the transform's norm, not each bin's
+  size). The fallback is reported as a ``GoldenNotExactWarning``. The ``_fft_ramp`` / ``_fft_rfft2`` keys (the two torch.fft uses
   on their own) are ordinary deterministic keys; the arithmetic fingerprint
   covers the FFT.
 """
@@ -55,7 +57,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from _golden import exact_env, tensors
+from _golden import exact_env, peak_close, tensors
 
 import fasttomo as ft
 
@@ -66,6 +68,15 @@ HAS_CUDA = torch.cuda.is_available()
 # docstring).
 LOOSE_TOL = {"cpu": 1e-6, "cuda": 1e-5}
 FP16_TOL = 2.0 ** -10
+
+# Outputs that go through torch.fft (ramp filter, FBP, the W-BP / wSIRT
+# deconvolution). On the loose branch their tolerance is relative to the
+# tensor's largest value (``_golden.peak_close``), because FFT round-off is
+# set by the transform's norm, not by each bin (CI run 36331234339 failed an
+# elementwise 1e-6 on a 3.8e-6 difference, 5.7e-8 of the peak). Names
+# without the device prefix and the ``#i`` tuple index.
+FFT_KEYS = {"_fft_ramp", "_fft_rfft2", "fbp", "fbp_mask", "fbp_h", "fbp_proj", "wbp",
+            "wsirt", "wsirt_cons"}
 
 # Outputs of fp32-atomics kernels (not reproducible run to run). cuda/gd_tv
 # and cuda/gd_tv_loss are not here: the TV forward is a fixed-order reduction
@@ -303,15 +314,23 @@ def _compare(dev: str) -> None:
         base = k.split("#")[0]
         diff = (a.double() - b.double()).abs().max().item() if a.numel() else 0.0
         scale = b.double().abs().max().item() if b.numel() else 0.0
+        how = ""
         if base in ATOMIC_KEYS:
             ok = torch.allclose(a, b, rtol=2e-6, atol=2e-6)
+            how = "atomics, 2e-6"
         elif exact:
             ok = torch.equal(a, b)
+            how = "exact"
         else:
             tol = FP16_TOL if b.dtype == torch.float16 else LOOSE_TOL[dev]
-            ok = torch.allclose(a, b, rtol=tol, atol=tol)
+            if base.split("/", 1)[1] in FFT_KEYS:
+                ok = peak_close(a, b, tol)[0]
+                how = f"FFT, {tol:.0e} of max(1, peak)"
+            else:
+                ok = torch.allclose(a, b, rtol=tol, atol=tol)
+                how = f"{tol:.0e} elementwise"
         if not ok:
-            bad.append(f"{k}: max|diff| {diff:.3e} (max|golden| {scale:.3e})")
+            bad.append(f"{k}: max|diff| {diff:.3e} (max|golden| {scale:.3e}; {how})")
     assert not bad, (f"{len(bad)} of {len(want)} outputs differ from the golden "
                      f"(exact={exact}, torch {torch.__version__}):\n"
                      + "\n".join(bad))

@@ -14,20 +14,22 @@ option at its no-op value, and must reproduce the golden:
   but only where the machine's arithmetic fingerprint (``tests/_golden.py``)
   is one the golden stores, because the last bit depends on the CPU's SIMD /
   FFT paths and the GPU, not on the torch version: GENFIRE-CPU against the
-  CPU fingerprint (elsewhere 1e-6), AD against the CUDA fingerprint
+  CPU fingerprint (elsewhere 1e-5 of the output's largest value, since
+  FFT round-off follows the transform's norm), AD against the CUDA fingerprint
   (elsewhere 1e-5), like the RESIRE golden in
   test_algorithms_genfire_resire.py. A fallback is reported as a
   ``GoldenNotExactWarning``. (Made with torch 2.12.1; torch.equal
   re-verified on 2.14.0+cu130, where the fingerprints were recorded.)
 * GENFIRE on CUDA (gridding atomics) and RESIRE (forward-projection
-  atomics) are not bit-reproducible even main-vs-main: 1e-5 tolerance.
+  atomics) are not bit-reproducible even main-vs-main: 1e-5 tolerance
+  (for GENFIRE relative to the output's largest value).
 """
 
 from pathlib import Path
 
 import pytest
 import torch
-from _golden import exact_env
+from _golden import exact_env, peak_close
 
 import fasttomo as ft
 
@@ -64,17 +66,26 @@ def _flat(v):
     return [v.detach().cpu() if isinstance(v, torch.Tensor) else v]
 
 
-def _check(now, golden, exact: bool, key: str, tol: float = 1e-5):
+def _check(now, golden, exact: bool, key: str, tol: float = 1e-5, fft: bool = False):
+    """Compare ``now`` with ``golden``: bit for bit when ``exact``, else at
+    ``tol`` elementwise, or, for FFT-based outputs (``fft=True``: GENFIRE),
+    at ``tol`` of the tensor's largest value (``_golden.peak_close``). A
+    failure reports the measured difference, not just the key."""
     a, b = _flat(now), _flat(golden)
     assert len(a) == len(b), key
-    for x, y in zip(a, b):
+    for i, (x, y) in enumerate(zip(a, b)):
         if not isinstance(x, torch.Tensor):
-            assert x == y, key
+            assert x == y, f"{key}[{i}]: {x!r} != {y!r}"
         elif exact:
-            assert torch.equal(x, y), key
+            assert torch.equal(x, y), f"{key}[{i}]: not bit-identical"
+        elif fft:
+            ok, diff, peak = peak_close(x, y, tol)
+            assert ok, (f"{key}[{i}]: max|diff| {diff:.3e} exceeds {tol:.0e} of "
+                        f"max(1, max|golden|) with max|golden| {peak:.3e} (shape "
+                        f"{tuple(x.shape)} vs {tuple(y.shape)})")
         else:
-            assert x.shape == y.shape, key
-            torch.testing.assert_close(x, y, rtol=tol, atol=tol, msg=key)
+            torch.testing.assert_close(x, y, rtol=tol, atol=tol,
+                                       msg=lambda m, i=i: f"{key}[{i}]: {m}")
 
 
 def _golden():
@@ -88,15 +99,15 @@ def test_genfire_cpu_identical_to_main():
     cb = _Calls()
     out = ft.run_genfire(sino, ang, n_iter=12, Nz=N, return_loss=True, loss_callback=cb,
                          progress=False, warm_start=None, support_mask=None)
-    _check(out, golden["genfire_cpu"], exact, "genfire_cpu", tol=1e-6)
+    _check(out, golden["genfire_cpu"], exact, "genfire_cpu", tol=1e-5, fft=True)
     assert cb.losses == out[1].tolist()          # the callback streams the history
     out = ft.run_genfire(sino, ang, n_iter=8, Nz=N, mask=False, resolution_extension=False,
                          sparsity=1e-3, positivity=False, return_loss=True,
                          loss_callback=_Calls(), warm_start=None, support_mask=None)
-    _check(out, golden["genfire_cpu_plain"], exact, "genfire_cpu_plain", tol=1e-6)
+    _check(out, golden["genfire_cpu_plain"], exact, "genfire_cpu_plain", tol=1e-5, fft=True)
     out = ft.run_genfire(sino, ang, n_iter=5, Nz=N, oversampling_ratio=3.0, cutoff_dist=0.7,
                          progress=False)
-    _check(out, golden["genfire_cpu_os"], exact, "genfire_cpu_os", tol=1e-6)
+    _check(out, golden["genfire_cpu_os"], exact, "genfire_cpu_os", tol=1e-5, fft=True)
 
 
 @needs_cuda
@@ -105,7 +116,7 @@ def test_genfire_cuda_matches_main():
     sino, ang, _, _, N = _inputs("cuda")
     out = ft.run_genfire(sino, ang, n_iter=12, Nz=N, return_loss=True, loss_callback=_Calls(),
                          progress=False, warm_start=None, support_mask=None)
-    _check(out, golden["genfire_cuda"], False, "genfire_cuda")
+    _check(out, golden["genfire_cuda"], False, "genfire_cuda", fft=True)
 
 
 @needs_cuda
