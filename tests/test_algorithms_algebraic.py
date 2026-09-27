@@ -617,11 +617,12 @@ class TestRunSirtCudaGraph:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         vol_bytes = Ny * N * N * 4
-        # kept: live tensors (static volume and C, >= 2 volumes), plus the
-        # graph pool's reserved blocks (BP output) and the volume texture
-        # array outside torch's allocator: >= 4 volumes of device memory
-        assert torch.cuda.memory_allocated() - alloc0 >= 2 * vol_bytes
-        assert free0 - torch.cuda.mem_get_info()[0] >= 4 * vol_bytes
+        # kept: live tensors (static volume, >= 1 volume; C is one plane),
+        # plus the graph pool's reserved blocks (BP output) and the volume
+        # texture array outside torch's allocator: >= 3 volumes of device
+        # memory
+        assert torch.cuda.memory_allocated() - alloc0 >= vol_bytes
+        assert free0 - torch.cuda.mem_get_info()[0] >= 3 * vol_bytes
         assert len(algebraic._SIRT_OPERATORS) == 1
 
         assert ft.release_cached_projectors() == 1
@@ -1237,3 +1238,30 @@ def test_loss_recording_host_syncs(algo):
         a = _sync_count(lambda: run(3, **kw))
         b = _sync_count(lambda: run(9, **kw))
         assert b - a == 6 * per_iter, (kw, a, b)
+
+
+# ── planar normalisers (solver audit P2 / P6) ──────────────────────────────
+
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("Ny, Nz, N, N_det", [(3, 17, 17, 17), (4, 12, 16, 20),
+                                              (8, 9, 13, 11), (5, 16, 16, 16)])
+def test_parallel_normalisers_are_y_invariant(dev, dtype, Ny, Nz, N, N_det):
+    """BP(1) and FP(1) of the parallel-beam operator are the same in every
+    Y-slice, bit for bit (fp16 with Ny % 4 == 0 uses the packed textures),
+    for all views at once and for one view: run_sirt and run_sart keep one
+    plane of the voxel normaliser (and run_sart computes both on an operator
+    of one texel row)."""
+    from fasttomo._operator import Geometry, _make_operator
+
+    n = 7
+    ang = torch.linspace(-63, 58, n, device=dev)
+    op = _make_operator(Geometry("parallel", (Ny, Nz, N), N_det, n, ang),
+                        torch.device(dev), dtype)
+    for geom in (None, ang[2:3]):
+        k = n if geom is None else 1
+        c = op.backproject(torch.ones(k, Ny, N_det, device=dev, dtype=dtype), geom)
+        r = op.project(torch.ones(Ny, Nz, N, device=dev, dtype=dtype), geom)
+        assert torch.equal(c, c[:1].expand_as(c))
+        assert torch.equal(r, r[:, :1].expand_as(r))

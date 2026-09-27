@@ -363,7 +363,7 @@ static void py_sirt_update_cuda(
     long mask_ptr, int mask_full,
     float omega, int positivity, float soft_thr,
     int Ny, int Nz, int Nx,
-    long stream_ptr, long vol_cache_ptr
+    long stream_ptr, long vol_cache_ptr, int C_full
 ) {
     sirt_update_cuda(
         io_dtype, eager_order,
@@ -374,7 +374,7 @@ static void py_sirt_update_cuda(
         reinterpret_cast<const void *>(mask_ptr), mask_full,
         omega, positivity, soft_thr, Ny, Nz, Nx,
         reinterpret_cast<TextureCache *>(vol_cache_ptr),
-        to_stream(stream_ptr));
+        to_stream(stream_ptr), C_full);
 }
 
 static void py_sirt_residual_tex_cuda(
@@ -731,14 +731,16 @@ void register_cuda(py::module_ &m) {
           "(else [1, Nz, Nx]); soft_thr <= 0 disables the soft threshold. "
           "vol_cache_ptr (0 = none): a volume texture cache with a surface "
           "that also receives vol_out; with it, vol_in_ptr = 0 reads the "
-          "volume from the texture and vol_out_ptr = 0 skips the global write.",
+          "volume from the texture and vol_out_ptr = 0 skips the global write. "
+          "C_full = 0: C_ptr is one [1, Nz, Nx] plane used for every Y-slice.",
           py::arg("io_dtype"), py::arg("eager_order"),
           py::arg("vol_in_ptr"), py::arg("vol_out_ptr"),
           py::arg("upd_ptr"), py::arg("C_ptr"),
           py::arg("mask_ptr"), py::arg("mask_full"),
           py::arg("omega"), py::arg("positivity"), py::arg("soft_thr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
-          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L);
+          py::arg("stream_ptr") = 0L, py::arg("vol_cache_ptr") = 0L,
+          py::arg("C_full") = 1);
 
     m.def("sirt_residual_tex_cuda", &py_sirt_residual_tex_cuda,
           py::call_guard<py::gil_scoped_release>(),

@@ -99,7 +99,7 @@ def run_sirt(
         CUDA graph path without ``projector`` only (default True): keep the
         internal projector and its captured graph after the call, so the
         next call with the same configuration replays it (one configuration
-        is kept, 4 volumes plus 4 sinograms of GPU memory; see
+        is kept, 3 volumes plus 4 sinograms of GPU memory; see
         :func:`release_cached_projectors`). False neither uses nor keeps
         that cache: the call builds its own projector and graph and frees
         them on return, as before; a configuration kept by earlier calls
@@ -185,6 +185,20 @@ def _texture_operator(op) -> CudaCachedOperator | None:
     return None
 
 
+def _voxel_normaliser_plane(C_vol: torch.Tensor, tex_op) -> torch.Tensor:
+    """One ``[1, Nz, Nx]`` plane of the voxel normaliser ``1 / BP(1)`` when
+    ``tex_op`` is FastTomo's own CUDA parallel-beam operator, else ``C_vol``
+    unchanged. That back-projection of a constant sinogram gives every
+    Y-slice the same bits (each slice is its own texture layer, sampled at
+    the same detector positions; pinned by
+    ``test_parallel_normalisers_are_y_invariant``), and the fused update
+    kernel reads one plane for every slice (solver audit P6): one volume
+    less to keep and to stream per iteration, same result."""
+    if tex_op is None or tex_op.kind != "parallel" or C_vol.shape[0] == 1:
+        return C_vol
+    return C_vol[:1].contiguous()
+
+
 def _operator_closures(op):
     """``(_fp, _bp)`` of a parallel operator, as `_build_fp_bp` builds them."""
     def _fp(v):
@@ -205,7 +219,7 @@ def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
     ones_sino = torch.ones_like(sinogram)
     C_vol     = _bp(ones_sino)
     _assert_projector_output_shape(C_vol, (Ny, Nz, Nx), "back-projection", "run_sirt")
-    C_vol     = _reciprocal_or_zero(C_vol)
+    C_vol     = _voxel_normaliser_plane(_reciprocal_or_zero(C_vol), tex_op)
 
     ones_vol  = torch.ones_like(volume)
     R_sino    = _fp(ones_vol)
@@ -340,9 +354,11 @@ def _fused_update(volume, update, C_vol, omega, constraints, *, eager_order: boo
     ``out`` skips its upload. ``texture_resident`` (with ``out`` is
     ``volume``): the volume lives in the texture, which is read and written
     instead of ``volume`` (left stale until ``tex_op._download_vol``); None
-    if the texture cannot be written."""
+    if the texture cannot be written. ``C_vol`` is ``[Ny, Nz, Nx]`` or one
+    ``[1, Nz, Nx]`` plane used for every Y-slice (`_voxel_normaliser`)."""
     if volume.ndim != 3 or not _fusable(volume, update, C_vol) or not (
-            volume.shape == update.shape == C_vol.shape):
+            volume.shape == update.shape and C_vol.ndim == 3
+            and C_vol.shape[1:] == volume.shape[1:] and C_vol.shape[0] in (1, volume.shape[0])):
         return None
     Ny, Nz, Nx = volume.shape
     mask = constraints._support_for(volume)
@@ -369,7 +385,8 @@ def _fused_update(volume, update, C_vol, omega, constraints, *, eager_order: boo
             int(mask is not None and mask.shape[0] == Ny and Ny > 1),
             float(omega), int(bool(constraints.positivity)),
             float(constraints.soft_threshold), Ny, Nz, Nx, _stream_ptr(vol.device),
-            vol_cache_ptr=0 if handle is None else handle)
+            vol_cache_ptr=0 if handle is None else handle,
+            C_full=int(C.shape[0] == Ny and Ny > 1))
     if handle is not None:
         tex_op._mark_vol_written(out)
     return out
@@ -663,16 +680,19 @@ def release_cached_projectors() -> int:
     dtype, device, ``omega``, constraints), so that call replays the captured
     CUDA graph instead of building a projector and capturing again. Only one
     configuration is kept, and a call with a different one drops it before
-    allocating its own. What is kept, 4 volumes plus 4 sinograms: the
+    allocating its own. What is kept, 3 volumes plus 4 sinograms: the
     projector's volume and sinogram texture arrays (1 + 1), the graph's
-    static volume and voxel normalisation (2 volumes), its static sinogram
-    and ray normalisation (2 sinograms), and the graph's memory pool with
-    the back-projection and forward-projection outputs (1 + 1); plus the
-    support mask when one is given (one more volume if it is full-size).
-    In fp32 at 61 views that is 0.31 GiB at 256^3 and 2.24 GiB at 512^3;
-    the device memory measured is 0.36 and 2.62 GiB, the rest being free
-    space inside the allocator segments of the static tensors. Pass
-    ``run_sirt(..., reuse_graph=False)`` to not keep it in the first place.
+    static volume (the voxel normalisation is one ``[1, Nz, Nx]`` plane),
+    its static sinogram and ray normalisation (2 sinograms), and the
+    graph's memory pool with the back-projection and forward-projection
+    outputs (1 + 1); plus the support mask when one is given (one more
+    volume if it is full-size). In fp32 at 61 views that is 0.25 GiB at
+    256^3 and 1.74 GiB at 512^3; the device memory measured is 0.30 and
+    2.12 GiB, the rest being free space inside the allocator segments of
+    the static tensors. A call with a loss (``return_loss`` or
+    ``loss_callback``) captures a second graph on the same projector, with
+    its own static buffers and pool. Pass ``run_sirt(..., reuse_graph=False)``
+    to not keep it in the first place.
 
     This releases it. The texture arrays go straight back to the driver; the
     tensors and the graph pool go back to PyTorch's caching allocator, which

@@ -243,7 +243,9 @@ void grad_angle_cuda(
  *   sirt_update_cuda: vol_out = constraints(vol_in + omega * C * upd) over
  *     [Ny, Nz, Nx], rounded in run_sirt's eager order (eager_order = 1) or
  *     its CUDA-graph order (0); mask is [1 | Ny, Nz, Nx] (mask_full = 1 for
- *     the latter) or null; soft_thr <= 0 disables the soft threshold.
+ *     the latter) or null, and so is C (C_full = 1 for the latter; a
+ *     [1, Nz, Nx] plane is used for every Y-slice); soft_thr <= 0 disables
+ *     the soft threshold.
  *     vol_out may alias vol_in. A non-null vol_tc (a volume TextureCache
  *     with a surface, tc_create_ex) also receives vol_out, so the next
  *     cached forward projection can skip its upload (upload = 0); with a
@@ -271,7 +273,8 @@ void sirt_update_cuda(
     float omega, int positivity, float soft_thr,
     int Ny, int Nz, int Nx,
     TextureCache *vol_tc,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int C_full = 1
 );
 
 void sirt_residual_tex_cuda(
