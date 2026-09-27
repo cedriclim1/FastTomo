@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
@@ -95,6 +96,26 @@ def _ad_recon_step_schedule(
     block = (iteration - pose_warmup_iters) // alternating_period
     step_volume = block % 2 == 0
     return step_volume, not step_volume
+
+
+def _ad_recon_active_steps(
+    n_iter: int,
+    *,
+    pose_warmup_iters: int = 0,
+    alternating_period: int = 0,
+) -> tuple[int, int]:
+    """``(volume_steps, pose_steps)``: how many of the ``n_iter`` iterations
+    step the volume optimiser and the pose/shift optimisers. Each cosine
+    schedule uses its optimiser's count as ``T_max`` so its learning rate
+    reaches ~0 at the end of that optimiser's own active iterations."""
+    vol = pose = 0
+    for it in range(n_iter):
+        step_volume, step_pose = _ad_recon_step_schedule(
+            it, pose_warmup_iters=pose_warmup_iters,
+            alternating_period=alternating_period)
+        vol += step_volume
+        pose += step_pose
+    return vol, pose
 
 
 def _prepare_ad_recon_pose_init(
@@ -1242,13 +1263,28 @@ def run_ad_recon(
         * if ``return_pose`` only  — ``(volume, euler_or_None, shifts_or_None)``
         * if both                  — ``(volume, loss_history, euler_or_None, shifts_or_None)``
 
+    Validation:
+        ``config.validate()`` runs on entry, so fields edited after the
+        dataclasses were constructed are checked too (for example an
+        ``alternating_period`` or ``pose_init_shifts`` set without the
+        matching refine flag, a negative weight, or an unknown ``loss_fn``).
+
+    Staging:
+        ``PoseRefinementConfig.pose_warmup_iters`` and ``alternating_period``
+        schedule volume-only, pose-only and joint iterations; ``n_iter``
+        counts all of them, and each cosine schedule spans only its
+        optimiser's active iterations. See :class:`PoseRefinementConfig`
+        for the Euler convention and how the pose constraints treat a pose
+        initialiser.
+
     Constraints:
         After every optimiser step, inside ``torch.no_grad``, the volume gets
         ``ConstraintConfig.positivity`` (clamp at 0), then the support mask
         (multiplied in, so a soft mask scales voxels), then
         ``ConstraintConfig.sparsity`` as a soft-threshold
         ``f <- sign(f) * max(|f| - sparsity, 0)`` (the proximal step of an L1
-        penalty, in volume units, once per iteration). It is independent of
+        penalty, in volume units, once per iteration in which the volume
+        was stepped, so not in pose-only iterations). It is independent of
         ``RegularizerConfig.sparsity``, which adds ``sparsity * mean(|f|)`` to
         the loss and acts through the gradient instead; both may be set.
 
@@ -1259,6 +1295,9 @@ def run_ad_recon(
     """
     if config is None:
         config = AdReconConfig()
+    # The dataclasses are mutable, so construction-time checks can be
+    # bypassed by later edits; validate the whole tree here.
+    config.validate()
 
     optim_cfg = config.optim
     reg_cfg = config.reg
@@ -1268,11 +1307,6 @@ def run_ad_recon(
     refine_pose = pose_cfg is not None and pose_cfg.refine_pose
     refine_shifts = pose_cfg is not None and pose_cfg.refine_shifts
     anchor_reference = pose_cfg is not None and pose_cfg.anchor_reference
-
-    if optim_cfg.loss_fn not in ("mse", "l1"):
-        raise ValueError(
-            f"OptimConfig.loss_fn must be 'mse' or 'l1', got {optim_cfg.loss_fn!r}"
-        )
 
     # Projector class/mode mismatch validation
     if projector is not None:
@@ -1369,11 +1403,30 @@ def run_ad_recon(
         opt_shifts = torch.optim.Adam([shifts], lr=pose_cfg.lr_shifts)
         optimisers.append(opt_shifts)
 
+    pose_warmup_iters = pose_cfg.pose_warmup_iters if pose_cfg is not None else 0
+    alternating_period = pose_cfg.alternating_period if pose_cfg is not None else 0
+    default_step_schedule = pose_warmup_iters == 0 and alternating_period == 0
+    if (refine_pose or refine_shifts) and pose_warmup_iters >= optim_cfg.n_iter > 0:
+        warnings.warn(
+            f"run_ad_recon: pose_warmup_iters={pose_warmup_iters} >= "
+            f"n_iter={optim_cfg.n_iter}, so the pose/shift parameters never step.",
+            stacklevel=2,
+        )
+
     # ── cosine LR schedulers ───────────────────────────────────────────────
+    # Each scheduler steps only when its optimiser steps, so T_max is that
+    # optimiser's number of active iterations (n_iter on the default joint
+    # schedule); every LR then anneals to ~0 by the end of its own stage.
     schedulers: list = []
     if optim_cfg.cosine_schedule:
+        vol_steps, pose_steps = _ad_recon_active_steps(
+            optim_cfg.n_iter,
+            pose_warmup_iters=pose_warmup_iters,
+            alternating_period=alternating_period,
+        )
         schedulers = [
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=optim_cfg.n_iter)
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=max(1, vol_steps if opt is opt_vol else pose_steps))
             for opt in optimisers
         ]
 
@@ -1407,9 +1460,6 @@ def run_ad_recon(
     send_components = (
         loss_callback is not None and _callback_accepts_components(loss_callback)
     )
-    pose_warmup_iters = pose_cfg.pose_warmup_iters if pose_cfg is not None else 0
-    alternating_period = pose_cfg.alternating_period if pose_cfg is not None else 0
-    default_step_schedule = pose_warmup_iters == 0 and alternating_period == 0
 
     for it in tqdm(range(optim_cfg.n_iter)):
         for opt in optimisers:
@@ -1485,6 +1535,7 @@ def run_ad_recon(
             if tilt_angle_opt.grad is not None:
                 tilt_angle_opt.grad[:, 2] = 0.0
 
+        step_volume = True
         if default_step_schedule:
             # Keep the default path exactly identical to the historical loop.
             for opt in optimisers:
@@ -1512,11 +1563,13 @@ def run_ad_recon(
                 volume.clamp_(min=0.0)
             if _cmask_mul is not None:
                 volume.mul_(_cmask_mul)
-            if constraints_cfg.sparsity > 0.0:
+            if constraints_cfg.sparsity > 0.0 and step_volume:
                 # Post-step L1 soft-threshold (ConstraintConfig.sparsity),
                 # last: positivity -> support mask -> sparsity. Positivity
                 # and a non-negative mask commute, so this is the same as
                 # ConstraintConfig.apply's mask -> positivity -> sparsity.
+                # Skipped in pose-only iterations: unlike positivity and the
+                # mask it is not idempotent and would shrink a frozen volume.
                 volume.copy_(_apply_sparsity(volume, constraints_cfg.sparsity))
             tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
             if tilt_bound_deg is not None and refine_pose and tilt_angle_opt is not None:
