@@ -19,6 +19,7 @@ from fasttomo._operator import (
     _UserProjectorOperator,
     _drain_deferred_handles,
     _make_operator,
+    _release_texture_pool,
 )
 from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.autograd import euler_zyz_to_rotmat
@@ -689,9 +690,17 @@ def release_cached_projectors() -> int:
     64 MiB per device reserved for the life of the process, outside
     PyTorch's allocator (not counted by ``torch.cuda.memory_*``).
 
+    It also frees the texture pool of the one-shot CUDA projections
+    (``forward_project``, ``back_project``, the ``*_3d`` variants and
+    ``run_fbp``): up to 4 texture arrays of the most recently used shapes,
+    kept so that repeated calls neither allocate nor synchronise
+    (``fasttomo._operator._TexturePool``); they are not counted in the
+    return value.
+
     Returns the number of configurations released (0 or 1). Safe to call at
     any time, also without CUDA.
     """
+    _release_texture_pool()
     n = _SIRT_OPERATORS.clear()
     if n and torch.cuda.is_available():
         # the textures were freed by the operators' finalizers; release any

@@ -29,7 +29,10 @@ Adapters (chosen by ``_make_operator``):
 
 ``UncachedOperator``     every call goes through the raw ``_launch`` layer
                          (fasttomo/autograd.py). The CPU adapter; on CUDA it
-                         is the one-shot path (a scoped texture per call).
+                         is the one-shot path: the functional API and FBP.
+                         Its textures come from a small process-wide pool
+                         (:class:`_TexturePool`) instead of being allocated
+                         and freed (with a stream sync) on every call.
 ``CudaCachedOperator``   persistent ``TextureCache`` handles reused across
                          calls (what the cached projectors always did); the
                          parallel angle gradient falls back to the uncached
@@ -45,7 +48,10 @@ layout, so they agree bit for bit (``tests/test_parity.py``).
 
 from __future__ import annotations
 
+import itertools
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -280,17 +286,19 @@ class UncachedOperator(ProjectionOperator):
         if self.kind == "parallel":
             return _forward_project_parallel_raw(volume, self._angles(geom), self.N_det,
                                                  self.num_threads, label=self._label,
-                                                 nonfinite=nonfinite)
+                                                 nonfinite=nonfinite, texture=_TEXTURE_POOL)
         return _forward_project_rotmat_raw(volume, self._rotmat_geom(geom), self.N_det,
-                                           self.num_threads, label=self._label)
+                                           self.num_threads, label=self._label,
+                                           texture=_TEXTURE_POOL)
 
     def bp(self, sinogram, geom=None, *, nonfinite=None):
         if self.kind == "parallel":
             return _back_project_parallel_raw(sinogram, self._angles(geom), self.Nz,
                                               self.num_threads, Nx=self.Nx, label=self._label,
-                                              nonfinite=nonfinite)
+                                              nonfinite=nonfinite, texture=_TEXTURE_POOL)
         return _back_project_rotmat_raw(sinogram, self._rotmat_geom(geom), self.Nz,
-                                        self.num_threads, Nx=self.Nx, label=self._label)
+                                        self.num_threads, Nx=self.Nx, label=self._label,
+                                        texture=_TEXTURE_POOL)
 
     _nonfinite_word = ProjectionOperator._parallel_fp16_word
 
@@ -795,3 +803,121 @@ def _release_handles(device: torch.device, handles: list[int]) -> None:
     for h in handles:
         _destroy(device, h)
     _drain_deferred_handles()
+
+
+# ── texture pool of the one-shot CUDA path (functional API, FBP) ────────────
+
+class _TexturePool:
+    """Texture caches of the one-shot CUDA path, kept between calls.
+
+    ``forward_project`` / ``back_project`` / ``*_3d`` and ``run_fbp`` on CUDA
+    used to build a texture per call (``cudaMalloc3DArray`` + texture object),
+    run the kernel, then synchronise the stream and free it: +0.15 ms per
+    call at 128-256^3 and +1.5 ms at 512^3 fp32, and the host blocked until
+    the kernel had finished, so a Python loop of calls could not queue work.
+    Now `_launch` leases a cache from this pool, runs the cached kernel
+    (upload + launch, stream-ordered, no sync) and returns the cache.
+
+    * Keyed by (device index, texture kind, I/O dtype, channels, dims): a
+      cache is only reused for the same shape and layout.
+    * At most ``maxsize`` (4) caches are kept, least recently used evicted;
+      memory retained is up to 4 textures, e.g. a 512^3 fp32 volume texture
+      is 512 MiB (outside PyTorch's allocator, not counted by
+      ``torch.cuda.memory_allocated``). :func:`release_cached_projectors`
+      (fasttomo.algorithms) frees them; so does an allocation failure of a
+      new texture (the pool is emptied and the allocation retried once).
+    * Thread-safe: a lease takes the cache out of the pool (``checkout``)
+      until the call has queued its work, so concurrent calls never share
+      one (a second one is created instead).
+    * Streams: the lease records the stream it ran on. A later call on
+      another stream makes its stream wait for that one first
+      (``wait_stream``, no host sync), so its upload cannot overwrite the
+      texture while the earlier kernel still reads it (the ordering
+      ``CudaCachedOperator`` applies since PR #95). Destroying a cache
+      synchronises the device first.
+    * CUDA-graph capture: not used (a captured graph would keep reading a
+      cache the pool may evict later); a call during capture takes the
+      one-shot binding as before.
+    """
+
+    def __init__(self, maxsize: int = 4) -> None:
+        self.maxsize = maxsize
+        # serial -> (key, handle, stream of the last lease); oldest first
+        self._free: OrderedDict[int, tuple] = OrderedDict()
+        self._serial = itertools.count()
+        self._lock = threading.Lock()
+        self.created = 0       # debug counter (tests): textures created
+
+    def launch(self, op: str, spec: tuple, ptrs: list, device: torch.device,
+               kwargs: dict) -> None:
+        """Run ``_core.<op>_cuda_cached`` for the one-shot binding's
+        arguments ``ptrs`` (io_dtype first) on a leased cache of layout
+        ``spec`` = (kind, io_dtype, channels, dim_a, dim_b, dim_c)."""
+        stream_ptr = _stream_ptr(device)
+        if torch.cuda.is_current_stream_capturing():
+            getattr(_core, op + "_cuda")(*ptrs, stream_ptr, **kwargs)
+            return
+        key = (device.index, *spec)
+        handle, last = self._checkout(key, device)
+        cur = torch.cuda.current_stream(device)
+        try:
+            if last is not None and last != cur:
+                cur.wait_stream(last)
+            getattr(_core, op + "_cuda_cached")(ptrs[0], handle, *ptrs[1:], stream_ptr,
+                                                upload=True, **kwargs)
+        finally:
+            self._checkin(key, handle, cur)
+
+    def _checkout(self, key: tuple, device: torch.device) -> tuple[int, object]:
+        with self._lock:
+            for serial, (k, handle, last) in self._free.items():
+                if k == key:
+                    del self._free[serial]
+                    return handle, last
+        kind, dtype, channels, a, b, c = key[1:]
+        try:
+            handle = int(_core.tc_create(kind, dtype, channels, a, b, c))
+        except RuntimeError:
+            # most likely out of memory: free what the pool holds, retry once
+            if not self.clear(device):
+                raise
+            handle = int(_core.tc_create(kind, dtype, channels, a, b, c))
+        self.created += 1
+        return handle, None
+
+    def _checkin(self, key: tuple, handle: int, stream) -> None:
+        with self._lock:
+            self._free[next(self._serial)] = (key, handle, stream)
+            evicted = []
+            while len(self._free) > self.maxsize:
+                evicted.append(self._free.popitem(last=False)[1])
+        for k, h, _ in evicted:
+            _release_handles(torch.device("cuda", k[0]), [h])
+
+    def clear(self, device: torch.device | None = None) -> int:
+        """Destroy the pooled caches (of ``device`` only, if given); returns
+        how many. Caches leased by a running call are not affected."""
+        with self._lock:
+            keep, drop = OrderedDict(), []
+            for serial, entry in self._free.items():
+                if device is None or entry[0][0] == device.index:
+                    drop.append(entry)
+                else:
+                    keep[serial] = entry
+            self._free = keep
+        for k, h, _ in drop:
+            _release_handles(torch.device("cuda", k[0]), [h])
+        return len(drop)
+
+    def __len__(self) -> int:
+        return len(self._free)
+
+
+_TEXTURE_POOL = _TexturePool()
+
+
+def _release_texture_pool() -> int:
+    """Free the one-shot path's pooled textures (release_cached_projectors)."""
+    if not _TEXTURE_POOL:
+        return 0
+    return _TEXTURE_POOL.clear()

@@ -196,3 +196,112 @@ def test_fp16_range_check_uses_the_kernel_word(monkeypatch):
     p.back(p.forward(vol))
     ft.forward_project_3d(vol, torch.zeros(5, 3, device=DEV))
     assert [flag for _, flag in seen] == [True] * 5 + [False]
+
+
+# ── texture pool of the one-shot path (functional API, FBP) ─────────────────
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_functional_calls_reuse_pooled_textures(dtype):
+    """Repeated functional calls of one shape lease the same pooled
+    textures (no new texture after the first call) and give the bits of
+    the one-shot binding (a texture allocated and freed per call)."""
+    from fasttomo._operator import _TEXTURE_POOL
+    from fasttomo.autograd import _back_project_parallel_raw, _forward_project_parallel_raw
+
+    ft.release_cached_projectors()
+    vol = torch.rand(5, 24, 20, device=DEV).to(dtype)
+    ang = _angles(9)
+    sino = ft.forward_project(vol, ang, N_det=22)
+    back = ft.back_project(sino, ang, Nz=24, Nx=20)
+    created = _TEXTURE_POOL.created
+    for _ in range(3):
+        assert torch.equal(ft.forward_project(vol, ang, N_det=22), sino)
+        assert torch.equal(ft.back_project(sino, ang, Nz=24, Nx=20), back)
+    assert _TEXTURE_POOL.created == created and len(_TEXTURE_POOL) == 2
+    assert torch.equal(_forward_project_parallel_raw(vol, ang, 22), sino)
+    assert torch.equal(_back_project_parallel_raw(sino, ang, 24, Nx=20), back)
+
+
+@needs_cuda
+def test_texture_pool_is_bounded_and_released():
+    """At most maxsize textures are kept (least recently used evicted);
+    release_cached_projectors() frees them."""
+    from fasttomo._operator import _TEXTURE_POOL
+
+    ang = _angles(4)
+    for Ny in range(1, 8):
+        ft.forward_project(torch.rand(Ny, 8, 8, device=DEV), ang)
+    assert len(_TEXTURE_POOL) == _TEXTURE_POOL.maxsize
+    ft.release_cached_projectors()
+    assert len(_TEXTURE_POOL) == 0
+
+
+@needs_cuda
+@pytest.mark.parametrize("kind", ["parallel", "rotmat"])
+def test_functional_calls_on_two_streams_match_serial(kind):
+    """Interleaved functional calls of one shape from two streams share the
+    pooled textures; the lease orders the second stream after the first
+    (as CudaCachedOperator does), so every result equals the serial one."""
+    dev = torch.device(DEV)
+    N, n = 128, 90
+    g = torch.Generator(device=dev).manual_seed(0)
+    va = torch.rand(N, N, N, device=dev, generator=g)
+    vb = torch.rand(N, N, N, device=dev, generator=g) + 5.0
+    ang = torch.linspace(-89, 89, n, device=dev)
+    if kind == "parallel":
+        fwd = lambda v: ft.forward_project(v, ang)                      # noqa: E731
+        back = lambda s: ft.back_project(s, ang)                        # noqa: E731
+    else:
+        eul = torch.stack([torch.zeros(n, device=dev), ang, torch.zeros(n, device=dev)], 1)
+        fwd = lambda v: ft.forward_project_3d(v, eul)                   # noqa: E731
+        back = lambda s: ft.back_project_3d(s, eul)                     # noqa: E731
+    sa, sb = fwd(va).clone(), fwd(vb).clone()
+    ba, bb = back(sa).clone(), back(sb).clone()
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    for _ in range(4):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            a = fwd(va)
+            x = back(sa)
+        with torch.cuda.stream(s2):
+            b = fwd(vb)
+            y = back(sb)
+        with torch.cuda.stream(s1):
+            a2 = fwd(va)
+        torch.cuda.synchronize()
+        assert torch.equal(a, sa) and torch.equal(b, sb) and torch.equal(a2, sa)
+        assert torch.equal(x, ba) and torch.equal(y, bb)
+
+
+@needs_cuda
+def test_functional_calls_from_threads_match_serial():
+    """Concurrent functional calls of one shape from several threads (the
+    bindings release the GIL) never share a leased texture."""
+    import threading
+
+    ang = _angles(31)
+    vols = [torch.rand(6, 64, 64, device=DEV) + k for k in range(4)]
+    ref = [ft.forward_project(v, ang) for v in vols]
+    torch.cuda.synchronize()
+    out, errors = [None] * 4, []
+
+    def work(k):
+        try:
+            s = torch.cuda.Stream()
+            with torch.cuda.stream(s):
+                for _ in range(10):
+                    r = ft.forward_project(vols[k], ang)
+            s.synchronize()
+            out[k] = r
+        except Exception as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    threads = [threading.Thread(target=work, args=(k,)) for k in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    for k in range(4):
+        assert torch.equal(out[k], ref[k])
