@@ -258,11 +258,11 @@ _SOFT_DEVICES = ["cpu", pytest.param("cuda", marks=needs_cuda)]
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
 @pytest.mark.parametrize("t", [1e-3, 3.3e-3, 0.25])
 def test_soft_threshold_matches_reference_expression(device, dtype, t):
-    """A6-7: the softshrink-based soft-threshold (out of place and in
-    place) equals ``sign(v) * max(|v| - t, 0)`` bit for bit (torch.equal:
-    a zero may come out +0 instead of -0), including values at +-t, zeros
-    and values just around the threshold; the in-place form keeps the
-    storage."""
+    """A6-7: run_ad_recon's in-place softshrink soft-threshold equals
+    ``sign(v) * max(|v| - t, 0)`` in value (torch.equal: a zero may come
+    out +0 instead of -0), including values at +-t, zeros and values just
+    around the threshold, and keeps the storage. The generic constraints
+    keep the expression bit for bit."""
     from fasttomo.constraints import _soft_threshold, _soft_threshold_
 
     g = torch.Generator().manual_seed(7)

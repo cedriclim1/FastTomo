@@ -11,13 +11,14 @@
   output. At 256^3, 61 views, pose + shifts: a volume-only (warm-up)
   iteration 5.4 -> 2.5 ms, `alternating_period=5` 6.3 -> 3.9 ms per
   iteration.
-- Soft-threshold constraint (`ConstraintConfig.soft_threshold`, the
-  `sparsity=` keyword of the classical `run_*` functions) is one
-  `softshrink` pass, in place, for fp32/fp64 volumes (fp16 keeps the old
-  expression, whose arithmetic differs). Bit-identical (a zero may now be
-  +0 instead of -0). `run_ad_recon` with positivity, cylinder and
-  soft-threshold at 256^3: 2.18 -> 1.85 ms per iteration, peak 448 ->
-  352 MiB.
+- `run_ad_recon`'s soft-threshold constraint (`ConstraintConfig.
+  soft_threshold`) is one in-place `softshrink` pass (fp32). Same values
+  as before (a zero may now be +0 instead of -0; the goldens compare
+  equal). With positivity, cylinder and soft-threshold at 256^3: 2.18 ->
+  1.85 ms per iteration, peak 448 -> 352 MiB. The generic constraints
+  (`apply_constraints`, the `sparsity=` keyword of the other `run_*`
+  functions) keep the old expression bit for bit: run_sirt's fused CUDA
+  kernels reproduce its bits, and the frozen GENFIRE/RESIRE use it.
 - Loss recording in `run_ad_recon` and `run_grad_descent`: with
   `return_loss` alone the losses stay on the device and are copied to the
   host once at the end (0 host syncs per iteration, was 1); with a

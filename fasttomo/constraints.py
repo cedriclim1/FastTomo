@@ -132,26 +132,29 @@ def _resolve_support_mask(
     return support_mask.to(device=device, dtype=dtype).contiguous()
 
 
-# dtypes for which ``softshrink`` gives exactly ``sign(v) * max(|v| - t, 0)``:
-# it computes ``v -+ t`` in the tensor's dtype with ``t`` rounded to it, the
-# same arithmetic as the reference expression for fp32 and fp64 (up to the
-# sign of a zero result: +0 where the expression gives -0). fp16/bf16 keep
-# the expression, whose fp32 op-math uses the unrounded threshold.
-_SOFTSHRINK_DTYPES = (torch.float32, torch.float64)
-
-
 def _soft_threshold(vol: torch.Tensor, weight: float) -> torch.Tensor:
     """L1 soft-threshold ``sign(v) * max(|v| - weight, 0)`` (the proximal
-    operator of ``weight * ||v||_1``), as a new tensor. One elementwise pass
-    (``softshrink``) for fp32/fp64."""
-    if vol.dtype in _SOFTSHRINK_DTYPES:
-        return torch.nn.functional.softshrink(vol, weight)
+    operator of ``weight * ||v||_1``)."""
     return vol.sign() * (vol.abs() - weight).clamp_(min=0.0)
 
 
+# dtypes for which ``softshrink`` gives the values of `_soft_threshold`: it
+# computes ``v -+ t`` in the tensor's dtype with ``t`` rounded to it, the
+# same arithmetic as the expression for fp32 and fp64. fp16/bf16 keep the
+# expression, whose fp32 op-math uses the unrounded threshold.
+_SOFTSHRINK_DTYPES = (torch.float32, torch.float64)
+
+
 def _soft_threshold_(vol: torch.Tensor, weight: float) -> None:
-    """In-place `_soft_threshold`: ``vol`` keeps its storage (leaf tensors,
-    CUDA-graph static buffers), with no temporaries for fp32/fp64."""
+    """In-place `_soft_threshold` for ``run_ad_recon``'s leaf volume: one
+    ``softshrink`` pass without temporaries for fp32/fp64 (A6-7).
+
+    Equal in value to `_soft_threshold` (``torch.equal``), but not in every
+    bit: a zero result may carry the other sign (``-0`` vs ``+0``) and a
+    NaN keeps its own payload. The generic constraints (`apply_constraints`,
+    `apply_constraints_`) keep the expression, because run_sirt's fused
+    CUDA update kernels reproduce its bits and the frozen GENFIRE / RESIRE
+    use it."""
     if vol.dtype in _SOFTSHRINK_DTYPES:
         torch.ops.aten.softshrink.out(vol, weight, out=vol)
     else:
@@ -202,4 +205,4 @@ def apply_constraints_(
     if positivity:
         volume.clamp_(min=0.0)
     if soft_threshold > 0.0:
-        _soft_threshold_(volume, soft_threshold)
+        volume.copy_(_soft_threshold(volume, soft_threshold))
