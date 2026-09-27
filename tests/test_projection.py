@@ -673,6 +673,95 @@ def test_bp3d_fp16_matches_fp32():
     assert rel_err(rec_fp16, rec_fp32) < 1e-2
 
 
+# ── fp16 range (audit P2): an fp16 result beyond 65504 raises ──────────────────
+
+
+def _fp16_overflow_inputs(device):
+    """A back-projection of 180 views of a sinogram of 1000 (the result is
+    1.8e5 > 65504, the fp32 accumulator is fine) and a forward projection of
+    a 64-wide volume of 3000 (ray sums ~1.9e5)."""
+    ang = torch.linspace(-89.5, 89.5, 180, device=device)
+    sino = torch.full((180, 2, 16), 1000.0, device=device)
+    vol = torch.full((2, 64, 64), 3000.0, device=device)
+    return ang, sino, vol
+
+
+@pytest.mark.parametrize("op", ["back_project", "forward_project",
+                                "back_project_3d", "forward_project_3d"])
+def test_fp16_overflow_raises(backend, op):
+    ang, sino, vol = _fp16_overflow_inputs(backend)
+    geom = ang if op in ("back_project", "forward_project") else make_euler_pure_y(ang)
+    x = sino if op.startswith("back") else vol
+    fn = getattr(ft, op)
+    ref = fn(x, geom)                           # fp32: finite, beyond fp16 max
+    assert torch.isfinite(ref).all() and ref.abs().max() > 65504
+    with pytest.raises(OverflowError, match=f"{op}: .*fp16 range"):
+        fn(x.half(), geom)
+    # scaled into range (the documented remedy), fp16 is fine
+    out = fn((x / 16).half(), geom)
+    assert torch.isfinite(out).all()
+    assert rel_err(out.float() * 16, ref) < 1e-2
+
+
+def test_fp16_inf_input_propagates_without_error(backend):
+    """An inf that came with the input is not an overflow: no error."""
+    ang, sino, _ = _fp16_overflow_inputs(backend)
+    s = (sino / 1000).half()
+    s[0, 0, 5] = float("inf")
+    out = ft.back_project(s, ang)
+    assert torch.isinf(out).any()
+
+
+@needs_cuda
+def test_fp16_overflow_raises_in_projectors_and_backward():
+    ang, sino, vol = _fp16_overflow_inputs(DEVICE)
+    with pytest.raises(OverflowError, match="ParallelProjector"):
+        ft.ParallelProjector((2, 16, 16), ang).back(sino.half())
+    with pytest.raises(OverflowError, match="ParallelProjector"):
+        ft.ParallelProjector(tuple(vol.shape), ang).forward(vol.half())
+    with pytest.raises(OverflowError, match="RotmatProjector"):
+        ft.RotmatProjector((2, 16, 16), 180, DEVICE).back(
+            sino.half(), ft.euler_zyz_to_rotmat(make_euler_pure_y(ang).to(DEVICE)))
+    # backward of a forward projection: BP of a large incoming gradient
+    v = torch.zeros(2, 64, 64, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    y = ft.forward_project(v, ang)
+    with pytest.raises(OverflowError, match=r"\(backward\)"):
+        y.backward(torch.full_like(y, 1000.0))
+
+
+@needs_cuda
+def test_fp16_overflow_in_iterative_algorithms_raises_once_at_the_end():
+    """FISTA's first gradient is BP(-sinogram): unnormalised fp16 data
+    overflow. The algorithms record a device-side flag per projection and
+    raise when they return; SIRT normalises its residual and does not."""
+    ang, sino, _ = _fp16_overflow_inputs(DEVICE)
+    big = sino[:, :, :].clone()
+    with pytest.raises(OverflowError, match="run_fista: "):
+        ft.run_fista(big.half(), ang, 3)
+    out = ft.run_fista((big / 1000).half(), ang, 3)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(ft.run_sirt(big.half(), ang, 3)).all()
+    assert torch.isfinite(ft.run_sirt(big.half(), ang, 3, return_loss=True)[0]).all()
+
+
+@needs_cuda
+def test_fp16_fbp_overflow_raises():
+    """FBP's back-projection sums n_angles filtered views before the pi /
+    n_angles scale: a density of 400 over 720 views is ~9.2e4 in fp16
+    before scaling (the sinogram itself, up to 2.6e4, fits)."""
+    ang = torch.linspace(-89.75, 89.75, 720, device=DEVICE)
+    vol = torch.zeros(2, 64, 64, device=DEVICE)
+    vol[:, 16:48, 16:48] = 400.0
+    sino = ft.forward_project(vol, ang)
+    assert sino.max() < 65504
+    ref = ft.run_fbp(sino, ang)
+    assert torch.isfinite(ref).all()
+    with pytest.raises(OverflowError, match="fp16 range"):
+        ft.run_fbp(sino.half(), ang)
+    out = ft.run_fbp((sino / 400).half(), ang).float() * 400
+    assert rel_err(out, ref) < 1e-2
+
+
 @needs_cuda
 def test_bf16_raises_on_forward_project():
     N      = 16

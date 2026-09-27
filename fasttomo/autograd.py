@@ -45,6 +45,7 @@ import fasttomo._core as _core
 from fasttomo._backend import (  # noqa: F401
     _assert_cuda,
     _assert_dtype_match,
+    _check_fp16_range,
     _check_shapes,
     _data_ptr,
     _ensure_fp32,
@@ -517,6 +518,7 @@ class _Project(torch.autograd.Function):
         ctx.save_for_backward(volume.detach() if need_geom else None,
                               None if geom is None else geom.detach())
         sino = op.fp(volume, geom)
+        _check_fp16_range(sino, volume, op._name)
         # e.g. which volume upload a cached texture holds right now; handed
         # back to op.grad_geom, which alone knows what it means
         ctx.token = op.fp_token()
@@ -531,7 +533,10 @@ class _Project(torch.autograd.Function):
         volume, geom = ctx.saved_tensors
         op = ctx.op
         grad_sino = grad_sino.contiguous()
-        grad_vol = op.bp(grad_sino, geom) if ctx.needs_input_grad[0] else None
+        grad_vol = None
+        if ctx.needs_input_grad[0]:
+            grad_vol = op.bp(grad_sino, geom)
+            _check_fp16_range(grad_vol, grad_sino, op._name + " (backward)")
         grad_geom = None
         if ctx.needs_input_grad[1]:
             grad_geom = op.grad_geom(volume, grad_sino, geom, token=ctx.token)
@@ -549,13 +554,18 @@ class _BackProject(torch.autograd.Function):
     def forward(ctx, sinogram, geom, op):
         ctx.op = op
         ctx.save_for_backward(None if geom is None else geom.detach())
-        return op.bp(sinogram, geom)
+        vol = op.bp(sinogram, geom)
+        _check_fp16_range(vol, sinogram, op._name)
+        return vol
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_vol):
         (geom,) = ctx.saved_tensors
-        return ctx.op.fp(grad_vol.contiguous(), geom), None, None
+        grad_vol = grad_vol.contiguous()
+        grad_sino = ctx.op.fp(grad_vol, geom)
+        _check_fp16_range(grad_sino, grad_vol, ctx.op._name + " (backward)")
+        return grad_sino, None, None
 
 
 # ── 3-D isotropic TV loss (fused CUDA kernel) ──────────────────────────────

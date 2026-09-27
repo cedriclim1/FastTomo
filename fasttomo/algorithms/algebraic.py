@@ -10,6 +10,7 @@ from typing import Any, Callable
 import torch
 
 from fasttomo._operator import Geometry, _drain_deferred_handles, _make_operator
+from fasttomo._backend import _fp16_overflow_checked
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.configs import ConstraintConfig
 from fasttomo.algorithms._common import (
@@ -26,6 +27,7 @@ from fasttomo.algorithms._common import (
 from fasttomo.algorithms.analytic import _make_wbp
 
 
+@_fp16_overflow_checked
 def run_sirt(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees
@@ -156,6 +158,7 @@ def run_sirt(
     return rec.finish(volume)
 
 
+@_fp16_overflow_checked
 def run_sart(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor,                   # [n_angles] degrees

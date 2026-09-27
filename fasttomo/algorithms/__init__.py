@@ -38,7 +38,10 @@ dtypes
     fp32 everywhere; fp16 also for FBP, SIRT, SART, FISTA and FISTA-TV
     (output in the input dtype). Anything else (fp64, bf16) raises
     TypeError; nothing is cast silently. A ``warm_start`` must have the
-    sinogram's dtype.
+    sinogram's dtype. fp16 values are limited to +-65504: an fp16 run whose
+    projections overflow (typically unnormalised data in FBP or FISTA)
+    raises OverflowError when it returns instead of returning inf; scale the
+    sinogram into range or use fp32 (`fasttomo._backend`, fp16 range).
 
 Support: ``mask`` and ``support_mask``
     ``mask=True`` restricts the volume to the inscribed cylinder of the XZ

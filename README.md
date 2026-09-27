@@ -2,7 +2,7 @@
 
 Ground-up fast tomography implementations in C and CUDA with direct workflows in PyTorch.
 
-Every public function takes and returns `torch.Tensor`. Projection and back-projection kernels run on the CPU (C/OpenMP) and on CUDA (texture memory). Volumes are `[Ny, Nz, Nx]`, sinograms `[n_angles, Ny, N_det]` and angles a 1-D tensor in degrees; `Ny` runs along the tilt axis. fp32 is supported everywhere; the parallel and 3D projections (functional and the projector classes) and FBP, SIRT, SART, FISTA and FISTA-TV also accept fp16 (output in the input dtype). Other dtypes raise `TypeError`; nothing is cast silently.
+Every public function takes and returns `torch.Tensor`. Projection and back-projection kernels run on the CPU (C/OpenMP) and on CUDA (texture memory). Volumes are `[Ny, Nz, Nx]`, sinograms `[n_angles, Ny, N_det]` and angles a 1-D tensor in degrees; `Ny` runs along the tilt axis. fp32 is supported everywhere; the parallel and 3D projections (functional and the projector classes) and FBP, SIRT, SART, FISTA and FISTA-TV also accept fp16 (output in the input dtype). An fp16 result beyond the fp16 range (65504) raises `OverflowError` instead of returning `inf` (the kernels accumulate in fp32; scale unnormalised data into range or use fp32). Other dtypes raise `TypeError`; nothing is cast silently.
 
 ## Algorithms
 
