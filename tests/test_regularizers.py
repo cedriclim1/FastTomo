@@ -72,6 +72,39 @@ def test_ssim_losses_do_not_sync_the_host():
     assert torch.isfinite(loss).item()
 
 
+def _ssim_map_fp64(x, y, *, win_size=11, sigma=1.5, data_range=None):
+    """Reference SSIM map (Wang et al. 2004), written out independently of
+    fasttomo: one dense 2-D Gaussian window (normalised to 1), torch
+    ``reflect`` padding (scipy's ``mirror``), population covariances,
+    ``C1 = (0.01 L)^2``, ``C2 = (0.03 L)^2`` with ``L = max(y) - min(y)``
+    unless given, and the textbook formula
+
+        SSIM = (2 mu_x mu_y + C1) (2 sigma_xy + C2)
+               / ((mu_x^2 + mu_y^2 + C1) (sigma_xx + sigma_yy + C2)).
+
+    ``x``, ``y``: ``[B, H, W]``; computed in float64 on the CPU."""
+    import torch.nn.functional as F
+
+    x, y = x.cpu().double(), y.cpu().double()
+    L = float(y.max() - y.min()) if data_range is None else data_range
+    C1, C2 = (0.01 * L) ** 2, (0.03 * L) ** 2
+    c = torch.arange(win_size, dtype=torch.float64) - (win_size - 1) / 2
+    g = torch.exp(-c ** 2 / (2 * sigma ** 2))
+    g = g / g.sum()
+    w = (g[:, None] * g[None, :])[None, None]
+    p = win_size // 2
+
+    def local_mean(v):
+        return F.conv2d(F.pad(v.unsqueeze(1), (p, p, p, p), mode="reflect"), w).squeeze(1)
+
+    mu_x, mu_y = local_mean(x), local_mean(y)
+    s_xx = local_mean(x * x) - mu_x ** 2
+    s_yy = local_mean(y * y) - mu_y ** 2
+    s_xy = local_mean(x * y) - mu_x * mu_y
+    return ((2 * mu_x * mu_y + C1) * (2 * s_xy + C2)
+            / ((mu_x ** 2 + mu_y ** 2 + C1) * (s_xx + s_yy + C2)))
+
+
 class TestTiltSSIM:
     def test_zero_for_identity(self):
         torch.manual_seed(0)
@@ -104,25 +137,75 @@ class TestTiltSSIM:
         assert x.grad.abs().sum().item() > 0.0
 
     def test_matches_skimage(self):
-        """Cross-check against skimage's structural_similarity.
-
-        Tolerance is loose (~1e-2) because skimage crops the SSIM map to the
-        valid region while we reflect-pad to full size — same SSIM math, just
-        different boundary handling.
-        """
-        skimage = pytest.importorskip("skimage.metrics")
+        """The fp64 reference below reproduces scikit-image's
+        ``structural_similarity`` on its valid region (value computed with
+        scikit-image 0.26 in fp64 on this input, hard-coded so the test does
+        not need scikit-image), and tilt_ssim_loss's full reflect-padded map
+        matches the same reference."""
         torch.manual_seed(42)
-        x_np = torch.rand(32, 32).numpy()
-        y_np = (torch.rand(32, 32) * 0.8 + 0.1).numpy()
-        sk = skimage.structural_similarity(
-            x_np, y_np, data_range=1.0, win_size=11,
-            gaussian_weights=True, sigma=1.5, use_sample_covariance=False,
-        )
-        loss = ft.tilt_ssim_loss(
-            torch.from_numpy(x_np)[None], torch.from_numpy(y_np)[None],
-            win_size=11, sigma=1.5, data_range=1.0,
-        ).item()
-        assert (1.0 - loss) == pytest.approx(sk, abs=1e-2)
+        x = torch.rand(32, 32)
+        y = torch.rand(32, 32) * 0.8 + 0.1
+        ssim_map = _ssim_map_fp64(x[None], y[None], data_range=1.0)
+        pad = 5
+        valid = ssim_map[:, pad:-pad, pad:-pad].mean().item()
+        assert valid == pytest.approx(0.019964165908094127, abs=1e-12)
+        loss = ft.tilt_ssim_loss(x[None], y[None], win_size=11, sigma=1.5,
+                                 data_range=1.0).item()
+        assert (1.0 - loss) == pytest.approx(ssim_map.mean().item(), abs=2e-7)
+
+    @pytest.mark.parametrize("device,tf32", [
+        ("cpu", False),
+        pytest.param("cuda", True, marks=needs_cuda),
+        pytest.param("cuda", False, marks=needs_cuda)])
+    @pytest.mark.parametrize("B,H", [(1, 128), (4, 128), (61, 64), (4, 256)])
+    def test_matches_fp64_reference_at_sinogram_scale(self, device, tf32, B, H):
+        """A6-1: loss and gradient against an fp64 evaluation of the
+        textbook formula, on sinogram-scale data (mean ~100, local std ~1-5)
+        where the old ``E[x^2] - mu^2`` form lost 1-6 % under cuDNN's
+        TF32 at small batches. cuDNN TF32 is set explicitly both ways."""
+        g = torch.Generator().manual_seed(B * 1000 + H)
+        base = 100.0 + 5.0 * torch.randn(B, H, H, generator=g)
+        target = base + torch.randn(B, H, H, generator=g)
+        pred = target * (1 + 0.02 * torch.randn(B, H, H, generator=g))
+
+        x64 = pred.double().requires_grad_(True)
+        ref = 1.0 - _ssim_map_fp64(x64, target.double()).mean()
+        ref.backward()
+
+        prev = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = tf32
+        try:
+            x = pred.to(device).requires_grad_(True)
+            loss = ft.tilt_ssim_loss(x, target.to(device))
+            loss.backward()
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev
+        assert abs(loss.item() - ref.item()) <= 1e-5 * abs(ref.item())
+        gerr = (x.grad.cpu().double() - x64.grad).norm() / x64.grad.norm()
+        assert gerr <= 1e-5
+
+    def test_cached_target_equals_public_function(self):
+        """run_ad_recon's cached target statistics give the public
+        function's value and gradient."""
+        from fasttomo.regularizers import _TiltSSIMTarget
+
+        g = torch.Generator().manual_seed(3)
+        y = 50 + torch.randn(5, 40, 36, generator=g)
+        x = (y + 0.3 * torch.randn(5, 40, 36, generator=g)).requires_grad_(True)
+        a = ft.tilt_ssim_loss(x, y)
+        (ga,) = torch.autograd.grad(a, x)
+        b = _TiltSSIMTarget(y)(x)
+        (gb,) = torch.autograd.grad(b, x)
+        assert torch.equal(a, b) and torch.equal(ga, gb)
+
+    def test_gradient_reaches_a_target_that_requires_grad(self):
+        g = torch.Generator().manual_seed(4)
+        y64 = (torch.rand(2, 24, 24, generator=g)).double().requires_grad_(True)
+        x = torch.rand(2, 24, 24, generator=g)
+        (1.0 - _ssim_map_fp64(x.double(), y64, data_range=1.0).mean()).backward()
+        y = y64.detach().float().requires_grad_(True)
+        ft.tilt_ssim_loss(x, y, data_range=1.0).backward()
+        torch.testing.assert_close(y.grad.double(), y64.grad, rtol=1e-4, atol=1e-7)
 
     def test_shape_mismatch_raises(self):
         x = torch.rand(4, 32, 32, dtype=torch.float32)
@@ -144,6 +227,61 @@ class TestTiltSSIM:
 
 
 class TestS3IM:
+    @pytest.mark.parametrize("device,tf32", [
+        ("cpu", False),
+        pytest.param("cuda", True, marks=needs_cuda),
+        pytest.param("cuda", False, marks=needs_cuda)])
+    def test_matches_fp64_reference_with_the_same_indices(self, device, tf32):
+        """A6-1 / A6-9: value and gradient against an fp64 textbook SSIM
+        (dense K x K Gaussian window, sigma K/2, stride K) of the same
+        patches, at sinogram scale; each patch is drawn without replacement."""
+        import torch.nn.functional as F
+        from fasttomo.regularizers import _S3IMTarget
+
+        g = torch.Generator().manual_seed(11)
+        y = 100.0 + 5.0 * torch.randn(9, 40, 40, generator=g)
+        x = y + torch.randn(9, 40, 40, generator=g)
+        M, K, side = 3, 4, 32
+        gen = torch.Generator(device=device).manual_seed(5)
+        idx = _S3IMTarget(y.to(device), patch_pixels=side * side, kernel_size=K,
+                          n_patches=M)._indices(gen).cpu()
+        assert idx.shape == (M, side * side)
+        assert all(row.unique().numel() == side * side for row in idx)
+
+        x64 = x.double().requires_grad_(True)
+        L = float(y.max() - y.min())
+        C1, C2 = (0.01 * L) ** 2, (0.03 * L) ** 2
+        c = torch.arange(K, dtype=torch.float64) - (K - 1) / 2
+        w1 = torch.exp(-c ** 2 / (2 * (K / 2.0) ** 2))
+        w1 = w1 / w1.sum()
+        w = (w1[:, None] * w1[None, :])[None, None]
+        px = x64.reshape(-1)[idx].view(M, 1, side, side)
+        py = y.double().reshape(-1)[idx].view(M, 1, side, side)
+
+        def lm(v):
+            return F.conv2d(v, w, stride=K)
+
+        mx, my = lm(px), lm(py)
+        sxx, syy, sxy = lm(px * px) - mx ** 2, lm(py * py) - my ** 2, lm(px * py) - mx * my
+        ssim = ((2 * mx * my + C1) * (2 * sxy + C2)
+                / ((mx ** 2 + my ** 2 + C1) * (sxx + syy + C2)))
+        ref = 1.0 - ssim.mean()
+        ref.backward()
+
+        prev = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = tf32
+        try:
+            xd = x.to(device).requires_grad_(True)
+            gen = torch.Generator(device=device).manual_seed(5)
+            loss = ft.s3im_loss(xd, y.to(device), patch_pixels=side * side, kernel_size=K,
+                                n_patches=M, generator=gen)
+            loss.backward()
+        finally:
+            torch.backends.cudnn.allow_tf32 = prev
+        assert abs(loss.item() - ref.item()) <= 1e-5 * abs(ref.item())
+        gerr = (xd.grad.cpu().double() - x64.grad).norm() / x64.grad.norm()
+        assert gerr <= 1e-5
+
     def test_zero_for_identity(self):
         torch.manual_seed(0)
         x = torch.rand(29, 200, 200, dtype=torch.float32)
@@ -411,6 +549,154 @@ def test_tv_loss_xz_value_and_grad(backend, shape):
     val = ft.tv_loss_xz(y_only, eps=0.0)
     val.backward()
     assert val.item() == 0.0
+
+
+def _tv_xz_torch(vol: torch.Tensor, eps: float) -> torch.Tensor:
+    dz = vol[:, 1:, :-1] - vol[:, :-1, :-1]
+    dx = vol[:, :-1, 1:] - vol[:, :-1, :-1]
+    return (dz ** 2 + dx ** 2 + eps).sqrt().mean()
+
+
+_XZ_SHAPES = [(1, 5, 7), (3, 4, 6), (2, 2, 2), (5, 33, 65), (4, 2, 33), (7, 31, 2),
+              (17, 31, 65), (3, 300, 7), (1, 64, 64), (40, 70, 67)]
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape", _XZ_SHAPES)
+def test_tv_loss_xz_cuda_kernel_matches_fp64(shape):
+    """A6-5: the planar CUDA kernel against the fp64 formula (value and
+    autograd gradient) on shapes with partial warps (Nx - 1 not a multiple
+    of 32), one corner per row (Nx = 2), Nz = 2, Ny = 1 and several blocks;
+    piecewise-constant data (flat regions, where eps matters) and a 1e3
+    offset. The value is bit-identical run to run (fixed-order reduction)."""
+    g = torch.Generator().manual_seed(sum(shape))
+    for data in ("rand", "flat", "offset"):
+        v = torch.rand(*shape, generator=g) * 3.0
+        if data == "flat":
+            v = (v > 1.5).float()
+        elif data == "offset":
+            v = v + 1e3
+        for eps in (1e-8, 1e-3):
+            v64 = v.double().requires_grad_(True)
+            ref = _tv_xz_torch(v64, eps)
+            ref.backward()
+            vc = v.cuda().requires_grad_(True)
+            vals = [ft.tv_loss_xz(vc, eps=eps) for _ in range(3)]
+            assert all(torch.equal(x, vals[0]) for x in vals)
+            vals[0].backward()
+            assert abs(vals[0].item() - ref.item()) <= 1e-6 * abs(ref.item()) + 1e-7
+            gerr = (vc.grad.cpu().double() - v64.grad).abs().max()
+            # fp32 inputs quantise 1e3-offset differences to ~6e-5
+            tol = 1e-4 if data == "offset" else 1e-5
+            assert gerr <= tol * v64.grad.abs().max(), (data, eps, gerr.item())
+
+
+@needs_cuda
+@pytest.mark.parametrize("shape", [(12, 14, 10), (2, 2, 2), (1, 6, 5), (6, 1, 5), (6, 5, 1)])
+def test_tv_loss_xz_backward_ignores_dirty_output_memory(shape):
+    """Like the 3-D kernel: the planar backward writes every voxel when
+    Nz, Nx >= 2 (its output is not zero-filled), and a degenerate volume
+    gets an exact zero gradient."""
+    from fasttomo.autograd import _tv_loss_grad_raw
+
+    torch.manual_seed(2)
+    vol = torch.randn(*shape, device=DEVICE)
+    g = torch.ones((), device=DEVICE)
+    grads = []
+    for fill in (float("nan"), 0.0):
+        junk = torch.full(shape, fill, device=DEVICE)
+        del junk
+        grads.append(_tv_loss_grad_raw(vol, g, 1e-7, "tv_loss_xz"))
+    assert torch.equal(grads[0], grads[1])
+    assert torch.isfinite(grads[0]).all()
+    if min(shape[1:]) < 2:
+        assert torch.equal(grads[0], torch.zeros_like(vol))
+
+
+@pytest.mark.parametrize("fn,shape", [
+    ("tv_loss_3d", (1, 8, 8)), ("tv_loss_3d", (8, 1, 8)), ("tv_loss_3d", (8, 8, 1)),
+    ("tv_loss_xz", (8, 1, 8)), ("tv_loss_xz", (8, 8, 1)), ("tv_loss_xz", (1, 1, 1))])
+def test_tv_losses_are_zero_without_corners(backend, fn, shape):
+    """A size-1 dimension leaves no difference sites: the loss is exactly 0
+    and the gradient zero on both backends (the CPU path returned NaN, the
+    mean of an empty tensor), even for non-finite volumes."""
+    v = torch.randn(*shape, device=backend)
+    v.view(-1)[0] = float("inf")
+    v.requires_grad_(True)
+    loss = getattr(ft, fn)(v)
+    assert loss.shape == () and loss.item() == 0.0
+    loss.backward()
+    assert torch.equal(v.grad, torch.zeros_like(v))
+
+
+def test_tv_loss_xz_single_slice_is_the_2d_tv(backend):
+    """Ny = 1: tv_loss_xz is the 2-D TV of that slice (tv_loss_3d is 0)."""
+    v = torch.rand(1, 9, 11, generator=torch.Generator().manual_seed(1))
+    got = ft.tv_loss_xz(v.to(backend), eps=1e-6).item()
+    assert got == pytest.approx(_tv_xz_torch(v.double(), 1e-6).item(), rel=1e-6)
+    assert ft.tv_loss_3d(v.to(backend)).item() == 0.0
+
+
+def _second_order_cases(device):
+    g = torch.Generator().manual_seed(9)
+    y = (100 + 3 * torch.randn(3, 24, 24, generator=g)).to(device)
+    v3 = torch.rand(4, 5, 6, generator=g).to(device)
+    return {
+        "tilt_ssim_loss": (y + torch.randn(y.shape, generator=g).to(device),
+                           lambda x: ft.tilt_ssim_loss(x, y)),
+        "s3im_loss": (y + torch.randn(y.shape, generator=g).to(device),
+                      lambda x: ft.s3im_loss(x, y, patch_pixels=256,
+                                             generator=torch.Generator(device=device).manual_seed(1))),
+        "tv_loss_3d": (v3, ft.tv_loss_3d),
+        "tv_loss_xz": (v3, ft.tv_loss_xz),
+    }
+
+
+_FIRST_ORDER = [("cpu", "tilt_ssim_loss"), ("cpu", "s3im_loss")] + [
+    pytest.param("cuda", fn, marks=needs_cuda)
+    for fn in ("tilt_ssim_loss", "s3im_loss", "tv_loss_3d", "tv_loss_xz")]
+
+
+@pytest.mark.parametrize("device,fn", _FIRST_ORDER)
+def test_hand_written_backwards_refuse_second_order(device, fn):
+    """The hand-written backwards (SSIM helpers, fused CUDA TV) are first
+    order only. A Hessian-vector product with respect to the input alone
+    (create_graph=True, no weight leaf) must raise, not silently treat the
+    backward as a constant (``once_differentiable`` did not catch this
+    case: the HVP came out 17-22 % wrong for the SSIM losses and without
+    the TV-xz term), and so must a second derivative through a weight. The
+    ordinary first-order gradient is unaffected."""
+    x0, f = _second_order_cases(device)[fn]
+    x = x0.clone().requires_grad_(True)
+    with pytest.raises(RuntimeError, match="first-order gradients only"):
+        (g,) = torch.autograd.grad(f(x), x, create_graph=True)
+        (g * torch.ones_like(g)).sum().backward()          # H @ 1
+    w = torch.tensor(2.0, device=device, requires_grad=True)
+    with pytest.raises(RuntimeError, match="first-order gradients only"):
+        torch.autograd.grad(w * f(x), x, create_graph=True)
+    (g,) = torch.autograd.grad(f(x), x)
+    assert torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+@pytest.mark.parametrize("fn", ["tv_loss_3d", "tv_loss_xz"])
+def test_cpu_tv_losses_stay_twice_differentiable(fn):
+    """The CPU TV expressions are plain autograd: their Hessian-vector
+    product matches central finite differences of the gradient."""
+    g = torch.Generator().manual_seed(4)
+    v = torch.rand(3, 5, 6, generator=g)
+    u = torch.randn(3, 5, 6, generator=g)
+    f = getattr(ft, fn)
+    x = v.clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(f(x, eps=1e-2), x, create_graph=True)
+    (hvp,) = torch.autograd.grad((grad * u).sum(), x)
+    h = 1e-3
+
+    def grad_at(z):
+        z = z.clone().requires_grad_(True)
+        return torch.autograd.grad(f(z, eps=1e-2), z)[0]
+
+    fd = (grad_at(v + h * u) - grad_at(v - h * u)) / (2 * h)
+    torch.testing.assert_close(hvp, fd, rtol=2e-2, atol=2e-4)
 
 
 def test_tv_loss_xz_rejects_bad_input():

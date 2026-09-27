@@ -251,6 +251,124 @@ def test_ad_recon_constraint_sparsity_cuda():
     assert rel_l2(rec, vol) < 1.0
 
 
+_SOFT_DEVICES = ["cpu", pytest.param("cuda", marks=needs_cuda)]
+
+
+@pytest.mark.parametrize("device", _SOFT_DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
+@pytest.mark.parametrize("t", [1e-3, 3.3e-3, 0.25])
+def test_soft_threshold_matches_reference_expression(device, dtype, t):
+    """A6-7: run_ad_recon's in-place softshrink soft-threshold equals
+    ``sign(v) * max(|v| - t, 0)`` in value (torch.equal: a zero may come
+    out +0 instead of -0), including values at +-t, zeros and values just
+    around the threshold, and keeps the storage. The generic constraints
+    keep the expression bit for bit."""
+    from fasttomo.constraints import _soft_threshold, _soft_threshold_
+
+    g = torch.Generator().manual_seed(7)
+    v = torch.randn(4, 9, 37, generator=g) * (3 * t)
+    edge = torch.tensor([t, -t, 0.0, -0.0, t * (1 + 1e-7), -t * (1 - 1e-7), 1e4, -1e4])
+    v.view(-1)[:edge.numel()] = edge
+    v = v.to(device=device, dtype=dtype)
+    ref = v.sign() * (v.abs() - t).clamp(min=0.0)
+    assert torch.equal(_soft_threshold(v, t), ref)
+    w = v.clone()
+    ptr = w.data_ptr()
+    _soft_threshold_(w, t)
+    assert torch.equal(w, ref) and w.data_ptr() == ptr
+    w = v.clone()
+    ft.constraints.apply_constraints_(w, soft_threshold=t, positivity=True)
+    assert torch.equal(w, (v.clamp(min=0) - t).clamp(min=0))
+
+
+def _count_syncs(fn) -> int:
+    """Host syncs torch's sync debug mode reports while ``fn`` runs."""
+    import warnings
+
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fn()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    return sum("synchroniz" in str(w.message).lower() for w in caught)
+
+
+@needs_cuda
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode")
+@pytest.mark.parametrize("mode,per_iter", [
+    ("return_loss", 0), ("callback", 1), ("components", 1), ("both", 1), ("none", 0)])
+@pytest.mark.parametrize("algorithm", ["ad", "gd"])
+def test_loss_recording_host_syncs_per_iteration(mode, per_iter, algorithm):
+    """A6-8: ``return_loss`` alone keeps the losses on the device (no host
+    sync per iteration, one transfer at the end); a ``loss_callback``,
+    with or without components, costs one sync per iteration (the total
+    and every component in one transfer). Counted as the difference
+    between a 6- and a 2-iteration run, so setup and the final transfer
+    cancel."""
+    sino, angles = _small_cuda_problem()
+    kw = {}
+    if mode in ("return_loss", "both"):
+        kw["return_loss"] = True
+    if mode in ("callback", "both"):
+        kw["loss_callback"] = lambda i, loss: None
+    if mode == "components":
+        kw["loss_callback"] = lambda i, loss, components=None: None
+
+    def run(n):
+        if algorithm == "ad":
+            cfg = ft.AdReconConfig(
+                optim=ft.OptimConfig(n_iter=n, lr_volume=0.05),
+                reg=ft.RegularizerConfig(tv_weight=1e-3, sparsity=1e-3))
+            ft.run_ad_recon(sino, angles, config=cfg, **kw)
+        else:
+            ft.run_grad_descent(sino, angles, n, lr=0.05, tv_weight=1e-3, **kw)
+
+    run(2)                                        # warm-up (lazy inits)
+    assert (_count_syncs(lambda: run(6)) - _count_syncs(lambda: run(2))) == 4 * per_iter
+
+
+def _small_cuda_problem():
+    torch.manual_seed(0)
+    angles = torch.linspace(-60, 60, 15, device="cuda")
+    vol = torch.zeros(3, 24, 24, device="cuda")
+    vol[:, 6:18, 8:16] = 1.0
+    return ft.forward_project(vol, angles), angles
+
+
+@needs_cuda
+@pytest.mark.parametrize("algorithm", ["ad", "gd"])
+def test_device_loss_history_equals_callback_values(algorithm):
+    """A6-8: the deferred (device) loss history is the same float32 tensor
+    the per-iteration path gives, and every callback value is a Python float
+    equal to it, components included."""
+    sino, angles = _small_cuda_problem()
+    calls = []
+
+    def cb(i, loss, components=None):
+        calls.append((i, loss, components))
+
+    def run(**kw):
+        if algorithm == "ad":
+            cfg = ft.AdReconConfig(
+                optim=ft.OptimConfig(n_iter=5, lr_volume=0.05),
+                reg=ft.RegularizerConfig(tv_weight=1e-3, sparsity=1e-3))
+            return ft.run_ad_recon(sino, angles, config=cfg, **kw)
+        return ft.run_grad_descent(sino, angles, 5, lr=0.05, tv_weight=1e-3, **kw)
+
+    vol_a, hist_a = run(return_loss=True)
+    vol_b, hist_b = run(return_loss=True, loss_callback=cb)
+    assert hist_a.dtype == torch.float32 and hist_a.device.type == "cpu"
+    assert torch.equal(vol_a, vol_b) and torch.equal(hist_a, hist_b)
+    assert [c[0] for c in calls] == list(range(5))
+    assert [c[1] for c in calls] == hist_a.tolist()
+    for _, loss, comps in calls:
+        assert type(loss) is float and all(type(v) is float for v in comps.values())
+        assert set(comps) == {"fidelity", "tv", "sparsity"} if algorithm == "ad" else {"fidelity", "tv"}
+
+
 def test_ad_recon_shape_guard_runs_before_shift_correction(monkeypatch):
     """A projector built for the wrong number of views must give the
     projector-shape error even with refine_shifts=True; the shift correction
@@ -611,6 +729,33 @@ class TestAdReconPoseConstraints:
         )
         assert euler[:, 0].abs().max().item() > 1e-3   # col0 actually moved
 
+    def test_antisymmetric_z_recovers_the_in_plane_rotation(self):
+        """A6-3: with psi = -phi built into the graph, phi is stepped with
+        the total derivative dL/dphi - dL/dpsi, so it converges to the true
+        in-plane rotation (volume fixed to the truth, noise-free). On this
+        problem the old scheme (partial dL/dphi, then psi := -phi) ended at
+        1.09 deg mean error, worse than the 0.88 deg start; now 0.03."""
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        N, n, q = 48, 25, 12
+        vol = torch.zeros(N, N, N, device="cuda")
+        vol[q:3 * q, q + 2:3 * q - 2, q - 2:3 * q - 4] = 1.0
+        vol[2 * q - 3:2 * q + 2, 2 * q - 3:2 * q, 2 * q - 1:3 * q + 1] = 2.0
+        vol = F.avg_pool3d(vol[None, None], 3, 1, 1)[0, 0].contiguous()
+        ang = torch.linspace(-60, 60, n, device="cuda")
+        phi_true = torch.randn(n, device="cuda")
+        sino = ft.forward_project_3d(vol, torch.stack([phi_true, ang, -phi_true], 1))
+        cfg = ft.AdReconConfig(
+            optim=ft.OptimConfig(n_iter=400, lr_volume=0.0, cosine_schedule=False),
+            pose=ft.PoseRefinementConfig(refine_pose=True, lr_angles=1e-2,
+                                         tilt_bound_deg=None))
+        _, euler, _ = ft.run_ad_recon(sino, ang, Nz=N, config=cfg, warm_start=vol,
+                                      return_pose=True)
+        err = (euler[:, 0] - phi_true.cpu()).abs().mean().item()
+        assert torch.equal(euler[:, 2], -euler[:, 0])
+        assert err < 0.1, err
+
     def test_antisymmetric_z_false_allows_drift(self):
         """antisymmetric_z=False lets col2 diverge from -col0 under high lr_angles."""
         _, euler, _ = ft.run_ad_recon(
@@ -901,11 +1046,12 @@ class _RecordingRotmatProjector(ft.RotmatProjector):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.vols, self.mats = [], []
+        self.vols, self.mats, self.requires_grad = [], [], []
 
     def forward(self, volume, mats):
         self.vols.append(volume.detach().clone())
         self.mats.append(mats.detach().clone())
+        self.requires_grad.append((volume.requires_grad, mats.requires_grad))
         return super().forward(volume, mats)
 
 
@@ -925,8 +1071,11 @@ def _staged_run(monkeypatch, n_iter, warmup, period):
     shift_log = []
     real_shift = algo.ad.apply_shifts_2d
 
+    shift_grad = []
+
     def recording_shift(pred, shifts):
         shift_log.append(shifts.detach().clone())
+        shift_grad.append(shifts.requires_grad)
         return real_shift(pred, shifts)
 
     monkeypatch.setattr(algo.ad, "apply_shifts_2d", recording_shift)
@@ -946,7 +1095,8 @@ def _staged_run(monkeypatch, n_iter, warmup, period):
     vols = proj.vols + [rec]
     mats = proj.mats + [ft.euler_zyz_to_rotmat(euler.to(dev))]
     shift_log.append(shifts.to(dev))
-    return loss, vols, mats, shift_log
+    grad_flags = [(v, m, sh) for (v, m), sh in zip(proj.requires_grad, shift_grad)]
+    return loss, vols, mats, shift_log, grad_flags
 
 
 def _moved(seq, k):
@@ -959,7 +1109,7 @@ def test_run_ad_recon_warmup_end_to_end(monkeypatch) -> None:
     not move during warm-up and moves on every later iteration; the volume
     moves on every iteration; the loss falls."""
     n_iter, warmup = 16, 6
-    loss, vols, mats, shifts = _staged_run(monkeypatch, n_iter, warmup, 0)
+    loss, vols, mats, shifts, _ = _staged_run(monkeypatch, n_iter, warmup, 0)
     for k in range(n_iter):
         assert _moved(vols, k), k
     for k in range(n_iter):
@@ -976,7 +1126,7 @@ def test_run_ad_recon_alternating_end_to_end(monkeypatch) -> None:
     pose-only (5-7, 11-13) blocks. Each parameter moves exactly in its own
     blocks; the loss falls."""
     n_iter, warmup, period = 14, 2, 3
-    loss, vols, mats, shifts = _staged_run(monkeypatch, n_iter, warmup, period)
+    loss, vols, mats, shifts, _ = _staged_run(monkeypatch, n_iter, warmup, period)
     for k in range(n_iter):
         step_volume, step_pose = _ad_recon_step_schedule(
             k, pose_warmup_iters=warmup, alternating_period=period)
@@ -988,6 +1138,42 @@ def test_run_ad_recon_alternating_end_to_end(monkeypatch) -> None:
     assert (loss[1:] <= loss[:-1]).all()
     assert loss[8] < loss[5]            # the pose-only block alone lowers the loss
     assert loss[-1] < 0.5 * loss[0]
+
+
+@needs_cuda
+def test_staged_iterations_differentiate_only_the_stepped_leaves(monkeypatch) -> None:
+    """A6-4: a volume-only iteration builds no graph for the pose and the
+    shifts (no grad_rotmat, no shift backward), a pose-only iteration none
+    for the volume (no back-projection). The default joint schedule keeps
+    every leaf differentiable."""
+    n_iter, warmup, period = 9, 2, 2
+    *_, flags = _staged_run(monkeypatch, n_iter, warmup, period)
+    assert len(flags) == n_iter
+    for k, (vol_rg, mats_rg, shift_rg) in enumerate(flags):
+        step_volume, step_pose = _ad_recon_step_schedule(
+            k, pose_warmup_iters=warmup, alternating_period=period)
+        assert (vol_rg, mats_rg, shift_rg) == (step_volume, step_pose, step_pose), k
+    *_, flags = _staged_run(monkeypatch, 3, 0, 0)
+    assert flags == [(True, True, True)] * 3
+
+
+@needs_cuda
+def test_ad_recon_uses_fused_adam_on_cuda(monkeypatch) -> None:
+    """A6-6: every run_ad_recon optimiser (volume, angles, shifts) is the
+    fused CUDA Adam; run_grad_descent keeps the caller's optimiser as is."""
+    made = []
+    real = torch.optim.Adam
+
+    def recording_adam(params, **kw):
+        made.append(kw.get("fused"))
+        return real(params, **kw)
+
+    monkeypatch.setattr(torch.optim, "Adam", recording_adam)
+    sino, angles = _small_cuda_problem()
+    cfg = ft.AdReconConfig(optim=ft.OptimConfig(n_iter=2),
+                           pose=ft.PoseRefinementConfig(refine_pose=True, refine_shifts=True))
+    ft.run_ad_recon(sino, angles, config=cfg)
+    assert made == [True, True, True]
 
 
 def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:
@@ -1043,6 +1229,36 @@ def test_run_grad_descent_cpu_converges():
         f"grad_descent did not converge: loss[0]={losses[0]:.4e}, "
         f"loss[-1]={losses[-1]:.4e}"
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+def test_run_grad_descent_sgd_default_step_is_landweber(device):
+    """Low item (A6-12): with optimizer_cls=SGD and no lr, the step is 1/L
+    of the data term (power iteration), so SGD converges; the old fixed
+    1e-2 was 54x too small on this tiny problem (3 400-13 400x at 64^3 to
+    256^3) and barely moved. Adam's default stays 1e-2 (bit-identical to
+    passing it)."""
+    from fasttomo._operator import Geometry, _make_operator
+    from fasttomo.algorithms.ad import _landweber_step
+
+    N = 32
+    angles = make_angles(30).to(device)
+    vol = phantom_2d(N).unsqueeze(0).to(device)
+    sino = ft.forward_project(vol, angles)
+    _, auto = ft.run_grad_descent(sino, angles, 30, optimizer_cls=torch.optim.SGD,
+                                  return_loss=True)
+    _, fixed = ft.run_grad_descent(sino, angles, 30, lr=1e-2,
+                                   optimizer_cls=torch.optim.SGD, return_loss=True)
+    assert torch.isfinite(auto).all()
+    assert auto[-1] < 0.01 * auto[0]           # 120 -> 0.08
+    assert fixed[-1] > 0.3 * fixed[0]          # 120 -> 52
+    op = _make_operator(Geometry("parallel", (1, N, N), N, 30, angles), vol.device,
+                        torch.float32)
+    step = _landweber_step(op, None, vol, sino.numel())
+    assert step > 10 * 1e-2      # 54x the old fixed 1e-2 on this small problem
+    a = ft.run_grad_descent(sino, angles, 5)
+    b = ft.run_grad_descent(sino, angles, 5, lr=1e-2)
+    assert torch.equal(a, b)
 
 
 def test_run_grad_descent_legacy_positional_call_raises_cpu():

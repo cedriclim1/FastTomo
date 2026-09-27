@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from fasttomo._operator import Geometry, _make_operator
 from fasttomo.autograd import euler_zyz_to_rotmat
 from fasttomo.projection import apply_shifts_2d
-from fasttomo.constraints import _soft_threshold
-from fasttomo.regularizers import s3im_loss, tilt_ssim_loss, tv_loss_3d, tv_loss_xz
+from fasttomo.constraints import _soft_threshold_
+from fasttomo.regularizers import _S3IMTarget, _TiltSSIMTarget, tv_loss_3d, tv_loss_xz
 from fasttomo.projector import ParallelProjector, RotmatProjector
 from fasttomo.configs import (
     AdReconConfig,
@@ -29,9 +29,75 @@ from fasttomo.configs import (
 from fasttomo.algorithms._common import (
     _S3IM_SEED,
     _assert_projector_output_shape,
+    _emit_loss,
     _prepare_recon,
     _LossRecorder,
 )
+
+
+class _DeviceLossRecorder(_LossRecorder):
+    """`_LossRecorder` that keeps tensor losses on the device (A6-8).
+
+    Same values and callback contract, fewer host syncs per iteration:
+
+    * ``return_loss`` alone: each loss is copied into a device buffer (no
+      sync); `history` / `finish` move it to the host once, at the end.
+    * with a ``loss_callback``: the total and its components go to the host
+      in one transfer (one sync instead of one per value), and the callback
+      still gets plain floats for the true iteration index. The history is
+      then kept from those floats.
+
+    Values are the fp32 losses the base class records (``tolist`` and
+    ``item`` convert the same fp32 value to the same Python float). Non-tensor
+    values fall back to the base class.
+    """
+
+    def __init__(self, return_loss, loss_callback, progress, n_iter, *, desc=None) -> None:
+        super().__init__(return_loss, loss_callback, progress, n_iter, desc=desc)
+        self._n_iter = n_iter
+        self._buf: torch.Tensor | None = None
+        self._n = 0
+
+    def record(self, it, loss, components=None) -> None:
+        if not self.wants_loss:
+            return
+        values = [loss]
+        if self.send_components and components is not None:
+            values += list(components.values())
+        if not all(isinstance(v, torch.Tensor) and v.numel() == 1
+                   and v.dtype == torch.float32 for v in values):
+            super().record(it, loss, components)
+            return
+        if self.loss_callback is None:
+            if self._buf is None:
+                self._buf = torch.empty(self._n_iter, dtype=torch.float32,
+                                        device=loss.device)
+            self._buf[self._n].copy_(loss.detach().reshape(()))
+            self._n += 1
+            return
+        host = torch.stack([v.detach().reshape(()) for v in values]).tolist()
+        loss_val = host[0]
+        if self.return_loss:
+            self.losses.append(loss_val)
+        comps = None
+        if self.send_components:
+            comps = ({"fidelity": loss_val} if components is None
+                     else dict(zip(components.keys(), host[1:])))
+        _emit_loss(self.loss_callback, self.send_components, it, loss_val, comps)
+
+    def _flush(self) -> None:
+        if self._buf is not None:
+            self.losses.extend(self._buf[:self._n].tolist())
+            self._buf = None
+            self._n = 0
+
+    def history(self) -> torch.Tensor:
+        self._flush()
+        return super().history()
+
+    def finish(self, volume):
+        self._flush()
+        return super().finish(volume)
 
 
 def _ad_recon_step_schedule(
@@ -96,6 +162,14 @@ def _prepare_ad_recon_pose_init(
     return initial.detach().clone()
 
 
+def _adam(param: torch.Tensor, lr: float) -> torch.optim.Adam:
+    """Adam on one leaf: the fused CUDA implementation for a CUDA fp32
+    leaf (one kernel per step, no volume-sized temporary; A6-6), else the
+    default one. Fused and foreach Adam agree to ~1 ulp per step."""
+    fused = param.is_cuda and param.dtype == torch.float32
+    return torch.optim.Adam([param], lr=lr, fused=True if fused else None)
+
+
 def _ad_sparsity_term(volume: torch.Tensor, weight: float) -> torch.Tensor:
     """L1 sparsity penalty for ``run_ad_recon``: ``weight * mean(|volume|)``.
 
@@ -128,19 +202,45 @@ class _AdRun:
     ref_idx: int | None                   # anchored view (anchor_reference)
     support: torch.Tensor | None          # resolved support, [1|Ny, Nz, Nx]
     s3im_gen: torch.Generator | None
+    ssim_target: _TiltSSIMTarget | None   # tilt_ssim_loss target statistics
+    s3im_target: _S3IMTarget | None       # s3im_loss constants
     default_step_schedule: bool
     pose_warmup_iters: int
     alternating_period: int
     pred_shape: tuple[int, int, int]      # (n_angles, Ny, N_det)
 
 
-def _ad_loss_terms(run: _AdRun, pred: torch.Tensor) -> dict[str, torch.Tensor]:
+def _ad_pose_euler(run: _AdRun) -> torch.Tensor | None:
+    """The ``[n, 3]`` ZYZ Euler angles of this iteration's forward
+    projection, built from the pose leaf inside the graph.
+
+    With ``antisymmetric_z``, ``psi = -phi`` is part of the graph, so the
+    gradient that reaches ``phi`` is the total derivative ``dL/dphi -
+    dL/dpsi`` on the constraint set (A6-3; stepping ``phi`` with the
+    partial ``dL/dphi`` and overwriting ``psi`` converged to the wrong pose).
+    ``psi`` is written as ``(psi_leaf + phi).detach() - phi``: exactly
+    ``-phi`` once the post-step constraint has set ``psi_leaf = -phi``, and
+    in iteration 0 the initialiser's own ``psi`` up to rounding (``(psi0 +
+    phi) - phi`` can differ from ``psi0`` by one ulp), which keeps the
+    documented behaviour of ``pose_init_euler_deg``. The leaf's ``psi``
+    column gets no gradient.
+    """
+    tilt = run.tilt_angle_opt
+    if tilt is None or not (run.pose_cfg is not None and run.pose_cfg.antisymmetric_z):
+        return tilt
+    phi = tilt[:, 0]
+    psi = (tilt[:, 2] + phi).detach() - phi
+    return torch.stack([phi, tilt[:, 1], psi], dim=1)
+
+
+def _ad_loss_terms(run: _AdRun, pred: torch.Tensor,
+                   euler: torch.Tensor | None) -> dict[str, torch.Tensor]:
     """Data-fit and regularisation terms, keyed for the loss_callback
     components contract (only the active ones). Insertion order is the
     summation order of the total loss (float addition is not associative),
-    kept identical to the historical loop."""
+    kept identical to the historical loop. ``euler``: `_ad_pose_euler`."""
     optim_cfg, reg_cfg, pose_cfg = run.optim_cfg, run.reg_cfg, run.pose_cfg
-    volume, sinogram, tilt = run.volume, run.sinogram, run.tilt_angle_opt
+    volume, sinogram, tilt = run.volume, run.sinogram, euler
     terms: dict[str, torch.Tensor] = {}
     if optim_cfg.loss_fn == "mse":
         terms["fidelity"] = F.mse_loss(pred, sinogram)
@@ -158,9 +258,9 @@ def _ad_loss_terms(run: _AdRun, pred: torch.Tensor) -> dict[str, torch.Tensor]:
             + tilt[:, 2].pow(2).mean()
         )
     if reg_cfg.s3im_weight > 0.0:
-        terms["s3im"] = reg_cfg.s3im_weight * s3im_loss(pred, sinogram, generator=run.s3im_gen)
+        terms["s3im"] = reg_cfg.s3im_weight * run.s3im_target(pred, run.s3im_gen)
     if reg_cfg.tilt_ssim_weight > 0.0:
-        terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * tilt_ssim_loss(pred, sinogram)
+        terms["tilt_ssim"] = reg_cfg.tilt_ssim_weight * run.ssim_target(pred)
     return terms
 
 
@@ -171,10 +271,28 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
     for opt in run.optimisers:
         opt.zero_grad()
 
-    # forward project
     tilt, shifts = run.tilt_angle_opt, run.shifts
-    if run.refine_pose and tilt is not None:
-        mats = euler_zyz_to_rotmat(tilt)
+    step_volume = step_pose = True
+    if not run.default_step_schedule:
+        step_volume, step_pose = _ad_recon_step_schedule(
+            it,
+            pose_warmup_iters=run.pose_warmup_iters,
+            alternating_period=run.alternating_period,
+        )
+        # Only the leaves stepped this iteration need a gradient: a
+        # volume-only iteration then skips grad_rotmat and the shift
+        # backward, a pose-only one the volume back-projection. The
+        # gradients that are computed do not depend on which other leaves
+        # require grad, so the result is bit-identical to computing all.
+        run.volume.requires_grad_(step_volume)
+        for leaf in (tilt, shifts):
+            if leaf is not None:
+                leaf.requires_grad_(step_pose)
+
+    # forward project
+    euler = _ad_pose_euler(run)
+    if run.refine_pose and euler is not None:
+        mats = euler_zyz_to_rotmat(euler)
         pred = run.fp(run.volume, mats)
     else:
         pred = run.fp(run.volume)
@@ -191,15 +309,12 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
     if run.refine_shifts and shifts is not None:
         pred = apply_shifts_2d(pred, shifts)
 
-    terms = _ad_loss_terms(run, pred)
+    terms = _ad_loss_terms(run, pred, euler)
     loss = terms["fidelity"]
     for key, term in terms.items():
         if key != "fidelity":
             loss = loss + term
 
-    # .item() (a host sync) only when the loss is returned or streamed
-    if rec.wants_loss:
-        rec.record(it, loss, terms)
     loss.backward()
 
     if run.ref_idx is not None:
@@ -208,12 +323,6 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         if shifts is not None and shifts.grad is not None:
             shifts.grad[run.ref_idx] = 0.0
 
-    antisymmetric_z = run.pose_cfg is not None and run.pose_cfg.antisymmetric_z
-    if antisymmetric_z and run.refine_pose and tilt is not None:
-        if tilt.grad is not None:
-            tilt.grad[:, 2] = 0.0
-
-    step_volume = True
     if run.default_step_schedule:
         # Keep the default path exactly identical to the historical loop.
         for opt in run.optimisers:
@@ -221,11 +330,6 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         for sched in run.schedulers:
             sched.step()
     else:
-        step_volume, step_pose = _ad_recon_step_schedule(
-            it,
-            pose_warmup_iters=run.pose_warmup_iters,
-            alternating_period=run.alternating_period,
-        )
         step_flags = [step_volume] + [step_pose] * (len(run.optimisers) - 1)
         for opt, should_step in zip(run.optimisers, step_flags):
             if should_step:
@@ -234,6 +338,11 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         for sched, should_step in zip(run.schedulers, step_flags):
             if should_step:
                 sched.step()
+    # The loss of the iterate entering this iteration (before its step),
+    # recorded after the step kernels are queued so that a callback's host
+    # sync does not sit between the forward and the backward pass.
+    if rec.wants_loss:
+        rec.record(it, loss, terms)
     return step_volume
 
 
@@ -255,7 +364,7 @@ def _ad_project_constraints(run: _AdRun, step_volume: bool) -> None:
             # order of fasttomo.constraints (mask -> positivity -> threshold).
             # Skipped in pose-only iterations: unlike positivity and the
             # mask it is not idempotent and would shrink a frozen volume.
-            volume.copy_(_soft_threshold(volume, constraints_cfg.soft_threshold))
+            _soft_threshold_(volume, constraints_cfg.soft_threshold)
         tilt_bound_deg = pose_cfg.tilt_bound_deg if pose_cfg is not None else None
         if tilt_bound_deg is not None and run.refine_pose and tilt is not None:
             tilt[:, 1].clamp_(
@@ -291,6 +400,12 @@ def run_ad_recon(
     loss: the total loss of each iteration, with components ``fidelity``
     plus the active regularisers (``tv``, ``tv_xz``, ``sparsity``,
     ``in_plane``, ``s3im``, ``tilt_ssim``), each already weighted.
+    ``loss_history[i]`` (and the callback's value for ``i``) is the loss of
+    the iterate *entering* iteration ``i``, the one whose gradient that
+    iteration steps with: before its optimiser step and constraints (like
+    SIRT's residual before the update). ``loss_history[-1]`` is therefore
+    not the loss of the returned volume (they differ by the last step, ~0
+    with the cosine schedule, whose last learning rate is ~0).
 
     Parameters
     ----------
@@ -442,17 +557,17 @@ def run_ad_recon(
             )
 
     # ── build optimiser list ───────────────────────────────────────────────
-    opt_vol = torch.optim.Adam([volume], lr=optim_cfg.lr_volume)
+    opt_vol = _adam(volume, optim_cfg.lr_volume)
     optimisers = [opt_vol]
 
     opt_angles: torch.optim.Optimizer | None = None
     opt_shifts: torch.optim.Optimizer | None = None
 
     if refine_pose and tilt_angle_opt is not None and pose_cfg is not None:
-        opt_angles = torch.optim.Adam([tilt_angle_opt], lr=pose_cfg.lr_angles)
+        opt_angles = _adam(tilt_angle_opt, pose_cfg.lr_angles)
         optimisers.append(opt_angles)
     if refine_shifts and shifts is not None and pose_cfg is not None:
-        opt_shifts = torch.optim.Adam([shifts], lr=pose_cfg.lr_shifts)
+        opt_shifts = _adam(shifts, pose_cfg.lr_shifts)
         optimisers.append(opt_shifts)
 
     pose_warmup_iters = pose_cfg.pose_warmup_iters if pose_cfg is not None else 0
@@ -484,8 +599,13 @@ def run_ad_recon(
 
     # ── S3IM generator (seeded once; reused each iteration) ───────────────
     _s3im_gen: torch.Generator | None = None
+    s3im_target: _S3IMTarget | None = None
     if reg_cfg.s3im_weight > 0.0:
         _s3im_gen = torch.Generator(device=device).manual_seed(_S3IM_SEED)
+        s3im_target = _S3IMTarget(sinogram)
+
+    # ── tilt SSIM: the sinogram's statistics, computed once ───────────────
+    ssim_target = _TiltSSIMTarget(sinogram) if reg_cfg.tilt_ssim_weight > 0.0 else None
 
     # ── iteration ─────────────────────────────────────────────────────────
     run = _AdRun(
@@ -495,11 +615,13 @@ def run_ad_recon(
         optim_cfg=optim_cfg, reg_cfg=reg_cfg, constraints_cfg=constraints_cfg,
         pose_cfg=pose_cfg, refine_pose=refine_pose, refine_shifts=refine_shifts,
         ref_idx=ref_idx, support=setup.constraints.support_mask, s3im_gen=_s3im_gen,
+        ssim_target=ssim_target, s3im_target=s3im_target,
         default_step_schedule=default_step_schedule,
         pose_warmup_iters=pose_warmup_iters, alternating_period=alternating_period,
         pred_shape=(n_angles, Ny, N_det),
     )
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_ad_recon")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter,
+                              desc="run_ad_recon")
     for it in rec.iterate(n_iter):
         step_volume = _ad_step(run, it, rec)
         _ad_project_constraints(run, step_volume)
@@ -525,12 +647,34 @@ def run_ad_recon(
 
 # ── autograd-based reference reconstruction ──────────────────────────────
 
+_LANDWEBER_POWER_ITERS = 20
+_LANDWEBER_SEED = 0x5EED
+
+
+def _landweber_step(op, geom, volume: torch.Tensor, n_meas: int) -> float:
+    """``1 / L`` for the gradient of ``mean((A x - b)^2)``: ``L = 2 ||B A||
+    / n_meas`` with ``||B A||`` from a seeded power iteration on the
+    operator's raw ``fp`` / ``bp`` (the global RNG is not touched), times a
+    1 % safety margin. One host sync per power step, at setup only."""
+    g = torch.Generator().manual_seed(_LANDWEBER_SEED)
+    v = torch.randn(volume.shape, generator=g, dtype=volume.dtype).to(volume.device)
+    v = v / v.norm()
+    norm = 0.0
+    with torch.no_grad():
+        for _ in range(_LANDWEBER_POWER_ITERS):
+            w = op.bp(op.fp(v, geom), geom)
+            norm = float(w.norm())
+            if not norm > 0.0:          # A v = 0 (or non-finite): keep 1e-2
+                return 1e-2
+            v = w / norm
+    return n_meas / (2.0 * norm * 1.01)
+
 def run_grad_descent(
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
     angles_deg: torch.Tensor | None = None,     # [n_angles] — single-axis
     n_iter: int = 200,
     *,
-    lr: float = 1e-2,
+    lr: float | None = None,
     Nz: int | None = None,
     optimizer_cls: type[torch.optim.Optimizer] = torch.optim.Adam,
     positivity: bool = False,
@@ -553,7 +697,9 @@ def run_grad_descent(
     closure is re-evaluated as it needs). Constraints are applied in place
     under ``torch.no_grad`` after each step, the autograd-safe way to project
     a leaf tensor. Recorded loss: the total loss of each step (the first
-    closure evaluation for LBFGS), components ``fidelity`` and ``tv``.
+    closure evaluation for LBFGS), components ``fidelity`` and ``tv``,
+    evaluated at the iterate entering the step (before the update and the
+    constraints).
 
     Not a replacement for SIRT/RESIRE: use it for a custom differentiable
     loss or a learnable prior. Peak memory ~7 N^3 vs SIRT's ~5 N^3.
@@ -565,8 +711,19 @@ def run_grad_descent(
         Single-axis angles; exactly one of ``angles_deg`` and ``euler_zyz_deg``.
     n_iter : int
         Optimiser steps (default 200).
-    lr : float
-        Learning rate (default 1e-2).
+    lr : float, optional
+        Learning rate. Default (None): 1e-2, except for
+        ``optimizer_cls=torch.optim.SGD`` (or a subclass), where it is
+        ``1 / L``, ``L = 2 ||B A|| / M`` the Lipschitz constant of the
+        gradient of the data term ``mean((A x - b)^2)`` (``M`` sinogram
+        entries, ``B`` the back-projection, ``||B A||`` from 20 power
+        iterations with a fixed seed): plain gradient descent at the
+        classic Landweber step. A fixed 1e-2 was 3 400 to 13 400 times
+        smaller than that at 64^3 to 256^3, so SGD barely moved. The TV
+        term is not included (its gradient is not Lipschitz for small
+        ``tv_eps``); lower ``lr`` if SGD with a large ``tv_weight``
+        oscillates. Adam's step does not depend on the gradient's scale, so
+        its default is unchanged.
     optimizer_cls : type
         Any ``torch.optim.Optimizer`` class.
     tv_weight, tv_eps : float
@@ -598,7 +755,6 @@ def run_grad_descent(
     constraints, n_iter = setup.constraints, setup.n_iter
 
     volume = setup.volume0.requires_grad_(True)
-    opt = optimizer_cls([volume], lr=lr)
 
     # parallel: the angles are the operator's; rotmat: matrices computed
     # once; RESIRE: its wrappers take the Euler angles themselves
@@ -616,8 +772,14 @@ def run_grad_descent(
     def _fp(v):
         return op.project(v, geom)
 
+    if lr is None:
+        lr = (_landweber_step(op, geom, volume, sinogram.numel())
+              if issubclass(optimizer_cls, torch.optim.SGD) else 1e-2)
+    opt = optimizer_cls([volume], lr=lr)
+
     is_lbfgs = isinstance(opt, torch.optim.LBFGS)
-    rec = _LossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_grad_descent")
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter,
+                              desc="run_grad_descent")
 
     # Loss terms of the first closure evaluation of each step: the loss
     # LBFGS.step returns is that evaluation's (it may evaluate several times).

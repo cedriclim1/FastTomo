@@ -7,7 +7,10 @@ through `_prepare_recon` and added keyword-only options (loss_callback,
 progress, warm_start, support_mask). run_ad_recon's loop was split into
 helpers. `tests/data/frozen_golden_main.pt` holds their outputs on
 origin/main 0bf45d6 (generator: `tests/data/frozen_golden_main_gen.py`, old
-keyword names). Here the same calls use the new names and pass every new
+keyword names), except the five run_ad_recon keys, regenerated for later
+deliberate AD changes by `tests/data/regenerate_golden_keys.py` (phase 1b:
+deterministic grad_rotmat, fused Adam, the antisymmetric_z total
+derivative). Here the same calls use the new names and pass every new
 option at its no-op value, and must reproduce the golden:
 
 * GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal,
@@ -138,39 +141,49 @@ def test_resire_matches_main():
     _check(out, golden["resire_euler"], False, "resire_euler")
 
 
-@needs_cuda
-def test_ad_recon_identical_to_main():
-    golden = _golden()
-    exact = exact_env(golden, "cuda", what=GOLDEN.name)
+def ad_cases() -> dict:
+    """The run_ad_recon golden cases (CUDA): key -> zero-argument call
+    returning that key's output. Also used by
+    tests/data/regenerate_golden_keys.py, so the test and the regeneration
+    cannot drift apart."""
     sino, ang, _, sm, N = _inputs("cuda")
     C, Opt, R, K, P = (ft.AdReconConfig, ft.OptimConfig, ft.RegularizerConfig,
-                     ft.ConstraintConfig, ft.PoseRefinementConfig)
-    extra = dict(loss_callback=_Calls(), progress=False, warm_start=None)
-    out = ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=Opt(n_iter=6)), return_loss=True, **extra)
-    _check(out, golden["ad"], exact, "ad")
-    out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=Opt(n_iter=6, loss_fn="l1"),
-        reg=R(tv_weight=1e-3, tv_xz_weight=1e-3, sparsity=1e-3),
-        constraints=K(positivity=True, cylinder=True, soft_threshold=1e-3)),
-        return_loss=True, **extra)
-    # ad_reg stays exact across PR #92 (fixed-order TV forward) only because
-    # its TV term moved by ~1.8e-12, far below one fp32 ulp (~2.4e-7) of the
-    # ~3.2 total loss, so the recorded loss rounds to the same value (the TV
-    # backward does not read the forward value, so the volume is unchanged).
-    # A golden with a larger tv_weight could legitimately move and would
-    # need regenerating.
-    _check(out, golden["ad_reg"], exact, "ad_reg")
-    out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=Opt(n_iter=6),
-        pose=P(refine_pose=True, refine_shifts=True, in_plane_weight=1e-2,
-               anchor_reference=True)), return_loss=True, return_pose=True, **extra)
-    _check(out, golden["ad_pose"], exact, "ad_pose")
-    out = ft.run_ad_recon(sino, ang, Nz=N, config=C(
-        optim=Opt(n_iter=8), constraints=K(soft_threshold=1e-3),
-        pose=P(refine_shifts=True, pose_warmup_iters=2, alternating_period=2)),
-        return_loss=True, return_pose=True, **extra)
-    _check(out, golden["ad_staged"], exact, "ad_staged")
-    # the n_iter positional overrides config.optim.n_iter
-    out = ft.run_ad_recon(sino, ang, 5, Nz=N, config=C(optim=Opt(n_iter=99)), support_mask=sm,
-                          **extra)
-    _check(out, golden["ad_support"], exact, "ad_support")
+                       ft.ConstraintConfig, ft.PoseRefinementConfig)
+
+    def extra():
+        return dict(loss_callback=_Calls(), progress=False, warm_start=None)
+
+    return {
+        "ad": lambda: ft.run_ad_recon(sino, ang, Nz=N, config=C(optim=Opt(n_iter=6)),
+                                      return_loss=True, **extra()),
+        "ad_reg": lambda: ft.run_ad_recon(sino, ang, Nz=N, config=C(
+            optim=Opt(n_iter=6, loss_fn="l1"),
+            reg=R(tv_weight=1e-3, tv_xz_weight=1e-3, sparsity=1e-3),
+            constraints=K(positivity=True, cylinder=True, soft_threshold=1e-3)),
+            return_loss=True, **extra()),
+        "ad_pose": lambda: ft.run_ad_recon(sino, ang, Nz=N, config=C(
+            optim=Opt(n_iter=6),
+            pose=P(refine_pose=True, refine_shifts=True, in_plane_weight=1e-2,
+                   anchor_reference=True)), return_loss=True, return_pose=True, **extra()),
+        "ad_staged": lambda: ft.run_ad_recon(sino, ang, Nz=N, config=C(
+            optim=Opt(n_iter=8), constraints=K(soft_threshold=1e-3),
+            pose=P(refine_shifts=True, pose_warmup_iters=2, alternating_period=2)),
+            return_loss=True, return_pose=True, **extra()),
+        # the n_iter positional overrides config.optim.n_iter
+        "ad_support": lambda: ft.run_ad_recon(sino, ang, 5, Nz=N,
+                                              config=C(optim=Opt(n_iter=99)),
+                                              support_mask=sm, **extra()),
+    }
+
+
+@needs_cuda
+def test_ad_recon_identical_to_main():
+    """The five AD keys were regenerated for deliberate changes (phase 1b:
+    deterministic grad_rotmat for ad_pose; fused Adam for all five and the
+    antisymmetric_z total derivative for ad_pose) with
+    tests/data/regenerate_golden_keys.py; they pin that behaviour bit for
+    bit where the fingerprint matches."""
+    golden = _golden()
+    exact = exact_env(golden, "cuda", what=GOLDEN.name)
+    for key, call in ad_cases().items():
+        _check(call(), golden[key], exact, key)

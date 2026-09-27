@@ -138,6 +138,29 @@ def _soft_threshold(vol: torch.Tensor, weight: float) -> torch.Tensor:
     return vol.sign() * (vol.abs() - weight).clamp_(min=0.0)
 
 
+# dtypes for which ``softshrink`` gives the values of `_soft_threshold`: it
+# computes ``v -+ t`` in the tensor's dtype with ``t`` rounded to it, the
+# same arithmetic as the expression for fp32 and fp64. fp16/bf16 keep the
+# expression, whose fp32 op-math uses the unrounded threshold.
+_SOFTSHRINK_DTYPES = (torch.float32, torch.float64)
+
+
+def _soft_threshold_(vol: torch.Tensor, weight: float) -> None:
+    """In-place `_soft_threshold` for ``run_ad_recon``'s leaf volume: one
+    ``softshrink`` pass without temporaries for fp32/fp64 (A6-7).
+
+    Equal in value to `_soft_threshold` (``torch.equal``), but not in every
+    bit: a zero result may carry the other sign (``-0`` vs ``+0``) and a
+    NaN keeps its own payload. The generic constraints (`apply_constraints`,
+    `apply_constraints_`) keep the expression, because run_sirt's fused
+    CUDA update kernels reproduce its bits and the frozen GENFIRE / RESIRE
+    use it."""
+    if vol.dtype in _SOFTSHRINK_DTYPES:
+        torch.ops.aten.softshrink.out(vol, weight, out=vol)
+    else:
+        vol.copy_(_soft_threshold(vol, weight))
+
+
 def apply_constraints(
     volume: torch.Tensor,
     *,

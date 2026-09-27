@@ -2,6 +2,99 @@
 
 ## Unreleased
 
+### AD reconstruction and regularisers: speed and accuracy (phase 1b, PR D)
+
+- `run_ad_recon` with a staged pose schedule (`pose_warmup_iters`,
+  `alternating_period`) now differentiates only the leaves stepped in each
+  iteration: a volume-only iteration skips `grad_rotmat` and the shift
+  backward, a pose-only one the volume back-projection. Bit-identical
+  output. At 256^3, 61 views, pose + shifts: a volume-only (warm-up)
+  iteration 5.4 -> 2.5 ms, `alternating_period=5` 6.3 -> 3.9 ms per
+  iteration.
+- `run_ad_recon`'s soft-threshold constraint (`ConstraintConfig.
+  soft_threshold`) is one in-place `softshrink` pass (fp32). Same values
+  as before (a zero may now be +0 instead of -0; the goldens compare
+  equal). With positivity, cylinder and soft-threshold at 256^3: 2.18 ->
+  1.85 ms per iteration, peak 448 -> 352 MiB. The generic constraints
+  (`apply_constraints`, the `sparsity=` keyword of the other `run_*`
+  functions) keep the old expression bit for bit: run_sirt's fused CUDA
+  kernels reproduce its bits, and the frozen GENFIRE/RESIRE use it.
+- Loss recording in `run_ad_recon` and `run_grad_descent`: with
+  `return_loss` alone the losses stay on the device and are copied to the
+  host once at the end (0 host syncs per iteration, was 1); with a
+  `loss_callback` the total and all components reach the host in one
+  transfer (1 sync per iteration, was 1 + number of components). The
+  `loss_callback(iter, loss)` contract is unchanged: plain floats, the
+  true iteration index, the same values. `run_ad_recon` 128^3 L2 with
+  `return_loss`: 0.42 -> 0.32 ms per iteration.
+- **`tilt_ssim_loss` values change (accuracy fix).** On CUDA, cuDNN ran
+  its dense 11 x 11 convolutions in TF32 at small batches, and the
+  `E[x^2] - mu^2` variance form turned that into a 1-6 % error in the loss
+  and its gradient at sinogram scale (mean ~100). The window is now
+  applied as two depthwise 1-D passes (no TF32 path) to data centred on
+  each target tilt's mean, with the SSIM formula rearranged so that no
+  step subtracts two `E[x^2]`-sized values. Against an fp64 reference the
+  error is now <= 1e-6 (loss) and 1.2e-7 (gradient), TF32 on or off, CPU
+  or CUDA. Same window, constants (`K1 = 0.01`, `K2 = 0.03`, `L = max -
+  min` of the target) and reflect padding. `run_ad_recon` caches the
+  measured sinogram's statistics. Faster: `tilt_ssim_loss` forward +
+  backward on 61 x 256^2 12.5 -> 2.2 ms; `run_ad_recon` with
+  `tilt_ssim_weight` 14.9 -> 3.7 ms per iteration at 256^3 (3.7 -> 1.0 ms
+  at 128^3).
+- The scikit-image SSIM cross-check test now runs without scikit-image
+  (an inline fp64 reference, anchored to a hard-coded scikit-image value).
+- **`s3im_loss` draws different patches for the same seed.** Each patch
+  is now the `B` largest of `n` uniform random numbers (`rand(n).topk(B)`,
+  still without replacement and uniformly random) instead of
+  `randperm(n)[:B]`, which sorted all `n` entries (0.40 -> 0.16 ms at
+  61 x 256^2). The `M` patches go through the SSIM as one batch, with the
+  same centred, separable statistics as `tilt_ssim_loss`; `run_ad_recon`
+  computes the constants once per run. `run_ad_recon` with `s3im_weight`
+  at 256^3: 2.39 -> 2.24 ms per iteration, peak 408 -> 352 MiB.
+- `tv_loss_xz` on CUDA is a fused kernel (the planar mode of the 3-D TV
+  kernel, `csrc/cuda/tv_loss.cu`: deterministic two-pass reduction with
+  fp64 partials, gather backward). Forward + backward at 256^3 2.19 ->
+  0.16 ms; `run_ad_recon` with `tv_xz_weight` 4.05 -> 2.00 ms per
+  iteration, peak 608 -> 368 MiB. Values move by fp32 rounding only
+  (<= 2.7e-7 relative vs the torch expression).
+- CPU `tv_loss_3d` returned NaN when a dimension is 1 (and `tv_loss_xz`
+  when `Nz` or `Nx` is 1); both now return 0 with a zero gradient, like
+  CUDA. A single-slice volume (`Ny = 1`) therefore has no 3-D TV (now
+  documented; `tv_loss_xz` is the per-slice TV).
+- **First-order only:** `tilt_ssim_loss`, `s3im_loss` and, on CUDA,
+  `tv_loss_3d` and `tv_loss_xz` have hand-written backwards. A backward
+  with `create_graph=True` (double backward, Hessian-vector products)
+  now raises RuntimeError instead of returning a wrong second derivative.
+  Before this release `tilt_ssim_loss`, `s3im_loss` and CUDA `tv_loss_xz`
+  were plain autograd (exact second order), while CUDA `tv_loss_3d`
+  silently dropped its second-order term; nothing in FastTomo uses
+  second-order gradients. The CPU TV expressions stay differentiable to
+  any order.
+- **`run_ad_recon` pose refinement with `antisymmetric_z=True` (the
+  default) changes (accuracy fix).** `phi` was stepped with the partial
+  derivative `dL/dphi` and `psi` then overwritten with `-phi`, whose
+  fixed points are not stationary points of the constrained problem.
+  `psi = -phi` is now built into the forward pass, so `phi` gets the
+  total derivative `dL/dphi - dL/dpsi`. On a 64^3, 31-view problem with
+  the volume fixed to the truth, the mean in-plane error goes from 0.275 to
+  0.051 deg (noise-free) and from 1.92 to 0.73 deg (5 % noise; start
+  0.87). The returned Euler angles still satisfy `psi = -phi` exactly, and
+  `pose_init_euler_deg` is still used in iteration 0 (its `psi` up to
+  one ulp of rounding).
+- `run_ad_recon` uses the fused CUDA Adam (`fused=True`) for the volume,
+  angles and shifts: L2 iteration 1.81 -> 1.72 ms at 256^3 (0.30 -> 0.25
+  ms at 128^3), peak 352 -> 304 MiB (no volume-sized temporary). Results move at the ulp level (all `ad_*` goldens were
+  regenerated). `run_grad_descent` keeps the caller's optimiser as given.
+- `run_grad_descent(optimizer_cls=torch.optim.SGD)` without `lr` now uses
+  the Landweber step `1 / L` of the data term (`L = 2 ||B A|| / M`, 20
+  seeded power iterations) instead of 1e-2, which was 3 400 to 13 400
+  times smaller at 64^3 to 256^3. `lr` defaults to None; with Adam (the
+  default) or any other optimiser it still means 1e-2, bit-identical.
+- Docs: the loss recorded for iteration `i` (`loss_history[i]`, the
+  callback value) is the loss of the iterate entering iteration `i`,
+  before its update, for SIRT-type algorithms and AD; the `loss_callback`
+  contract (values, indices, types) is unchanged.
+
 ### ⚠ FBP output values change: zero-padded Ram-Lak ramp filter
 
 `ramp_filter` multiplied the unpadded detector FFT by `|xi|`, which zeroes

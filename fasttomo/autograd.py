@@ -40,6 +40,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 import fasttomo._core as _core
+from fasttomo.regularizers import _first_order_only
 # Moved to fasttomo._backend (ARCH P8); imported here so the raw layer below
 # and the old ``fasttomo.autograd._X`` import paths keep working.
 from fasttomo._backend import (  # noqa: F401
@@ -568,49 +569,75 @@ class _BackProject(torch.autograd.Function):
         return grad_sino, None, None
 
 
-# ── 3-D isotropic TV loss (fused CUDA kernel) ──────────────────────────────
+# ── TV losses (fused CUDA kernels): 3-D isotropic and planar XZ ───────────
 
-def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
-    _assert_cuda(volume, "tv_loss_3d")
-    _ensure_fp32(volume, "tv_loss_3d")
+# name -> (forward, workspace, backward kernel, number of corners N). The
+# caller divides the kernel's sum by N (1 when there are no corners).
+_TV_KERNELS = {
+    "tv_loss_3d": ("tv_loss_iso_3d_cuda", "tv_loss_iso_3d_workspace",
+                   "tv_loss_iso_3d_grad_cuda",
+                   lambda Ny, Nz, Nx: (Ny - 1) * (Nz - 1) * (Nx - 1)),
+    "tv_loss_xz": ("tv_loss_xz_cuda", "tv_loss_xz_workspace", "tv_loss_xz_grad_cuda",
+                   lambda Ny, Nz, Nx: Ny * (Nz - 1) * (Nx - 1)),
+}
+
+
+def _tv_corners(name: str, Ny: int, Nz: int, Nx: int) -> int:
+    return max(1, _TV_KERNELS[name][3](Ny, Nz, Nx))
+
+
+def _tv_loss_raw(volume: torch.Tensor, eps: float, name: str) -> torch.Tensor:
+    _assert_cuda(volume, name)
+    _ensure_fp32(volume, name)
     if volume.ndim != 3:
-        raise ValueError(f"tv_loss_3d expects a 3-D [Ny, Nz, Nx] tensor, "
+        raise ValueError(f"{name} expects a 3-D [Ny, Nz, Nx] tensor, "
                          f"got shape {tuple(volume.shape)}")
+    fwd, workspace, _, _ = _TV_KERNELS[name]
     vol = volume.contiguous()
     Ny, Nz, Nx = vol.shape
     acc = torch.zeros(1, dtype=torch.float32, device=vol.device)
     # fp64 per-block partials of the deterministic two-pass reduction
-    partials = torch.empty(max(1, _core.tv_loss_iso_3d_workspace(Ny, Nz, Nx)),
+    partials = torch.empty(max(1, getattr(_core, workspace)(Ny, Nz, Nx)),
                            dtype=torch.float64, device=vol.device)
     stream = _stream_ptr(vol.device)
     with _on_device(vol):
-        _core.tv_loss_iso_3d_cuda(
+        getattr(_core, fwd)(
             vol.data_ptr(), acc.data_ptr(), partials.data_ptr(),
             Ny, Nz, Nx, float(eps), stream,
         )
-    N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))
-    return acc.squeeze(0) / float(N)
+    return acc.squeeze(0) / float(_tv_corners(name, Ny, Nz, Nx))
 
 
-def _tv_loss_iso_3d_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
-                             eps: float) -> torch.Tensor:
+def _tv_loss_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
+                      eps: float, name: str) -> torch.Tensor:
+    grad_kernel = _TV_KERNELS[name][2]
     vol = volume.contiguous()
     Ny, Nz, Nx = vol.shape
-    N = max(1, (Ny - 1) * (Nz - 1) * (Nx - 1))
+    N = _tv_corners(name, Ny, Nz, Nx)
     g_scaled = (grad_out.detach().to(dtype=torch.float32, device=vol.device)
                 .reshape(1).contiguous() / float(N))
-    # The kernel writes every voxel when each dimension is >= 2 (no memset
+    # The kernel writes every voxel when there are corners (no memset
     # needed, kernel audit F10); otherwise it writes nothing and the
-    # gradient is zero.
-    grad_vol = (torch.empty_like(vol) if min(Ny, Nz, Nx) >= 2
-                else torch.zeros_like(vol))
+    # gradient is zero. 3-D: every dimension >= 2; planar: Nz, Nx >= 2.
+    has_corners = (min(Ny, Nz, Nx) >= 2 if name == "tv_loss_3d"
+                   else min(Nz, Nx) >= 2)
+    grad_vol = torch.empty_like(vol) if has_corners else torch.zeros_like(vol)
     stream = _stream_ptr(vol.device)
     with _on_device(vol):
-        _core.tv_loss_iso_3d_grad_cuda(
+        getattr(_core, grad_kernel)(
             vol.data_ptr(), g_scaled.data_ptr(), grad_vol.data_ptr(),
             Ny, Nz, Nx, float(eps), stream,
         )
     return grad_vol
+
+
+def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
+    return _tv_loss_raw(volume, eps, "tv_loss_3d")
+
+
+def _tv_loss_iso_3d_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
+                             eps: float) -> torch.Tensor:
+    return _tv_loss_grad_raw(volume, grad_out, eps, "tv_loss_3d")
 
 
 class _TVLossIso3D(torch.autograd.Function):
@@ -621,17 +648,38 @@ class _TVLossIso3D(torch.autograd.Function):
     projection ops, this Function's adjoint is exact (it implements the
     closed-form gradient of a smooth scalar function), so ``gradcheck``
     would pass — we still verify against the pure-PyTorch reference instead
-    of relying on it, matching the rest of the test suite.
+    of relying on it, matching the rest of the test suite. First-order
+    only: the backward raises RuntimeError when a graph of the gradient is
+    requested (``create_graph=True``) instead of silently treating it as a
+    constant (``fasttomo.regularizers._first_order_only``).
     """
 
     @staticmethod
     def forward(ctx, volume, eps):
         ctx.save_for_backward(volume)
         ctx.eps = float(eps)
-        return _tv_loss_iso_3d_raw(volume, eps)
+        return _tv_loss_raw(volume, eps, "tv_loss_3d")
 
     @staticmethod
     def backward(ctx, grad_out):
+        _first_order_only("tv_loss_3d on CUDA")
         (volume,) = ctx.saved_tensors
-        grad_vol = _tv_loss_iso_3d_grad_raw(volume, grad_out, ctx.eps)
-        return grad_vol, None
+        return _tv_loss_grad_raw(volume, grad_out, ctx.eps, "tv_loss_3d"), None
+
+
+class _TVLossXZ(torch.autograd.Function):
+    """Fused planar (XZ) TV loss, ``tv_loss_xz`` on CUDA: the 3-D kernel's
+    structure without the ``dy`` term, over ``Ny * (Nz-1) * (Nx-1)``
+    corners; same determinism, first-order only like `_TVLossIso3D`."""
+
+    @staticmethod
+    def forward(ctx, volume, eps):
+        ctx.save_for_backward(volume)
+        ctx.eps = float(eps)
+        return _tv_loss_raw(volume, eps, "tv_loss_xz")
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        _first_order_only("tv_loss_xz on CUDA")
+        (volume,) = ctx.saved_tensors
+        return _tv_loss_grad_raw(volume, grad_out, ctx.eps, "tv_loss_xz"), None
