@@ -52,11 +52,17 @@ def back_project(
     angles_deg: torch.Tensor,      # [n_angles] degrees
     Nz: int = -1,
     num_threads: int | None = None,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     """
     Back-project sinogram → volume [Ny, Nz, Nx].
 
-    Nz defaults to N_det (square reconstruction).
+    Nz and Nx default to N_det (square reconstruction). Pass ``Nx`` (and
+    ``Nz``) to back-project onto a volume whose width differs from the
+    detector; this is the adjoint of ``forward_project(volume, angles, N_det)``
+    for a ``[Ny, Nz, Nx]`` volume, and the backward of ``forward_project``
+    uses it automatically.
 
     The CPU path is OpenMP-parallel; pass ``num_threads=N`` to opt in (default
     serial; resolution order kwarg → ``OMP_NUM_THREADS`` env → 1).
@@ -66,7 +72,7 @@ def back_project(
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
     nt = _resolve_num_threads(num_threads)
-    return _BPParallel.apply(sinogram, angles_deg, Nz, nt)
+    return _BPParallel.apply(sinogram, angles_deg, Nz, nt, Nx)
 
 
 def forward_project_3d(
@@ -123,6 +129,8 @@ def back_project_3d(
     euler_zyz_deg: torch.Tensor,    # [n_angles, 3] — (φ, θ, ψ) degrees
     Nz: int = -1,
     num_threads: int | None = None,
+    *,
+    Nx: int = -1,
 ) -> torch.Tensor:
     """
     3D rotation-matrix back-projection (CPU + CUDA).
@@ -130,8 +138,9 @@ def back_project_3d(
     Adjoint of forward_project_3d. Voxel-driven gather: each voxel samples
     the sinogram at its rotated detector position for every projection.
 
-    Returns volume [Ny, Nz, Nx] on the same device as ``sinogram``.
-    Pass ``num_threads=N`` to opt into OpenMP parallelism on the CPU path
+    Returns volume [Ny, Nz, Nx] on the same device as ``sinogram``; ``Nz``
+    and ``Nx`` default to N_det (pass ``Nx`` when the volume is not as wide
+    as the detector). Pass ``num_threads=N`` to opt into OpenMP parallelism on the CPU path
     (default 1 — serial). Resolution order: kwarg → OMP_NUM_THREADS → 1.
 
     Differentiable w.r.t. ``sinogram``: backward calls forward_project_3d.
@@ -139,7 +148,7 @@ def back_project_3d(
     if sinogram.ndim == 2:
         sinogram = sinogram.unsqueeze(1)
     nt = _resolve_num_threads(num_threads)
-    return _BPRotmat.apply(sinogram, euler_zyz_deg, Nz, nt)
+    return _BPRotmat.apply(sinogram, euler_zyz_deg, Nz, nt, Nx)
 
 
 def forward_project_resire(
