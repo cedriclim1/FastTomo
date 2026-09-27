@@ -1216,7 +1216,8 @@ def _sync_count(fn) -> int:
 
 
 @needs_cuda
-@pytest.mark.parametrize("algo", ["sirt", "sirt_rotmat", "wsirt", "fista", "fista_tv"])
+@pytest.mark.parametrize("algo", ["sirt", "sirt_rotmat", "wsirt", "fista", "fista_tv",
+                                  "sart", "sart_cpu_angles"])
 def test_loss_recording_host_syncs(algo):
     """return_loss alone costs no host sync per iteration (the losses stay
     on the device until the end); a loss_callback one per iteration (the
@@ -1233,6 +1234,9 @@ def test_loss_recording_host_syncs(algo):
         "wsirt": lambda k, **kw: ft.run_wsirt(sino, ang, k, **kw),
         "fista": lambda k, **kw: ft.run_fista(sino, ang, k, L=100.0, **kw),
         "fista_tv": lambda k, **kw: ft.run_fista_tv(sino, ang, k, L=100.0, tv_weight=0.1, **kw),
+        # SART: no sync per subset step either, CPU angles included (P2)
+        "sart": lambda k, **kw: ft.run_sart(sino, ang, k, **kw),
+        "sart_cpu_angles": lambda k, **kw: ft.run_sart(sino, ang.cpu(), k, subset_size=3, **kw),
     }[algo]
     for kw, per_iter in ((dict(return_loss=True), 0), (dict(loss_callback=lambda i, v: None), 1)):
         a = _sync_count(lambda: run(3, **kw))
@@ -1265,3 +1269,23 @@ def test_parallel_normalisers_are_y_invariant(dev, dtype, Ny, Nz, N, N_det):
         r = op.project(torch.ones(Ny, Nz, N, device=dev, dtype=dtype), geom)
         assert torch.equal(c, c[:1].expand_as(c))
         assert torch.equal(r, r[:, :1].expand_as(r))
+
+
+@needs_cuda
+def test_sart_memory_is_planar():
+    """run_sart keeps one sinogram of ray normalisers and one [1, Nz, Nx]
+    plane per subset instead of one volume per subset (P2): at 64^3 with 61
+    single-view subsets the peak is below 5 volumes + 2 sinograms (the
+    volume, the back-projection, the constraint output, 61 planes, the ray
+    normalisers; it was 61 volumes of normalisers alone)."""
+    N, n = 64, 61
+    ang = torch.linspace(-60, 60, n, device=DEVICE)
+    sino = ft.forward_project(torch.rand(N, N, N, device=DEVICE), ang)
+    ft.run_sart(sino, ang, 1)                              # warm-up
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    ft.run_sart(sino, ang, 1)
+    peak = torch.cuda.max_memory_allocated() - base
+    vol_b, sino_b = N ** 3 * 4, n * N * N * 4
+    assert peak < 5 * vol_b + 2 * sino_b, (peak, vol_b, sino_b)

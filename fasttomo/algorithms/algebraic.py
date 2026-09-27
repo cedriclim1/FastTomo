@@ -424,8 +424,15 @@ def run_sart(
     data MSE after the subset sweep, before the constraints (one extra
     forward projection per iteration, only when the loss is needed).
 
-    A reference implementation: no CUDA graph (on CUDA the projections do
-    reuse cached textures). Use :func:`run_sirt` when speed matters.
+    On CUDA each subset step is the fused residual and update kernels of
+    :func:`run_sirt` (the residual goes straight into the sinogram texture,
+    the updated volume into the volume texture), and no step waits for the
+    host. In parallel geometry the voxel normalisers ``C_S`` are kept as one
+    ``[1, Nz, Nx]`` plane per subset (they are the same in every Y-slice),
+    computed with the ray normalisers on a one-slice operator: the setup
+    memory is one sinogram plus one plane per subset instead of one volume
+    per subset (256^3, 61 views: 16 MiB instead of 4.3 GiB). Rotation-matrix
+    geometry keeps full-volume normalisers.
 
     Parameters
     ----------
@@ -457,64 +464,105 @@ def run_sart(
         setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
     volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
     constraints = setup.constraints
+    rotmat = euler_zyz_deg is not None
 
     # One projection operator for every subset (CUDA: one cached volume
     # texture plus one sinogram texture per subset size); each subset
     # passes its own angles or rotation matrices, computed once here.
     op = _make_operator(
-        Geometry("parallel" if euler_zyz_deg is None else "rotmat", (Ny, Nz, Nx), N_det,
-                 n_angles, angles_deg if euler_zyz_deg is None else None),
+        Geometry("rotmat" if rotmat else "parallel", (Ny, Nz, Nx), N_det,
+                 n_angles, None if rotmat else angles_deg),
         device, compute_dtype, num_threads=num_threads)
+    tex_op = _texture_operator(op) if sinogram.is_cuda else None
 
-    def _subset_geom(idx: torch.Tensor | None) -> torch.Tensor | None:
-        if euler_zyz_deg is None:
-            return None if idx is None else angles_deg[idx]
-        e = euler_zyz_deg if idx is None else euler_zyz_deg[idx]
-        return euler_zyz_to_rotmat(e).to(device=device)
-
-    # Build subsets: list of index tensors
+    sino_o, ang_o, eul_o = sinogram, angles_deg, euler_zyz_deg
     clamp = max(1, min(subset_size, n_angles))
-    all_idx = torch.arange(n_angles, dtype=torch.long)
-    subsets = list(torch.split(all_idx, clamp))
-    geoms = [_subset_geom(idx) for idx in subsets]
+    bounds = [(s, min(s + clamp, n_angles)) for s in range(0, n_angles, clamp)]
+    if rotmat:
+        # per subset, as before: the matrices of a slice of the Euler table
+        geoms = [euler_zyz_to_rotmat(eul_o[s:e]).to(device=device) for s, e in bounds]
+    else:
+        # the angles on the compute device once: no host-to-device copy
+        # (and sync) per projection
+        ang_dev = ang_o.detach().to(device=device)
+        geoms = [ang_dev[s:e] for s, e in bounds]
 
-    # Pre-compute per-subset normalisations (done once, outside the outer loop).
-    ones_vol = torch.ones(Ny, Nz, Nx, dtype=compute_dtype, device=device)
-    R_list: list[torch.Tensor] = []  # row normalisers [|S|, Ny, N_det]
-    C_list: list[torch.Tensor] = []  # col normalisers [Ny, Nz, Nx]
-    for idx, geom in zip(subsets, geoms):
-        R_s = op.project(ones_vol, geom)
-        R_s = _reciprocal_or_zero(R_s)
-        R_list.append(R_s)
-
-        # ones_sino for this subset
-        ones_sino_s = torch.ones(len(idx), Ny, N_det, dtype=compute_dtype, device=device)
-        C_s = op.backproject(ones_sino_s, geom)
-        C_s = _reciprocal_or_zero(C_s)
-        C_list.append(C_s)
+    R_sub, C_sub = _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev if not rotmat
+                                     else None, (Ny, Nz, Nx), N_det, n_angles, device,
+                                     compute_dtype, num_threads)
 
     rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")
-    full_geom = _subset_geom(None) if rec.wants_loss else None
+    full_geom = None
+    if rec.wants_loss and rotmat:
+        full_geom = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+    no_constraints = ConstraintConfig()
 
-    # --- outer iteration loop ---
-    for it in rec.iterate(n_iter):
-        # --- inner subset loop ---
-        for idx, geom, R_s, C_s in zip(subsets, geoms, R_list, C_list):
-            sino_s = sinogram[idx]                   # [|S|, Ny, N_det]
-            pred_s = op.project(volume, geom)        # [|S|, Ny, N_det]
-            r_s    = sino_s - pred_s                 # [|S|, Ny, N_det]
-            volume = volume + omega * C_s * op.backproject(r_s * R_s, geom)
+    try:
+        # --- outer iteration loop ---
+        for it in rec.iterate(n_iter):
+            # --- inner subset loop ---
+            for (s, e), geom, R_s, C_s in zip(bounds, geoms, R_sub, C_sub):
+                sino_s = sino_o[s:e]                     # [|S|, Ny, N_det]
+                pred_s = op.project(volume, geom)        # [|S|, Ny, N_det]
+                fused = _fused_residual(sino_s, pred_s, R_s, want_raw=False, tex_op=tex_op)
+                if fused is None:
+                    upd = op.backproject((sino_s - pred_s) * R_s, geom)
+                elif fused[1] is None:
+                    upd = tex_op.bp_from_texture(geom)
+                else:
+                    upd = op.backproject(fused[1], geom)
+                # `volume + omega * C_s * upd`, in place (volume is this
+                # call's own tensor) and into the volume texture
+                if _fused_update(volume, upd, C_s, omega, no_constraints, eager_order=True,
+                                 out=volume, tex_op=tex_op) is None:
+                    volume = volume + omega * C_s * upd
 
-        # Loss over the full sinogram after the subset sweep, before the
-        # constraints (costs one extra full forward projection).
-        if rec.wants_loss:
-            with torch.no_grad():
-                raw_res = sinogram - op.project(volume, full_geom)
-                rec.record(it, raw_res.pow(2).mean())
+            # Loss over the full sinogram after the subset sweep, before the
+            # constraints (costs one extra full forward projection).
+            if rec.wants_loss:
+                with torch.no_grad():
+                    raw_res = sinogram - op.project(volume, full_geom)
+                    rec.record(it, raw_res.pow(2).mean())
 
-        volume = constraints.apply(volume)
+            volume = constraints.apply(volume)
+    finally:
+        if tex_op is not None:
+            tex_op._forget_texture_writes()
 
     return rec.finish(volume)
+
+
+def _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev, vol_shape, N_det,
+                      n_angles, device, dtype, num_threads):
+    """Per-subset ``(R_S, C_S)`` of run_sart: ``1 / A_S 1`` ``[|S|, Ny,
+    N_det]`` and ``1 / A_S^T 1``.
+
+    Parallel geometry: both are the same in every Y-slice, bit for bit
+    (``test_parallel_normalisers_are_y_invariant``), so they are computed on
+    an operator of one texel row (the main operator's packing: 4 slices for
+    packed fp16 textures, else 1), R_S broadcast into slices of one
+    sinogram and C_S kept as a ``[1, Nz, Nx]`` plane. Rotation matrices:
+    full volumes from the main operator."""
+    Ny, Nz, Nx = vol_shape
+    R_sub, C_sub = [], []
+    if rotmat:
+        ones_vol = torch.ones(Ny, Nz, Nx, dtype=dtype, device=device)
+        for (s, e), geom in zip(bounds, geoms):
+            R_sub.append(_reciprocal_or_zero(op.project(ones_vol, geom)))
+            ones_sino = torch.ones(e - s, Ny, N_det, dtype=dtype, device=device)
+            C_sub.append(_reciprocal_or_zero(op.backproject(ones_sino, geom)))
+        return R_sub, C_sub
+    ny = tex_op._channels() if tex_op is not None else 1
+    op_n = _make_operator(Geometry("parallel", (ny, Nz, Nx), N_det, n_angles, ang_dev),
+                          device, dtype, num_threads=num_threads)
+    ones_vol = torch.ones(ny, Nz, Nx, dtype=dtype, device=device)
+    R_all = torch.empty(n_angles, Ny, N_det, dtype=dtype, device=device)
+    for (s, e), geom in zip(bounds, geoms):
+        R_all[s:e] = _reciprocal_or_zero(op_n.project(ones_vol, geom))[:, :1]
+        R_sub.append(R_all[s:e])
+        ones_sino = torch.ones(e - s, ny, N_det, dtype=dtype, device=device)
+        C_sub.append(_reciprocal_or_zero(op_n.backproject(ones_sino, geom))[:1].contiguous())
+    return R_sub, C_sub
 
 
 def run_wsirt(
