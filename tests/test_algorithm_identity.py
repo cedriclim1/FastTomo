@@ -12,6 +12,10 @@ voxel order moved from a host NumPy ``rng.permutation`` per slice to a keyed
 Feistel permutation built in the CUDA kernel (and mirrored in NumPy for the
 CPU sweep). With the old order injected, the new code reproduced the old
 golden bit for bit on both backends; only the order changed.
+They were regenerated again in phase 1b, when the MBIR prior became the
+paper's qGGMRF, the CUDA sweep arithmetic was pinned and the parallel CUDA
+sweep became the default (``tests/data/regen_mbir_goldens.py``, which
+replaces only these two keys and checks that every other key is unchanged).
 
 Exception: the ramp-filter and FBP keys (``_fft_ramp``, ``fbp``,
 ``fbp_mask``, ``fbp_h`` and, on CUDA, ``fbp_proj``) were regenerated when

@@ -496,55 +496,65 @@ _SWEEP_ANGLES = (9, 61, 100, 140, 260)
 _SWEEP_GOLDEN = Path(__file__).parent / "data" / "mbir_sweep_golden.pt"
 
 
-def _sweep_golden_cases(pre_restructure: bool = False) -> dict[str, torch.Tensor]:
+def _sweep_golden_cases() -> dict[str, torch.Tensor]:
     """Volume and error sinogram after three CUDA sweeps for every sweep
-    variant (see tests/data/mbir_sweep_golden_gen.py). ``pre_restructure``
-    calls the binding without ``work_ptr`` (the older signature)."""
+    variant (see tests/data/mbir_sweep_golden_gen.py): the serial kernel for
+    every slot count and the generic kernel, with and without lambdas and the
+    Huber weight (keys ``n{n}_lam{0|1}_T{T}/...``), and the parallel group
+    kernel for the slot counts it takes (``par_n{n}_...``, on a 20-wide
+    slice so that the +-75 degree group spacing 8 applies), all through the
+    raw binding."""
     import fasttomo._core as _core
-    from fasttomo.algorithms.mbir import _mbir_perm_key
+    from fasttomo.algorithms.mbir import _mbir_group_spacing, _mbir_perm_key
     out = {}
     g = torch.Generator().manual_seed(123)
-    Ny, Nz, Nx, Nd = 2, 9, 11, 11
-    for n in _SWEEP_ANGLES:
-        ang = torch.linspace(-75, 75, n) * math.pi / 180
-        cos_a, sin_a = torch.cos(ang).to(DEVICE), torch.sin(ang).to(DEVICE)
-        vol0 = torch.rand(Ny, Nz, Nx, generator=g)
-        vol0 = (vol0 * (torch.rand(Ny, Nz, Nx, generator=g) > 0.3)).to(DEVICE)
-        e0 = torch.randn(n, Ny, Nd, generator=g).to(DEVICE)
-        lam_t = (torch.rand(n, Ny, Nd, generator=g) + 0.2).to(DEVICE)
-        for use_lam in (False, True):
-            for T in (float("inf"), 1.5):
-                vol, e = vol0.clone(), e0.clone()
-                work = torch.empty(Ny * Nz * Nx * 2, device=DEVICE)
-                extra = {} if pre_restructure else {"work_ptr": work.data_ptr()}
-                for it in range(3):
-                    snap = vol.clone()
-                    _core.mbir_icd_sweep_cuda(
-                        vol_ptr=vol.data_ptr(), e_sino_ptr=e.data_ptr(),
-                        vol_snapshot_ptr=snap.data_ptr(),
-                        lambdas_ptr=lam_t.data_ptr() if use_lam else 0,
-                        perm_ptr=0, perm_key=_mbir_perm_key(9, it),
-                        cos_ptr=cos_a.data_ptr(), sin_ptr=sin_a.data_ptr(),
-                        Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n, N_det=Nd,
-                        qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.4,
-                        huber_T=T, huber_delta=0.5, sigma=0.8,
-                        stream_ptr=torch.cuda.current_stream().cuda_stream, **extra)
-                    torch.cuda.synchronize()
-                key = f"n{n}_lam{int(use_lam)}_T{T}"
-                out[key + "/vol"] = vol.cpu()
-                out[key + "/e"] = e.cpu()
+    for par in (False, True):
+        Ny, Nz, Nx, Nd = (2, 9, 20, 20) if par else (2, 9, 11, 11)
+        for n in _SWEEP_ANGLES:
+            if par and n > 256:
+                continue
+            ang = torch.linspace(-75, 75, n) * math.pi / 180
+            cos_a, sin_a = torch.cos(ang).to(DEVICE), torch.sin(ang).to(DEVICE)
+            S = _mbir_group_spacing(cos_a, Nz, Nx, Nd) if par else 0
+            assert S > 0 or not par
+            vol0 = torch.rand(Ny, Nz, Nx, generator=g)
+            vol0 = (vol0 * (torch.rand(Ny, Nz, Nx, generator=g) > 0.3)).to(DEVICE)
+            e0 = torch.randn(n, Ny, Nd, generator=g).to(DEVICE)
+            lam_t = (torch.rand(n, Ny, Nd, generator=g) + 0.2).to(DEVICE)
+            for use_lam in (False, True):
+                for T in (float("inf"), 1.5):
+                    vol, e = vol0.clone(), e0.clone()
+                    work = torch.empty(Ny * Nz * Nx * 2, device=DEVICE)
+                    for it in range(3):
+                        snap = vol.clone()
+                        _core.mbir_icd_sweep_cuda(
+                            vol_ptr=vol.data_ptr(), e_sino_ptr=e.data_ptr(),
+                            vol_snapshot_ptr=snap.data_ptr(),
+                            lambdas_ptr=lam_t.data_ptr() if use_lam else 0,
+                            perm_ptr=0, perm_key=_mbir_perm_key(9, it), work_ptr=work.data_ptr(),
+                            cos_ptr=cos_a.data_ptr(), sin_ptr=sin_a.data_ptr(),
+                            Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n, N_det=Nd,
+                            qggmrf_p=1.2, qggmrf_q=2.0, qggmrf_c=1e-3, sigma_f=0.4,
+                            huber_T=T, huber_delta=0.5, sigma=0.8,
+                            stream_ptr=torch.cuda.current_stream().cuda_stream,
+                            group_spacing=S)
+                        torch.cuda.synchronize()
+                    key = f"{'par_' if par else ''}n{n}_lam{int(use_lam)}_T{T}"
+                    out[key + "/vol"] = vol.cpu()
+                    out[key + "/e"] = e.cpu()
     return out
 
 
 @needs_cuda
-def test_mbir_cuda_sweep_matches_pre_restructure_golden():
-    """The one-warp-per-slice sweep (prepare kernel, register-resident e,
-    fused warp reduction) reproduces the previous 64-thread kernel bit for
-    bit on sm_120, for every variant: same order, same arithmetic, same
-    summation order. On other GPUs the compiler may contract differently, so
-    where the CUDA arithmetic fingerprint (tests/_golden.py) is not one the
-    golden stores the comparison falls back to 1e-5 (with a
-    GoldenNotExactWarning)."""
+def test_mbir_cuda_sweep_matches_golden():
+    """The serial and the parallel CUDA sweep reproduce their golden bit for
+    bit on sm_120, for every variant (same order, same arithmetic, same
+    summation order). Regenerated in phase 1b for the paper's qGGMRF prior,
+    the pinned rounding and the parallel kernel (tests/data/
+    regen_mbir_goldens.py). On other GPUs the compiler may round the prior's
+    powf differently, so where the CUDA arithmetic fingerprint
+    (tests/_golden.py) is not one the golden stores the comparison falls
+    back to 1e-5 (with a GoldenNotExactWarning)."""
     raw = torch.load(_SWEEP_GOLDEN, weights_only=True)
     golden = tensors(raw)
     now = _sweep_golden_cases()
@@ -553,7 +563,7 @@ def test_mbir_cuda_sweep_matches_pre_restructure_golden():
     bad = [k for k in sorted(now)
            if not (torch.equal(now[k], golden[k]) if exact
                    else torch.allclose(now[k], golden[k], rtol=1e-5, atol=1e-5))]
-    assert not bad, f"differ from the pre-restructure sweep (exact={exact}): {bad}"
+    assert not bad, f"differ from the sweep golden (exact={exact}): {bad}"
 
 
 # ── parallel sweep (conflict-free voxel groups) ─────────────────────────────
