@@ -18,6 +18,7 @@ from fasttomo.algorithms._common import (
     _LIPSCHITZ_SAFETY,
     _NORM_EPS,
     _TV_DUAL_STEP,
+    _as_int,
     _deprecated_kwarg,
     _reject_unknown_kwargs,
     _prepare_recon,
@@ -505,8 +506,23 @@ def run_fista_tv(
         Isotropic TV weight, required and > 0 (use :func:`run_fista` for 0).
         Keyword-only (it used to be the third positional).
     tv_inner_iter : int
-        Inner dual iterations (default 20).
+        Inner dual iterations of the TV prox per outer iteration (default 20,
+        >= 0). The prox is solved inexactly, the more so the stronger the
+        prox weight ``lam = tv_weight / L``: at the default, the relative
+        duality gap of the prox is 1-3 % at ``lam = 0.02`` and 13-24 % at
+        ``lam = 0.1`` (prox error 0.4-0.5 % and 2.1-2.7 %; fp64 gap on the
+        prox inputs of a 96^3 run, solver audit P1b). End to end at
+        ``lam = 0.1`` (96^3, 2 % noise) the objective after 50 outer
+        iterations was 7.69e6 with 20, 7.16e6 with 50 and 7.00e6 with 200
+        inner iterations (relative error to the phantom 0.225 / 0.178 /
+        0.169), so raise it for strong regularisation. On CUDA an inner
+        iteration is two kernels (~0.8 ms at 256^3), so 100 inner iterations
+        now cost about what 20 did with the former PyTorch prox. The dual
+        restarts from zero every outer iteration (warm-starting it across
+        outer iterations was measured to raise the objective).
     tv_inner : {"fgp", "chambolle"}
+        Dual solver of the prox (default ``"fgp"``, O(1/k^2); ``"chambolle"``
+        is O(1/k)).
     Nz, positivity, mask, support_mask, warm_start, num_threads, return_loss,
     loss_callback, progress
         See Conventions of :mod:`fasttomo.algorithms`.
@@ -523,6 +539,11 @@ def run_fista_tv(
         raise ValueError(
             f"run_fista_tv requires tv_weight > 0 (got {tv_weight}). "
             "Use run_fista for the unregularised problem."
+        )
+    tv_inner_iter = _as_int(tv_inner_iter, "tv_inner_iter", "run_fista_tv")
+    if tv_inner not in ("fgp", "chambolle"):
+        raise ValueError(
+            f"run_fista_tv: unknown mode tv_inner={tv_inner!r}; expected 'fgp' or 'chambolle'."
         )
 
     setup = _prepare_recon(

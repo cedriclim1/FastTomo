@@ -509,3 +509,21 @@ def test_tv_prox_cuda_matches_cpu_reference():
         a = _tv_prox_3d(z.cuda(), 0.1, True, None, 20, mode).cpu()
         b = _tv_prox_3d(z, 0.1, True, None, 20, mode)
         assert (a - b).abs().max() <= 1e-6 * b.abs().max()
+
+
+def test_fista_tv_inner_iter_keyword():
+    """tv_inner_iter is honoured (more inner iterations: a more exact prox,
+    so a different result; 0 is allowed) and validated before any work."""
+    N = 16
+    angles = make_angles(10)
+    vol = phantom_2d(N).unsqueeze(0)
+    sino = ft.forward_project(vol, angles)
+    kw = dict(tv_weight=5.0, n_iter=3, Nz=N, L=100.0)
+    a = ft.run_fista_tv(sino, angles, **kw)
+    assert torch.equal(a, ft.run_fista_tv(sino, angles, tv_inner_iter=20, **kw))
+    assert not torch.equal(a, ft.run_fista_tv(sino, angles, tv_inner_iter=60, **kw))
+    assert torch.isfinite(ft.run_fista_tv(sino, angles, tv_inner_iter=0, **kw)).all()
+    with pytest.raises(ValueError, match="tv_inner_iter"):
+        ft.run_fista_tv(sino, angles, tv_inner_iter=-1, **kw)
+    with pytest.raises(TypeError, match="tv_inner_iter"):
+        ft.run_fista_tv(sino, angles, tv_inner_iter=2.5, **kw)
