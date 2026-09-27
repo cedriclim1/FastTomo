@@ -36,8 +36,9 @@ CUDACXX=$C/bin/nvcc uv pip install --python .venv/bin/python -e . \
 
 ## Testing
 
-- Full suite on one GPU: `CUDA_VISIBLE_DEVICES=<idx> python -m pytest tests -q` gives 232 passed, 18 skipped (17 of the skips are cross-device tests that need 2 visible GPUs). `test_genfire_reconstruction_quality` passes.
-- CPU-only build: `FASTTOMO_EXPECT_CUDA=0 pytest tests -q` gives 109 passed, 141 skipped; the CUDA tests (`tests/test_cuda.py`, `tests/test_projector_cache.py` and CUDA cases elsewhere) skip themselves.
+- Tests are grouped by topic: `test_projection.py`, `test_projector.py`, `test_parity.py` (CPU <-> CUDA, cached <-> functional), `test_algorithms_{analytic,algebraic,fista,ad,mbir,genfire_resire,alignment}.py`, `test_contracts.py` (the uniform API and the frozen `loss_callback` / `support_mask` contracts), `test_regularizers.py`, `test_kernel_correctness.py`, `test_frozen_identity.py`, `test_wsirt.py`, `test_wheel_smoke.py`. Shared fixtures (`backend` = cpu/cuda, `dtype` = fp32/fp16 with a per-op capability table) and helpers (`make_angles`, `phantom_2d`, `phantom_3d`, `rel_err`, `rel_l2`) live in `tests/conftest.py`, which also tags every CUDA test with the `gpu` marker (`multi_gpu` for the cross-device ones).
+- Full suite on one GPU: `CUDA_VISIBLE_DEVICES=<idx> python -m pytest tests -q` gives 916 passed, 19 skipped (17 of the skips are cross-device tests that need 2 visible GPUs, 1 needs scikit-image, 1 needs `FASTTOMO_EXPECT_CUDA`).
+- CPU only: `CUDA_VISIBLE_DEVICES= python -m pytest tests -q` gives 480 passed, 422 skipped (the `gpu` tests skip themselves); `pytest tests -m "not gpu"` runs the same 480 without listing the skips.
 - With a non-editable install, run the `pytest` entry point rather than `python -m pytest` from the repo root, otherwise the source tree (without a compiled `_core`) shadows the installed package.
 
 ## CI

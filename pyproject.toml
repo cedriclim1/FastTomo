@@ -20,6 +20,14 @@ cmake.version = ">=3.18"
 cmake.build-type = "Release"
 wheel.packages = ["fasttomo"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA GPU (added automatically by tests/conftest.py)",
+    "multi_gpu: needs two CUDA GPUs (added automatically by tests/conftest.py)",
+    "op(name): the operation whose dtype capabilities (conftest.DTYPE_CAPS) the dtype fixture applies",
+]
+
 [tool.ruff.lint]
 # ruff's classic default rule set, pinned so newer ruff releases (which
 # widen the default) do not change what `ruff check fasttomo tests` reports.
@@ -28,3 +36,5 @@ select = ["E4", "E7", "E9", "F"]
 [tool.ruff.lint.per-file-ignores]
 # the version and CUDA checks must run before the extension is imported
 "fasttomo/__init__.py" = ["E402"]
+# re-exports every name of the pre-split algorithms.py (ARCH P8)
+"fasttomo/algorithms/__init__.py" = ["F401"]

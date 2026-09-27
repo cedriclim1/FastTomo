@@ -2,7 +2,7 @@
  * Classical MBIR (Model-Based Iterative Reconstruction) for single-axis
  * parallel-beam tomography. CPU reference implementation: simple,
  * single-threaded-per-Y-slice, mirrors the CUDA kernel one-for-one so they
- * cross-validate in `tests/test_cpu.py::test_mbir_cpu_cuda_consistency`.
+ * cross-validate in `tests/test_parity.py::test_mbir_cpu_cuda_consistency`.
  *
  * Reference: Venkatakrishnan et al. 2015, "MBIR for Bright-Field Electron
  * Tomography", IEEE TCI 1(1).

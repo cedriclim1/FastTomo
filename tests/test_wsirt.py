@@ -2,7 +2,8 @@
 Weighted SIRT / exact weighted back-projection: CPU/CUDA parity and
 convergence.
 
-Root causes fixed (see the "exact weighting filter" notes in algorithms.py):
+Root causes fixed (see the "exact weighting filter" notes in
+fasttomo/algorithms/analytic.py):
 - the exact-filter deconvolution was a circular FFT on the bare [Nz, Nx]
   grid, with the circular boundary on the volume edge; wSIRT diverged at
   omega=1 on 32 of 45 geometries tested (CUDA), through a mode in the

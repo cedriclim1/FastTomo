@@ -15,6 +15,8 @@ See fasttomo/autograd.py and fasttomo-wiki/wiki/concepts/autograd-projectors.md.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from fasttomo.autograd import (
@@ -31,8 +33,80 @@ __all__ = [
     "back_project_resire",
     "euler_zyz_to_rotmat",
 ]
-from fasttomo.utilities import apply_shifts_2d
 
+
+# ── detector-plane shifts (used by forward_project_3d's ``shifts``) ─────────
+#
+# Moved from fasttomo.utilities (ARCH P8), which re-exports them.
+
+def apply_shifts(
+    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
+    shifts: torch.Tensor,     # [n_angles] detector-axis shifts in pixels
+) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
+    """
+    Sub-pixel shift each projection row along the detector axis via Fourier
+    phase multiplication.  Positive shift moves the signal to the right.
+
+    shifts may be on CPU even when sinogram is on CUDA.
+    """
+    N_det = sinogram.shape[-1]
+    s = shifts.to(device=sinogram.device, dtype=torch.float32)
+    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device)          # [N_freq]
+    phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s.view(-1, 1, 1)
+    phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
+    F = torch.fft.rfft(sinogram.float(), n=N_det, dim=-1)
+    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
+
+
+def apply_shifts_2d(
+    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
+    shifts: torch.Tensor,     # [n_angles, 2] — (det-axis, tilt-axis) pixel shifts
+) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
+    """
+    Per-tilt sub-pixel translation of the sinogram in the detector plane via
+    bilinear ``grid_sample``.  Differentiable w.r.t. both ``sinogram`` and
+    ``shifts`` — autograd flows through ``grid_sample`` natively.
+
+    ``shifts[:, 0]`` shifts along the detector axis (last dim, ``N_det``);
+    ``shifts[:, 1]`` shifts along the tilt axis (``Ny``).  Sign convention
+    matches ``apply_shifts``: positive shift moves the signal toward larger
+    indices (right / down).
+
+    Intended for joint optimization with the volume and pose: drop in after
+    ``forward_project_3d`` (or pass ``shifts=`` to it directly) so per-tilt
+    translational alignment becomes a learnable parameter.
+    """
+    if shifts.ndim != 2 or shifts.shape[-1] != 2:
+        raise ValueError(f"shifts must have shape [n_angles, 2], got {tuple(shifts.shape)}")
+    n_a, Ny, Nd = sinogram.shape
+    if shifts.shape[0] != n_a:
+        raise ValueError(
+            f"shifts has {shifts.shape[0]} entries but sinogram has {n_a} angles"
+        )
+
+    s = shifts.to(device=sinogram.device, dtype=torch.float32)
+
+    ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=torch.float32)
+    xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=torch.float32)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")                  # [Ny, Nd]
+    base = torch.stack((gx, gy), dim=-1)                            # [Ny, Nd, 2]
+    base = base.unsqueeze(0).expand(n_a, -1, -1, -1)                # [n_a, Ny, Nd, 2]
+
+    # Sample from (x - sx, y - sy) so positive shift moves the signal +x / +y.
+    # Normalized coords with align_corners=True: 1 pixel = 2/(N-1).
+    norm_x = 2.0 / max(Nd - 1, 1)
+    norm_y = 2.0 / max(Ny - 1, 1)
+    off = torch.stack((s[:, 0] * norm_x, s[:, 1] * norm_y), dim=-1) # [n_a, 2]
+    grid = base - off.view(n_a, 1, 1, 2)                            # [n_a, Ny, Nd, 2]
+
+    inp = sinogram.unsqueeze(1).float()                             # [n_a, 1, Ny, Nd]
+    out = torch.nn.functional.grid_sample(
+        inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+    )
+    return out.squeeze(1)
+
+
+# ── projection ops ─────────────────────────────────────────────────────────
 
 def forward_project(
     volume: torch.Tensor,          # [Ny, Nz, Nx]

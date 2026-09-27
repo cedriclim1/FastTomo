@@ -20,9 +20,11 @@ to the data-fidelity loss and call ``.backward()`` as usual.
   cause hot-pixel speckling in the volume.
 
 All return scalar tensors that drop directly into any autograd loop.
-``tv_loss_3d`` (3-D isotropic total-variation regularisation on the volume)
-lives separately in ``fasttomo.utilities``; combine the three additively in the
-loss expression as needed.
+* :func:`tv_loss_3d` — 3-D isotropic total-variation regularisation on the
+  volume (fused CUDA kernel, PyTorch on CPU). Moved here from
+  ``fasttomo.utilities``, which re-exports it.
+
+Combine them additively in the loss expression as needed.
 """
 
 from __future__ import annotations
@@ -31,6 +33,52 @@ import math
 
 import torch
 import torch.nn.functional as F
+
+
+# ── 3-D isotropic Total-Variation loss ────────────────────────────────────
+
+def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Isotropic 3-D total-variation loss.
+
+        loss = mean( sqrt( dy² + dz² + dx² + eps ) )
+
+    where the differences are the standard half-pixel-shifted forward
+    differences anchored at each (i, j, k) in the inner-corner grid of
+    shape (Ny-1) × (Nz-1) × (Nx-1).
+
+    Differentiable w.r.t. ``volume`` — drop into any autograd loop in
+    place of the pure-PyTorch expression. On CUDA, dispatches to a single
+    fused kernel (one read-pass over the volume, one atomic-reduction to
+    a scalar) and a voxel-driven gather kernel for the backward. On CPU,
+    falls back to the equivalent pure-PyTorch expression so the same
+    public function works on either device.
+
+    Args:
+        volume: [Ny, Nz, Nx] float32 tensor.
+        eps:    smoothing constant inside the sqrt (default 1e-8). Keeps
+                the gradient well-defined near flat regions.
+
+    Returns:
+        Scalar tensor (shape ``[]``) on the same device as ``volume``.
+    """
+    if volume.dtype != torch.float32:
+        raise TypeError(f"tv_loss_3d is fp32-only (got {volume.dtype}). "
+                        "Cast your tensor to float32 first.")
+    if volume.ndim != 3:
+        raise ValueError(f"tv_loss_3d expects a 3-D [Ny, Nz, Nx] tensor, "
+                         f"got shape {tuple(volume.shape)}")
+
+    if volume.is_cuda:
+        from fasttomo.autograd import _TVLossIso3D
+        return _TVLossIso3D.apply(volume, eps)
+
+    # CPU fallback — pure PyTorch, autograd works automatically.
+    dy = volume[1:, :, :] - volume[:-1, :, :]
+    dz = volume[:, 1:, :] - volume[:, :-1, :]
+    dx = volume[:, :, 1:] - volume[:, :, :-1]
+    return (dx[:-1, :-1, :] ** 2 + dy[:, :-1, :-1] ** 2
+            + dz[:-1, :, :-1] ** 2 + eps).sqrt().mean()
 
 
 # ── XZ-plane 2-D isotropic TV (no Y-coupling) ────────────────────────────

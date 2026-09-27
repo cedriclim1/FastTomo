@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### ⚠ `run_mbir` is single-threaded on CPU by default
+
+`run_mbir` used to run its CPU ICD sweep on a hardcoded 4 OpenMP threads. It
+now follows the library-wide policy (`num_threads` keyword, else the
+`OMP_NUM_THREADS` environment variable, else 1), so **a default CPU `run_mbir`
+call is up to ~4x slower than before**. Results are unchanged. To restore
+the old speed pass `num_threads=4` (or more), or set `OMP_NUM_THREADS`
+before starting Python. CUDA runs are not affected.
+
+### Internal restructure (no behaviour change)
+
+- `fasttomo/algorithms.py` is now the package `fasttomo/algorithms/`
+  (`_common`, `analytic`, `algebraic`, `fista`, `ad`, `genfire`, `resire`,
+  `alignment`, `mbir`). `fasttomo.algorithms` re-exports every name the
+  module had, so imports such as `from fasttomo.algorithms import run_sirt`
+  or `fasttomo.algorithms._prepare_recon` keep working. Code that
+  monkeypatches a name an algorithm calls must patch the submodule that
+  calls it (for example `fasttomo.algorithms.ad.ParallelProjector` or
+  `fasttomo.algorithms._common._check_inputs`), not the package.
+- Backend helpers (`_on_device`, `_resolve_num_threads`, the dtype codes,
+  `_stream_ptr`, `_data_ptr`, `_check_shapes`) live in `fasttomo._backend`;
+  their old `fasttomo.autograd` / `fasttomo.projector` paths still resolve.
+- `apply_shifts` and `apply_shifts_2d` are defined in `fasttomo.projection`
+  and `tv_loss_3d` in `fasttomo.regularizers`; `fasttomo.utilities` and
+  `fasttomo` re-export all three. This removes the import cycle between
+  `fasttomo.utilities` and `fasttomo.projection`.
+- Tests are grouped by topic (`tests/test_projection.py`,
+  `test_algorithms_*.py`, `test_contracts.py`, ...) with shared fixtures in
+  `tests/conftest.py`; `gpu` and `multi_gpu` markers are registered, so
+  `pytest -m "not gpu"` runs the CPU tests only.
+
 ### Breaking changes and deprecations (API consistency refactor)
 
 Deprecated names keep working for one release and emit `DeprecationWarning`;
@@ -48,7 +79,8 @@ peak). Passing it raises `TypeError` with that explanation.
   `warm_start` instead of casting silently, like the other fp32 algorithms.
 - `run_mbir` uses `num_threads` (keyword, else `OMP_NUM_THREADS`, else 1)
   instead of a hardcoded 4 CPU threads. Results are identical; the default is
-  single-threaded unless `OMP_NUM_THREADS` is set.
+  single-threaded unless `OMP_NUM_THREADS` is set (see the warning at the top:
+  pass `num_threads=4` to restore the old speed).
 - `run_ad_recon`'s tqdm bar is opt-in (`progress=True`); it was always shown.
 - `run_resire(mask=True, support_mask=T)` (and the old `support=T`) raises
   `ValueError`; before, `support` silently won. Same contract as every other

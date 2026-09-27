@@ -49,7 +49,7 @@ Then verify:
 
 ```bash
 python -c "import fasttomo._core as c; print('CUDA:', c.cuda_available)"  # expect: True
-pytest tests/test_cuda.py
+pytest tests -m gpu
 ```
 
 To force the CUDA build to fail loudly if no toolkit is present (instead of silently falling back to CPU):
@@ -88,9 +88,9 @@ Then `uv sync`. `uv` will build from source on first install and cache the wheel
 
 ```bash
 python -c "import fasttomo, fasttomo._core as c; print('CUDA:', c.cuda_available)"
-pytest tests/                    # all
-pytest tests/test_cpu.py         # CPU only
-pytest tests/test_cuda.py        # CUDA (auto-skipped if no GPU)
+pytest tests/                    # all (CUDA tests skip themselves without a GPU)
+pytest tests -m "not gpu"        # CPU only
+pytest tests -m gpu              # CUDA only
 ```
 
 ## Faster local iteration

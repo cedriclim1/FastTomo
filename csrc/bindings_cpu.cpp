@@ -4,7 +4,7 @@
  * Same convention as bindings_cuda.cpp: every array argument is the integer
  * `data_ptr()` of a torch tensor the Python caller allocated, followed by the
  * dims. The caller (fasttomo/autograd.py `_launch`, the MBIR/GENFIRE code in
- * algorithms.py) guarantees each buffer is C-contiguous float32 (int32 for
+ * fasttomo/algorithms/) guarantees each buffer is C-contiguous float32 (int32 for
  * the MBIR permutation), sized for the dims, and zeroed where noted. No numpy
  * round trip, no silent copy, and the GIL is released while the C code runs.
  *

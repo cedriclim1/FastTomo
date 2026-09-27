@@ -1,19 +1,28 @@
 """
-Utility functions for FastTomo: the ramp filter, the 3-D TV loss, and
-shift estimation and correction.
+Utility functions for FastTomo: the ramp filter and shift estimation.
 
-``cylindrical_mask`` lives in :mod:`fasttomo.constraints` and is
-re-exported here, its historical home.
+Re-exported here, their historical home: ``cylindrical_mask`` (lives in
+:mod:`fasttomo.constraints`), ``tv_loss_3d`` (:mod:`fasttomo.regularizers`)
+and ``apply_shifts`` / ``apply_shifts_2d`` (:mod:`fasttomo.projection`,
+which applies them inside ``forward_project_3d``). Keeping the shift
+operators next to the projectors is what lets this module import
+:mod:`fasttomo.projection` at the top without an import cycle.
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 
 # Moved to fasttomo.constraints (ARCH P10); re-exported here, its historical home.
 from fasttomo.constraints import cylindrical_mask
+# Moved to fasttomo.projection / fasttomo.regularizers (ARCH P8); re-exported here.
+from fasttomo.projection import (
+    apply_shifts,
+    apply_shifts_2d,
+    forward_project,
+    forward_project_3d,
+)
+from fasttomo.regularizers import tv_loss_3d
 
 __all__ = [
     "cylindrical_mask",
@@ -69,119 +78,6 @@ def ramp_filter(sinogram: torch.Tensor) -> torch.Tensor:
     return out.to(sinogram.dtype) if sinogram.dtype != torch.float32 else out
 
 
-# ── 3-D isotropic Total-Variation loss ────────────────────────────────────
-
-def tv_loss_3d(volume: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    Isotropic 3-D total-variation loss.
-
-        loss = mean( sqrt( dy² + dz² + dx² + eps ) )
-
-    where the differences are the standard half-pixel-shifted forward
-    differences anchored at each (i, j, k) in the inner-corner grid of
-    shape (Ny-1) × (Nz-1) × (Nx-1).
-
-    Differentiable w.r.t. ``volume`` — drop into any autograd loop in
-    place of the pure-PyTorch expression. On CUDA, dispatches to a single
-    fused kernel (one read-pass over the volume, one atomic-reduction to
-    a scalar) and a voxel-driven gather kernel for the backward. On CPU,
-    falls back to the equivalent pure-PyTorch expression so the same
-    public function works on either device.
-
-    Args:
-        volume: [Ny, Nz, Nx] float32 tensor.
-        eps:    smoothing constant inside the sqrt (default 1e-8). Keeps
-                the gradient well-defined near flat regions.
-
-    Returns:
-        Scalar tensor (shape ``[]``) on the same device as ``volume``.
-    """
-    if volume.dtype != torch.float32:
-        raise TypeError(f"tv_loss_3d is fp32-only (got {volume.dtype}). "
-                        "Cast your tensor to float32 first.")
-    if volume.ndim != 3:
-        raise ValueError(f"tv_loss_3d expects a 3-D [Ny, Nz, Nx] tensor, "
-                         f"got shape {tuple(volume.shape)}")
-
-    if volume.is_cuda:
-        from fasttomo.autograd import _TVLossIso3D
-        return _TVLossIso3D.apply(volume, eps)
-
-    # CPU fallback — pure PyTorch, autograd works automatically.
-    dy = volume[1:, :, :] - volume[:-1, :, :]
-    dz = volume[:, 1:, :] - volume[:, :-1, :]
-    dx = volume[:, :, 1:] - volume[:, :, :-1]
-    return (dx[:-1, :-1, :] ** 2 + dy[:, :-1, :-1] ** 2
-            + dz[:-1, :, :-1] ** 2 + eps).sqrt().mean()
-
-
-def apply_shifts(
-    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
-    shifts: torch.Tensor,     # [n_angles] detector-axis shifts in pixels
-) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
-    """
-    Sub-pixel shift each projection row along the detector axis via Fourier
-    phase multiplication.  Positive shift moves the signal to the right.
-
-    shifts may be on CPU even when sinogram is on CUDA.
-    """
-    N_det = sinogram.shape[-1]
-    s = shifts.to(device=sinogram.device, dtype=torch.float32)
-    freqs = torch.fft.rfftfreq(N_det, device=sinogram.device)          # [N_freq]
-    phase_arg = -2.0 * math.pi * freqs.view(1, 1, -1) * s.view(-1, 1, 1)
-    phase_mul = torch.polar(torch.ones_like(phase_arg), phase_arg)
-    F = torch.fft.rfft(sinogram.float(), n=N_det, dim=-1)
-    return torch.fft.irfft(F * phase_mul, n=N_det, dim=-1)
-
-
-def apply_shifts_2d(
-    sinogram: torch.Tensor,   # [n_angles, Ny, N_det]
-    shifts: torch.Tensor,     # [n_angles, 2] — (det-axis, tilt-axis) pixel shifts
-) -> torch.Tensor:            # [n_angles, Ny, N_det], same device as sinogram
-    """
-    Per-tilt sub-pixel translation of the sinogram in the detector plane via
-    bilinear ``grid_sample``.  Differentiable w.r.t. both ``sinogram`` and
-    ``shifts`` — autograd flows through ``grid_sample`` natively.
-
-    ``shifts[:, 0]`` shifts along the detector axis (last dim, ``N_det``);
-    ``shifts[:, 1]`` shifts along the tilt axis (``Ny``).  Sign convention
-    matches ``apply_shifts``: positive shift moves the signal toward larger
-    indices (right / down).
-
-    Intended for joint optimization with the volume and pose: drop in after
-    ``forward_project_3d`` (or pass ``shifts=`` to it directly) so per-tilt
-    translational alignment becomes a learnable parameter.
-    """
-    if shifts.ndim != 2 or shifts.shape[-1] != 2:
-        raise ValueError(f"shifts must have shape [n_angles, 2], got {tuple(shifts.shape)}")
-    n_a, Ny, Nd = sinogram.shape
-    if shifts.shape[0] != n_a:
-        raise ValueError(
-            f"shifts has {shifts.shape[0]} entries but sinogram has {n_a} angles"
-        )
-
-    s = shifts.to(device=sinogram.device, dtype=torch.float32)
-
-    ys = torch.linspace(-1.0, 1.0, Ny, device=sinogram.device, dtype=torch.float32)
-    xs = torch.linspace(-1.0, 1.0, Nd, device=sinogram.device, dtype=torch.float32)
-    gy, gx = torch.meshgrid(ys, xs, indexing="ij")                  # [Ny, Nd]
-    base = torch.stack((gx, gy), dim=-1)                            # [Ny, Nd, 2]
-    base = base.unsqueeze(0).expand(n_a, -1, -1, -1)                # [n_a, Ny, Nd, 2]
-
-    # Sample from (x - sx, y - sy) so positive shift moves the signal +x / +y.
-    # Normalized coords with align_corners=True: 1 pixel = 2/(N-1).
-    norm_x = 2.0 / max(Nd - 1, 1)
-    norm_y = 2.0 / max(Ny - 1, 1)
-    off = torch.stack((s[:, 0] * norm_x, s[:, 1] * norm_y), dim=-1) # [n_a, 2]
-    grid = base - off.view(n_a, 1, 1, 2)                            # [n_a, Ny, Nd, 2]
-
-    inp = sinogram.unsqueeze(1).float()                             # [n_a, 1, Ny, Nd]
-    out = torch.nn.functional.grid_sample(
-        inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-    )
-    return out.squeeze(1)
-
-
 def estimate_shifts_xcorr(
     volume: torch.Tensor,                       # [Ny, Nz, Nx]
     sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
@@ -215,10 +111,6 @@ def estimate_shifts_xcorr(
             shifts = ft.estimate_shifts_xcorr(vol, aligned_sino, angles)
             aligned_sino = ft.apply_shifts(aligned_sino, shifts)
     """
-    # Import here to avoid circular imports: projection imports utilities,
-    # so utilities must not import from projection at module level.
-    from fasttomo.projection import forward_project, forward_project_3d
-
     if "upsample_factor" in removed:
         raise TypeError(
             "estimate_shifts_xcorr: upsample_factor was removed. It never had an "

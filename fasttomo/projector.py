@@ -51,36 +51,19 @@ import math
 import torch
 
 import fasttomo._core as _core
-from fasttomo.autograd import (
-    _FPParallelCached, _BPParallelCached, _FPRotmatCached, _BPRotmatCached, _io_dtype_code,
+from fasttomo._backend import (  # noqa: F401  (re-exported for old import paths)
+    _TC_DTYPE_FP16,
+    _TC_DTYPE_FP32,
+    _TC_SINO_LAYERED,
+    _TC_VOL_3D,
+    _TC_VOL_LAYERED,
+    _dtype_to_tc_code,
+    _io_dtype_code,
+    _stream_ptr,
 )
-
-
-# Texture-cache kind enum mirrors texture_cache.h:
-_TC_VOL_LAYERED  = 0
-_TC_SINO_LAYERED = 1
-_TC_VOL_3D       = 2
-
-# Texture-cache dtype enum mirrors texture_cache.h tc_dtype_t:
-_TC_DTYPE_FP32 = 0
-_TC_DTYPE_FP16 = 1
-
-
-def _dtype_to_tc_code(dtype: torch.dtype) -> int:
-    """Translate a torch dtype to the tc_dtype_t int used by tc_create."""
-    if dtype == torch.float32:
-        return _TC_DTYPE_FP32
-    if dtype == torch.float16:
-        return _TC_DTYPE_FP16
-    if dtype == torch.bfloat16:
-        raise TypeError(
-            "Projector textures do not support torch.bfloat16: CUDA "
-            "textures have no BF16 channel descriptor. Cast to "
-            "torch.float16 or torch.float32."
-        )
-    raise TypeError(
-        f"Projector textures only support float32 and float16 (got {dtype})."
-    )
+from fasttomo.autograd import (
+    _FPParallelCached, _BPParallelCached, _FPRotmatCached, _BPRotmatCached,
+)
 
 
 class _ProjectorBase:
@@ -338,7 +321,7 @@ class ParallelProjector(_ProjectorBase):
                 vol.data_ptr(), sino.data_ptr(),
                 self._cos.data_ptr(), self._sin.data_ptr(),
                 self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-                torch.cuda.current_stream(self.device).cuda_stream,
+                _stream_ptr(self.device),
             )
         return sino
 
@@ -357,7 +340,7 @@ class ParallelProjector(_ProjectorBase):
                 sino.data_ptr(), vol.data_ptr(),
                 self._cos.data_ptr(), self._sin.data_ptr(),
                 self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-                torch.cuda.current_stream(self.device).cuda_stream,
+                _stream_ptr(self.device),
             )
         return vol
 
@@ -453,7 +436,7 @@ class RotmatProjector(_ProjectorBase):
                 self._vol_handle,
                 vol.data_ptr(), sino.data_ptr(), mats.data_ptr(),
                 self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-                torch.cuda.current_stream(self.device).cuda_stream,
+                _stream_ptr(self.device),
             )
         self._vol_cache_epoch += 1
         return sino
@@ -473,7 +456,7 @@ class RotmatProjector(_ProjectorBase):
                 self._sino_handle,
                 sino.data_ptr(), vol.data_ptr(), mats.data_ptr(),
                 self.Ny, self.Nz, self.Nx, self.n_angles, self.N_det,
-                torch.cuda.current_stream(self.device).cuda_stream,
+                _stream_ptr(self.device),
             )
         return vol
 
@@ -508,7 +491,7 @@ class RotmatProjector(_ProjectorBase):
                 self._vol_handle,
                 gs.data_ptr(), mats.data_ptr(), grad_mats.data_ptr(),
                 Ny, Nz, Nx, n_angles, N_det,
-                torch.cuda.current_stream(self.device).cuda_stream,
+                _stream_ptr(self.device),
             )
         return grad_mats
 

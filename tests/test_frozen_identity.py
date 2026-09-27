@@ -10,13 +10,16 @@ origin/main 0bf45d6 (generator: `tests/data/frozen_golden_main_gen.py`, old
 keyword names). Here the same calls use the new names and pass every new
 option at its no-op value, and must reproduce the golden:
 
-* GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal
-  (AD only in the environment the golden was made on, sm_120 with torch
-  2.12, like the RESIRE golden in test_python_correctness.py).
+* GENFIRE on CPU and the AD reconstructions are deterministic: torch.equal,
+  but only in the environment the golden was made on, because the result
+  depends on the torch FFT / reduction backends: GENFIRE-CPU on Linux x86_64
+  with torch 2.12 (elsewhere 1e-6), AD on sm_120 with torch 2.12 (elsewhere
+  1e-5), like the RESIRE golden in test_algorithms_genfire_resire.py.
 * GENFIRE on CUDA (gridding atomics) and RESIRE (forward-projection
   atomics) are not bit-reproducible even main-vs-main: 1e-5 tolerance.
 """
 
+import platform
 from pathlib import Path
 
 import pytest
@@ -57,7 +60,7 @@ def _flat(v):
     return [v.detach().cpu() if isinstance(v, torch.Tensor) else v]
 
 
-def _check(now, golden, exact: bool, key: str):
+def _check(now, golden, exact: bool, key: str, tol: float = 1e-5):
     a, b = _flat(now), _flat(golden)
     assert len(a) == len(b), key
     for x, y in zip(a, b):
@@ -67,11 +70,19 @@ def _check(now, golden, exact: bool, key: str):
             assert torch.equal(x, y), key
         else:
             assert x.shape == y.shape, key
-            torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5, msg=key)
+            torch.testing.assert_close(x, y, rtol=tol, atol=tol, msg=key)
 
 
 def _exact_env() -> bool:
     return torch.cuda.get_device_capability() == (12, 0) and torch.__version__.startswith("2.12.")
+
+
+def _genfire_cpu_exact_env() -> bool:
+    """The environment frozen_golden_main.pt's GENFIRE-CPU keys were made in
+    (torch 2.12 CPU FFT on Linux x86_64). Elsewhere the comparison falls back
+    to 1e-6 (#85 review N7)."""
+    return (torch.__version__.startswith("2.12.") and platform.system() == "Linux"
+            and platform.machine() == "x86_64")
 
 
 def _golden():
@@ -80,19 +91,20 @@ def _golden():
 
 def test_genfire_cpu_identical_to_main():
     golden = _golden()
+    exact = _genfire_cpu_exact_env()
     sino, ang, _, _, N = _inputs("cpu")
     cb = _Calls()
     out = ft.run_genfire(sino, ang, n_iter=12, Nz=N, return_loss=True, loss_callback=cb,
                          progress=False, warm_start=None, support_mask=None)
-    _check(out, golden["genfire_cpu"], True, "genfire_cpu")
+    _check(out, golden["genfire_cpu"], exact, "genfire_cpu", tol=1e-6)
     assert cb.losses == out[1].tolist()          # the callback streams the history
     out = ft.run_genfire(sino, ang, n_iter=8, Nz=N, mask=False, resolution_extension=False,
                          sparsity=1e-3, positivity=False, return_loss=True,
                          loss_callback=_Calls(), warm_start=None, support_mask=None)
-    _check(out, golden["genfire_cpu_plain"], True, "genfire_cpu_plain")
+    _check(out, golden["genfire_cpu_plain"], exact, "genfire_cpu_plain", tol=1e-6)
     out = ft.run_genfire(sino, ang, n_iter=5, Nz=N, oversampling_ratio=3.0, cutoff_dist=0.7,
                          progress=False)
-    _check(out, golden["genfire_cpu_os"], True, "genfire_cpu_os")
+    _check(out, golden["genfire_cpu_os"], exact, "genfire_cpu_os", tol=1e-6)
 
 
 @needs_cuda

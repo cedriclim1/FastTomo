@@ -15,6 +15,13 @@ in this order (the *constraints order* the algorithm docstrings refer to):
 With a non-negative support, steps 1 and 2 commute, so ``run_ad_recon``'s
 positivity-then-mask order gives the same result.
 
+A binary support leaves the out-of-support voxels of the result exactly 0,
+except in GENFIRE (frozen): it applies the support in real space on its
+oversampled grid, inside the loop, and multiplies only a user
+``support_mask`` into the cropped output. With ``mask=True`` (its default
+when no ``support_mask`` is given) voxels outside the cylinder are 0 only up
+to FFT round-off (~1e-7 in float32).
+
 Support-mask contract (frozen by the 2026-06 desktop-app handoff): a
 ``support_mask`` tensor has shape ``[Nz, Nx]``, ``[1, Nz, Nx]`` or
 ``[Ny, Nz, Nx]`` (the 2-D and leading-1 forms broadcast along the tilt axis),

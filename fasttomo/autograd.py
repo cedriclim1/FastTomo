@@ -25,98 +25,24 @@ See: fasttomo-wiki/wiki/concepts/autograd-projectors.md
 
 from __future__ import annotations
 
-import contextlib
 import math
-import os
 
 import torch
 
 import fasttomo._core as _core
-
-
-def _on_device(t: torch.Tensor):
-    """Pin the current CUDA device to ``t.device`` for the enclosed block.
-
-    Any CUDA allocation or kernel launch issued by ``_core.*_cuda*`` runs on
-    the *current* device, not the device of the data pointer. Without this
-    guard, calling a CUDA op on cuda:1 while the process default is cuda:0
-    allocates textures on cuda:0 and crashes the kernel with
-    ``cudaErrorIllegalAddress``. No-op on CPU tensors.
-    """
-    return torch.cuda.device(t.device) if t.is_cuda else contextlib.nullcontext()
-
-
-# ── private guards ───────────────────────────────────────────────────────────
-
-def _assert_cuda(t, name="op"):
-    if not t.is_cuda:
-        raise RuntimeError(f"{name} requires a CUDA tensor; got {t.device}")
-
-def _ensure_fp32(t, op_name):
-    if t.dtype != torch.float32:
-        raise TypeError(f"{op_name} is fp32-only (got {t.dtype}). "
-                        "Cast your tensor to float32 first.")
-
-
-def _assert_dtype_match(a: torch.Tensor, b: torch.Tensor,
-                        a_name: str, b_name: str, op_name: str) -> None:
-    if a.dtype != b.dtype:
-        raise TypeError(
-            f"{op_name}: {a_name} ({a.dtype}) and {b_name} ({b.dtype}) "
-            "must have the same dtype. Cast one to match the other."
-        )
-
-
-# ── thread-count resolution ──────────────────────────────────────────────────
-#
-# Resolution order for the CPU 3D rotmat kernels:
-#   1. Explicit num_threads kwarg on the Python call
-#   2. OMP_NUM_THREADS environment variable
-#   3. 1 (serial)
-#
-# Step 3 is deliberate — OpenMP's stock default of `omp_get_max_threads()`
-# (≈ all cores) would silently parallelize when the user didn't ask. The
-# library defaults to predictable serial execution; the caller opts in.
-
-def _resolve_num_threads(num_threads: int | None) -> int:
-    if num_threads is not None:
-        return max(1, int(num_threads))
-    env = os.environ.get("OMP_NUM_THREADS")
-    if env is not None and env.strip():
-        try:
-            return max(1, int(env))
-        except ValueError:
-            pass
-    return 1
-
-
-# ── dtype dispatch ─────────────────────────────────────────────────────────
-#
-# The 4 in-scope projection ops (FP/BP scalar + FP/BP rotmat) preserve the
-# I/O dtype of the input tensor. On CUDA the kernels are templated on
-# float32 / __half (single-channel fp16 textures, fp32 accumulators). On CPU
-# kernels stay fp32 only — fp16 inputs are upcast on entry and the output is
-# downcast back to the user's dtype. BF16 raises (no native CUDA texture
-# support; see fasttomo-wiki/wiki/concepts/half-precision-projection.md).
-
-def _io_dtype_code(t: torch.Tensor) -> int:
-    """Map a tensor dtype to the io_dtype int the bindings expect.
-    Returns 0 for float32, 1 for float16. Raises on bfloat16 (no native
-    CUDA texture support) and other unsupported dtypes."""
-    if t.dtype == torch.float32:
-        return 0
-    if t.dtype == torch.float16:
-        return 1
-    if t.dtype == torch.bfloat16:
-        raise TypeError(
-            "FastTomo projection ops do not support torch.bfloat16: CUDA "
-            "textures have no BF16 channel descriptor. Cast to torch.float16 "
-            "(half precision, mirrors TorchRadon) or torch.float32."
-        )
-    raise TypeError(
-        f"FastTomo projection ops only support float32 and float16 "
-        f"(got {t.dtype}). BF16 is intentionally not supported."
-    )
+# Moved to fasttomo._backend (ARCH P8); imported here so the raw layer below
+# and the old ``fasttomo.autograd._X`` import paths keep working.
+from fasttomo._backend import (  # noqa: F401
+    _assert_cuda,
+    _assert_dtype_match,
+    _check_shapes,
+    _data_ptr,
+    _ensure_fp32,
+    _io_dtype_code,
+    _on_device,
+    _resolve_num_threads,
+    _stream_ptr,
+)
 
 
 # ── ZYZ Euler → rotation matrix ──────────────────────────────────────────────
@@ -179,10 +105,6 @@ def _trig_on_device(angles_deg: torch.Tensor, device: torch.device) -> tuple[tor
     return torch.cos(a).contiguous(), torch.sin(a).contiguous()
 
 
-def _stream_ptr(device: torch.device) -> int:
-    return torch.cuda.current_stream(device).cuda_stream
-
-
 def _kernel_input(t: torch.Tensor, name: str, ndim: int = 3,
                   fp32_only: bool = False) -> torch.Tensor:
     """``t`` as the kernels read it: detached and C-contiguous, float32 on CPU
@@ -205,29 +127,6 @@ def _mats_input(mats_flat: torch.Tensor, device: torch.device) -> torch.Tensor:
         raise ValueError("rotation matrices must have shape [n_angles, 9] or "
                          f"[n_angles, 3, 3], got {tuple(mats_flat.shape)}")
     return mats_flat.detach().reshape(-1, 9).to(device=device, dtype=torch.float32).contiguous()
-
-
-def _data_ptr(t: torch.Tensor, name: str, device: torch.device | None = None) -> int:
-    """``t.data_ptr()`` for a kernel binding, refusing a strided tensor (the
-    kernels index dense row-major buffers) or one on the wrong device."""
-    if not t.is_contiguous():
-        raise ValueError(f"{name} must be C-contiguous (stride {t.stride()})")
-    if device is not None and t.device != device:
-        raise ValueError(f"{name} is on {t.device}, expected {device}")
-    return t.data_ptr()
-
-
-def _check_shapes(op: str, items) -> None:
-    """Raise ValueError unless every ``(name, tensor, expected_shape)`` in
-    ``items`` has exactly that shape (``tensor`` may be None: skipped). The
-    kernels receive bare pointers plus dims, so a buffer that is smaller than
-    the dims say is read or written out of bounds; this is the one place
-    that prevents it."""
-    for name, t, shape in items:
-        if t is not None and tuple(t.shape) != tuple(shape):
-            raise ValueError(
-                f"{op}: {name} has shape {tuple(t.shape)}, expected "
-                f"{tuple(shape)} (sizes must agree with the other inputs)")
 
 
 def _launch(op: str, out: torch.Tensor, *args, shapes, io_dtype: int | None = None,
@@ -680,7 +579,7 @@ def _tv_loss_iso_3d_raw(volume: torch.Tensor, eps: float) -> torch.Tensor:
     vol = volume.contiguous()
     Ny, Nz, Nx = vol.shape
     acc = torch.zeros(1, dtype=torch.float32, device=vol.device)
-    stream = torch.cuda.current_stream(vol.device).cuda_stream
+    stream = _stream_ptr(vol.device)
     with _on_device(vol):
         _core.tv_loss_iso_3d_cuda(
             vol.data_ptr(), acc.data_ptr(),
@@ -698,7 +597,7 @@ def _tv_loss_iso_3d_grad_raw(volume: torch.Tensor, grad_out: torch.Tensor,
     g_scaled = (grad_out.detach().to(dtype=torch.float32, device=vol.device)
                 .reshape(1).contiguous() / float(N))
     grad_vol = torch.zeros_like(vol)
-    stream = torch.cuda.current_stream(vol.device).cuda_stream
+    stream = _stream_ptr(vol.device)
     with _on_device(vol):
         _core.tv_loss_iso_3d_grad_cuda(
             vol.data_ptr(), g_scaled.data_ptr(), grad_vol.data_ptr(),
