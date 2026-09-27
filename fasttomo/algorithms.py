@@ -2544,18 +2544,69 @@ def _mbir_icd_sweep_cpu(
         ("cos_a (angles)", cos_a, (n_angles,)),
         ("sin_a (angles)", sin_a, (n_angles,)),
     ])
-    _core.mbir_icd_sweep_cpu(
-        vol_ptr=_data_ptr(volume, "volume"),
-        e_sino_ptr=_data_ptr(e_sino, "e_sino"),
-        vol_snapshot_ptr=_data_ptr(vol_snap, "volume_snapshot"),
-        lambdas_ptr=_data_ptr(lambdas, "lambdas") if lambdas is not None else 0,
-        perm_ptr=_data_ptr(perm, "perm"),
-        cos_ptr=_data_ptr(cos_a, "cos_a"), sin_ptr=_data_ptr(sin_a, "sin_a"),
-        Ny=Ny, Nz=Nz, Nx=Nx, n_angles=n_angles, N_det=N_det,
-        qggmrf_p=qggmrf_p, qggmrf_q=qggmrf_q, qggmrf_c=qggmrf_c, sigma_f=sigma_f,
-        huber_T=huber_T, huber_delta=huber_delta, sigma=sigma,
-        num_threads=num_threads,
-    )
+    vol_ptr = _data_ptr(volume, "volume")
+    e_sino_ptr = _data_ptr(e_sino, "e_sino")
+    vol_snapshot_ptr = _data_ptr(vol_snap, "volume_snapshot")
+    lambdas_ptr = _data_ptr(lambdas, "lambdas") if lambdas is not None else 0
+    perm_ptr = _data_ptr(perm, "perm")
+    cos_ptr = _data_ptr(cos_a, "cos_a")
+    sin_ptr = _data_ptr(sin_a, "sin_a")
+    try:
+        _core.mbir_icd_sweep_cpu(
+            vol_ptr=vol_ptr,
+            e_sino_ptr=e_sino_ptr,
+            vol_snapshot_ptr=vol_snapshot_ptr,
+            lambdas_ptr=lambdas_ptr,
+            perm_ptr=perm_ptr,
+            cos_ptr=cos_ptr,
+            sin_ptr=sin_ptr,
+            Ny=Ny,
+            Nz=Nz,
+            Nx=Nx,
+            n_angles=n_angles,
+            N_det=N_det,
+            qggmrf_p=qggmrf_p,
+            qggmrf_q=qggmrf_q,
+            qggmrf_c=qggmrf_c,
+            sigma_f=sigma_f,
+            huber_T=huber_T,
+            huber_delta=huber_delta,
+            sigma=sigma,
+            num_threads=num_threads,
+        )
+    except TypeError as exc:
+        # Compatibility fallback for stale editable installs whose _core was
+        # compiled before ARCH P12 (old signature with internal offset/variance
+        # updates). Keep those updates disabled so Python remains the single
+        # source of truth and CPU/CUDA behavior stays identical.
+        if "incompatible function arguments" not in str(exc):
+            raise
+        _core.mbir_icd_sweep_cpu(
+            vol_ptr=vol_ptr,
+            e_sino_ptr=e_sino_ptr,
+            vol_snapshot_ptr=vol_snapshot_ptr,
+            d_offsets_ptr=0,
+            lambdas_ptr=lambdas_ptr,
+            perm_ptr=perm_ptr,
+            cos_ptr=cos_ptr,
+            sin_ptr=sin_ptr,
+            Ny=Ny,
+            Nz=Nz,
+            Nx=Nx,
+            n_angles=n_angles,
+            N_det=N_det,
+            qggmrf_p=qggmrf_p,
+            qggmrf_q=qggmrf_q,
+            qggmrf_c=qggmrf_c,
+            sigma_f=sigma_f,
+            huber_T=huber_T,
+            huber_delta=huber_delta,
+            sigma=sigma,
+            sigma_min=sigma,
+            estimate_offset=False,
+            estimate_variance=False,
+            num_threads=num_threads,
+        )
 
 
 def _run_mbir_single_scale(

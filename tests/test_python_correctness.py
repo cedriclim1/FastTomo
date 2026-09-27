@@ -788,6 +788,48 @@ def test_mbir_cpu_uses_the_python_offset_variance_update(monkeypatch):
     assert calls == [(True, True)] * 3
 
 
+def test_mbir_cpu_sweep_falls_back_to_legacy_core_signature(monkeypatch):
+    import fasttomo.algorithms as algo
+    calls = []
+
+    def fake_mbir_icd_sweep_cpu(**kwargs):
+        calls.append(kwargs)
+        if "d_offsets_ptr" not in kwargs:
+            raise TypeError("incompatible function arguments")
+        return 0.0
+
+    monkeypatch.setattr(algo._core, "mbir_icd_sweep_cpu", fake_mbir_icd_sweep_cpu)
+    volume = torch.zeros(2, 4, 4, dtype=torch.float32)
+    e_sino = torch.zeros(3, 2, 4, dtype=torch.float32)
+    vol_snap = volume.clone()
+    perm = torch.arange(2 * 4 * 4, dtype=torch.int32).reshape(2, 16)
+    cos_a = torch.ones(3, dtype=torch.float32)
+    sin_a = torch.zeros(3, dtype=torch.float32)
+
+    algo._mbir_icd_sweep_cpu(
+        volume,
+        e_sino,
+        None,
+        vol_snap,
+        perm,
+        cos_a,
+        sin_a,
+        qggmrf_p=1.2,
+        qggmrf_q=2.0,
+        qggmrf_c=1e-3,
+        sigma_f=1.0,
+        huber_T=float("inf"),
+        huber_delta=0.5,
+        sigma=1.0,
+        num_threads=1,
+    )
+    assert len(calls) == 2
+    assert "d_offsets_ptr" not in calls[0]
+    assert calls[1]["d_offsets_ptr"] == 0
+    assert calls[1]["estimate_offset"] is False
+    assert calls[1]["estimate_variance"] is False
+
+
 @needs_cuda
 def test_mbir_cpu_cuda_consistency_with_offset_and_variance():
     """test_mbir_cpu_cuda_consistency runs with estimation off; this one
