@@ -27,7 +27,7 @@
  * templated impl. cos/sin tables and rotation matrices stay fp32 in all
  * paths. Out-of-scope ops below (RESIRE, grad_*) keep their fp32-only
  * signatures. */
-void forward_project_cuda(
+void forward_project_parallel_cuda(
     int io_dtype,
     const void  *d_volume,
     void        *d_sinogram,
@@ -38,7 +38,7 @@ void forward_project_cuda(
     cudaStream_t stream
 );
 
-void back_project_cuda(
+void back_project_parallel_cuda(
     int io_dtype,
     const void  *d_sinogram,
     void        *d_volume,
@@ -79,7 +79,7 @@ void back_project_rotmat_cuda(
  * cudaArray, then launches the kernel. Output buffer is written through a
  * regular device pointer.
  */
-void forward_project_cuda_cached(
+void forward_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
     const void   *d_volume,
@@ -91,7 +91,7 @@ void forward_project_cuda_cached(
     cudaStream_t stream
 );
 
-void back_project_cuda_cached(
+void back_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
     const void   *d_sinogram,
@@ -241,7 +241,7 @@ void genfire_gridding_2d_cuda(
 
 /*
  * MBIR voxel-driven bilinear scatter forward projection (CUDA). Distinct
- * from forward_project_cuda's ray-marching FP — this matches the column-A
+ * from forward_project_parallel_cuda's ray-marching FP — this matches the column-A
  * model used by mbir_icd_sweep_cuda. Output sinogram is zeroed by the
  * wrapper before the kernel launches (atomicAdd scatter).
  */

@@ -2,8 +2,8 @@
  * Scalar single-axis (2D) forward and back projection.
  * Kernels: forward_project_kernel, forward_project_kernel_packed_h4,
  *          back_project_kernel, back_project_kernel_packed_h4.
- * Host wrappers: forward_project_cuda, forward_project_cuda_cached,
- *                back_project_cuda, back_project_cuda_cached.
+ * Host wrappers: forward_project_parallel_cuda, forward_project_parallel_cuda_cached,
+ *                back_project_parallel_cuda, back_project_parallel_cuda_cached.
  */
 
 #include "common.cuh"
@@ -284,7 +284,7 @@ static void back_project_launch(
     CUDA_CHECK_KERNEL();
 }
 
-void forward_project_cuda(
+void forward_project_parallel_cuda(
     int io_dtype,
     const void  *d_volume,
     void        *d_sinogram,
@@ -294,7 +294,7 @@ void forward_project_cuda(
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    check_io_dtype(io_dtype, "forward_project_cuda");
+    check_io_dtype(io_dtype, "forward_project_parallel_cuda");
     ScopedTextureCache tc(TC_VOL_LAYERED, tc_dtype_of(io_dtype),
                           one_shot_channels(io_dtype, Ny), Ny, Nz, Nx, stream);
     forward_project_launch(io_dtype, tc.get(), d_volume, d_sinogram,
@@ -302,7 +302,7 @@ void forward_project_cuda(
     tc.finish();
 }
 
-void forward_project_cuda_cached(
+void forward_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
     const void   *d_volume,
@@ -313,14 +313,14 @@ void forward_project_cuda_cached(
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    check_io_dtype(io_dtype, "forward_project_cuda_cached");
+    check_io_dtype(io_dtype, "forward_project_parallel_cuda_cached");
     tc_validate(vol_cache, TC_VOL_LAYERED, io_dtype, Ny, Nz, Nx,
-                "forward_project_cuda_cached");
+                "forward_project_parallel_cuda_cached");
     forward_project_launch(io_dtype, vol_cache, d_volume, d_sinogram,
                            d_cos_a, d_sin_a, Ny, Nz, Nx, n_angles, N_det, stream);
 }
 
-void back_project_cuda(
+void back_project_parallel_cuda(
     int io_dtype,
     const void  *d_sinogram,
     void        *d_volume,
@@ -330,7 +330,7 @@ void back_project_cuda(
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    check_io_dtype(io_dtype, "back_project_cuda");
+    check_io_dtype(io_dtype, "back_project_parallel_cuda");
     ScopedTextureCache tc(TC_SINO_LAYERED, tc_dtype_of(io_dtype),
                           one_shot_channels(io_dtype, Ny), n_angles, Ny, N_det, stream);
     back_project_launch(io_dtype, tc.get(), d_sinogram, d_volume,
@@ -338,7 +338,7 @@ void back_project_cuda(
     tc.finish();
 }
 
-void back_project_cuda_cached(
+void back_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
     const void   *d_sinogram,
@@ -349,9 +349,9 @@ void back_project_cuda_cached(
     int n_angles, int N_det,
     cudaStream_t stream
 ) {
-    check_io_dtype(io_dtype, "back_project_cuda_cached");
+    check_io_dtype(io_dtype, "back_project_parallel_cuda_cached");
     tc_validate(sino_cache, TC_SINO_LAYERED, io_dtype, n_angles, Ny, N_det,
-                "back_project_cuda_cached");
+                "back_project_parallel_cuda_cached");
     back_project_launch(io_dtype, sino_cache, d_sinogram, d_volume,
                         d_cos_a, d_sin_a, Ny, Nz, Nx, n_angles, N_det, stream);
 }

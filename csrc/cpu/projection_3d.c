@@ -26,7 +26,7 @@
  * [-1, N) and per-corner safe loads — a strict fx<Nx-1 check would zero the
  * last slice entirely.
  */
-void forward_project_3d_cpu(
+void forward_project_rotmat_cpu(
     const float *volume,     /* [Ny, Nz, Nx] */
     float       *sinogram,   /* [n_angles, Ny, N_det] */
     const float *matrices,   /* [n_angles*9] row-major */
@@ -95,12 +95,12 @@ void forward_project_3d_cpu(
 /* ── 3D rotation-matrix back-projection (CPU) ──────────────────────────────
  * Voxel-driven gather (mirrors back_project_rotmat_cuda); each voxel reads
  * the bilinearly-interpolated sinogram value at its rotated detector position
- * and accumulates over angles. Approximate adjoint of forward_project_3d_cpu
+ * and accumulates over angles. Approximate adjoint of forward_project_rotmat_cpu
  * — see CLAUDE.md note that CPU/CUDA BP outputs are not expected to match
  * numerically. Border-zero semantics: a voxel mapping to u_det == N_det-1
  * still contributes the last detector column.
  */
-void back_project_3d_cpu(
+void back_project_rotmat_cpu(
     const float *sinogram,   /* [n_angles, Ny, N_det] */
     float       *volume,     /* [Ny, Nz, Nx] */
     const float *matrices,   /* [n_angles*9] row-major */
@@ -155,7 +155,7 @@ void back_project_3d_cpu(
 
 /* ── gradient of 3D rotmat FP w.r.t. rotation matrix (CPU) ─────────────────
  * Same sampling, loose bounds (-1, N) and border-zero corners as
- * grad_rotmat_kernel (CUDA) and forward_project_3d_cpu, so it is the exact
+ * grad_rotmat_kernel (CUDA) and forward_project_rotmat_cpu, so it is the exact
  * gradient of the forward away from trilinear kinks; the two backends differ
  * only in fp32 summation order. Detector-driven loop accumulates per-ray
  * partials of all 9 matrix entries, no reduction needed (pure serial).

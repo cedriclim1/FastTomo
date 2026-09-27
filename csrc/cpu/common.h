@@ -2,7 +2,7 @@
 /*
  * common.h — shared helpers included by all CPU translation units.
  *
- * Currently only houses the SAMP3 macro used by forward_project_3d_cpu
+ * Currently only houses the SAMP3 macro used by forward_project_rotmat_cpu
  * and grad_rotmat_cpu (both in projection_3d.c).
  */
 

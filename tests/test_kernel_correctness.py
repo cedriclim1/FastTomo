@@ -10,6 +10,12 @@ Regression tests for kernel and binding correctness fixes in ``csrc/``.
 - P1: textures are not destroyed under in-flight kernels (one-shot wrappers
   and a projector dropped right after launching work).
 - P4: texture extents beyond the device limits raise a clear ValueError.
+- P3 / scope 2a: every op (CPU and CUDA) gives the same result for strided
+  (transposed, sliced, expanded) inputs as for their contiguous copies; the
+  CPU bindings take data_ptr ints, so the Python layer must densify first.
+- D1 (same bug class): the tilt-angle gradient accepts fp16 and strided
+  volumes on CUDA.
+- GENFIRE CPU gridding is bit-identical to the pre-change numpy binding.
 
 CUDA tests skip automatically when no GPU is visible; the CPU tests always run.
 """
@@ -375,3 +381,149 @@ def test_projector_collected_during_graph_capture_is_freed_after_capture():
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(x, torch.ones_like(x))
+
+
+# ── P3: strided inputs give the same result as contiguous ones ─────────────
+
+def _variants(x: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Non-contiguous tensors with the same shape as ``x``."""
+    t = x.transpose(1, 2).contiguous().transpose(1, 2)       # permuted strides
+    big = torch.zeros(*x.shape[:-1], 2 * x.shape[-1], dtype=x.dtype, device=x.device)
+    big[..., ::2] = x
+    sl = big[..., ::2]                                         # sliced, stride 2
+    ex = x[:1].expand_as(x)                                    # stride-0 broadcast
+    for v in (t, sl, ex):
+        assert not v.is_contiguous()
+    return {"transposed": t, "sliced": sl, "expanded": ex}
+
+
+def _devices():
+    return ["cpu"] + (["cuda"] if HAS_CUDA else [])
+
+
+def _ops(device):
+    """name -> (make_inputs, run) for every projection op and its gradients."""
+    g = torch.Generator().manual_seed(7)
+    Ny, Nz, Nx, n = 5, 12, 10, 9
+    vol = torch.rand(Ny, Nz, Nx, generator=g).to(device)
+    sino = torch.rand(n, Ny, Nx, generator=g).to(device)
+    angles = torch.linspace(-60, 55, n).to(device)
+    euler = torch.stack([torch.linspace(-10, 10, n), torch.linspace(-60, 55, n),
+                         torch.linspace(5, -5, n)], dim=1).to(device)
+
+    def grad_angle(v):
+        a = angles.clone().requires_grad_(True)
+        ft.forward_project(v, a).mul(sino).sum().backward()
+        return a.grad
+
+    def grad_euler(v):
+        e = euler.clone().requires_grad_(True)
+        ft.forward_project_3d(v, e).mul(sino).sum().backward()
+        return e.grad
+
+    return {
+        "forward_project": (vol, lambda v: ft.forward_project(v, angles)),
+        "back_project": (sino, lambda s: ft.back_project(s, angles, Nz=Nz)),
+        "forward_project_3d": (vol, lambda v: ft.forward_project_3d(v, euler)),
+        "back_project_3d": (sino, lambda s: ft.back_project_3d(s, euler, Nz=Nz)),
+        "grad_angle": (vol, grad_angle),
+        "grad_rotmat": (vol, grad_euler),
+    }
+
+
+_OP_NAMES = ["forward_project", "back_project", "forward_project_3d",
+             "back_project_3d", "grad_angle", "grad_rotmat"]
+
+
+@pytest.mark.parametrize("device", _devices())
+@pytest.mark.parametrize("op", _OP_NAMES)
+@pytest.mark.parametrize("layout", ["transposed", "sliced", "expanded"])
+def test_strided_input_matches_contiguous(device, op, layout):
+    x, run = _ops(device)[op]
+    v = _variants(x)[layout]
+    out = run(v)
+    ref = run(v.contiguous())
+    assert out.shape == ref.shape and out.dtype == ref.dtype
+    if device == "cpu":
+        assert torch.equal(out, ref)
+    else:   # CUDA angle/matrix gradients use atomics: order may differ
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_strided_angles_and_fp16_on_cpu_and_cuda(device):
+    """Strided angle tables and fp16 volumes (upcast on CPU) are densified too."""
+    g = torch.Generator().manual_seed(3)
+    vol = torch.rand(4, 9, 9, generator=g).to(device)
+    angles_big = torch.linspace(-60, 60, 16).to(device)
+    a = angles_big[::2]
+    assert not a.is_contiguous()
+    assert torch.equal(ft.forward_project(vol, a), ft.forward_project(vol, a.contiguous()))
+    h = _variants(vol.half())["transposed"]
+    out = ft.forward_project(h, a)
+    assert out.dtype == torch.float16
+    assert torch.equal(out, ft.forward_project(h.contiguous(), a))
+
+
+def test_mbir_cpu_strided_sinogram_matches_contiguous():
+    torch.manual_seed(0)
+    angles = torch.linspace(-60, 60, 12)
+    vol = torch.zeros(4, 12, 12)
+    vol[:, 3:9, 3:9] = 1.0
+    sino = ft.forward_project(vol, angles)
+    strided = _variants(sino)["transposed"]
+    kw = dict(outer_iters=2, multires_levels=1, seed=3)
+    assert torch.equal(ft.run_mbir(strided, angles, **kw),
+                       ft.run_mbir(strided.contiguous(), angles, **kw))
+
+
+@needs_cuda
+@pytest.mark.parametrize("layout", ["fp16", "transposed"])
+def test_grad_angle_cuda_fp16_and_strided_match_cpu(layout):
+    """D1: the CUDA tilt-angle kernel is fp32/dense-only; fp16 and strided
+    volumes must be densified before their pointer is taken."""
+    torch.manual_seed(0)
+    vol = torch.rand(6, 16, 16)
+    angles = torch.linspace(-50, 50, 8)
+    w = torch.randn(8, 6, 16)
+
+    def grad(v, dev):
+        a = angles.clone().to(dev).requires_grad_(True)
+        ft.forward_project(v, a).float().mul(w.to(dev)).sum().backward()
+        return a.grad.cpu()
+
+    ref = grad(vol, "cpu")
+    v = vol.cuda()
+    v = v.half() if layout == "fp16" else _variants(v)["transposed"]
+    ref_same_input = grad(v.float().contiguous().cpu(), "cpu")
+    out = grad(v, "cuda")
+    assert torch.isfinite(out).all()
+    assert _rel(out, ref_same_input) < 1e-3
+    if layout == "transposed":
+        assert _rel(out, ref) < 1e-3
+
+
+# ── GENFIRE CPU gridding: bit-identical to the pre-change binding ──────────
+
+def test_genfire_gridding_cpu_bit_identical_to_numpy_binding():
+    """The CPU gridding binding moved from py::array_t to data_ptr ints. The
+    golden file holds inputs and outputs produced by the previous (numpy)
+    binding on origin/main; the new call path must reproduce them exactly
+    (GENFIRE is frozen)."""
+    import pathlib
+
+    import fasttomo._core as _core
+
+    d = np.load(pathlib.Path(__file__).parent / "data" / "genfire_gridding_cpu_golden.npz")
+    fk_r = torch.from_numpy(d["fk_real"])
+    fk_i = torch.from_numpy(d["fk_imag"])
+    cos_a = torch.from_numpy(d["cos_a"])
+    sin_a = torch.from_numpy(d["sin_a"])
+    n_angles, Ny, bigN = fk_r.shape
+    grids = [torch.zeros(Ny, bigN, bigN, dtype=torch.float32) for _ in range(3)]
+    _core.genfire_gridding_2d_cpu(
+        fk_r.data_ptr(), fk_i.data_ptr(), cos_a.data_ptr(), sin_a.data_ptr(),
+        *(t.data_ptr() for t in grids), bigN, Ny, n_angles, float(d["cutoff_dist"]),
+    )
+    for t, key in zip(grids, ("grid_real", "grid_imag", "weight_grid")):
+        assert torch.equal(t, torch.from_numpy(d[key])), key

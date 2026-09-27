@@ -20,7 +20,7 @@
 /* Persistent cudaArray + cudaTextureObject pair, sized once and reused across
  * many forward/back-projection calls of the same shape. The hot path becomes
  *   tc_upload(cache, new_data_ptr, stream)   // cudaMemcpy3DAsync only
- *   forward_project_cuda_cached(cache, ...)  // kernel launch
+ *   forward_project_parallel_cuda_cached(cache, ...)  // kernel launch
  * with no per-call cudaMalloc3DArray or cudaCreateTextureObject. The
  * non-cached entry points wrap the same code in a ScopedTextureCache (below).
  *

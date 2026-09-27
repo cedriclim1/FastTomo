@@ -18,14 +18,14 @@ static inline cudaStream_t to_stream(long stream_ptr) {
 
 /* ── CUDA projection bindings ─────────────────────────────────────────── */
 
-static void py_forward_project_cuda(
+static void py_forward_project_parallel_cuda(
     int io_dtype,
     long volume_ptr, long sinogram_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    forward_project_cuda(
+    forward_project_parallel_cuda(
         io_dtype,
         reinterpret_cast<const void *>(volume_ptr),
         reinterpret_cast<void *>(sinogram_ptr),
@@ -36,14 +36,14 @@ static void py_forward_project_cuda(
     );
 }
 
-static void py_back_project_cuda(
+static void py_back_project_parallel_cuda(
     int io_dtype,
     long sinogram_ptr, long volume_ptr,
     long cos_ptr, long sin_ptr,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    back_project_cuda(
+    back_project_parallel_cuda(
         io_dtype,
         reinterpret_cast<const void *>(sinogram_ptr),
         reinterpret_cast<void *>(volume_ptr),
@@ -197,7 +197,7 @@ static void py_tc_destroy(long handle) {
 
 /* ── cached FP/BP entry points ─────────────────────────────────────────── */
 
-static void py_forward_project_cuda_cached(
+static void py_forward_project_parallel_cuda_cached(
     int io_dtype,
     long cache_ptr,
     long volume_ptr, long sinogram_ptr,
@@ -205,7 +205,7 @@ static void py_forward_project_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    forward_project_cuda_cached(
+    forward_project_parallel_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
         reinterpret_cast<const void *>(volume_ptr),
@@ -217,7 +217,7 @@ static void py_forward_project_cuda_cached(
     );
 }
 
-static void py_back_project_cuda_cached(
+static void py_back_project_parallel_cuda_cached(
     int io_dtype,
     long cache_ptr,
     long sinogram_ptr, long volume_ptr,
@@ -225,7 +225,7 @@ static void py_back_project_cuda_cached(
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     long stream_ptr
 ) {
-    back_project_cuda_cached(
+    back_project_parallel_cuda_cached(
         io_dtype,
         reinterpret_cast<TextureCache *>(cache_ptr),
         reinterpret_cast<const void *>(sinogram_ptr),
@@ -369,7 +369,7 @@ static void py_mbir_icd_sweep_cuda(
 }
 
 void register_cuda(py::module_ &m) {
-    m.def("forward_project_cuda", &py_forward_project_cuda,
+    m.def("forward_project_parallel_cuda", &py_forward_project_parallel_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "Forward projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints. "
@@ -381,7 +381,7 @@ void register_cuda(py::module_ &m) {
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
 
-    m.def("back_project_cuda", &py_back_project_cuda,
+    m.def("back_project_parallel_cuda", &py_back_project_parallel_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "Back-projection (CUDA). io_dtype: 0=fp32, 1=fp16. "
           "All ptr args are device data_ptr() ints.",
@@ -489,7 +489,7 @@ void register_cuda(py::module_ &m) {
           "finish before its textures and cudaArray are freed.",
           py::arg("handle"));
 
-    m.def("forward_project_cuda_cached", &py_forward_project_cuda_cached,
+    m.def("forward_project_parallel_cuda_cached", &py_forward_project_parallel_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
           "Forward projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
           "cache_ptr: TC_VOL_LAYERED handle sized to (Ny, Nz, Nx) with matching dtype. "
@@ -503,7 +503,7 @@ void register_cuda(py::module_ &m) {
           py::arg("n_angles"), py::arg("N_det"),
           py::arg("stream_ptr") = 0L);
 
-    m.def("back_project_cuda_cached", &py_back_project_cuda_cached,
+    m.def("back_project_parallel_cuda_cached", &py_back_project_parallel_cuda_cached,
           py::call_guard<py::gil_scoped_release>(),
           "Back-projection (CUDA, cached). io_dtype: 0=fp32, 1=fp16. "
           "cache_ptr: TC_SINO_LAYERED handle sized to (n_angles, Ny, N_det) with matching dtype.",
@@ -571,7 +571,7 @@ void register_cuda(py::module_ &m) {
     m.def("mbir_forward_project_cuda", &py_mbir_forward_project_cuda,
           py::call_guard<py::gil_scoped_release>(),
           "MBIR voxel-driven bilinear scatter forward projection (CUDA). "
-          "Distinct from forward_project_cuda (ray-marching). sino_ptr is "
+          "Distinct from forward_project_parallel_cuda (ray-marching). sino_ptr is "
           "zeroed by the wrapper before launch.",
           py::arg("vol_ptr"), py::arg("sino_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
@@ -588,8 +588,7 @@ void register_cuda(py::module_ &m) {
           "wrapper using the post-call e_sino.",
           py::arg("vol_ptr"), py::arg("e_sino_ptr"),
           py::arg("vol_snapshot_ptr"),
-          py::arg("d_offsets_ptr") = 0L,
-          py::arg("lambdas_ptr") = 0L,
+          py::arg("d_offsets_ptr"), py::arg("lambdas_ptr"),
           py::arg("perm_ptr"),
           py::arg("cos_ptr"), py::arg("sin_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),

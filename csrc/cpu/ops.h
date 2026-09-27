@@ -20,7 +20,7 @@ extern "C" {
  *
  * Integration uses 1-pixel steps along the ray with bilinear interpolation.
  */
-void forward_project_cpu(
+void forward_project_parallel_cpu(
     const float *volume,
     float       *sinogram,
     const float *cos_a,
@@ -39,7 +39,7 @@ void forward_project_cpu(
  *
  * For each voxel, accumulates linearly-interpolated sinogram values over all angles.
  */
-void back_project_cpu(
+void back_project_parallel_cpu(
     const float *sinogram,
     float       *volume,
     const float *cos_a,
@@ -94,7 +94,7 @@ void grad_angle_cpu(
  * Slower than the CUDA path by O(10×) — useful for testing on hosts without
  * a GPU and as a reference for the autograd backward.
  */
-void forward_project_3d_cpu(
+void forward_project_rotmat_cpu(
     const float *volume,
     float       *sinogram,
     const float *matrices,
@@ -103,7 +103,7 @@ void forward_project_3d_cpu(
     int num_threads
 );
 
-void back_project_3d_cpu(
+void back_project_rotmat_cpu(
     const float *sinogram,
     float       *volume,
     const float *matrices,
@@ -143,7 +143,7 @@ void genfire_gridding_2d_cpu(
 /*
  * MBIR voxel-driven bilinear forward projection (CPU).
  *
- * Distinct from `forward_project_cpu` — this uses the voxel-driven scatter
+ * Distinct from `forward_project_parallel_cpu` — this uses the voxel-driven scatter
  * model A_MBIR that matches the column-A used in `mbir_icd_sweep_cpu`.
  * For voxel (ix, iz, iy) at angle θ_k the detector coord is
  *   u = (ix - half_x)·cos θ_k - (iz - half_z)·sin θ_k + half_det,

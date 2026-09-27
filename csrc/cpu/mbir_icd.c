@@ -10,7 +10,7 @@
  * Provided entry points (mirroring `csrc/cpu/ops.h`):
  *   mbir_forward_project_mbir_cpu - voxel-driven bilinear FP (no super-
  *       sampling) used inside MBIR. Distinct from the existing ray-marching
- *       `forward_project_cpu` so the column-A model used in the ICD updates
+ *       `forward_project_parallel_cpu` so the column-A model used in the ICD updates
  *       below matches the FP used to compute the initial e = g - Af.
  *   mbir_icd_sweep_cpu - one full outer iteration: ICD sweep over all
  *       voxels (Y-parallel via OpenMP), optional offset update, optional
@@ -112,7 +112,7 @@ static inline float huber_surr_weight(float r, float T, float delta) {
  * Parallel-safe: writes to disjoint per-angle, per-iy strips of sinogram
  * because we iterate the angle/iy outer loops and accumulate via a local
  * partial-sum then write once. This matches the existing
- * `forward_project_cpu` parallelism shape. */
+ * `forward_project_parallel_cpu` parallelism shape. */
 void mbir_forward_project_cpu(
     const float *volume,        /* [Ny, Nz, Nx] */
     float       *sinogram,      /* [n_angles, Ny, N_det] — overwritten */

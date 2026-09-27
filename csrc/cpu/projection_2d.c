@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <omp.h>
 
-void forward_project_cpu(
+void forward_project_parallel_cpu(
     const float *volume,
     float       *sinogram,
     const float *cos_a,
@@ -58,7 +58,7 @@ void forward_project_cpu(
     }
 }
 
-void back_project_cpu(
+void back_project_parallel_cpu(
     const float *sinogram,
     float       *volume,
     const float *cos_a,

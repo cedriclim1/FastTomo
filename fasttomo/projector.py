@@ -317,7 +317,7 @@ class ParallelProjector(_ProjectorBase):
                 self.n_angles, self.Ny, self.N_det,
                 dtype=self.dtype, device=self.device,
             )
-            _core.forward_project_cuda_cached(
+            _core.forward_project_parallel_cuda_cached(
                 io_dtype,
                 self._vol_handle,
                 vol.data_ptr(), sino.data_ptr(),
@@ -336,7 +336,7 @@ class ParallelProjector(_ProjectorBase):
                 self.Ny, self.Nz, self.Nx,
                 dtype=self.dtype, device=self.device,
             )
-            _core.back_project_cuda_cached(
+            _core.back_project_parallel_cuda_cached(
                 io_dtype,
                 self._sino_handle,
                 sino.data_ptr(), vol.data_ptr(),
