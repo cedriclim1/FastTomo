@@ -533,6 +533,90 @@ class TestRunSirtCudaGraph:
         assert torch.isfinite(rec).all()
 
 
+# ── fused SIRT elementwise kernels (kernel audit F7) ─────────────────────────
+
+
+def _with_edge_values(t: torch.Tensor) -> torch.Tensor:
+    """``t`` with NaN, +-inf, +-0, subnormals and fp16 extremes up front."""
+    vals = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0, 1e-40, -1e-40,
+            6e-8, -6e-8, 65504.0, -65504.0, 1e-8, -1e-8]
+    t.view(-1)[:len(vals)] = torch.tensor(vals, device=t.device).to(t.dtype)
+    return t
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.int16 if t.dtype == torch.float16 else torch.int32)
+
+
+@needs_cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("shape", [(3, 5, 7), (2, 33, 65), (5, 16, 24)])
+def test_fused_sirt_kernels_bit_identical_to_torch_chain(dtype, shape):
+    """The fused residual and update kernels give the bits of the PyTorch
+    chains they replace in both rounding orders (run_sirt's eager loop and
+    `_sirt_iter_inplace`), for every constraint combination, broadcast and
+    full support masks, and NaN / inf / signed zero / subnormal inputs.
+    The shapes cover the scalar and the 16-byte vectorised kernels."""
+    from fasttomo.algorithms.algebraic import _fused_residual, _fused_update
+    from fasttomo.configs import ConstraintConfig
+    g = torch.Generator(device="cpu").manual_seed(0)
+
+    def rand(*sz, scale=1.0, positive=False):
+        x = torch.rand(*sz, generator=g) if positive else torch.randn(*sz, generator=g)
+        return (x * scale).to(DEVICE, dtype)
+
+    Ny, Nz, Nx = shape
+    vol = _with_edge_values(rand(*shape, scale=3.0))
+    upd = _with_edge_values(rand(*shape, scale=10.0))
+    C = rand(*shape, scale=0.1, positive=True)
+    sino, fp = _with_edge_values(rand(*shape, scale=3.0)), rand(*shape)
+    R = rand(*shape, positive=True)
+
+    raw, res = _fused_residual(sino, fp, R, want_raw=True)
+    assert torch.equal(_bits(raw), _bits(sino - fp))
+    assert torch.equal(_bits(res), _bits((sino - fp) * R))
+
+    for mask_shape in (None, (1, Nz, Nx), (Ny, Nz, Nx)):
+        mask = None if mask_shape is None else rand(*mask_shape, scale=2.0, positive=True)
+        for omega in (1.0, 0.8, 0.37):
+            for positivity in (False, True):
+                for soft in (0.0, 1e-3, 0.5):
+                    cons = ConstraintConfig(positivity=positivity, support_mask=mask,
+                                            soft_threshold=soft)
+                    # run_sirt's eager loop
+                    want = cons.apply(vol + omega * C * upd)
+                    got = _fused_update(vol, upd, C, omega, cons, eager_order=True)
+                    assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
+                                                                   positivity, soft)
+                    # _sirt_iter_inplace (in place, as in the CUDA graph)
+                    want = vol.clone()
+                    u = upd.clone()
+                    u.mul_(C)
+                    want.add_(u, alpha=omega)
+                    cons.apply_inplace_(want)
+                    got = vol.clone()
+                    assert _fused_update(got, upd, C, omega, cons, eager_order=False,
+                                         out=got) is got
+                    assert torch.equal(_bits(got), _bits(want)), (mask_shape, omega,
+                                                                   positivity, soft)
+
+
+@needs_cuda
+def test_fused_sirt_kernels_decline_unfusable_inputs():
+    """Mixed dtypes, CPU tensors and odd mask shapes fall back to the
+    PyTorch chain (the helpers return None)."""
+    from fasttomo.algorithms.algebraic import _fused_residual, _fused_update
+    from fasttomo.configs import ConstraintConfig
+
+    v = torch.ones(2, 4, 4, device=DEVICE)
+    cons = ConstraintConfig()
+    assert _fused_residual(v, v.half(), v, want_raw=False) is None
+    assert _fused_residual(v.cpu(), v.cpu(), v.cpu(), want_raw=False) is None
+    assert _fused_update(v, v, v.double(), 1.0, cons, eager_order=True) is None
+    odd = ConstraintConfig(support_mask=torch.ones(4, 4, device=DEVICE))   # 2-D
+    assert _fused_update(v, v, v, 1.0, odd, eager_order=True) is None
+
+
 # ── SART ──────────────────────────────────────────────────────────────────────
 
 

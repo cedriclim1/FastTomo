@@ -228,6 +228,36 @@ void grad_angle_cuda(
  * device buffer). d_grad_vol must be zeroed by the caller (kernel writes
  * once per voxel).
  */
+/*
+ * Fused elementwise steps of one SIRT iteration (sirt_update.cu), bit-for-bit
+ * the PyTorch op chains they replace. io_dtype 0 = fp32, 1 = fp16; every
+ * tensor contiguous.
+ *   sirt_residual_cuda: raw = sino - fp, res = raw * R over n elements;
+ *     raw_out / res_out may be null (skipped).
+ *   sirt_update_cuda: vol_out = constraints(vol_in + omega * C * upd) over
+ *     [Ny, Nz, Nx], rounded in run_sirt's eager order (eager_order = 1) or
+ *     its CUDA-graph order (0); mask is [1 | Ny, Nz, Nx] (mask_full = 1 for
+ *     the latter) or null; soft_thr <= 0 disables the soft threshold.
+ *     vol_out may alias vol_in.
+ */
+void sirt_residual_cuda(
+    int io_dtype,
+    const void *sino, const void *fp, const void *R,
+    void *raw_out, void *res_out,
+    long long n,
+    cudaStream_t stream
+);
+
+void sirt_update_cuda(
+    int io_dtype, int eager_order,
+    const void *vol_in, void *vol_out,
+    const void *upd, const void *C,
+    const void *mask, int mask_full,
+    float omega, int positivity, float soft_thr,
+    int Ny, int Nz, int Nx,
+    cudaStream_t stream
+);
+
 long long tv_loss_iso_3d_workspace(int Ny, int Nz, int Nx);
 
 void tv_loss_iso_3d_cuda(

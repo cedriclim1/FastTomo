@@ -303,6 +303,43 @@ static void py_tv_loss_iso_3d_grad_cuda(
     );
 }
 
+static void py_sirt_residual_cuda(
+    int io_dtype,
+    long sino_ptr, long fp_ptr, long R_ptr,
+    long raw_out_ptr, long res_out_ptr,
+    long long n,
+    long stream_ptr
+) {
+    sirt_residual_cuda(
+        io_dtype,
+        reinterpret_cast<const void *>(sino_ptr),
+        reinterpret_cast<const void *>(fp_ptr),
+        reinterpret_cast<const void *>(R_ptr),
+        reinterpret_cast<void *>(raw_out_ptr),
+        reinterpret_cast<void *>(res_out_ptr),
+        n, to_stream(stream_ptr));
+}
+
+static void py_sirt_update_cuda(
+    int io_dtype, int eager_order,
+    long vol_in_ptr, long vol_out_ptr,
+    long upd_ptr, long C_ptr,
+    long mask_ptr, int mask_full,
+    float omega, int positivity, float soft_thr,
+    int Ny, int Nz, int Nx,
+    long stream_ptr
+) {
+    sirt_update_cuda(
+        io_dtype, eager_order,
+        reinterpret_cast<const void *>(vol_in_ptr),
+        reinterpret_cast<void *>(vol_out_ptr),
+        reinterpret_cast<const void *>(upd_ptr),
+        reinterpret_cast<const void *>(C_ptr),
+        reinterpret_cast<const void *>(mask_ptr), mask_full,
+        omega, positivity, soft_thr, Ny, Nz, Nx,
+        to_stream(stream_ptr));
+}
+
 static void py_genfire_gridding_2d_cuda(
     long fk_real_ptr, long fk_imag_ptr,
     long cos_ptr,     long sin_ptr,
@@ -572,6 +609,28 @@ void register_cuda(py::module_ &m) {
           py::arg("vol_ptr"), py::arg("g_scaled_ptr"), py::arg("grad_vol_ptr"),
           py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("eps"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("sirt_residual_cuda", &py_sirt_residual_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused SIRT residual: raw = sino - fp, res = raw * R (n elements, "
+          "io_dtype 0 = fp32, 1 = fp16). raw_out_ptr / res_out_ptr may be 0.",
+          py::arg("io_dtype"), py::arg("sino_ptr"), py::arg("fp_ptr"), py::arg("R_ptr"),
+          py::arg("raw_out_ptr"), py::arg("res_out_ptr"), py::arg("n"),
+          py::arg("stream_ptr") = 0L);
+
+    m.def("sirt_update_cuda", &py_sirt_update_cuda,
+          py::call_guard<py::gil_scoped_release>(),
+          "Fused SIRT update + constraints: vol_out = constraints(vol_in + "
+          "omega * C * upd), eager (1) or CUDA-graph (0) rounding order; "
+          "mask_ptr 0 = no support mask, mask_full = 1 for a [Ny, Nz, Nx] mask "
+          "(else [1, Nz, Nx]); soft_thr <= 0 disables the soft threshold.",
+          py::arg("io_dtype"), py::arg("eager_order"),
+          py::arg("vol_in_ptr"), py::arg("vol_out_ptr"),
+          py::arg("upd_ptr"), py::arg("C_ptr"),
+          py::arg("mask_ptr"), py::arg("mask_full"),
+          py::arg("omega"), py::arg("positivity"), py::arg("soft_thr"),
+          py::arg("Ny"), py::arg("Nz"), py::arg("Nx"),
           py::arg("stream_ptr") = 0L);
 
     m.def("genfire_gridding_2d_cuda", &py_genfire_gridding_2d_cuda,

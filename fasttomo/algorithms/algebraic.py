@@ -11,6 +11,8 @@ from typing import Any, Callable
 
 import torch
 
+import fasttomo._core as _core
+from fasttomo._backend import _stream_ptr
 from fasttomo._operator import (
     CudaCachedOperator,
     Geometry,
@@ -195,14 +197,95 @@ def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
     # The loss is the data MSE before the update (SIRT's loss is pure
     # fidelity; sparsity acts as a proximal constraint, not a loss term).
     for it in rec.iterate(n_iter):
-        raw_res  = sinogram - _fp(volume)
+        fp = _fp(volume)
+        fused = _fused_residual(sinogram, fp, R_sino, want_raw=rec.wants_loss)
+        if fused is None:
+            raw_res  = sinogram - fp
+            residual = raw_res * R_sino
+        else:
+            raw_res, residual = fused
         if rec.wants_loss:
             rec.record(it, raw_res.pow(2).mean())
-        residual = raw_res * R_sino
-        volume   = volume + omega * C_vol * _bp(residual)
-        volume   = constraints.apply(volume)
+        update = _bp(residual)
+        new = _fused_update(volume, update, C_vol, omega, constraints, eager_order=True)
+        if new is None:
+            volume = volume + omega * C_vol * update
+            volume = constraints.apply(volume)
+        else:
+            volume = new
 
     return rec.finish(volume)
+
+
+# ---------------------------------------------------------------------------
+# Fused elementwise steps of the SIRT iteration (kernel audit F7)
+# ---------------------------------------------------------------------------
+#
+# One kernel for the residual (sub, mul) and one for the update and the
+# constraints (mul, add, support multiply, positivity clamp, soft
+# threshold), instead of 2 + 5 PyTorch kernels. They round every
+# intermediate exactly where the PyTorch chain materialises a tensor, so the
+# output is bit-identical (csrc/cuda/sirt_update.cu). Used for CUDA fp32 /
+# fp16 tensors of one dtype; anything else (CPU, a duck-typed projector
+# returning another dtype, an unexpected mask shape) returns None and the
+# caller runs the PyTorch chain.
+
+def _fusable(*tensors: torch.Tensor) -> bool:
+    t0 = tensors[0]
+    return (t0.is_cuda and t0.dtype in (torch.float32, torch.float16)
+            and hasattr(_core, "sirt_update_cuda")
+            and all(t.device == t0.device and t.dtype == t0.dtype for t in tensors[1:]))
+
+
+def _fused_residual(sinogram, fp, R_sino, *, want_raw: bool):
+    """``(sinogram - fp, (sinogram - fp) * R_sino)`` in one kernel (the first
+    is None unless ``want_raw``), or None if not fusable."""
+    if not _fusable(sinogram, fp, R_sino) or not (
+            sinogram.shape == fp.shape == R_sino.shape):
+        return None
+    sino, fp, R = sinogram.contiguous(), fp.contiguous(), R_sino.contiguous()
+    raw = torch.empty_like(sino) if want_raw else None
+    res = torch.empty_like(sino)
+    with torch.cuda.device(sino.device):
+        _core.sirt_residual_cuda(
+            0 if sino.dtype == torch.float32 else 1,
+            sino.data_ptr(), fp.data_ptr(), R.data_ptr(),
+            0 if raw is None else raw.data_ptr(), res.data_ptr(),
+            sino.numel(), _stream_ptr(sino.device))
+    return raw, res
+
+
+def _fused_update(volume, update, C_vol, omega, constraints, *, eager_order: bool,
+                  out: torch.Tensor | None = None):
+    """``constraints(volume + omega * C_vol * update)`` in one kernel, written
+    to ``out`` (may be ``volume``; default a new tensor) and returned, with
+    the rounding of run_sirt's eager loop (``eager_order``) or of
+    `_sirt_iter_inplace`. None if not fusable."""
+    if volume.ndim != 3 or not _fusable(volume, update, C_vol) or not (
+            volume.shape == update.shape == C_vol.shape):
+        return None
+    Ny, Nz, Nx = volume.shape
+    mask = constraints._support_for(volume)
+    if mask is not None and not (
+            _fusable(volume, mask) and mask.ndim == 3
+            and tuple(mask.shape[1:]) == (Nz, Nx) and mask.shape[0] in (1, Ny)):
+        return None
+    if out is None:
+        out = torch.empty_like(volume, memory_format=torch.contiguous_format)
+    elif not out.is_contiguous():
+        return None
+    vol, upd, C = volume.contiguous(), update.contiguous(), C_vol.contiguous()
+    if mask is not None:
+        mask = mask.contiguous()
+    with torch.cuda.device(vol.device):
+        _core.sirt_update_cuda(
+            0 if vol.dtype == torch.float32 else 1, int(eager_order),
+            vol.data_ptr(), out.data_ptr(), upd.data_ptr(), C.data_ptr(),
+            0 if mask is None else mask.data_ptr(),
+            int(mask is not None and mask.shape[0] == Ny and Ny > 1),
+            float(omega), int(bool(constraints.positivity)),
+            float(constraints.soft_threshold), Ny, Nz, Nx, _stream_ptr(vol.device))
+    return out
 
 
 def run_sart(
@@ -602,9 +685,14 @@ def _sirt_iter_inplace(
     ``copy_``) so that ``vol_static``'s memory address is stable —
     a requirement for CUDA Graph capture to replay correctly.
     """
-    raw_res  = sinogram - _fp(vol_static)
-    residual = raw_res * R_sino
+    fp = _fp(vol_static)
+    fused = _fused_residual(sinogram, fp, R_sino, want_raw=False)
+    residual = (sinogram - fp) * R_sino if fused is None else fused[1]
     update   = _bp(residual)
+    if vol_static.is_contiguous() and _fused_update(
+            vol_static, update, C_vol, omega, constraints,
+            eager_order=False, out=vol_static) is not None:
+        return
     # Avoid creating a temporary for `update * C_vol` to keep allocations
     # inside the graph's memory pool.
     update.mul_(C_vol)
