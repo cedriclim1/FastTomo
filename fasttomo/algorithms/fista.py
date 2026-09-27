@@ -40,15 +40,38 @@ def _estimate_lipschitz(
     (``_LIPSCHITZ_SAFETY``) so the
     FISTA step size 1/L sits strictly inside the contraction region even if
     the iteration hasn't fully converged.
+
+    The norms are fp32 whatever the volume dtype: an fp16 norm overflows to
+    inf once L exceeds 65504 (parallel beam: L ~ n_views x N, so a 512-pixel
+    detector with 180 views), which zeroed the next iterate and made
+    ``1 / L`` raise ZeroDivisionError. L stays on the device between steps
+    (one host sync at the end instead of one per step); the normalisation
+    by ``L + eps`` rounds exactly as the former division by the Python float
+    did (`_normalise`), so fp32 runs are unchanged bit for bit.
     """
     v = torch.randn(vol_shape, device=device, dtype=dtype)
-    v = v / (v.norm() + _NORM_EPS)
-    L = 0.0
+    if dtype == torch.float32:
+        v = v / (v.norm() + _NORM_EPS)
+    else:
+        v = (v.float() / (torch.linalg.vector_norm(v, dtype=torch.float32) + _NORM_EPS)).to(dtype)
+    nrm = None
     for _ in range(n_iter):
         AtAv = _bp(_fp(v))
-        L = float(AtAv.norm())
-        v = AtAv / (L + _NORM_EPS)
+        nrm = torch.linalg.vector_norm(AtAv, dtype=torch.float32)
+        v = _normalise(AtAv, nrm + _NORM_EPS)
+    L = 0.0 if nrm is None else float(nrm)
     return L * _LIPSCHITZ_SAFETY
+
+
+def _normalise(t: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+    """``t / den`` for a 0-d fp32 device tensor ``den``, rounded as ATen
+    rounds ``t / float(den)``: on CUDA a Python-scalar divisor becomes a
+    multiplication by its fp32 reciprocal, on CPU an fp32 true division.
+    fp16 ``t`` is computed in fp32 and rounded once (casting ``den`` or its
+    reciprocal to fp16 first would lose it to the subnormal range)."""
+    t32 = t if t.dtype == torch.float32 else t.float()
+    out = t32 * torch.reciprocal(den) if t.is_cuda else t32 / den
+    return out if t.dtype == torch.float32 else out.to(t.dtype)
 
 
 def _tv_grad(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

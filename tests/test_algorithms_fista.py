@@ -295,3 +295,45 @@ def test_fista_tv_unknown_inner_mode_raises():
     sino   = torch.zeros(len(angles), 1, N)
     with pytest.raises(ValueError, match="unknown mode"):
         ft.run_fista_tv(sino, angles, tv_weight=0.01, n_iter=1, Nz=N, tv_inner="bogus")
+
+
+# ── Lipschitz power iteration in fp16 (solver audit A4) ──────────────────────
+
+
+@pytest.mark.parametrize("dev", ["cpu", pytest.param("cuda", marks=needs_cuda)])
+def test_lipschitz_fp16_above_fp16_range(dev):
+    """The power-iteration norms are fp32: an operator with ||A^T A|| above
+    65504 (the fp16 maximum) gives its true L in fp16 too. The fp16 norm
+    used to overflow to inf, zero the iterate and make 1 / L raise
+    ZeroDivisionError."""
+    from fasttomo.algorithms.fista import _estimate_lipschitz
+
+    s = 300.0                               # A = s * I: L = s**2 = 90000
+
+    def fp(v):
+        return v * s
+
+    def bp(r):
+        return r * s
+
+    torch.manual_seed(0)
+    L = _estimate_lipschitz(fp, bp, (2, 8, 8), torch.device(dev), torch.float16, 5)
+    assert L == pytest.approx(s * s * 1.01, rel=2e-3)
+
+
+@needs_cuda
+def test_fista_fp16_large_lipschitz_runs():
+    """512-pixel detector, 180 views: L ~ 1.3e5 > 65504. fp16 run_fista used
+    to raise ZeroDivisionError (audit A4); it now runs and agrees with fp32."""
+    N, Ny, n = 512, 4, 180
+    ang = torch.linspace(0, 179, n, device="cuda")
+    vol = torch.zeros(Ny, N, N, device="cuda")
+    vol[:, N // 2 - 20:N // 2 + 20, N // 2 - 20:N // 2 + 20] = 1.0
+    sino = ft.forward_project(vol, ang)
+    torch.manual_seed(0)
+    x32 = ft.run_fista(sino, ang, 5)
+    torch.manual_seed(0)
+    x16 = ft.run_fista(sino.half(), ang, 5)
+    assert x16.dtype == torch.float16 and torch.isfinite(x16).all()
+    err = (x16.float() - x32).norm() / x32.norm()
+    assert err < 1e-2, err
