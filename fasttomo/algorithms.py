@@ -260,6 +260,28 @@ def _emit_loss(
         )
 
 
+def _emit_volume(
+    volume_callback: Callable[[int, torch.Tensor], None],
+    iteration: int,
+    volume: torch.Tensor,
+) -> None:
+    """Invoke ``volume_callback(iteration, volume)``, swallowing (but logging)
+    any exception.
+
+    ``volume`` is the live iterate on its device, passed without a copy; the
+    callback must not modify it and must ``.clone()`` it to keep it past the
+    call. One failed call must not stop subsequent invocations.
+    """
+    try:
+        volume_callback(iteration, volume)
+    except Exception:
+        _log.warning(
+            "volume_callback raised at iteration %d; continuing reconstruction",
+            iteration,
+            exc_info=True,
+        )
+
+
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
 
 def _compute_exact_wf(
@@ -448,6 +470,7 @@ def run_sirt(
     volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
     support_mask: torch.Tensor | None = None,   # precomputed support, enforced each iteration
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Iterative Reconstruction Technique.
@@ -501,6 +524,15 @@ def run_sirt(
     raised by the callback are logged and swallowed. Independent of
     ``return_loss``; supplying a callback forces the eager loop (no CUDA
     Graph capture).
+    volume_callback: optional hook invoked once per iteration, after that
+    iteration's update and constraints, as ``volume_callback(i, volume)`` —
+    0-based index and the live ``[Ny, Nz, Nx]`` iterate on its device, in
+    the compute dtype (the same representation that is returned). The
+    callback must not modify the tensor and must ``.clone()`` it to keep
+    it. Exceptions raised by the callback are logged and swallowed. Unlike
+    ``loss_callback`` it does not force the eager loop: on the CUDA Graph
+    path it runs between graph replays on the graph's static volume buffer.
+    ``None`` (default) leaves the code path unchanged.
 
     Returns volume [Ny, Nz, Nx].
     mask=True enforces cylindrical support at each iteration (GENFIRE-style).
@@ -579,6 +611,7 @@ def run_sirt(
                  tuple(constraints.mask.shape)
                  if isinstance(constraints.mask, torch.Tensor) else None,
                  euler_zyz_deg is not None),
+            volume_callback=volume_callback,
         )
         if graph_result is not None:
             return graph_result
@@ -598,6 +631,8 @@ def run_sirt(
         residual = raw_res * R_sino
         volume   = volume + omega * C_vol * _bp(residual)
         volume   = constraints.apply(volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
 
     return _finish_iters(volume, losses, return_loss)
 
@@ -763,6 +798,7 @@ def _fista_loop(
     prox_fn,
     return_loss: bool,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Shared Beck-Teboulle FISTA outer loop.
 
@@ -775,6 +811,9 @@ def _fista_loop(
     at ``x_k``. ``loss_callback`` streams the same value per iteration
     (components: ``{"fidelity": loss}`` — the recorded loss is the data-fit
     term only, regardless of prox regularisation).
+
+    ``volume_callback`` receives ``x_{k+1}`` (the prox output, i.e. the
+    iterate that is returned), not the momentum point ``y``.
     """
     inv_L = 1.0 / L
     t = 1.0
@@ -798,6 +837,8 @@ def _fista_loop(
                 )
         grad = _bp(fp_y - sinogram)
         x_new = prox_fn(y - inv_L * grad)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, x_new)
         t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
         beta = (t - 1.0) / t_new
         y = x_new + beta * (x_new - x_prev)
@@ -870,6 +911,7 @@ def run_fista(
     projector: object | None = None,
     volume: torch.Tensor | None = None,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA (Beck & Teboulle 2009) on the smooth least-squares problem
@@ -906,6 +948,13 @@ def run_fista(
         loss_callback: optional per-iteration hook ``loss_callback(i, loss)``
                       streaming the same value recorded in ``loss_history``
                       (see :func:`run_sirt` for the full contract).
+        volume_callback: optional per-iteration hook
+                      ``volume_callback(i, volume)`` receiving the live
+                      iterate ``x_{k+1}`` after the projection step (not the
+                      momentum point), ``[Ny, Nz, Nx]`` on its device in the
+                      compute dtype. Must not modify it; ``.clone()`` to keep
+                      it. Exceptions are logged and swallowed (see
+                      :func:`run_sirt` for the full contract).
 
     Returns the reconstructed volume (or ``(volume, loss_history)`` when
     ``return_loss=True``). Eager CUDA only — no CUDA Graph capture because
@@ -940,7 +989,7 @@ def run_fista(
 
     return _fista_loop(
         volume, sinogram, _fp, _bp, n_iter, L_eff, constraints.apply,
-        return_loss, loss_callback,
+        return_loss, loss_callback, volume_callback,
     )
 
 
@@ -962,6 +1011,7 @@ def run_fista_tv(
     projector: object | None = None,
     volume: torch.Tensor | None = None,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FISTA-TV (Beck & Teboulle 2009 + 2009b) on the composite problem
@@ -977,8 +1027,9 @@ def run_fista_tv(
     Args:
         sinogram, angles_deg, n_iter, Nz, positivity, mask, euler_zyz_deg,
         return_loss, n_power_iter, L, num_threads, projector, volume,
-        loss_callback:
-                      see :func:`run_fista`.
+        loss_callback, volume_callback:
+                      see :func:`run_fista`. ``volume_callback`` receives the
+                      TV-prox output ``x_{k+1}`` each iteration.
         tv_weight:    isotropic TV regularisation weight (required, > 0).
                       Pass ``tv_weight=0`` and use :func:`run_fista` directly.
         tv_inner_iter: inner dual-projection iterations (default 20).
@@ -1024,7 +1075,7 @@ def run_fista_tv(
 
     return _fista_loop(
         volume, sinogram, _fp, _bp, n_iter, L_eff, prox,
-        return_loss, loss_callback,
+        return_loss, loss_callback, volume_callback,
     )
 
 
@@ -1042,6 +1093,7 @@ def run_sart(
     sparsity: float = 0.0,
     num_threads: int | None = None,             # CPU 3D path only
     volume: torch.Tensor | None = None,         # optional warm-start [Ny, Nz, Nx]; controls dtype
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simultaneous Algebraic Reconstruction Technique (SART / OS-SART).
@@ -1083,6 +1135,13 @@ def run_sart(
     sets the compute dtype (and must match the sinogram). When None, the
     algorithm zero-initialises in ``sinogram.dtype`` (fp32 or fp16). Output
     preserves the compute dtype.
+
+    volume_callback: optional hook invoked once per outer iteration (after
+    all subsets and the constraints) as ``volume_callback(i, volume)`` —
+    0-based index and the live ``[Ny, Nz, Nx]`` iterate on its device in
+    the compute dtype. The callback must not modify the tensor and must
+    ``.clone()`` it to keep it. Exceptions raised by the callback are
+    logged and swallowed.
 
     Returns volume [Ny, Nz, Nx].
     """
@@ -1146,7 +1205,7 @@ def run_sart(
     losses: list[float] = []
 
     # --- outer iteration loop ---
-    for _ in range(n_iter):
+    for it in range(n_iter):
         # --- inner subset loop ---
         for idx, R_s, C_s in zip(subsets, R_list, C_list):
             sino_s = sinogram[idx]                   # [|S|, Ny, N_det]
@@ -1160,6 +1219,8 @@ def run_sart(
                 losses.append(raw_res.pow(2).mean().item())
 
         volume = constraints.apply(volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
 
     return _finish_iters(volume, losses, return_loss)
 
@@ -1175,6 +1236,7 @@ def run_ad_recon(
     return_loss: bool = False,
     return_pose: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple:
     """
     Autograd-based reconstruction with optional pose and shift refinement.
@@ -1221,6 +1283,16 @@ def run_ad_recon(
                          ``s3im``, ``tilt_ssim``), each already weighted so
                          ``sum(components.values()) ≈ loss``. Exceptions
                          raised by the callback are logged and swallowed.
+        volume_callback: Optional hook invoked once per iteration, after the
+                         optimiser step(s) and the in-place constraints, as
+                         ``volume_callback(i, volume)`` — 0-based index and
+                         the live volume detached from autograd
+                         (``[Ny, Nz, Nx]`` float32 on the CUDA device; the
+                         same representation that is returned). It shares
+                         storage with the optimised parameter, so the
+                         callback must not modify it and must ``.clone()``
+                         it to keep it. Exceptions raised by the callback
+                         are logged and swallowed.
 
     Returns:
         * ``volume``               — float32 CUDA tensor [Ny, Nz, Nx]
@@ -1489,6 +1561,9 @@ def run_ad_recon(
             if antisymmetric_z and refine_pose and tilt_angle_opt is not None:
                 tilt_angle_opt[:, 2] = -tilt_angle_opt[:, 0]
 
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume.detach())
+
     out = volume.detach()
 
     # ── build return tuple ─────────────────────────────────────────────────
@@ -1527,12 +1602,18 @@ def _run_sirt_cuda_graph(
     constraints: ConstraintConfig,
     projector,
     key: tuple,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | None:
     """
     Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
 
     Returns the reconstructed volume tensor, or ``None`` if capture was
     skipped / failed (caller should fall back to the eager loop).
+
+    ``volume_callback`` (if given) is invoked after each replay, outside
+    capture, with the static volume buffer that holds the current iterate.
+    It runs on the replay stream, so work it enqueues is ordered after the
+    replay and before the next one without an explicit synchronize.
 
     The graph is cached on ``projector._sirt_graph_cache[key]``.
 
@@ -1635,8 +1716,10 @@ def _run_sirt_cuda_graph(
         mask_static.copy_(constraints.mask)
 
     with torch.cuda.device(target_device):
-        for _ in range(n_iter):
+        for it in range(n_iter):
             g.replay()
+            if volume_callback is not None:
+                _emit_volume(volume_callback, it, vol_static)
         torch.cuda.synchronize(target_device)
 
     return vol_static.clone()
@@ -1712,6 +1795,7 @@ def run_genfire(
     resolution_extension: bool = True,
     return_loss: bool = False,
     sparsity: float = 0.0,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     GENFIRE reconstruction (Pryor et al. 2017).
@@ -1729,6 +1813,18 @@ def run_genfire(
 
     sparsity: L1 soft-threshold applied in real space after each IFFT step
     (proximal operator of sparsity·‖x‖₁). 0.0 disables it.
+
+    volume_callback: optional hook invoked once per iteration as
+    ``volume_callback(i, volume)`` — 0-based index and that iteration's
+    real-space iterate after the support/positivity/sparsity constraints
+    (the iterate whose Fourier error lands in ``loss_history[i]``), cropped
+    to ``[Ny, Nz, Nx]`` float32 on its device. The returned volume is the
+    lowest-error iterate re-synthesised from its Fourier transform, so it
+    matches the callback volume at ``argmin(loss_history)`` (up to FFT
+    round-off), which is the last one only when the final iterate is the
+    best. The tensor is a view into a per-iteration buffer: the callback
+    must not modify it and must ``.clone()`` it to keep it. Exceptions
+    raised by the callback are logged and swallowed.
 
     Returns volume [Ny, Nz, Nx].
     mask=True inscribes a cylindrical support in the reconstruction plane.
@@ -1864,6 +1960,8 @@ def run_genfire(
 
         # real-space constraints: support → positivity → sparsity
         vol = _inner_constraints.apply(vol)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, i_iter, vol[:, z0:z1, x0:x1])
 
         # FFT back to Fourier space (centred convention: ifftshift before fft)
         F_cur = torch.fft.fftn(
@@ -2074,6 +2172,7 @@ def run_resire(
     euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — overrides angles_deg
     return_loss: bool = False,
     sparsity: float = 0.0,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     REal Space Iterative REconstruction (RESIRE, Miao group).  CUDA only.
@@ -2103,6 +2202,13 @@ def run_resire(
 
     fp32 only — the RESIRE FP/BP kernels (`csrc/cuda/projection_resire.cu`)
     have no half-precision path. Cast your sinogram to ``torch.float32`` first.
+
+    volume_callback: optional hook invoked once per iteration, after the
+    gradient step and the constraints, as ``volume_callback(i, volume)`` —
+    0-based index and the live ``[Ny, Nz, Nx]`` float32 iterate on its
+    device. The callback must not modify the tensor and must ``.clone()``
+    it to keep it. Exceptions raised by the callback are logged and
+    swallowed.
 
     Returns volume [Ny, Nz, Nx].
     """
@@ -2135,12 +2241,14 @@ def run_resire(
     constraints = ConstraintConfig(positivity=positivity, mask=_mask, sparsity=sparsity)
     losses: list[float] = []
 
-    for _ in range(n_iter):
+    for it in range(n_iter):
         residual = sinogram - _fp(volume)
         if return_loss:
             losses.append(residual.pow(2).mean().item())
         volume   = volume + alpha * _bp(residual)
         volume   = constraints.apply(volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
 
     return _finish_iters(volume, losses, return_loss)
 
@@ -2162,6 +2270,7 @@ def run_grad_descent(
     return_loss: bool = False,
     num_threads: int | None = None,             # CPU 3D path only
     tv_eps: float = 1e-8,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Reference autograd-based reconstruction.
@@ -2201,6 +2310,17 @@ def run_grad_descent(
         return_loss:    if True, also return the per-iteration loss history.
         tv_eps:         smoothing constant inside the TV sqrt (default
                         1e-8); only used when ``tv_weight > 0``.
+        volume_callback: optional hook invoked once per optimizer step,
+                        after the in-place constraints, as
+                        ``volume_callback(i, volume)`` — 0-based index and
+                        the live volume detached from autograd
+                        (``[Ny, Nz, Nx]`` float32 on its device; the same
+                        representation that is returned). It shares storage
+                        with the optimised parameter, so the callback must
+                        not modify it and must ``.clone()`` it to keep it.
+                        Exceptions are logged and swallowed. With LBFGS one
+                        call corresponds to one ``step()`` (which may
+                        evaluate the closure several times).
 
     Constraints (positivity, mask) are applied **inside torch.no_grad()** on
     the leaf tensor — the autograd-correct way to project. Users hand-rolling
@@ -2253,7 +2373,7 @@ def run_grad_descent(
         loss.backward()
         return loss
 
-    for _ in range(n_iter):
+    for it in range(n_iter):
         if is_lbfgs:
             loss_val = opt.step(closure)
         else:
@@ -2262,6 +2382,8 @@ def run_grad_descent(
         losses.append(float(loss_val.detach()))
         with torch.no_grad():
             constraints.apply_inplace_(volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume.detach())
 
     out = volume.detach()
     return _finish_iters(out, losses, return_loss)
@@ -2422,6 +2544,7 @@ def _run_mbir_single_scale(
     init_state: _MbirState | None,
     lambdas: torch.Tensor | None,
     return_history: bool,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> tuple[_MbirState, list[float]]:
     """Inner loop for one resolution scale. The public `run_mbir` wraps
     this in a coarse-to-fine multiresolution loop.
@@ -2511,6 +2634,8 @@ def _run_mbir_single_scale(
             rel_change = float((f_new - f_old).norm() / denom)
         if return_history:
             history.append(rel_change)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
         if rel_change < convergence_tol:
             break
 
@@ -2567,6 +2692,7 @@ def run_mbir(
     lambdas: torch.Tensor | None = None,
     sigma_f_per_scale: list[float] | None = None,
     return_history: bool = False,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple:
     """Classical MBIR (Model-Based Iterative Reconstruction) for single-axis
     parallel-beam tomography.
@@ -2604,6 +2730,17 @@ def run_mbir(
         scales with voxel size).
     return_history : if True, also returns the per-iteration convergence
         history (relative L2 change).
+    volume_callback : optional hook invoked once per outer iteration (one
+        full ICD sweep plus the offset/variance updates) as
+        ``volume_callback(i, volume)`` — 0-based index and the live
+        ``[Ny, Nz, Nx]`` float32 volume on its device, the same tensor that
+        is returned. The callback must not modify it and must ``.clone()``
+        it to keep it. Exceptions raised by the callback are logged and
+        swallowed. Because of ``convergence_tol`` early stopping it may be
+        called fewer than ``outer_iters`` times; set ``convergence_tol=0``
+        for a fixed count. Only supported with ``multires_levels=1``: the
+        coarse levels iterate on a downsampled ``(Nz, Nx)`` grid, so a
+        callback with ``multires_levels > 1`` raises ``ValueError``.
 
     Returns
     -------
@@ -2612,6 +2749,11 @@ def run_mbir(
     """
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
+    if volume_callback is not None and multires_levels > 1:
+        raise ValueError(
+            "volume_callback is not supported by run_mbir with "
+            "multires_levels > 1"
+        )
     if sinogram.dim() != 3:
         raise ValueError("sinogram must be [n_angles, Ny, N_det]")
     if angles_deg.dim() != 1:
@@ -2715,6 +2857,7 @@ def run_mbir(
             init_state=state,
             lambdas=lam_lvl,
             return_history=return_history,
+            volume_callback=volume_callback,
         )
         history_all.append(hist)
 
