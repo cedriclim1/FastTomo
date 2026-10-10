@@ -33,6 +33,7 @@ from fasttomo.algorithms._common import (
     _prepare_recon,
     _DeviceLossRecorder,
     _build_fp_bp,
+    _emit_volume,
     _reciprocal_or_zero,
 )
 from fasttomo.algorithms.analytic import _clear_wf_cache, _make_wbp
@@ -56,6 +57,7 @@ def run_sirt(
     num_threads: int | None = None,             # CPU paths
     return_loss: bool = False,
     loss_callback: Callable | None = None,      # per-iteration loss streaming hook
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     reuse_graph: bool = True,                   # keep the internal CUDA graph for the next call
     **deprecated: Any,
@@ -106,6 +108,16 @@ def run_sirt(
         them on return, as before; a configuration kept by earlier calls
         stays until released. With ``projector`` the graph lives on that
         projector, whatever this flag says.
+    volume_callback : callable, optional
+        Optional hook invoked once per iteration, after that iteration's
+        update and constraints, as ``volume_callback(i, volume)`` — 0-based
+        index and the live ``[Ny, Nz, Nx]`` iterate on its device, in the
+        compute dtype (the same representation that is returned). The
+        callback must not modify the tensor and must ``.clone()`` it to keep
+        it. Exceptions raised by the callback are logged and swallowed.
+        Unlike ``loss_callback`` it does not force the eager loop: on the
+        CUDA Graph path it runs between graph replays on the graph's static
+        volume buffer. ``None`` (default) leaves the code path unchanged.
 
     Returns
     -------
@@ -162,7 +174,8 @@ def run_sirt(
     try:
         return _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
                               (Ny, Nz, Nx), n_angles, N_det, use_graph, graph_key,
-                              return_loss, loss_callback, progress, tex_op, tex_geom)
+                              return_loss, loss_callback, progress, tex_op, tex_geom,
+                              volume_callback)
     finally:
         if tex_op is not None:
             # the textures' contents are not the caller's business any more
@@ -212,7 +225,8 @@ def _operator_closures(op):
 
 def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
                    vol_shape, n_angles, N_det, use_graph, graph_key,
-                   return_loss, loss_callback, progress, tex_op, tex_geom):
+                   return_loss, loss_callback, progress, tex_op, tex_geom,
+                   volume_callback=None):
     """run_sirt after validation and operator selection."""
     Ny, Nz, Nx = vol_shape
 
@@ -249,6 +263,7 @@ def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
             on_replay=rec.tick,
             tex_op=tex_op,
             rec=rec if rec.wants_loss else None,
+            volume_callback=volume_callback,
         )
         if graph_result is not None:
             return rec.finish(graph_result)
@@ -276,6 +291,8 @@ def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
             volume = constraints.apply(volume)
         else:
             volume = new
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
 
     return rec.finish(volume)
 
@@ -412,6 +429,7 @@ def run_sart(
     num_threads: int | None = None,             # CPU paths
     return_loss: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -465,6 +483,13 @@ def run_sart(
         See Conventions of :mod:`fasttomo.algorithms`.
     euler_zyz_deg
         As in :func:`run_sirt`.
+    volume_callback : callable, optional
+        Optional hook invoked once per outer iteration (after all subsets
+        and the constraints) as ``volume_callback(i, volume)`` — 0-based
+        index and the live ``[Ny, Nz, Nx]`` iterate on its device in the
+        compute dtype. The callback must not modify the tensor and must
+        ``.clone()`` it to keep it. Exceptions raised by the callback are
+        logged and swallowed.
 
     Returns
     -------
@@ -555,6 +580,8 @@ def run_sart(
                     rec.record(it, raw_res.pow(2).mean())
 
             volume = constraints.apply(volume)
+            if volume_callback is not None:
+                _emit_volume(volume_callback, it, volume)
     finally:
         if tex_op is not None:
             tex_op._forget_texture_writes()
@@ -857,6 +884,7 @@ def _run_sirt_cuda_graph(
     on_replay: Callable[[], None] | None = None,
     tex_op: CudaCachedOperator | None = None,
     rec: _DeviceLossRecorder | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | None:
     """
     Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
@@ -868,6 +896,13 @@ def _run_sirt_cuda_graph(
 
     Returns the reconstructed volume tensor, or ``None`` if capture was
     skipped / failed (caller should fall back to the eager loop).
+
+    ``volume_callback`` (if given) is invoked after each replay, outside
+    capture, with the static volume buffer that holds the current iterate
+    (refreshed from the volume texture first when the graph keeps the
+    volume texture-resident). It runs on the replay stream, so work it
+    enqueues is ordered after the replay and before the next one without an
+    explicit synchronize.
 
     The graph is cached on ``projector._sirt_graph_cache[key]``; keys whose
     capture failed are kept in ``projector._sirt_graph_bad_keys`` so later
@@ -993,6 +1028,10 @@ def _run_sirt_cuda_graph(
             g.replay()
             if rec is not None:
                 rec.record(it, loss_static)
+            if volume_callback is not None:
+                if resident:
+                    tex_op._download_vol(vol_static)
+                _emit_volume(volume_callback, it, vol_static)
             if on_replay is not None:
                 on_replay()
         if resident:

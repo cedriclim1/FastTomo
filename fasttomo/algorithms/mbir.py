@@ -31,6 +31,7 @@ from fasttomo.algorithms._common import (
     _as_int,
     _prepare_recon,
     _LossRecorder,
+    _emit_volume,
 )
 
 
@@ -496,6 +497,7 @@ def _run_mbir_single_scale(
     num_threads: int = 1,
     support: torch.Tensor | None = None,
     sweep_kernel: str = "auto",
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> tuple[_MbirState, list[float]]:
     """Inner loop for one resolution scale. The public `run_mbir` wraps
     this in a coarse-to-fine multiresolution loop.
@@ -590,6 +592,8 @@ def _run_mbir_single_scale(
         if rec.wants_loss:
             rec.record(it_offset + it, e_sino.pow(2).mean())
         rec.tick()
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it_offset + it, volume)
 
         # Convergence check: relative L2 change on a strided sample so it
         # scales as O(Nvox / 8). Cheap vs the per-iter compute.
@@ -715,6 +719,7 @@ def run_mbir(
     return_loss: bool = False,
     return_state: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple:
@@ -866,6 +871,18 @@ def run_mbir(
     return_state : bool
         Also return ``(d_offsets, sigma)``: the ``[n_angles]`` offsets and the
         final noise std.
+    volume_callback : callable, optional
+        Optional hook invoked once per outer iteration (one full ICD sweep
+        plus the offset/variance updates) as ``volume_callback(i, volume)``
+        — 0-based index and the live ``[Ny, Nz, Nx]`` float32 volume on its
+        device, the same tensor that is returned. The callback must not
+        modify it and must ``.clone()`` it to keep it. Exceptions raised by
+        the callback are logged and swallowed. Because of
+        ``convergence_tol`` early stopping it may be called fewer than
+        ``n_iter`` times; set ``convergence_tol=0`` for a fixed count. Only
+        supported with ``multires_levels=1``: the coarse levels iterate on a
+        downsampled ``(Nz, Nx)`` grid, so a callback with
+        ``multires_levels > 1`` raises ``ValueError``.
 
     Returns
     -------
@@ -916,6 +933,11 @@ def run_mbir(
             getattr(config, k) for k in tuning)
     if multires_levels < 1:
         raise ValueError("multires_levels must be >= 1")
+    if volume_callback is not None and multires_levels > 1:
+        raise ValueError(
+            "volume_callback is not supported by run_mbir with "
+            "multires_levels > 1"
+        )
     _check_qggmrf(qggmrf_p, qggmrf_q, qggmrf_c, sigma_f, sigma_f_per_scale)
     if sweep_kernel not in _SWEEP_KERNELS:
         raise ValueError(f"run_mbir: sweep_kernel must be one of {_SWEEP_KERNELS}, "
@@ -1055,7 +1077,7 @@ def run_mbir(
             lambdas=lam_lvl,
             return_history=return_history,
             rec=rec, it_offset=it_offset, num_threads=nt, support=support_lvl,
-            sweep_kernel=sweep_kernel,
+            sweep_kernel=sweep_kernel, volume_callback=volume_callback,
         )
         history_all.append(hist)
         it_offset += state.n_done

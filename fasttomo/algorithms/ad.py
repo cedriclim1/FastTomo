@@ -32,6 +32,7 @@ from fasttomo.algorithms._common import (
     _prepare_recon,
     _DeviceLossRecorder,
     _LossRecorder,
+    _emit_volume,
 )
 
 
@@ -324,6 +325,7 @@ def run_ad_recon(
     return_loss: bool = False,
     return_pose: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple:
     """Autograd reconstruction with optional pose and shift refinement (CUDA, fp32).
@@ -366,6 +368,15 @@ def run_ad_recon(
     return_pose : bool
         Also return ``(euler, shifts)``: the refined ``[n_angles, 3]`` Euler
         angles and ``[n_angles, 2]`` shifts on CPU, each None if not refined.
+    volume_callback : callable, optional
+        Optional hook invoked once per iteration, after the optimiser
+        step(s) and the in-place constraints, as ``volume_callback(i,
+        volume)`` — 0-based index and the live volume detached from autograd
+        (``[Ny, Nz, Nx]`` float32 on the CUDA device; the same
+        representation that is returned). It shares storage with the
+        optimised parameter, so the callback must not modify it and must
+        ``.clone()`` it to keep it. Exceptions raised by the callback are
+        logged and swallowed.
 
     Returns
     -------
@@ -560,6 +571,8 @@ def run_ad_recon(
     for it in rec.iterate(n_iter):
         step_volume = _ad_step(run, it, rec)
         _ad_project_constraints(run, step_volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume.detach())
     rec.close()
 
     out = volume.detach()
@@ -623,6 +636,7 @@ def run_grad_descent(
     num_threads: int | None = None,             # CPU paths
     return_loss: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reference autograd reconstruction with a ``torch.optim`` optimiser. fp32.
@@ -668,6 +682,15 @@ def run_grad_descent(
         Rotation-matrix projector.
     use_resire_projector : bool
         With ``euler_zyz_deg``: RESIRE's projector instead (CUDA only).
+    volume_callback : callable, optional
+        Optional hook invoked once per optimizer step, after the in-place
+        constraints, as ``volume_callback(i, volume)`` — 0-based index and
+        the live volume detached from autograd (``[Ny, Nz, Nx]`` float32 on
+        its device; the same representation that is returned). It shares
+        storage with the optimised parameter, so the callback must not
+        modify it and must ``.clone()`` it to keep it. Exceptions are logged
+        and swallowed. With LBFGS one call corresponds to one ``step()``
+        (which may evaluate the closure several times).
     Nz, positivity, mask, support_mask, warm_start, num_threads, return_loss,
     loss_callback, progress
         See Conventions of :mod:`fasttomo.algorithms`.
@@ -747,5 +770,7 @@ def run_grad_descent(
             rec.record(it, loss_val.detach(), terms)
         with torch.no_grad():
             constraints.apply_inplace_(volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume.detach())
 
     return rec.finish(volume.detach())

@@ -471,6 +471,28 @@ def _emit_loss(
         )
 
 
+def _emit_volume(
+    volume_callback: Callable[[int, torch.Tensor], None],
+    iteration: int,
+    volume: torch.Tensor,
+) -> None:
+    """Invoke ``volume_callback(iteration, volume)``, swallowing (but logging)
+    any exception.
+
+    ``volume`` is the live iterate on its device, passed without a copy; the
+    callback must not modify it and must ``.clone()`` it to keep it past the
+    call. One failed call must not stop subsequent invocations.
+    """
+    try:
+        volume_callback(iteration, volume)
+    except Exception:
+        _log.warning(
+            "volume_callback raised at iteration %d; continuing reconstruction",
+            iteration,
+            exc_info=True,
+        )
+
+
 def _loss_float(value: object) -> float:
     """A loss value as a plain CPU float (``.item()`` on a tensor)."""
     return value.item() if isinstance(value, torch.Tensor) else float(value)

@@ -168,6 +168,7 @@ from fasttomo.algorithms._common import (
     _check_inputs,
     _deprecated_kwarg,
     _emit_loss,
+    _emit_volume,
     _finish_iters,
     _GENFIRE_RES_EXTENSION_PIVOTS,
     _is_default,

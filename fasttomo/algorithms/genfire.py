@@ -21,6 +21,7 @@ from fasttomo.algorithms._common import (
     _GENFIRE_RES_EXTENSION_PIVOTS,
     _prepare_recon,
     _LossRecorder,
+    _emit_volume,
 )
 
 
@@ -71,6 +72,7 @@ def run_genfire(
     warm_start: torch.Tensor | None = None,
     return_loss: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """GENFIRE (Pryor et al. 2017). fp32, CPU and CUDA. Frozen numerics.
@@ -111,6 +113,18 @@ def run_genfire(
         data.
     Nz, sparsity, return_loss, loss_callback, progress
         See Conventions of :mod:`fasttomo.algorithms`.
+    volume_callback : callable, optional
+        Optional hook invoked once per iteration as ``volume_callback(i,
+        volume)`` — 0-based index and that iteration's real-space iterate
+        after the support/positivity/sparsity constraints (the iterate whose
+        Fourier error lands in ``loss_history[i]``), cropped to ``[Ny, Nz,
+        Nx]`` float32 on its device. The returned volume is the lowest-error
+        iterate re-synthesised from its Fourier transform, so it matches the
+        callback volume at ``argmin(loss_history)`` (up to FFT round-off),
+        which is the last one only when the final iterate is the best. The
+        tensor is a view into a per-iteration buffer: the callback must not
+        modify it and must ``.clone()`` it to keep it. Exceptions raised by
+        the callback are logged and swallowed.
 
     Returns
     -------
@@ -275,6 +289,8 @@ def run_genfire(
 
         # real-space constraints: support → positivity → sparsity
         vol = _inner_constraints.apply(vol)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, i_iter, vol[:, z0:z1, x0:x1])
 
         # FFT back to Fourier space (centred convention: ifftshift before fft)
         F_cur = torch.fft.fftn(

@@ -25,6 +25,7 @@ from fasttomo.algorithms._common import (
     _DeviceLossRecorder,
     _LossRecorder,
     _build_fp_bp,
+    _emit_volume,
 )
 
 
@@ -284,6 +285,7 @@ def _fista_loop(
     *,
     constraints=None,
     tex_op=None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Shared Beck-Teboulle FISTA outer loop.
 
@@ -304,6 +306,9 @@ def _fista_loop(
     the momentum around ``prox_fn`` are one kernel each. The new ``y`` also
     goes into ``tex_op``'s volume texture when possible, so the next forward
     projection skips its upload.
+
+    ``volume_callback`` receives ``x_{k+1}`` (the prox output, i.e. the
+    iterate that is returned), not the momentum point ``y``.
     """
     inv_L = 1.0 / L
     t = 1.0
@@ -329,6 +334,8 @@ def _fista_loop(
                                      None, tex_op):
                     y = x_new + beta * (x_new - x_prev)
                 x_prev = x_new
+            if volume_callback is not None:
+                _emit_volume(volume_callback, it, x_prev)
             t = t_new
     finally:
         if tex_op is not None:
@@ -412,6 +419,7 @@ def run_fista(
     num_threads: int | None = None,
     return_loss: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -462,6 +470,12 @@ def run_fista(
         Power-iteration steps for the Lipschitz estimate (default 10).
     L : float, optional
         Lipschitz constant ``||A^T A||``; skips the power iteration.
+    volume_callback : callable, optional
+        Optional per-iteration hook ``volume_callback(i, volume)`` receiving
+        the live iterate ``x_{k+1}`` after the projection step (not the
+        momentum point), ``[Ny, Nz, Nx]`` on its device in the compute
+        dtype. Must not modify it; ``.clone()`` to keep it. Exceptions are
+        logged and swallowed (see :func:`run_sirt` for the full contract).
 
     Returns
     -------
@@ -492,6 +506,7 @@ def run_fista(
     return _fista_loop(
         volume, sinogram, _fp, _bp, n_iter, L_eff, setup.constraints.apply, rec,
         constraints=setup.constraints, tex_op=_fista_texture_operator(_op, sinogram),
+        volume_callback=volume_callback,
     )
 
 
@@ -516,6 +531,7 @@ def run_fista_tv(
     num_threads: int | None = None,
     return_loss: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -567,8 +583,9 @@ def run_fista_tv(
     Nz, positivity, mask, support_mask, warm_start, num_threads, return_loss,
     loss_callback, progress
         See Conventions of :mod:`fasttomo.algorithms`.
-    euler_zyz_deg, projector, n_power_iter, L
-        As in :func:`run_fista`.
+    euler_zyz_deg, projector, n_power_iter, L, volume_callback
+        As in :func:`run_fista`. ``volume_callback`` receives the TV-prox
+        output ``x_{k+1}`` each iteration.
 
     Returns
     -------
@@ -614,4 +631,5 @@ def run_fista_tv(
 
     rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
     return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec,
-                       tex_op=_fista_texture_operator(_op, sinogram))
+                       tex_op=_fista_texture_operator(_op, sinogram),
+                       volume_callback=volume_callback)

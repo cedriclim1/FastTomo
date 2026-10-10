@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### `volume_callback` on the iterative algorithms
+
+New keyword-only `volume_callback(i, volume)` on `run_sirt`, `run_sart`,
+`run_fista`, `run_fista_tv`, `run_resire`, `run_grad_descent`,
+`run_ad_recon`, `run_genfire` and `run_mbir`, for snapshotting the iterate
+during a run. It is called once per (outer) iteration, after that
+iteration's update and constraints, with the 0-based index and the live
+`[Ny, Nz, Nx]` iterate on its device, without a copy: the callback must not
+modify it and must `.clone()` it to keep it. A raising callback is logged
+and called again on the next iteration, like `loss_callback`. Per
+algorithm: FISTA and FISTA-TV pass the prox output `x_{k+1}`, not the
+momentum point; AD recon and gradient descent the detached parameter after
+the in-place constraints (one call per optimiser `step()`, also with
+LBFGS); GENFIRE the constrained real-space iterate cropped to
+`[Ny, Nz, Nx]` (the returned volume matches the call at
+`argmin(loss_history)`); MBIR one call per ICD sweep, possibly fewer than
+`n_iter` under `convergence_tol`, and `multires_levels > 1` with a callback
+raises ValueError. On CUDA `run_sirt` keeps its CUDA graph: the callback
+runs between replays on the graph's static volume buffer (refreshed from
+the volume texture when the graph keeps the volume there). Without a
+callback (the default `None`) nothing changes; GENFIRE and RESIRE stay
+bit-identical (`tests/test_frozen_identity.py`,
+`tests/test_volume_callback.py`).
+
 ### ⚠ Parallel-beam projector: loose sampling boundary; symmetric geometry gradients at grid alignments (phase 1b, PR G)
 
 **Every parallel-beam result changes slightly at the volume edges.** The

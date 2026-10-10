@@ -18,6 +18,7 @@ from fasttomo.algorithms._common import (
     _reject_unknown_kwargs,
     _prepare_recon,
     _LossRecorder,
+    _emit_volume,
 )
 
 
@@ -36,6 +37,7 @@ def run_resire(
     warm_start: torch.Tensor | None = None,
     return_loss: bool = False,
     loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -66,6 +68,12 @@ def run_resire(
     Nz, positivity, mask, sparsity, warm_start, return_loss, loss_callback,
     progress
         See Conventions of :mod:`fasttomo.algorithms`.
+    volume_callback : callable, optional
+        Optional hook invoked once per iteration, after the gradient step
+        and the constraints, as ``volume_callback(i, volume)`` — 0-based
+        index and the live ``[Ny, Nz, Nx]`` float32 iterate on its device.
+        The callback must not modify the tensor and must ``.clone()`` it to
+        keep it. Exceptions raised by the callback are logged and swallowed.
 
     Returns
     -------
@@ -116,5 +124,7 @@ def run_resire(
             rec.record(it, residual.pow(2).mean())
         volume   = volume + alpha * _bp(residual)
         volume   = constraints.apply(volume)
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
 
     return rec.finish(volume)
