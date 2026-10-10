@@ -5,12 +5,19 @@
 #include "texture_cache.h"
 
 /*
- * All CUDA entry points run on a caller-supplied stream so the kernels
- * compose cleanly with PyTorch's stream model. None of them call
- * cudaDeviceSynchronize — the caller (PyTorch) syncs implicitly when the
- * output tensor is read.
+ * All CUDA entry points launch on a caller-supplied stream. Synchronisation:
+ *   - The *_cached entry points and the texture-free kernels (grad_angle,
+ *     TV, GENFIRE, RESIRE, MBIR forward and ICD sweep) never synchronize;
+ *     PyTorch orders the work through the stream.
+ *   - The one-shot entry points that build their own texture
+ *     (forward/back_project_parallel_cuda, forward/back_project_rotmat_cuda,
+ *     grad_rotmat_cuda) call cudaStreamSynchronize on their stream before
+ *     releasing it (ScopedTextureCache, texture_cache.h). cudaFreeArray would synchronize anyway.
+ *   - The Python-side `tc_destroy` binding synchronizes the device.
  *
- * Every host-callable function may throw std::runtime_error on a CUDA error.
+ * Every host-callable function may throw: std::runtime_error on a CUDA error,
+ * std::invalid_argument (Python ValueError) for a cache that does not match
+ * the call (tc_validate) or an extent beyond the device texture limits.
  *
  * Cos/sin tables (single-axis kernels) are passed as device pointers so the
  * trig precompute can stay on the GPU.
@@ -27,26 +34,39 @@
  * templated impl. cos/sin tables and rotation matrices stay fp32 in all
  * paths. Out-of-scope ops below (RESIRE, grad_*) keep their fp32-only
  * signatures. */
-void forward_project_cuda(
+
+/* Channel count (Y slices per texel) of the parallel FP/BP textures for
+ * io_dtype and Ny: 2 for fp32 and 4 for fp16 when Ny >= 2, else 1
+ * (texture_cache.h). The one-shot wrappers use it; a cached caller
+ * creates its caches with it so both paths share one layout. */
+int parallel_channels(int io_dtype, int Ny);
+
+/* The four parallel FP/BP entry points take an optional `nonfinite` device
+ * int (null = off): an fp16 kernel ORs 1 into it when it stores an inf and 2
+ * when it stores a NaN, so the fp16 overflow check reads 4 bytes instead of
+ * scanning the output (fp32 outputs never set it). The caller zeroes it. */
+void forward_project_parallel_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_cos_a,
-    const float *d_sin_a,
+    const void  *vol,
+    void        *sino,
+    const float *cos_a,
+    const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite = nullptr
 );
 
-void back_project_cuda(
+void back_project_parallel_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_cos_a,
-    const float *d_sin_a,
+    const void  *sino,
+    void        *vol,
+    const float *cos_a,
+    const float *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int *nonfinite = nullptr
 );
 
 /*
@@ -55,9 +75,9 @@ void back_project_cuda(
  */
 void forward_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_volume,
-    void        *d_sinogram,
-    const float *d_matrices,
+    const void  *vol,
+    void        *sino,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -65,9 +85,9 @@ void forward_project_rotmat_cuda(
 
 void back_project_rotmat_cuda(
     int io_dtype,
-    const void  *d_sinogram,
-    void        *d_volume,
-    const float *d_matrices,
+    const void  *sino,
+    void        *vol,
+    const float *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -79,50 +99,56 @@ void back_project_rotmat_cuda(
  * cudaArray, then launches the kernel. Output buffer is written through a
  * regular device pointer.
  */
-void forward_project_cuda_cached(
+void forward_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_cos_a,
-    const float  *d_sin_a,
+    const void   *vol,
+    void         *sino,
+    const float  *cos_a,
+    const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1,  /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int *nonfinite = nullptr
 );
 
-void back_project_cuda_cached(
+void back_project_parallel_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_cos_a,
-    const float  *d_sin_a,
+    const void   *sino,
+    void         *vol,
+    const float  *cos_a,
+    const float  *sin_a,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1,  /* 0: the cache already holds the input (tc_create_ex surface write) */
+    int *nonfinite = nullptr
 );
 
 void forward_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const void   *d_volume,
-    void         *d_sinogram,
-    const float  *d_matrices,
+    const void   *vol,
+    void         *sino,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
 );
 
 void back_project_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *sino_cache,
-    const void   *d_sinogram,
-    void         *d_volume,
-    const float  *d_matrices,
+    const void   *sino,
+    void         *vol,
+    const float  *mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int upload = 1   /* 0: the cache already holds the input (tc_create_ex surface write) */
 );
 
 /*
@@ -153,15 +179,16 @@ void back_project_resire_cuda(
 
 /*
  * Gradient of 3D rotation-matrix forward projection w.r.t. the rotation
- * matrix entries. d_grad_matrices is [n_angles*9] row-major, must be zeroed
- * by the caller. Used by _FP3D's autograd backward; the host chains the
+ * matrix entries. grad_mats is [n_angles*9] row-major and is overwritten
+ * (a fixed-order two-pass reduction, bit-reproducible; no zeroing needed).
+ * Used by _FPRotmat's autograd backward; the host chains the
  * result through _euler_zyz_to_rotmat (pure-PyTorch) to yield ∂L/∂euler.
  */
 void grad_rotmat_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *vol,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -172,29 +199,37 @@ void grad_rotmat_cuda(
  * already uploaded by a preceding forward_project_rotmat_cuda_cached call.
  * Uses vol_cache->tex_point (point-filter view) for bit-exact corner reads.
  * io_dtype: 0=fp32, 1=fp16 (controls which kernel template is instantiated).
- * d_grad_matrices must be zeroed by the caller; result is accumulated via atomicAdd.
+ * grad_mats is overwritten (fixed-order two-pass reduction, no atomics).
  */
 void grad_rotmat_cuda_cached(
     int io_dtype,
     TextureCache *vol_cache,
-    const float *d_grad_sino,
-    const float *d_matrices,
-    float       *d_grad_matrices,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
 );
 
 /*
- * Gradient of forward projection w.r.t. tilt angles.
- * d_grad_angles must be zeroed by the caller; result is in radians.
+ * Test hook: turn the ray clipping of forward_project_rotmat_kernel on (1,
+ * the default) or off (0, the full [-ray_len, ray_len] step loop). Returns
+ * the previous setting. Results are bit-identical either way; tests compare
+ * the two paths with torch.equal. Process-wide, not thread-safe: tests only.
+ */
+int _debug_set_rotmat_ray_clip(int on);
+
+/*
+ * Gradient of forward projection w.r.t. tilt angles, in radians.
+ * grad_angles is overwritten (fixed-order two-pass reduction, no atomics).
  */
 void grad_angle_cuda(
-    const float *d_volume,
-    const float *d_grad_sino,
-    const float *d_cos_a,
-    const float *d_sin_a,
-    float       *d_grad_angles,
+    const float *vol,
+    const float *grad_sino,
+    const float *cos_a,
+    const float *sin_a,
+    float       *grad_angles,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     cudaStream_t stream
@@ -203,21 +238,157 @@ void grad_angle_cuda(
 /*
  * Fused 3-D isotropic Total-Variation loss.
  *   loss = mean( sqrt( dy² + dz² + dx² + eps ) )
- * over the (Ny-1)·(Nz-1)·(Nx-1) inner-corner grid. d_acc must be zeroed
- * by the caller; the kernel atomicAdds Σ s into it. The 1/N normalization
- * is applied by the Python caller. Backward expects `d_g_scaled[0]` to
- * already contain `grad_out · 1/N` (single-element device buffer).
- * d_grad_vol must be zeroed by the caller (kernel writes once per voxel).
+ * over the (Ny-1)·(Nz-1)·(Nx-1) inner-corner grid. The forward writes Σ s
+ * to d_acc[0] (deterministic two-pass reduction, fp64 above the per-lane
+ * sums, no atomics); d_acc is left untouched (so must be zeroed by the
+ * caller) when a dimension is < 2. d_partials is fp64 scratch of
+ * tv_loss_iso_3d_workspace(Ny, Nz, Nx) elements (0 when a dimension is < 2).
+ * The 1/N normalization is applied by the Python caller. Backward expects
+ * `d_g_scaled[0]` to already contain `grad_out · 1/N` (single-element
+ * device buffer). The backward kernel writes every voxel of d_grad_vol
+ * exactly once when Ny, Nz and Nx are all >= 2; with a dimension < 2 it
+ * launches nothing, so only then must the caller zero d_grad_vol.
  */
+/*
+ * Fused elementwise steps of one SIRT iteration (sirt_update.cu), bit-for-bit
+ * the PyTorch op chains they replace. io_dtype 0 = fp32, 1 = fp16; every
+ * tensor contiguous.
+ *   sirt_residual_cuda: raw = sino - fp, res = raw * R over n elements;
+ *     raw_out / res_out may be null (skipped).
+ *   sirt_update_cuda: vol_out = constraints(vol_in + omega * C * upd) over
+ *     [Ny, Nz, Nx], rounded in run_sirt's eager order (eager_order = 1) or
+ *     its CUDA-graph order (0); mask is [1 | Ny, Nz, Nx] (mask_full = 1 for
+ *     the latter) or null, and so is C (C_full = 1 for the latter; a
+ *     [1, Nz, Nx] plane is used for every Y-slice); soft_thr <= 0 disables
+ *     the soft threshold.
+ *     vol_out may alias vol_in. A non-null vol_tc (a volume TextureCache
+ *     with a surface, tc_create_ex) also receives vol_out, so the next
+ *     cached forward projection can skip its upload (upload = 0); with a
+ *     vol_tc, a null vol_in reads the volume from the texture and a null
+ *     vol_out skips the global write (the volume then lives in the texture;
+ *     tc_download fetches it).
+ *   sirt_residual_tex_cuda: res = (sino - fp) * R written into res_tc (a
+ *     [n_angles, Ny, N_det] sinogram TextureCache with a surface) instead
+ *     of global memory, for a cached back-projection with upload = 0;
+ *     raw_out (sino - fp) may be null.
+ */
+void sirt_residual_cuda(
+    int io_dtype,
+    const void *sino, const void *fp, const void *R,
+    void *raw_out, void *res_out,
+    long long n,
+    cudaStream_t stream
+);
+
+void sirt_update_cuda(
+    int io_dtype, int eager_order,
+    const void *vol_in, void *vol_out,
+    const void *upd, const void *C,
+    const void *mask, int mask_full,
+    float omega, int positivity, float soft_thr,
+    int Ny, int Nz, int Nx,
+    TextureCache *vol_tc,
+    cudaStream_t stream,
+    int C_full = 1
+);
+
+void sirt_residual_tex_cuda(
+    int io_dtype,
+    const void *sino, const void *fp, const void *R,
+    void *raw_out,
+    TextureCache *res_tc,
+    int n_angles, int Ny, int N_det,
+    cudaStream_t stream
+);
+
+/*
+ * Fused elementwise steps of one FISTA iteration (fista_update.cu), bit for
+ * bit the PyTorch op chains they replace. io_dtype 0 = fp32, 1 = fp16;
+ * every tensor contiguous [Ny, Nz, Nx]; step = 1/L and beta as floats.
+ *   mode 0 (FISTA):    x_out = constraints(a_in - step * grad),
+ *                      y_out = x + beta * (x - xp_in)
+ *   mode 1 (step):     x_out = a_in - step * grad
+ *   mode 2 (momentum): y_out = a_in + beta * (a_in - xp_in)
+ * a_in is y (modes 0, 1) or the prox output x (mode 2). constraints: the
+ * support mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter, or null)
+ * then clamp(min=0) if positivity. y_out may alias a_in, x_out may alias
+ * xp_in. A non-null vol_tc (volume TextureCache with a surface) also
+ * receives y_out in modes 0 and 2 when its layout allows (1 channel, or
+ * packed layered: 2 fp32 / 4 fp16 slices per texel, any Ny); returns 1 if
+ * it did, else 0.
+ */
+int fista_update_cuda(
+    int io_dtype, int mode,
+    const void *a_in, const void *grad, const void *xp_in,
+    const void *mask, int mask_full,
+    void *x_out, void *y_out,
+    float step, float beta, int positivity,
+    int Ny, int Nz, int Nx,
+    TextureCache *vol_tc,
+    cudaStream_t stream
+);
+
+/*
+ * 3-D isotropic TV proximal operator of run_fista_tv (tv_prox.cu), bit for
+ * bit fasttomo.algorithms.fista._tv_prox_3d: n_iter dual iterations of FGP
+ * (fgp = 1; betas[it] the momentum of iteration it, a host array) or
+ * Chambolle (fgp = 0; betas ignored), dual step `step`, inv_lam = 1/lam
+ * computed in double and rounded once to fp32 (what CUDA ATen multiplies by
+ * for `tensor / lam`), then v_out = P_C(z - div(p)), P_C = clamp(min=0) if
+ * positivity then * mask ([1 | Ny, Nz, Nx], mask_full = 1 for the latter,
+ * or null). work: (fgp ? 6 : 3) * Ny*Nz*Nx elements of the I/O dtype
+ * (zeroed here). io_dtype 0 = fp32, 1 = fp16; tensors contiguous.
+ */
+void tv_prox_cuda(
+    int io_dtype, int fgp,
+    const void *z, void *v_out, void *work,
+    const void *mask, int mask_full, int positivity,
+    float step, float inv_lam, const float *betas, int n_iter,
+    int Ny, int Nz, int Nx,
+    cudaStream_t stream
+);
+
+long long tv_loss_iso_3d_workspace(int Ny, int Nz, int Nx);
+
 void tv_loss_iso_3d_cuda(
     const float *d_vol,
     float       *d_acc,
+    double      *d_partials,
     int Ny, int Nz, int Nx,
     float eps,
     cudaStream_t stream
 );
 
 void tv_loss_iso_3d_grad_cuda(
+    const float *d_vol,
+    const float *d_g_scaled,
+    float       *d_grad_vol,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+);
+
+/*
+ * Planar (XZ) mode of the TV loss: loss = mean( sqrt( dz² + dx² + eps ) )
+ * over the Ny·(Nz-1)·(Nx-1) corners of every Y-slice (no dy term), for
+ * tv_loss_xz. Same conventions as tv_loss_iso_3d_*: d_acc zeroed by the
+ * caller and left untouched when Nz or Nx is < 2, fp64 scratch of
+ * tv_loss_xz_workspace elements, 1/N applied by the caller, and a backward
+ * that writes every voxel once when Nz, Nx >= 2 (else nothing: zero the
+ * buffer). Ny = 1 is valid.
+ */
+long long tv_loss_xz_workspace(int Ny, int Nz, int Nx);
+
+void tv_loss_xz_cuda(
+    const float *d_vol,
+    float       *d_acc,
+    double      *d_partials,
+    int Ny, int Nz, int Nx,
+    float eps,
+    cudaStream_t stream
+);
+
+void tv_loss_xz_grad_cuda(
     const float *d_vol,
     const float *d_g_scaled,
     float       *d_grad_vol,
@@ -241,7 +412,7 @@ void genfire_gridding_2d_cuda(
 
 /*
  * MBIR voxel-driven bilinear scatter forward projection (CUDA). Distinct
- * from forward_project_cuda's ray-marching FP — this matches the column-A
+ * from forward_project_parallel_cuda's ray-marching FP — this matches the column-A
  * model used by mbir_icd_sweep_cuda. Output sinogram is zeroed by the
  * wrapper before the kernel launches (atomicAdd scatter).
  */
@@ -259,30 +430,55 @@ void mbir_forward_project_cuda(
  * One outer iteration of MBIR-AM-PE (CUDA). In-place mutates d_volume and
  * d_e_sino. Per-tilt offset d_k and noise variance σ are updated host-side
  * in PyTorch by the Python wrapper — the kernel only does the ICD sweep.
+ * Asynchronous on `stream` (no host synchronisation).
  *
- *   d_volume_snapshot : start-of-outer-iter copy of volume, bound to a
- *                       tex3D for the qGGMRF 26-neighbour reads. Caller
- *                       guarantees this is a valid snapshot.
- *   d_d_offsets       : [n_angles] read-only; passed through but the
- *                       kernel relies on the host's e = g - Af - d
- *                       invariant rather than re-reading d_k.
+ *   d_volume_snapshot : start-of-outer-iter copy of volume; the qGGMRF
+ *                       26-neighbour values are read from it.
  *   d_lambdas         : per-pixel data weights or nullptr → uniform 1.
- *   d_perm            : [Ny, Nz*Nx] int32 host-generated permutation.
+ *   d_perm            : [Ny, Nz*Nx] int32 explicit voxel order (each row a
+ *                       permutation), or nullptr (the normal case): the
+ *                       order is generated on the device from perm_key
+ *                       (see mbir_perm_* in mbir_icd.cu).
+ *   perm_key          : 64-bit key of this outer iteration's order.
+ *   d_work            : scratch of Ny*Nz*Nx float2 (8 bytes per voxel,
+ *                       8-byte aligned), reusable across calls.
  *   sigma             : current noise std for the Huber surrogate.
+ *   group_spacing     : 0 runs the serial sweep (one warp per Y-slice, the
+ *                       order above); S > 0 the parallel sweep over
+ *                       conflict-free voxel groups of spacing S, in its own
+ *                       keyed group order (d_perm must be null; throws
+ *                       std::invalid_argument when unsupported). The caller
+ *                       guarantees S * min|cos| >= 2 + eps.
  */
 void mbir_icd_sweep_cuda(
     float       *d_volume,
     float       *d_e_sino,
     const float *d_volume_snapshot,
-    const float *d_d_offsets,
     const float *d_lambdas,
     const int   *d_perm,
+    unsigned long long perm_key,
+    float       *d_work,
     const float *d_cos_a,
     const float *d_sin_a,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
     float huber_T, float huber_delta, float sigma,
+    int group_spacing,
     cudaStream_t stream
+);
+
+/* Whether the parallel (group) sweep supports n_angles views and N_det
+ * detector pixels on the current device: n_angles <= 256 and
+ * n_angles * (N_det + 1) * 4 bytes of shared memory per block. */
+bool mbir_group_sweep_supported(int n_angles, int N_det);
+
+/*
+ * Test hook: the voxel order mbir_icd_sweep_cuda uses when d_perm is null,
+ * written to d_out as [Ny, nvox] int32. Mirrors
+ * fasttomo.algorithms.mbir._mbir_permutation bit for bit.
+ */
+void mbir_permutation_cuda(
+    int *d_out, int Ny, int nvox, unsigned long long perm_key, cudaStream_t stream
 );
 
 #endif /* FASTTOMO_CUDA_OPS_H */

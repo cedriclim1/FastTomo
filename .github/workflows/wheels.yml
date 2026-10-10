@@ -1,7 +1,7 @@
 name: Build wheels
 
 # Two jobs:
-#   build_cpu  — manylinux_2_28 CPU wheels for cp39..cp313
+#   build_cpu  — manylinux_2_28 CPU wheels for cp310..cp314
 #   build_cuda — single-CUDA-toolkit wheels per Python ABI; libcudart is
 #                excluded from the wheel via auditwheel and resolved at import
 #                time against the libcudart that PyTorch loaded into the
@@ -33,18 +33,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: [cp39, cp310, cp311, cp312, cp313]
+        python: [cp310, cp311, cp312, cp313, cp314]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pypa/cibuildwheel@v2.21.3
+      # v3.1+ builds CPython 3.14 by default (v2.x has no cp314 identifiers).
+      # CIBW_BUILD names the GIL build only, so cp314t is not selected.
+      - uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
           CIBW_SKIP: "*-musllinux*"
           CIBW_ARCHS_LINUX: x86_64
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT_LINUX: FASTTOMO_USE_CUDA=OFF
-          CIBW_CONFIG_SETTINGS: cmake.define.FASTTOMO_USE_CUDA=OFF
+          # Portable C flags: no -march=native in published wheels.
+          CIBW_CONFIG_SETTINGS: >
+            cmake.define.FASTTOMO_USE_CUDA=OFF
+            cmake.define.FASTTOMO_MARCH_NATIVE=OFF
           # Test the built wheel against PyTorch's CPU-only PyPI build.
           CIBW_TEST_REQUIRES: pytest
           CIBW_BEFORE_TEST_LINUX: pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -62,11 +67,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: [cp39, cp310, cp311, cp312, cp313]
+        python: [cp310, cp311, cp312, cp313, cp314]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pypa/cibuildwheel@v2.21.3
+      - uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
           CIBW_SKIP: "*-musllinux*"
@@ -94,7 +99,8 @@ jobs:
 
           CIBW_CONFIG_SETTINGS: >
             cmake.define.FASTTOMO_USE_CUDA=ON
-            cmake.define.CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90
+            cmake.define.FASTTOMO_MARCH_NATIVE=OFF
+            cmake.define.CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;100;120
 
           # The whole point: do NOT bundle libcudart into the wheel. At runtime
           # it resolves to the libcudart that PyTorch loaded into the process.

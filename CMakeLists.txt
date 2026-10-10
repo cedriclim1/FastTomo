@@ -143,6 +143,27 @@ else()
     message(STATUS "CUDA backend forced OFF via FASTTOMO_USE_CUDA")
 endif()
 
+# Default CUDA architectures. This must be set before project() enables the
+# CUDA language: once CUDA is enabled, CMake (policy CMP0104) initialises
+# CMAKE_CUDA_ARCHITECTURES to nvcc's own default (sm_75 for CUDA 13), and a
+# later `if(NOT DEFINED ...)` never fires. sm_70 is not listed because CUDA 13
+# dropped offline compilation for architectures below sm_75. sm_75 (Turing,
+# e.g. T4 / RTX 20xx) stays in the list: each entry N generates sm_N SASS plus
+# compute_N PTX, and on Turing it is the sm_75 SASS that runs (the compute_75
+# PTX is only a JIT fallback); nothing else in the binary can run there.
+# Override with -DCMAKE_CUDA_ARCHITECTURES="..." (pip/uv:
+# --config-settings=cmake.define.CMAKE_CUDA_ARCHITECTURES=...) or the
+# CUDAARCHS environment variable. An empty CUDAARCHS counts as unset, matching
+# CMake, which ignores an empty CUDAARCHS and would otherwise fall back to
+# nvcc's sm_75-only default.
+# The value is cached: when changing architectures, wipe the build directory
+# (or pass CMAKE_CUDA_ARCHITECTURES explicitly) so a stale value is not reused.
+if(FASTTOMO_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES
+   AND "$ENV{CUDAARCHS}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;120" CACHE STRING
+        "CUDA architectures to build for")
+endif()
+
 if(FASTTOMO_CUDA)
     project(fasttomo LANGUAGES C CXX CUDA)
 else()
@@ -155,7 +176,11 @@ find_package(OpenMP REQUIRED)
 
 # Host C++ compiler floor: GCC >= 10 (NVIDIA's CUDA 13 install guide
 # supports GCC 6-15, but FastTomo standardises on GCC >= 10 — older
-# toolchains miss C++17 polish and aren't tested).
+# toolchains miss C++17 polish and aren't tested). Known pitfall: a conda
+# nvcc 13.0 prepends its env's bin/ to PATH, so with an un-activated env it
+# mixes the system GCC's version with conda-forge GCC 14.3's libstdc++ headers
+# and fails (`__is_array` / `__type_pack_element` errors). Passing
+# -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++ avoids that (see AGENTS.md).
 if(FASTTOMO_CUDA AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
     message(FATAL_ERROR
@@ -168,20 +193,23 @@ set(CORE_SOURCES
     csrc/bindings.cpp
     csrc/bindings_cpu.cpp
     csrc/bindings_cuda.cpp
-    csrc/cpu/projection_2d.c
-    csrc/cpu/projection_3d.c
+    csrc/cpu/projection_parallel.c
+    csrc/cpu/projection_rotmat.c
     csrc/cpu/genfire.c
     csrc/cpu/mbir_icd.c
 )
 
 if(FASTTOMO_CUDA)
     list(APPEND CORE_SOURCES
-        csrc/cuda/projection_2d.cu
-        csrc/cuda/projection_3d.cu
+        csrc/cuda/projection_parallel.cu
+        csrc/cuda/projection_rotmat.cu
         csrc/cuda/projection_resire.cu
         csrc/cuda/genfire.cu
         csrc/cuda/grad_angle.cu
         csrc/cuda/tv_loss.cu
+        csrc/cuda/sirt_update.cu
+        csrc/cuda/fista_update.cu
+        csrc/cuda/tv_prox.cu
         csrc/cuda/texture_cache.cu
         csrc/cuda/mbir_icd.cu
     )
@@ -213,14 +241,29 @@ if(FASTTOMO_CUDA)
         CUDA_STANDARD 14
         CUDA_RUNTIME_LIBRARY Shared
     )
-    # Override at configure time via -DCMAKE_CUDA_ARCHITECTURES="80;86"
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 70 80 86 120)
-    endif()
+    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
+# -march=native bakes the build machine's ISA into the binary, which breaks
+# published wheels on older CPUs (illegal instruction). Off by default so
+# builds are portable; turn it on for a local source build with
+# -DFASTTOMO_MARCH_NATIVE=ON (pip/uv:
+# --config-settings=cmake.define.FASTTOMO_MARCH_NATIVE=ON).
+option(FASTTOMO_MARCH_NATIVE "Compile C sources with -march=native (not portable)" OFF)
+
+# -ffp-contract=off: no fused multiply-add contraction in the C kernels. The
+# default x86-64 target has no FMA, so the default build's code does not
+# change; with -march=native (or any FMA-capable target) gcc would otherwise
+# fuse a*b + c and change the kernels' fp32 results (FP/BP/rotmat bits, up
+# to 3.4e-2 of max in grad_rotmat at trilinear kinks), which the goldens'
+# arithmetic fingerprint cannot see. With it, a FASTTOMO_MARCH_NATIVE build
+# gives the same bits as the portable one, only faster (AVX2/AVX-512 SIMD).
 target_compile_options(_core PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:-O3 -march=native>
+    $<$<COMPILE_LANGUAGE:C>:-O3>
+    $<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>
 )
+if(FASTTOMO_MARCH_NATIVE)
+    target_compile_options(_core PRIVATE $<$<COMPILE_LANGUAGE:C>:-march=native>)
+endif()
 
 install(TARGETS _core DESTINATION fasttomo)

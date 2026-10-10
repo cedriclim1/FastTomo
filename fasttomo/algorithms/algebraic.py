@@ -1,0 +1,1097 @@
+"""
+Algebraic reconstruction: SIRT (with its CUDA-graph fast path), SART and
+weighted SIRT (wSIRT).
+"""
+
+from __future__ import annotations
+
+import threading
+from collections import OrderedDict
+from typing import Any, Callable
+
+import torch
+
+import fasttomo._core as _core
+from fasttomo._backend import _fp16_overflow_checked, _stream_ptr
+from fasttomo._operator import (
+    CudaCachedOperator,
+    Geometry,
+    _UserProjectorOperator,
+    _drain_deferred_handles,
+    _make_operator,
+    _release_texture_pool,
+)
+from fasttomo.projector import ParallelProjector, RotmatProjector
+from fasttomo.autograd import euler_zyz_to_rotmat
+from fasttomo.configs import ConstraintConfig
+from fasttomo.algorithms._common import (
+    _log,
+    _assert_projector_output_shape,
+    _deprecated_kwarg,
+    _reject_unknown_kwargs,
+    _as_int,
+    _prepare_recon,
+    _DeviceLossRecorder,
+    _build_fp_bp,
+    _emit_volume,
+    _reciprocal_or_zero,
+)
+from fasttomo.algorithms.analytic import _clear_wf_cache, _make_wbp
+
+
+@_fp16_overflow_checked
+def run_sirt(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    n_iter: int = 50,
+    *,
+    omega: float = 1.0,
+    Nz: int | None = None,
+    positivity: bool = False,
+    mask: bool = False,
+    support_mask: torch.Tensor | None = None,   # precomputed support, enforced each iteration
+    sparsity: float = 0.0,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
+    projector: object | None = None,            # ParallelProjector / RotmatProjector for cached FP/BP
+    warm_start: torch.Tensor | None = None,     # [Ny, Nz, Nx]; its dtype must match the sinogram
+    num_threads: int | None = None,             # CPU paths
+    return_loss: bool = False,
+    loss_callback: Callable | None = None,      # per-iteration loss streaming hook
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
+    progress: bool = False,
+    reuse_graph: bool = True,                   # keep the internal CUDA graph for the next call
+    **deprecated: Any,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Simultaneous Iterative Reconstruction Technique.
+
+    ``x <- x + omega * C * A^T (R * (b - A x))`` with the voxel and ray
+    normalisations ``C = 1 / A^T 1`` and ``R = 1 / A 1``, then the
+    constraints (support, positivity, soft-threshold ``sparsity``) every
+    iteration. Recorded loss: the data MSE ``mean((b - A x)^2)`` *before*
+    each update (components ``{"fidelity": loss}``).
+
+    On CUDA the projections go through a cached projector (built internally
+    unless ``projector`` is given) and, when no loss is needed, ``n_iter > 1``
+    and ``euler_zyz_deg`` is None, the iteration body runs as a captured
+    CUDA graph cached on the projector. Without ``projector`` (and with
+    ``reuse_graph=True``) the internal projector and its graph are kept for
+    the next call with the same shapes, dtype, device and options, so
+    repeated calls skip the capture; see :func:`release_cached_projectors`
+    for the memory this keeps and how to free it.
+
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        ``[n_angles, Ny, N_det]`` fp32/fp16, ``[n_angles]`` degrees, and the
+        number of iterations (default 50).
+    omega : float
+        Relaxation (default 1.0).
+    Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`. ``warm_start``'s dtype
+        is the compute dtype (it must match the sinogram's).
+    euler_zyz_deg : Tensor ``[n_angles, 3]``, optional
+        ZYZ Euler angles (degrees, the convention of
+        :func:`fasttomo.euler_zyz_to_rotmat`); switches to the rotation-matrix
+        projector.
+    projector : ParallelProjector or RotmatProjector, optional
+        Reuse its texture cache (and, on CUDA, CUDA graphs) across calls. Must
+        be sized for this volume and sinogram; its angles replace
+        ``angles_deg``, and a RotmatProjector needs ``euler_zyz_deg``.
+    reuse_graph : bool
+        CUDA graph path without ``projector`` only (default True): keep the
+        internal projector and its captured graph after the call, so the
+        next call with the same configuration replays it (one configuration
+        is kept, 3 volumes plus 4 sinograms of GPU memory; see
+        :func:`release_cached_projectors`). False neither uses nor keeps
+        that cache: the call builds its own projector and graph and frees
+        them on return, as before; a configuration kept by earlier calls
+        stays until released. With ``projector`` the graph lives on that
+        projector, whatever this flag says.
+    volume_callback : callable, optional
+        Optional hook invoked once per iteration, after that iteration's
+        update and constraints, as ``volume_callback(i, volume)`` — 0-based
+        index and the live ``[Ny, Nz, Nx]`` iterate on its device, in the
+        compute dtype (the same representation that is returned). The
+        callback must not modify the tensor and must ``.clone()`` it to keep
+        it. Exceptions raised by the callback are logged and swallowed.
+        Unlike ``loss_callback`` it does not force the eager loop: on the
+        CUDA Graph path it runs between graph replays on the graph's static
+        volume buffer. ``None`` (default) leaves the code path unchanged.
+
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
+    """
+    warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sirt")
+    _reject_unknown_kwargs(deprecated, "run_sirt")
+    setup = _prepare_recon(
+        "run_sirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
+    )
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
+
+    # Gate of the CUDA-graph path: CUDA input, n_iter > 1, parallel
+    # geometry. Rotmat mode (euler_zyz_deg) stays on the eager path because
+    # the per-call matrix tensor can vary, while cached graphs assume fixed
+    # captured inputs. A requested loss is computed inside the graph (the
+    # eager loop's rounding order, so the result does not change) and
+    # recorded on the device after each replay (solver audit P5).
+    use_graph = sinogram.is_cuda and n_iter > 1 and euler_zyz_deg is None
+    graph_key = None
+    cache_key = None
+    if use_graph:
+        graph_key = (Ny, Nz, Nx, n_angles, N_det,
+                     sinogram.dtype,
+                     float(omega),
+                     constraints.positivity,
+                     float(constraints.soft_threshold),
+                     tuple(constraints.support_mask.shape)
+                     if constraints.support_mask is not None else None,
+                     euler_zyz_deg is not None)
+        if projector is None and reuse_graph:
+            # Reuse the internal operator (and the graph captured on it) of
+            # the previous call with this configuration.
+            cache_key = (device, *graph_key)
+            op = _SIRT_OPERATORS.checkout(cache_key)
+            if op is not None:
+                op._set_default_angles(angles_deg)
+                _fp, _bp = _operator_closures(op)
+    if cache_key is None or op is None:
+        _fp, _bp, op = _build_fp_bp(
+            sinogram, angles_deg, (Ny, Nz, Nx), N_det, n_angles,
+            device, num_threads, projector, euler_zyz_deg,
+        )
+    # The cached textures the fused kernels may write directly (kernel audit
+    # F6), and the geometry for back-projecting what they wrote.
+    tex_op = _texture_operator(op) if sinogram.is_cuda else None
+    tex_geom = None
+    if tex_op is not None and euler_zyz_deg is not None:
+        tex_geom = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+    try:
+        return _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
+                              (Ny, Nz, Nx), n_angles, N_det, use_graph, graph_key,
+                              return_loss, loss_callback, progress, tex_op, tex_geom,
+                              volume_callback)
+    finally:
+        if tex_op is not None:
+            # the textures' contents are not the caller's business any more
+            tex_op._forget_texture_writes()
+        if cache_key is not None and isinstance(op, CudaCachedOperator):
+            _SIRT_OPERATORS.checkin(cache_key, op)
+
+
+def _texture_operator(op) -> CudaCachedOperator | None:
+    """The cached CUDA operator behind ``op`` whose textures the fused SIRT
+    kernels may write: ``op`` itself, or the operator of a plain
+    ``ParallelProjector`` / ``RotmatProjector`` passed as ``projector=``
+    (whose ``forward`` / ``back`` only validate and call it). None for
+    anything else (CPU, a duck-typed or subclassed projector)."""
+    if isinstance(op, CudaCachedOperator):
+        return op
+    if isinstance(op, _UserProjectorOperator):
+        p = op._projector
+        if type(p) in (ParallelProjector, RotmatProjector) and isinstance(p._op, CudaCachedOperator):
+            return p._op
+    return None
+
+
+def _voxel_normaliser_plane(C_vol: torch.Tensor, tex_op) -> torch.Tensor:
+    """One ``[1, Nz, Nx]`` plane of the voxel normaliser ``1 / BP(1)`` when
+    ``tex_op`` is FastTomo's own CUDA parallel-beam operator, else ``C_vol``
+    unchanged. That back-projection of a constant sinogram gives every
+    Y-slice the same bits (each slice is its own texture layer, sampled at
+    the same detector positions; pinned by
+    ``test_parallel_normalisers_are_y_invariant``), and the fused update
+    kernel reads one plane for every slice (solver audit P6): one volume
+    less to keep and to stream per iteration, same result."""
+    if tex_op is None or tex_op.kind != "parallel" or C_vol.shape[0] == 1:
+        return C_vol
+    return C_vol[:1].contiguous()
+
+
+def _operator_closures(op):
+    """``(_fp, _bp)`` of a parallel operator, as `_build_fp_bp` builds them."""
+    def _fp(v):
+        return op.project(v, None)
+
+    def _bp(s):
+        return op.backproject(s, None)
+    return _fp, _bp
+
+
+def _run_sirt_body(sinogram, volume, constraints, n_iter, omega, op, _fp, _bp,
+                   vol_shape, n_angles, N_det, use_graph, graph_key,
+                   return_loss, loss_callback, progress, tex_op, tex_geom,
+                   volume_callback=None):
+    """run_sirt after validation and operator selection."""
+    Ny, Nz, Nx = vol_shape
+
+    # --- normalisation matrices (computed once with the chosen projector) ---
+    ones_sino = torch.ones_like(sinogram)
+    C_vol     = _bp(ones_sino)
+    _assert_projector_output_shape(C_vol, (Ny, Nz, Nx), "back-projection", "run_sirt")
+    C_vol     = _voxel_normaliser_plane(_reciprocal_or_zero(C_vol), tex_op)
+
+    ones_vol  = torch.ones_like(volume)
+    R_sino    = _fp(ones_vol)
+    _assert_projector_output_shape(R_sino, (n_angles, Ny, N_det), "forward-projection", "run_sirt")
+    R_sino    = _reciprocal_or_zero(R_sino)
+
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sirt")
+
+    # --- CUDA Graph capture path ----------------------------------------
+    # If capture fails, fall back to the eager loop below. With a loss the
+    # graph is a different one (it also computes the loss, in the eager
+    # rounding order): the key says which, the kept operator may hold both.
+    if use_graph:
+        graph_result = _run_sirt_cuda_graph(
+            volume=volume,
+            sinogram=sinogram,
+            n_iter=n_iter,
+            omega=omega,
+            C_vol=C_vol,
+            R_sino=R_sino,
+            _fp=_fp,
+            _bp=_bp,
+            constraints=constraints,
+            projector=op,
+            key=(*graph_key, rec.wants_loss),
+            on_replay=rec.tick,
+            tex_op=tex_op,
+            rec=rec if rec.wants_loss else None,
+            volume_callback=volume_callback,
+        )
+        if graph_result is not None:
+            return rec.finish(graph_result)
+
+    # --- eager iteration loop (fallback / CPU / loss-tracking path) ------
+    # The loss is the data MSE before the update (SIRT's loss is pure
+    # fidelity; sparsity acts as a proximal constraint, not a loss term).
+    for it in rec.iterate(n_iter):
+        fp = _fp(volume)
+        fused = _fused_residual(sinogram, fp, R_sino, want_raw=rec.wants_loss,
+                                tex_op=tex_op)
+        if fused is None:
+            raw_res  = sinogram - fp
+            residual = raw_res * R_sino
+        else:
+            raw_res, residual = fused
+        if rec.wants_loss:
+            rec.record(it, raw_res.pow(2).mean())
+        # residual None: it went straight into the sinogram texture
+        update = _bp(residual) if residual is not None else tex_op.bp_from_texture(tex_geom)
+        new = _fused_update(volume, update, C_vol, omega, constraints, eager_order=True,
+                            tex_op=tex_op)
+        if new is None:
+            volume = volume + omega * C_vol * update
+            volume = constraints.apply(volume)
+        else:
+            volume = new
+        if volume_callback is not None:
+            _emit_volume(volume_callback, it, volume)
+
+    return rec.finish(volume)
+
+
+# ---------------------------------------------------------------------------
+# Fused elementwise steps of the SIRT iteration (kernel audit F7)
+# ---------------------------------------------------------------------------
+#
+# One kernel for the residual (sub, mul) and one for the update and the
+# constraints (mul, add, support multiply, positivity clamp, soft
+# threshold), instead of 2 + 5 PyTorch kernels. They round every
+# intermediate exactly where the PyTorch chain materialises a tensor, so the
+# output is bit-identical (csrc/cuda/sirt_update.cu). Used for CUDA fp32 /
+# fp16 tensors of one dtype; anything else (CPU, a duck-typed projector
+# returning another dtype, an unexpected mask shape) returns None and the
+# caller runs the PyTorch chain.
+
+def _fusable(*tensors: torch.Tensor) -> bool:
+    t0 = tensors[0]
+    return (t0.is_cuda and t0.dtype in (torch.float32, torch.float16)
+            and hasattr(_core, "sirt_update_cuda")
+            and all(t.device == t0.device and t.dtype == t0.dtype for t in tensors[1:]))
+
+
+def _tex_target(tex_op, t: torch.Tensor, kind: str) -> int | None:
+    """``tex_op``'s volume / sinogram texture handle if a fused kernel can
+    write ``t`` into it directly, else None."""
+    if tex_op is None or tex_op.dtype != t.dtype or t.device != tex_op.device:
+        return None
+    if kind == "vol":
+        if tuple(t.shape) != tex_op.vol_shape:
+            return None
+        return tex_op._vol_write_target()
+    if t.ndim != 3 or tuple(t.shape[1:]) != (tex_op.Ny, tex_op.N_det):
+        return None
+    return tex_op._sino_write_target(int(t.shape[0]))
+
+
+def _fused_residual(sinogram, fp, R_sino, *, want_raw: bool, tex_op=None):
+    """``(sinogram - fp, (sinogram - fp) * R_sino)`` in one kernel (the first
+    is None unless ``want_raw``), or None if not fusable. With ``tex_op``
+    (a `CudaCachedOperator`) the residual goes straight into its sinogram
+    texture when possible: then it is returned as None and
+    ``tex_op.bp_from_texture`` back-projects it."""
+    if not _fusable(sinogram, fp, R_sino) or not (
+            sinogram.shape == fp.shape == R_sino.shape):
+        return None
+    sino, fp, R = sinogram.contiguous(), fp.contiguous(), R_sino.contiguous()
+    raw = torch.empty_like(sino) if want_raw else None
+    code = 0 if sino.dtype == torch.float32 else 1
+    handle = _tex_target(tex_op, sino, "sino")
+    with torch.cuda.device(sino.device):
+        if handle is not None:
+            n, Ny, N_det = sino.shape
+            _core.sirt_residual_tex_cuda(
+                code, sino.data_ptr(), fp.data_ptr(), R.data_ptr(),
+                0 if raw is None else raw.data_ptr(), handle,
+                n, Ny, N_det, _stream_ptr(sino.device))
+            tex_op._mark_sino_written(n)
+            return raw, None
+        res = torch.empty_like(sino)
+        _core.sirt_residual_cuda(
+            code, sino.data_ptr(), fp.data_ptr(), R.data_ptr(),
+            0 if raw is None else raw.data_ptr(), res.data_ptr(),
+            sino.numel(), _stream_ptr(sino.device))
+    return raw, res
+
+
+def _fused_update(volume, update, C_vol, omega, constraints, *, eager_order: bool,
+                  out: torch.Tensor | None = None, tex_op=None,
+                  texture_resident: bool = False):
+    """``constraints(volume + omega * C_vol * update)`` in one kernel, written
+    to ``out`` (may be ``volume``; default a new tensor) and returned, with
+    the rounding of run_sirt's eager loop (``eager_order``) or of
+    `_sirt_iter_inplace`. None if not fusable. With ``tex_op`` the result
+    also goes into its volume texture when possible, so the next ``fp`` of
+    ``out`` skips its upload. ``texture_resident`` (with ``out`` is
+    ``volume``): the volume lives in the texture, which is read and written
+    instead of ``volume`` (left stale until ``tex_op._download_vol``); None
+    if the texture cannot be written. ``C_vol`` is ``[Ny, Nz, Nx]`` or one
+    ``[1, Nz, Nx]`` plane used for every Y-slice (`_voxel_normaliser`)."""
+    if volume.ndim != 3 or not _fusable(volume, update, C_vol) or not (
+            volume.shape == update.shape and C_vol.ndim == 3
+            and C_vol.shape[1:] == volume.shape[1:] and C_vol.shape[0] in (1, volume.shape[0])):
+        return None
+    Ny, Nz, Nx = volume.shape
+    mask = constraints._support_for(volume)
+    if mask is not None and not (
+            _fusable(volume, mask) and mask.ndim == 3
+            and tuple(mask.shape[1:]) == (Nz, Nx) and mask.shape[0] in (1, Ny)):
+        return None
+    if out is None:
+        out = torch.empty_like(volume, memory_format=torch.contiguous_format)
+    elif not out.is_contiguous():
+        return None
+    vol, upd, C = volume.contiguous(), update.contiguous(), C_vol.contiguous()
+    if mask is not None:
+        mask = mask.contiguous()
+    handle = _tex_target(tex_op, out, "vol")
+    if texture_resident and (handle is None or out is not volume):
+        return None
+    in_ptr, out_ptr = (0, 0) if texture_resident else (vol.data_ptr(), out.data_ptr())
+    with torch.cuda.device(vol.device):
+        _core.sirt_update_cuda(
+            0 if vol.dtype == torch.float32 else 1, int(eager_order),
+            in_ptr, out_ptr, upd.data_ptr(), C.data_ptr(),
+            0 if mask is None else mask.data_ptr(),
+            int(mask is not None and mask.shape[0] == Ny and Ny > 1),
+            float(omega), int(bool(constraints.positivity)),
+            float(constraints.soft_threshold), Ny, Nz, Nx, _stream_ptr(vol.device),
+            vol_cache_ptr=0 if handle is None else handle,
+            C_full=int(C.shape[0] == Ny and Ny > 1))
+    if handle is not None:
+        tex_op._mark_vol_written(out)
+    return out
+
+
+@_fp16_overflow_checked
+def run_sart(
+    sinogram: torch.Tensor,                     # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,                   # [n_angles] degrees
+    n_iter: int = 5,
+    *,
+    subset_size: int = 1,
+    omega: float = 1.0,
+    Nz: int | None = None,
+    positivity: bool = False,
+    mask: bool = False,
+    support_mask: torch.Tensor | None = None,
+    sparsity: float = 0.0,
+    euler_zyz_deg: torch.Tensor | None = None,  # [n_angles, 3] — use 3D projector if set
+    view_order: str = "sequential",
+    warm_start: torch.Tensor | None = None,     # [Ny, Nz, Nx]; its dtype must match the sinogram
+    num_threads: int | None = None,             # CPU paths
+    return_loss: bool = False,
+    loss_callback: Callable | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
+    progress: bool = False,
+    **deprecated: Any,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """SART / OS-SART (Andersen & Kak 1984; Wang & Yu 2007).
+
+    The views are visited in ``view_order`` and cut into consecutive subsets
+    ``S`` of ``subset_size`` views (the last may be shorter); for each:
+    ``x += omega * C_S * A_S^T ((b_S - A_S x) / R_S)`` with
+    ``R_S = A_S 1`` and ``C_S = 1 / A_S^T 1``. ``subset_size=1`` is plain
+    SART, ``subset_size=n_angles`` one SIRT step. The constraints run once
+    per outer iteration, after all subsets. Recorded loss: the full-sinogram
+    data MSE after the subset sweep, before the constraints (one extra
+    forward projection per iteration, only when the loss is needed).
+
+    On CUDA each subset step is the fused residual and update kernels of
+    :func:`run_sirt` (the residual goes straight into the sinogram texture,
+    the updated volume into the volume texture), and no step waits for the
+    host. In parallel geometry the voxel normalisers ``C_S`` are kept as one
+    ``[1, Nz, Nx]`` plane per subset (they are the same in every Y-slice),
+    computed with the ray normalisers on a one-slice operator: the setup
+    memory is one sinogram plus one plane per subset instead of one volume
+    per subset (256^3, 61 views: 16 MiB instead of 4.3 GiB). Rotation-matrix
+    geometry keeps full-volume normalisers.
+
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32/fp16 sinogram, degrees, outer iterations (default 5).
+    subset_size : int
+        Angles per subset (default 1; clamped to ``[1, n_angles]``).
+    omega : float
+        Relaxation (default 1.0).
+    view_order : {"sequential", "golden"}
+        Order in which the views are visited (and grouped into subsets).
+        ``"sequential"`` (default): as given, so adjacent subsets hold
+        adjacent angles. ``"golden"``: view ``k`` is visited at the rank of
+        ``frac(k * (sqrt(5) - 1) / 2)``, so consecutive subsets are far apart
+        in angle (0, 34, 13, 47, ... for 61 views) and each subset spans the
+        tilt range. After one sweep the golden order is much closer to the
+        phantom (measured, 64^2 slice, 1 % Gaussian noise, ``subset_size=1``,
+        relative L2 error, CPU and CUDA alike: 0.096 vs 0.650 sequential at
+        180 views over 180 degrees, 0.31 vs 0.70 at 61 views over +-60
+        degrees; SIRT after one iteration 0.67 / 0.70). With noise the
+        golden order reaches its best error within the first sweep, so
+        further sweeps fit noise (0.126 / 0.31 after 3) while the sequential
+        order is still approaching it (0.57 / 0.50). The default stays
+        ``"sequential"`` (earlier results unchanged). ``"golden"`` permutes
+        a copy of the sinogram once per call.
+    Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms`.
+    euler_zyz_deg
+        As in :func:`run_sirt`.
+    volume_callback : callable, optional
+        Optional hook invoked once per outer iteration (after all subsets
+        and the constraints) as ``volume_callback(i, volume)`` — 0-based
+        index and the live ``[Ny, Nz, Nx]`` iterate on its device in the
+        compute dtype. The callback must not modify the tensor and must
+        ``.clone()`` it to keep it. Exceptions raised by the callback are
+        logged and swallowed.
+
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
+    """
+    warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sart")
+    _reject_unknown_kwargs(deprecated, "run_sart")
+    if view_order not in ("sequential", "golden"):
+        raise ValueError(
+            f"run_sart: view_order must be 'sequential' or 'golden', got {view_order!r}")
+    setup = _prepare_recon(
+        "run_sart", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
+        allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
+    )
+    subset_size = _as_int(subset_size, "subset_size", "run_sart", minimum=None)
+    n_angles, Ny, N_det, Nz, Nx, device = (
+        setup.n_angles, setup.Ny, setup.N_det, setup.Nz, setup.Nx, setup.device)
+    volume, compute_dtype, n_iter = setup.volume0, setup.compute_dtype, setup.n_iter
+    constraints = setup.constraints
+    rotmat = euler_zyz_deg is not None
+
+    # One projection operator for every subset (CUDA: one cached volume
+    # texture plus one sinogram texture per subset size); each subset
+    # passes its own angles or rotation matrices, computed once here.
+    op = _make_operator(
+        Geometry("rotmat" if rotmat else "parallel", (Ny, Nz, Nx), N_det,
+                 n_angles, None if rotmat else angles_deg),
+        device, compute_dtype, num_threads=num_threads)
+    tex_op = _texture_operator(op) if sinogram.is_cuda else None
+
+    # The visiting order: the sinogram and the geometry are permuted once,
+    # so every subset is a slice (a view, no gather, no host sync).
+    sino_o, ang_o, eul_o = sinogram, angles_deg, euler_zyz_deg
+    if view_order == "golden" and n_angles > 1:
+        perm = _golden_view_order(n_angles)
+        sino_o = sinogram.index_select(0, perm.to(device))
+        if rotmat:
+            eul_o = euler_zyz_deg[perm.to(euler_zyz_deg.device)]
+        else:
+            ang_o = angles_deg[perm.to(angles_deg.device)]
+    clamp = max(1, min(subset_size, n_angles))
+    bounds = [(s, min(s + clamp, n_angles)) for s in range(0, n_angles, clamp)]
+    if rotmat:
+        # per subset, as before: the matrices of a slice of the Euler table
+        geoms = [euler_zyz_to_rotmat(eul_o[s:e]).to(device=device) for s, e in bounds]
+    else:
+        # the angles on the compute device once: no host-to-device copy
+        # (and sync) per projection
+        ang_dev = ang_o.detach().to(device=device)
+        geoms = [ang_dev[s:e] for s, e in bounds]
+
+    R_sub, C_sub = _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev if not rotmat
+                                     else None, (Ny, Nz, Nx), N_det, n_angles, device,
+                                     compute_dtype, num_threads)
+
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_sart")
+    full_geom = None
+    if rec.wants_loss and rotmat:
+        full_geom = euler_zyz_to_rotmat(euler_zyz_deg).to(device=device)
+    no_constraints = ConstraintConfig()
+
+    try:
+        # --- outer iteration loop ---
+        for it in rec.iterate(n_iter):
+            # --- inner subset loop ---
+            for (s, e), geom, R_s, C_s in zip(bounds, geoms, R_sub, C_sub):
+                sino_s = sino_o[s:e]                     # [|S|, Ny, N_det]
+                pred_s = op.project(volume, geom)        # [|S|, Ny, N_det]
+                fused = _fused_residual(sino_s, pred_s, R_s, want_raw=False, tex_op=tex_op)
+                if fused is None:
+                    upd = op.backproject((sino_s - pred_s) * R_s, geom)
+                elif fused[1] is None:
+                    upd = tex_op.bp_from_texture(geom)
+                else:
+                    upd = op.backproject(fused[1], geom)
+                # `volume + omega * C_s * upd`, in place (volume is this
+                # call's own tensor) and into the volume texture
+                if _fused_update(volume, upd, C_s, omega, no_constraints, eager_order=True,
+                                 out=volume, tex_op=tex_op) is None:
+                    volume = volume + omega * C_s * upd
+
+            # Loss over the full sinogram after the subset sweep, before the
+            # constraints (costs one extra full forward projection).
+            if rec.wants_loss:
+                with torch.no_grad():
+                    raw_res = sinogram - op.project(volume, full_geom)
+                    rec.record(it, raw_res.pow(2).mean())
+
+            volume = constraints.apply(volume)
+            if volume_callback is not None:
+                _emit_volume(volume_callback, it, volume)
+    finally:
+        if tex_op is not None:
+            tex_op._forget_texture_writes()
+
+    return rec.finish(volume)
+
+
+def _golden_view_order(n: int) -> torch.Tensor:
+    """The golden-ratio visiting order of ``n`` views: view ``k`` at the rank
+    of ``frac(k * (sqrt(5) - 1) / 2)`` (CPU int64 permutation)."""
+    g = (5.0 ** 0.5 - 1.0) / 2.0
+    key = torch.remainder(torch.arange(n, dtype=torch.float64) * g, 1.0)
+    return torch.argsort(key, stable=True)
+
+
+def _sart_normalisers(op, tex_op, rotmat, geoms, bounds, ang_dev, vol_shape, N_det,
+                      n_angles, device, dtype, num_threads):
+    """Per-subset ``(R_S, C_S)`` of run_sart: ``1 / A_S 1`` ``[|S|, Ny,
+    N_det]`` and ``1 / A_S^T 1``.
+
+    Parallel geometry: both are the same in every Y-slice, bit for bit
+    (``test_parallel_normalisers_are_y_invariant``), so they are computed on
+    an operator of one texel row (the main operator's packing: 2 fp32 or 4
+    fp16 slices per packed texel, else 1), R_S broadcast into slices of one
+    sinogram and C_S kept as a ``[1, Nz, Nx]`` plane. Rotation matrices:
+    full volumes from the main operator."""
+    Ny, Nz, Nx = vol_shape
+    R_sub, C_sub = [], []
+    if rotmat:
+        ones_vol = torch.ones(Ny, Nz, Nx, dtype=dtype, device=device)
+        for (s, e), geom in zip(bounds, geoms):
+            R_sub.append(_reciprocal_or_zero(op.project(ones_vol, geom)))
+            ones_sino = torch.ones(e - s, Ny, N_det, dtype=dtype, device=device)
+            C_sub.append(_reciprocal_or_zero(op.backproject(ones_sino, geom)))
+        return R_sub, C_sub
+    ny = tex_op._channels() if tex_op is not None else 1
+    op_n = _make_operator(Geometry("parallel", (ny, Nz, Nx), N_det, n_angles, ang_dev),
+                          device, dtype, num_threads=num_threads)
+    # every view's ray normaliser in one projection (each view's rays are
+    # computed on their own, so this is what the per-subset calls gave)
+    ones_vol = torch.ones(ny, Nz, Nx, dtype=dtype, device=device)
+    R_all = _reciprocal_or_zero(op_n.project(ones_vol, ang_dev))[:, :1].expand(
+        n_angles, Ny, N_det).contiguous()
+    for (s, e), geom in zip(bounds, geoms):
+        R_sub.append(R_all[s:e])
+        ones_sino = torch.ones(e - s, ny, N_det, dtype=dtype, device=device)
+        C_sub.append(_reciprocal_or_zero(op_n.backproject(ones_sino, geom))[:1].contiguous())
+    return R_sub, C_sub
+
+
+def run_wsirt(
+    sinogram: torch.Tensor,         # [n_angles, Ny, N_det]
+    angles_deg: torch.Tensor,       # [n_angles] degrees
+    n_iter: int = 50,
+    *,
+    omega: float = 1.0,
+    Nz: int | None = None,
+    positivity: bool = False,
+    mask: bool = False,
+    support_mask: torch.Tensor | None = None,
+    sparsity: float = 0.0,
+    threshold_scale: float = 1.0,
+    warm_start: torch.Tensor | None = None,
+    num_threads: int | None = None,
+    return_loss: bool = False,
+    loss_callback: Callable | None = None,
+    progress: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Weighted SIRT (Wolf et al. 2014). fp32, CPU and CUDA.
+
+    ``x <- x + omega * W-BP(b - A x)``, then the constraints, where W-BP is
+    the exact weighted back-projection of :func:`run_weighted_backprojection`
+    (edge margin, voxel-driven on both backends). CPU and CUDA agree to
+    ~2e-4, the floor set by the CUDA texture unit's 8-bit interpolation
+    weights. Recorded loss: the data MSE before each update.
+
+    Long runs: W-BP is not an exact inverse of the projector (the weighting
+    filter is cropped to the volume, which is not positive semi-definite),
+    so without ``positivity`` the iteration is slowly unstable: the spectral
+    radius of ``I - omega W A`` is 1.0013-1.008 for every ``omega > 0``
+    (dense eigenvalues at N = 32 and 48, solver audit A3). The first ~200
+    iterations are accurate, then the error grows, on both backends alike
+    (64^2 slice, 61 views over +-60 degrees, relative error to the phantom
+    after 20 / 200 / 1000 / 3000 iterations: noise-free 0.28 / 0.24 / 0.31
+    / 1.46, 1 % noise 0.29 / 0.28 / 0.65 / 6.1). ``positivity=True`` makes
+    it stable (noise-free 0.18 / 0.145 / 0.112 / 0.097; with 1 % noise it
+    fits the noise as any unregularised iteration does, 0.19 / 0.21 / 0.32
+    / 0.42). Without positivity keep ``n_iter`` at a few hundred at most.
+
+    Parameters
+    ----------
+    sinogram, angles_deg, n_iter
+        fp32 sinogram, degrees, iterations (default 50).
+    omega : float
+        Relaxation (default 1.0).
+    threshold_scale : float
+        Missing-wedge threshold of the weighting filter (default 1.0).
+    Nz, positivity, mask, support_mask, sparsity, warm_start, num_threads,
+    return_loss, loss_callback, progress
+        See Conventions of :mod:`fasttomo.algorithms` (``num_threads`` drives
+        the CPU forward projection and the CPU W-BP back-projection).
+
+    Returns
+    -------
+    volume, or ``(volume, loss_history)``; see Conventions.
+    """
+    setup = _prepare_recon(
+        "run_wsirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter, warm_start=warm_start,
+        positivity=positivity, mask=mask, support_mask=support_mask, sparsity=sparsity,
+    )
+    N_det, Nz, Nx, device = setup.N_det, setup.Nz, setup.Nx, setup.device
+    volume, constraints, n_iter = setup.volume0, setup.constraints, setup.n_iter
+
+    # exact W-BP operator, built once per tilt geometry
+    _wbp = _make_wbp(angles_deg, Nz, Nx, N_det, device, threshold_scale, num_threads)
+    op = _make_operator(Geometry("parallel", (setup.Ny, Nz, Nx), N_det, setup.n_angles,
+                                 angles_deg), device, sinogram.dtype, num_threads=num_threads)
+
+    rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_wsirt")
+
+    for it in rec.iterate(n_iter):
+        proj     = op.project(volume)
+        residual = sinogram - proj
+        if rec.wants_loss:
+            rec.record(it, residual.pow(2).mean())
+        volume   = volume + omega * _wbp(residual)
+        volume   = constraints.apply(volume)
+
+    return rec.finish(volume)
+
+
+# ---------------------------------------------------------------------------
+# CUDA Graph helper for run_sirt
+# ---------------------------------------------------------------------------
+
+class _SirtOperatorCache:
+    """The internal projection operator of run_sirt's CUDA-graph path, kept
+    between calls so a repeated call replays the graph captured by the
+    previous one instead of capturing again (kernel audit F8). Public
+    handle: :func:`release_cached_projectors`.
+
+    Keyed by device plus the graph key (volume and sinogram shapes, dtype,
+    omega, positivity, soft threshold, support-mask shape). Each operator
+    holds the one graph of its key and the graph's static buffers. The
+    per-call data never enters the key and is never stale: the sinogram,
+    the normalisations and the support mask are copied into the static
+    buffers before every replay sequence, and the tilt angles into the
+    operator's cos/sin buffers (``CudaCachedOperator._set_default_angles``).
+
+    An operator is taken out while a call uses it (``checkout``) and put
+    back afterwards (``checkin``), so concurrent calls from several threads
+    never share static buffers. One configuration is kept (``maxsize=1``):
+    a call with any other configuration (shape, dtype, device or option)
+    drops the kept operator *before* building its own, so two
+    configurations never coexist in memory; ``clear()`` drops it too.
+
+    A graph capture that failed marks the key bad on the kept operator
+    (``_sirt_graph_bad_keys``), so repeated calls with that configuration
+    run the eager loop without re-trying a capture that fails every time.
+    That mark does not outlive the kept operator: a call with another
+    configuration and ``clear()`` (``release_cached_projectors``) drop the
+    operator and clear its marks, so the next call with the failed
+    configuration builds a new operator and tries the capture again (a
+    failure caused by a transient condition, such as an out-of-memory
+    error or another thread's capture, is not permanent).
+    """
+
+    def __init__(self, maxsize: int = 1) -> None:
+        self.maxsize = maxsize
+        self._ops: OrderedDict[tuple, CudaCachedOperator] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def checkout(self, key: tuple) -> CudaCachedOperator | None:
+        """Take the operator for ``key`` (None if not kept). Any operator
+        kept for another configuration is dropped first."""
+        with self._lock:
+            op = self._ops.pop(key, None)
+            stale = list(self._ops.values())
+            self._ops.clear()
+        _forget_capture_failures(stale)
+        del stale       # released outside the lock (texture frees sync the device)
+        return op
+
+    def checkin(self, key: tuple, op: CudaCachedOperator) -> None:
+        with self._lock:
+            self._ops[key] = op
+            self._ops.move_to_end(key)
+            evicted = []
+            while len(self._ops) > self.maxsize:
+                evicted.append(self._ops.popitem(last=False)[1])
+        del evicted     # released outside the lock (texture frees sync the device)
+
+    def clear(self) -> int:
+        with self._lock:
+            ops = list(self._ops.values())
+            self._ops.clear()
+        _forget_capture_failures(ops)
+        n = len(ops)
+        del ops
+        return n
+
+    def __len__(self) -> int:
+        return len(self._ops)
+
+
+def _forget_capture_failures(ops) -> None:
+    """Clear the failed-capture marks of operators the cache drops."""
+    for op in ops:
+        bad = getattr(op, "_sirt_graph_bad_keys", None)
+        if bad is not None:
+            bad.clear()
+
+
+_SIRT_OPERATORS = _SirtOperatorCache()
+
+
+def release_cached_projectors() -> int:
+    """Free the projector and CUDA graph that :func:`run_sirt` keeps between
+    calls.
+
+    Without ``projector=``, a CUDA ``run_sirt`` on the graph path keeps its
+    internal projector for the next call with the same configuration (shapes,
+    dtype, device, ``omega``, constraints), so that call replays the captured
+    CUDA graph instead of building a projector and capturing again. Only one
+    configuration is kept, and a call with a different one drops it before
+    allocating its own. What is kept, 3 volumes plus 4 sinograms: the
+    projector's volume and sinogram texture arrays (1 + 1), the graph's
+    static volume (the voxel normalisation is one ``[1, Nz, Nx]`` plane),
+    its static sinogram and ray normalisation (2 sinograms), and the
+    graph's memory pool with the back-projection and forward-projection
+    outputs (1 + 1); plus the support mask when one is given (one more
+    volume if it is full-size). In fp32 at 61 views that is 0.25 GiB at
+    256^3 and 1.74 GiB at 512^3; the device memory measured is 0.30 and
+    2.12 GiB, the rest being free space inside the allocator segments of
+    the static tensors. A call with a loss (``return_loss`` or
+    ``loss_callback``) captures a second graph on the same projector, with
+    its own static buffers and pool. Pass ``run_sirt(..., reuse_graph=False)``
+    to not keep it in the first place.
+
+    This releases it. The texture arrays go straight back to the driver; the
+    tensors and the graph pool go back to PyTorch's caching allocator, which
+    reuses them for later tensors but still holds them as reserved memory
+    (``torch.cuda.memory_reserved``, visible in ``nvidia-smi``). Call
+    ``torch.cuda.empty_cache()`` afterwards to return that to the driver as
+    well, e.g. for another process or library. A call running concurrently
+    on another thread keeps its projector until it returns (and then keeps
+    it again).
+
+    It also forgets a failed graph capture: after one, the kept projector
+    runs the eager loop for that configuration (without re-trying the
+    capture on every call) until this is called or a call with another
+    configuration replaces it; the next call then captures again.
+
+    It also drops the exact W-BP weighting filters that
+    :func:`run_weighted_backprojection` and :func:`run_wsirt` keep per
+    geometry (up to 8, ``[Pz, Px // 2 + 1]`` fp32 each on their device:
+    ~10.6 MiB at 2048^2, 85 MiB for 8; not counted in the return value).
+
+    It does not free the scratch pool of the CUDA geometry-gradient kernels
+    (``grad_rotmat`` / ``grad_angle``): that stream-ordered pool keeps up to
+    64 MiB per device reserved for the life of the process, outside
+    PyTorch's allocator (not counted by ``torch.cuda.memory_*``).
+
+    It also frees the texture pool of the one-shot CUDA projections
+    (``forward_project``, ``back_project``, the ``*_3d`` variants and
+    ``run_fbp``): up to 4 texture arrays of the most recently used shapes,
+    kept so that repeated calls neither allocate nor synchronise
+    (``fasttomo._operator._TexturePool``); they are not counted in the
+    return value.
+
+    Returns the number of configurations released (0 or 1). Safe to call at
+    any time, also without CUDA.
+    """
+    _release_texture_pool()
+    _clear_wf_cache()
+    n = _SIRT_OPERATORS.clear()
+    if n and torch.cuda.is_available():
+        # the textures were freed by the operators' finalizers; release any
+        # handle whose free was deferred by a capture on this thread
+        _drain_deferred_handles()
+    return n
+
+# Number of CUDA graphs run_sirt has captured in this process (tests use it
+# to tell a replayed graph from a fresh capture).
+_sirt_graph_captures = 0
+
+
+def _run_sirt_cuda_graph(
+    volume: torch.Tensor,
+    sinogram: torch.Tensor,
+    n_iter: int,
+    omega: float,
+    C_vol: torch.Tensor,
+    R_sino: torch.Tensor,
+    _fp,
+    _bp,
+    constraints: ConstraintConfig,
+    projector,
+    key: tuple,
+    on_replay: Callable[[], None] | None = None,
+    tex_op: CudaCachedOperator | None = None,
+    rec: _DeviceLossRecorder | None = None,
+    volume_callback: Callable[[int, torch.Tensor], None] | None = None,
+) -> torch.Tensor | None:
+    """
+    Run ``n_iter`` SIRT iterations via a captured CUDA Graph.
+
+    With ``rec`` the graph also computes the data MSE before each update
+    (in a static 0-d buffer, rounded like the eager loop, whose update order
+    it uses too), recorded after every replay: a device copy without a sync
+    for ``return_loss``, one host transfer per iteration for a callback.
+
+    Returns the reconstructed volume tensor, or ``None`` if capture was
+    skipped / failed (caller should fall back to the eager loop).
+
+    ``volume_callback`` (if given) is invoked after each replay, outside
+    capture, with the static volume buffer that holds the current iterate
+    (refreshed from the volume texture first when the graph keeps the
+    volume texture-resident). It runs on the replay stream, so work it
+    enqueues is ordered after the replay and before the next one without an
+    explicit synchronize.
+
+    The graph is cached on ``projector._sirt_graph_cache[key]``; keys whose
+    capture failed are kept in ``projector._sirt_graph_bad_keys`` so later
+    calls with that projector skip capture. Both are declared by the
+    projector base class; a projector without them (a duck-typed object)
+    runs the eager loop.
+    """
+    cache = getattr(projector, "_sirt_graph_cache", None)
+    bad_keys = getattr(projector, "_sirt_graph_bad_keys", None)
+    if cache is None or bad_keys is None or key in bad_keys:
+        return None
+
+    # CUDA Graph capture is rooted on the *current* CUDA device. When the
+    # caller's tensors live on a non-default device (e.g. cuda:1 while the
+    # process default is cuda:0), torch.cuda.graph(g) captures on the wrong
+    # device's stream — the graph captures nothing and the failed capture
+    # leaves the runtime in a state that crashes the eager fallback. Pin
+    # the current device to the tensor's device for capture and replay.
+    target_device = volume.device
+
+    if key not in cache:
+        # --- build a new graph for this key ---
+        try:
+            # Allocate persistent static buffers. The constraint mask is a
+            # graph input too (captured by pointer inside apply_inplace_),
+            # so it gets its own static buffer refreshed on every replay —
+            # otherwise a later call with a different mask of the same shape
+            # would silently replay the first call's mask.
+            vol_static = volume.clone()
+            sino_static = sinogram.clone()
+            C_static = C_vol.clone()
+            R_static = R_sino.clone()
+            mask_static = (
+                constraints.support_mask.clone()
+                if constraints.support_mask is not None else None
+            )
+            static_constraints = ConstraintConfig(
+                positivity=constraints.positivity,
+                support_mask=mask_static,
+                soft_threshold=constraints.soft_threshold,
+            )
+
+            # With direct texture writes the captured forward projection
+            # reads the volume texture the previous replay's update wrote,
+            # without an upload; the first replay needs vol_static in the
+            # texture beforehand (loaded below, once per call).
+            # The volume then lives in the texture for the whole replay
+            # sequence (read and written there by the fused update, fetched
+            # into vol_static afterwards), saving a global read and write of
+            # the volume per iteration.
+            resident = _fusable(vol_static) and _tex_target(tex_op, vol_static, "vol") is not None
+            if resident:
+                tex_op._upload_vol(vol_static)
+
+            # No eager warm-up iteration: run_sirt's normalisation
+            # projections already created both texture caches and locked the
+            # dtype, and the iteration body has no lazily initialised library
+            # state (no cuFFT/cuBLAS), so the capture can run first.
+            #
+            # Capture the iteration body on the correct device. Use an
+            # explicit Stream pinned to the target device so torch.cuda.graph
+            # captures on the right device — the implicit side stream is
+            # created lazily on the first call's device and reused for later
+            # calls, which corrupts cross-device captures.
+            try:
+                with torch.cuda.device(target_device):
+                    torch.cuda.synchronize(target_device)
+                    capture_stream = torch.cuda.Stream(device=target_device)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
+                        loss_static = _sirt_iter_inplace(
+                            vol_static, sino_static, C_static, R_static, omega,
+                            _fp, _bp, static_constraints, tex_op=tex_op,
+                            texture_resident=resident, with_loss=rec is not None,
+                        )
+                    torch.cuda.synchronize(target_device)
+            finally:
+                # Free texture caches of projectors collected during the
+                # capture (their release was deferred, see projector.py).
+                _drain_deferred_handles()
+            if resident and not tex_op._vol_texture_holds(vol_static):
+                # the captured forward projection uploaded after all: the
+                # graph would read a stale vol_static
+                raise RuntimeError("texture-resident SIRT capture is inconsistent")
+
+            cache[key] = (g, vol_static, sino_static, C_static, R_static,
+                          mask_static, resident, loss_static)
+            global _sirt_graph_captures
+            _sirt_graph_captures += 1
+
+        except Exception as exc:
+            _log.warning(
+                "run_sirt: CUDA Graph capture failed for key %s (%s). "
+                "Falling back to eager loop for this and future calls "
+                "with this configuration and projector (for run_sirt's kept "
+                "internal projector: until release_cached_projectors() or a "
+                "call with another configuration).",
+                key, exc,
+            )
+            bad_keys.add(key)
+            return None
+
+    g, vol_static, sino_static, C_static, R_static, mask_static, resident, loss_static = cache[key]
+
+    # Load the caller's starting volume into the captured static buffer
+    # (the capture itself does not execute, but a cache hit holds the
+    # previous call's result). Each replay then applies one SIRT iteration.
+    vol_static.copy_(volume)
+    # Keep graph inputs fresh on cache hits; captured CUDA graphs replay with
+    # pointer-stable tensors, so dynamic call-time tensors must be copied into
+    # those static buffers before replay.
+    sino_static.copy_(sinogram)
+    C_static.copy_(C_vol)
+    R_static.copy_(R_sino)
+    if mask_static is not None:
+        mask_static.copy_(constraints.support_mask)
+    if resident:
+        # the graph reads and writes the volume in the texture only
+        tex_op._upload_vol(vol_static)
+
+    with torch.cuda.device(target_device):
+        for it in range(n_iter):
+            g.replay()
+            if rec is not None:
+                rec.record(it, loss_static)
+            if volume_callback is not None:
+                if resident:
+                    tex_op._download_vol(vol_static)
+                _emit_volume(volume_callback, it, vol_static)
+            if on_replay is not None:
+                on_replay()
+        if resident:
+            tex_op._download_vol(vol_static)
+        torch.cuda.synchronize(target_device)
+
+    return vol_static.clone()
+
+
+def _sirt_iter_inplace(
+    vol_static: torch.Tensor,
+    sinogram: torch.Tensor,
+    C_vol: torch.Tensor,
+    R_sino: torch.Tensor,
+    omega: float,
+    _fp,
+    _bp,
+    constraints: ConstraintConfig,
+    tex_op: CudaCachedOperator | None = None,
+    texture_resident: bool = False,
+    with_loss: bool = False,
+) -> torch.Tensor | None:
+    """
+    One in-place SIRT iteration on ``vol_static``. With ``with_loss`` it
+    returns the data MSE ``mean((b - A x)^2)`` before the update (0-d) and
+    rounds the update in the eager loop's order (``volume + omega * C *
+    update``), so a run with a loss equals `_run_sirt_body`'s eager loop bit
+    for bit; else None, in the CUDA-graph order.
+
+    All writes go through in-place ops (``add_``, ``mul_``, ``clamp_``,
+    ``copy_``) or the fused kernels writing into ``vol_static`` so that
+    ``vol_static``'s memory address is stable — a requirement for CUDA
+    Graph capture to replay correctly. With ``tex_op`` (parallel geometry)
+    the residual and the updated volume also go straight into its textures;
+    ``texture_resident``: the volume lives only in the texture (read and
+    written there; ``vol_static`` is left stale, see `_fused_update`).
+    """
+    fp = _fp(vol_static)
+    fused = _fused_residual(sinogram, fp, R_sino, want_raw=with_loss, tex_op=tex_op)
+    if fused is None:
+        raw = sinogram - fp
+        update = _bp(raw * R_sino)
+    else:
+        raw = fused[0]
+        update = tex_op.bp_from_texture(None) if fused[1] is None else _bp(fused[1])
+    loss = raw.pow(2).mean() if with_loss else None
+    if vol_static.is_contiguous() and _fused_update(
+            vol_static, update, C_vol, omega, constraints,
+            eager_order=with_loss, out=vol_static, tex_op=tex_op,
+            texture_resident=texture_resident) is not None:
+        return loss
+    if texture_resident:
+        raise RuntimeError("texture-resident SIRT update not possible")
+    if with_loss:
+        # the eager loop's `volume + omega * C_vol * update`, in place
+        vol_static.add_(omega * C_vol * update)
+    else:
+        # Avoid creating a temporary for `update * C_vol` to keep
+        # allocations inside the graph's memory pool.
+        update.mul_(C_vol)
+        vol_static.add_(update, alpha=omega)
+    constraints.apply_inplace_(vol_static)
+    return loss

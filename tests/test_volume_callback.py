@@ -16,11 +16,8 @@ import pytest
 import torch
 
 import fasttomo as ft
+from conftest import needs_cuda
 from fasttomo.algorithms import _emit_volume
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="no CUDA GPU available"
-)
 
 N_ANGLES = 5
 NY = 16
@@ -59,6 +56,12 @@ def make_sino(device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
     return sino, angles
 
 
+def _euler(angles):
+    e = torch.zeros(angles.numel(), 3, device=angles.device)
+    e[:, 1] = angles
+    return e
+
+
 def _ad_config():
     return ft.AdReconConfig(optim=ft.OptimConfig(n_iter=N_ITER, lr_volume=0.05))
 
@@ -66,8 +69,8 @@ def _ad_config():
 RUNNERS = {
     "sirt_graph": lambda s, a, **kw: ft.run_sirt(s, a, n_iter=N_ITER, **kw),
     "sirt_eager": lambda s, a, **kw: ft.run_sirt(
-        s, a, n_iter=N_ITER, return_loss=True, **kw
-    )[0],
+        s, a, n_iter=N_ITER, euler_zyz_deg=_euler(a), **kw
+    ),
     "sart": lambda s, a, **kw: ft.run_sart(s, a, n_iter=N_ITER, subset_size=2, **kw),
     "fista": lambda s, a, **kw: ft.run_fista(s, a, n_iter=N_ITER, positivity=True, **kw),
     "fista_tv": lambda s, a, **kw: ft.run_fista_tv(
@@ -79,7 +82,7 @@ RUNNERS = {
     ),
     "ad_recon": lambda s, a, **kw: ft.run_ad_recon(s, a, config=_ad_config(), **kw),
     "mbir": lambda s, a, **kw: ft.run_mbir(
-        s, a, outer_iters=N_ITER, convergence_tol=0.0, **kw
+        s, a, n_iter=N_ITER, convergence_tol=0.0, **kw
     ),
 }
 
@@ -143,7 +146,7 @@ def test_run_fbp_has_no_volume_callback():
     assert "volume_callback" not in inspect.signature(ft.run_fbp).parameters
 
 
-@requires_cuda
+@needs_cuda
 @pytest.mark.parametrize("name", list(RUNNERS))
 def test_volume_callback_contract(name):
     runner = RUNNERS[name]
@@ -161,7 +164,7 @@ def test_volume_callback_contract(name):
     _assert_same_result(name, out_cb, out_ref)
 
 
-@requires_cuda
+@needs_cuda
 def test_genfire_volume_callback_contract():
     sino, angles = make_sino()
     cb = VolumeRecorder()
@@ -182,7 +185,7 @@ def test_genfire_volume_callback_contract():
     assert torch.equal(hist, hist_ref)
 
 
-@requires_cuda
+@needs_cuda
 def test_sirt_graph_path_kept_with_volume_callback():
     sino, angles = make_sino()
     proj = ft.ParallelProjector((NY, N, N), angles, device=sino.device, N_det=N)
@@ -194,7 +197,17 @@ def test_sirt_graph_path_kept_with_volume_callback():
     torch.testing.assert_close(cb.volumes[-1], out, rtol=0, atol=0)
 
 
-@requires_cuda
+@needs_cuda
+@pytest.mark.parametrize("n_iter", [2, N_ITER])
+def test_sirt_graph_intermediate_volumes_match_shorter_runs(n_iter):
+    sino, angles = make_sino()
+    cb = VolumeRecorder()
+    ft.run_sirt(sino, angles, n_iter=N_ITER + 2, volume_callback=cb)
+    ref = ft.run_sirt(sino, angles, n_iter=n_iter)
+    assert torch.equal(cb.volumes[n_iter - 1], ref)
+
+
+@needs_cuda
 @pytest.mark.parametrize("name", ["sirt_graph", "fista", "ad_recon"])
 def test_raising_volume_callback_does_not_abort(name):
     runner = RUNNERS[name]

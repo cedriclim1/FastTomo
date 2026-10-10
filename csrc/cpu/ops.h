@@ -9,7 +9,8 @@ extern "C" {
  * Parallel-beam forward projection (CPU).
  *
  * volume   : [Ny, Nz, Nx]  float32, C-contiguous (Nx is fastest)
- * sinogram : [n_angles, Ny, N_det]  float32, caller-allocated and zeroed
+ * sinogram : [n_angles, Ny, N_det]  float32, caller-allocated; every
+ *            element is written
  * cos_a    : [n_angles]  precomputed cos(angles)
  * sin_a    : [n_angles]  precomputed sin(angles)
  *
@@ -18,11 +19,16 @@ extern "C" {
  * is t = x·cosθ + z·sinθ, with x ∈ [-(Nx-1)/2, (Nx-1)/2] and similarly z.
  * Detector bins are centred: id=0 ↔ t=-(N_det-1)/2.
  *
- * Integration uses 1-pixel steps along the ray with bilinear interpolation.
+ * Integration uses 1-pixel steps along the ray with bilinear interpolation;
+ * loose sampling rule (as the rotmat kernels and the CUDA border texture):
+ * a sample counts while any corner of its 2x2 stencil is inside the slice,
+ * fx in (-1, Nx), fz in (-1, Nz), and corners outside read 0.
+ * Y-batched (FT_YB slices per SIMD loop, common.h). Returns 0, or -1 if the
+ * scratch allocation ((Nz+2)*(Nx+2)*min(Ny, FT_YB) floats) fails.
  */
-void forward_project_cpu(
-    const float *volume,
-    float       *sinogram,
+int forward_project_parallel_cpu(
+    const float *vol,
+    float       *sino,
     const float *cos_a,
     const float *sin_a,
     int Ny, int Nz, int Nx,
@@ -31,19 +37,121 @@ void forward_project_cpu(
 );
 
 /*
- * Parallel-beam back-projection (CPU).
+ * Parallel-beam back-projection (CPU): the ray-driven scatter that is the
+ * exact transpose of forward_project_parallel_cpu (every ray sample adds its
+ * sinogram value, bilinearly weighted, to the corners of its 2x2 voxel
+ * stencil that are inside the slice).
  *
  * sinogram : [n_angles, Ny, N_det]  float32
  * volume   : [Ny, Nz, Nx]  float32, caller-allocated — overwritten, NOT accumulated
  * cos_a / sin_a : [n_angles] precomputed trig values
  *
- * For each voxel, accumulates linearly-interpolated sinogram values over all angles.
+ * Y-batched, OpenMP over Z bands; the result does not depend on
+ * num_threads. Returns 0, or -1 if the scratch allocation
+ * ((Nz*(Nx+2) + n_angles*N_det) * min(Ny, FT_YB) floats, no sinogram copy
+ * for Ny = 1) fails.
  */
-void back_project_cpu(
-    const float *sinogram,
-    float       *volume,
+int back_project_parallel_cpu(
+    const float *sino,
+    float       *vol,
     const float *cos_a,
     const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+/*
+ * Voxel-driven (gather) parallel back-projection (CPU), the operator of the
+ * weighted back-projection (W-BP / wSIRT): for every voxel and view, the
+ * sinogram row linearly interpolated at u = x cos + z sin + (N_det-1)/2,
+ * zero outside the detector. Same operator as the CUDA
+ * back_project_parallel_kernel, with exact fp32 weights, and bit-for-bit
+ * the PyTorch reference `_bp_gather`. NOT the adjoint of
+ * forward_project_parallel_cpu (that is back_project_parallel_cpu).
+ *
+ * sino : [n_angles, Ny, N_det] float32; vol : [Ny, Nz, Nx], overwritten.
+ * Y-batched for Ny >= 2. Returns 0, or -1 if the scratch allocation fails
+ * (padded sinogram rows and an x*cos table: n_angles*(min(Ny, FT_YB)*(N_det+2)
+ * + Nx) floats plus Nx*min(Ny, FT_YB) per thread; Ny = 1:
+ * n_angles*(N_det+2+Nx) floats).
+ */
+int back_project_gather_parallel_cpu(
+    const float *sino,
+    float       *vol,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+/*
+ * Gradient of forward projection w.r.t. tilt angles (CPU).
+ *
+ * Computes ∂L/∂θ_ia for each angle, given the upstream gradient on the
+ * sinogram.  Uses the identity ∂x/∂θ = −z, ∂z/∂θ = x at each ray step,
+ * combined with bilinear-weighted finite differences for ∂vol/∂x and ∂vol/∂z
+ * (the forward's loose rule; at a sample on a grid line the average of the
+ * two one-sided differences, i.e. the central derivative).
+ *
+ * grad_angles : [n_angles] — overwritten; per radian
+ *
+ * Y-batched; fp64 accumulation in an order fixed by the geometry, so the
+ * result does not depend on num_threads. Returns 0, or -1 if the scratch
+ * allocation ((Nz+4)*(Nx+4)*min(Ny, FT_YB) floats, plus
+ * n_angles*(ceil(N_det/32)*16 + 1) doubles) fails.
+ */
+int grad_angle_cpu(
+    const float *vol,
+    const float *grad_sino,
+    float       *grad_angles,
+    const float *cos_a,
+    const float *sin_a,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+/*
+ * 3D rotation-matrix forward / back projection (CPU).
+ *
+ * Mirrors the CUDA texture-based projector pair (forward_project_rotmat_cuda
+ * / back_project_rotmat_cuda). Detector-driven trilinear FP, voxel-driven
+ * gather BP. matrices: [n_angles*9] row-major; M[ia*9 + row*3 + col].
+ *
+ * Slower than the CUDA path by O(10×) — useful for testing on hosts without
+ * a GPU and as a reference for the autograd backward.
+ */
+void forward_project_rotmat_cpu(
+    const float *vol,
+    float       *sino,
+    const float *mats,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+void back_project_rotmat_cpu(
+    const float *sino,
+    float       *vol,
+    const float *mats,
+    int Ny, int Nz, int Nx,
+    int n_angles, int N_det,
+    int num_threads
+);
+
+/*
+ * Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries
+ * (CPU). grad_matrices: [n_angles*9] zeroed by this function before
+ * accumulating. Used by _FPRotmat's autograd backward on CPU; PyTorch chains
+ * the result through _euler_zyz_to_rotmat to yield ∂L/∂euler.
+ */
+void grad_rotmat_cpu(
+    const float *vol,
+    const float *grad_sino,
+    const float *mats,
+    float       *grad_mats,
     int Ny, int Nz, int Nx,
     int n_angles, int N_det,
     int num_threads
@@ -64,70 +172,6 @@ void back_project_cpu(
  * Each point within cutoff_dist of a grid cell contributes value/distance.
  * Normalization by accumulated weights is left to the caller.
  */
-/*
- * Gradient of forward projection w.r.t. tilt angles (CPU).
- *
- * Computes ∂L/∂θ_ia for each angle, given the upstream gradient on the
- * sinogram.  Uses the identity ∂x/∂θ = −z, ∂z/∂θ = x at each ray step,
- * combined with bilinear-weighted finite differences for ∂vol/∂x and ∂vol/∂z.
- *
- * grad_angles : [n_angles] — zeroed by caller; returned in radians
- */
-void grad_angle_cpu(
-    const float *volume,
-    const float *grad_sino,
-    float       *grad_angles,
-    const float *cos_a,
-    const float *sin_a,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det,
-    int num_threads
-);
-
-/*
- * 3D rotation-matrix forward / back projection (CPU).
- *
- * Mirrors the CUDA texture-based projector pair (forward_project_rotmat_cuda
- * / back_project_rotmat_cuda). Detector-driven trilinear FP, voxel-driven
- * gather BP. matrices: [n_angles*9] row-major; M[ia*9 + row*3 + col].
- *
- * Slower than the CUDA path by O(10×) — useful for testing on hosts without
- * a GPU and as a reference for the autograd backward.
- */
-void forward_project_3d_cpu(
-    const float *volume,
-    float       *sinogram,
-    const float *matrices,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det,
-    int num_threads
-);
-
-void back_project_3d_cpu(
-    const float *sinogram,
-    float       *volume,
-    const float *matrices,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det,
-    int num_threads
-);
-
-/*
- * Gradient of 3D rotmat forward projection w.r.t. rotation matrix entries
- * (CPU). grad_matrices: [n_angles*9] zeroed by this function before
- * accumulating. Used by _FP3D's autograd backward on CPU; PyTorch chains
- * the result through _euler_zyz_to_rotmat to yield ∂L/∂euler.
- */
-void grad_rotmat_cpu(
-    const float *volume,
-    const float *grad_sino,
-    const float *matrices,
-    float       *grad_matrices,
-    int Ny, int Nz, int Nx,
-    int n_angles, int N_det,
-    int num_threads
-);
-
 void genfire_gridding_2d_cpu(
     const float *fk_real,
     const float *fk_imag,
@@ -143,7 +187,7 @@ void genfire_gridding_2d_cpu(
 /*
  * MBIR voxel-driven bilinear forward projection (CPU).
  *
- * Distinct from `forward_project_cpu` — this uses the voxel-driven scatter
+ * Distinct from `forward_project_parallel_cpu` — this uses the voxel-driven scatter
  * model A_MBIR that matches the column-A used in `mbir_icd_sweep_cpu`.
  * For voxel (ix, iz, iy) at angle θ_k the detector coord is
  *   u = (ix - half_x)·cos θ_k - (iz - half_z)·sin θ_k + half_det,
@@ -161,25 +205,23 @@ void mbir_forward_project_cpu(
 );
 
 /*
- * One outer iteration of MBIR-AM-PE (CPU reference).
+ * ICD sweep of one outer iteration of MBIR-AM-PE (CPU reference).
  *
- *   volume, e_sino, d_offsets, sigma_out : in-place outputs
+ *   volume, e_sino                       : in-place outputs
  *   volume_snapshot                      : read-only snapshot for qGGMRF
  *   perm[Ny, Nz*Nx]                      : per-Y-slice voxel permutation
  *   lambdas[n_angles, Ny, N_det]         : per-pixel Λ data weights; NULL → 1
  *
- * Y-slices are parallelized via OpenMP (cross-slice qGGMRF reads use
- * the snapshot, so slices are independent — "Jacobi-loose" semantics
- * matching the paper). Within a slice, the sweep is sequential
+ * Y-slices are parallelized via OpenMP. All 26 qGGMRF neighbour reads
+ * (in-slice ones included) use the snapshot, so slices are independent
+ * and the prior is Jacobi. Within a slice the data term is sequential
  * Gauss-Seidel ICD via the incremental error sinogram.
  *
- * Set estimate_offset=0 / estimate_variance=0 (and pass NULL for
- * d_offsets / sigma_out) to disable those updates. */
+ * The per-tilt offset and noise-variance updates are done by the caller in
+ * Python (`_mbir_update_offset_variance`), as on the CUDA path. */
 int mbir_icd_sweep_cpu(
     float       *volume,
     float       *e_sino,
-    float       *d_offsets,
-    float       *sigma_out,
     const float *volume_snapshot,
     const int   *perm,
     const float *cos_a,
@@ -187,8 +229,7 @@ int mbir_icd_sweep_cpu(
     const float *lambdas,
     int Ny, int Nz, int Nx, int n_angles, int N_det,
     float qggmrf_p, float qggmrf_q, float qggmrf_c, float sigma_f,
-    float huber_T, float huber_delta, float sigma, float sigma_min,
-    int estimate_offset, int estimate_variance,
+    float huber_T, float huber_delta, float sigma,
     int num_threads
 );
 
