@@ -1209,6 +1209,39 @@ def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:
         assert (not torch.equal(vols[k], vols[k + 1])) == step_volume, k
 
 
+def test_support_mask_skipped_in_pose_only_iterations(monkeypatch) -> None:
+    """Soft supports are allowed by contract and are not idempotent, so they
+    must not be reapplied in pose-only iterations."""
+    seen = []
+
+    class _Recording(_ZMeanProjector):
+        def forward(self, volume):
+            seen.append(volume.detach().clone())
+            return super().forward(volume)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kw):
+        n, ny, nd = sinogram.shape
+        return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo.ad, "ParallelProjector", _Recording)
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=6, lr_volume=0.2, cosine_schedule=False),
+        constraints=ft.ConstraintConfig(positivity=False),
+        pose=ft.PoseRefinementConfig(refine_shifts=True, lr_shifts=0.1, alternating_period=2),
+    )
+    support = torch.full((6, 6), 0.5)
+    sino = torch.rand(5, 2, 6, generator=torch.Generator().manual_seed(0)) + 1.0
+    rec = ft.run_ad_recon(
+        sino, torch.linspace(-30, 30, 5), Nz=6,
+        projector=_Recording(), config=cfg, support_mask=support)
+    vols = seen + [rec]
+    assert rec.abs().max() > 0.1
+    for k in range(6):
+        step_volume, _ = _ad_recon_step_schedule(k, alternating_period=2)
+        assert (not torch.equal(vols[k], vols[k + 1])) == step_volume, k
+
+
 # ── run_grad_descent ──────────────────────────────────────────────────────────
 
 
