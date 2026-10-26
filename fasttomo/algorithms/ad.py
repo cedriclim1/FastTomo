@@ -32,6 +32,7 @@ from fasttomo.algorithms._common import (
     _prepare_recon,
     _DeviceLossRecorder,
     _LossRecorder,
+    _emit_pose,
     _emit_volume,
 )
 
@@ -326,6 +327,7 @@ def run_ad_recon(
     return_pose: bool = False,
     loss_callback: Callable | None = None,
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
+    pose_callback: Callable[[int, torch.Tensor | None, torch.Tensor | None], None] | None = None,
     progress: bool = False,
 ) -> torch.Tensor | tuple:
     """Autograd reconstruction with optional pose and shift refinement (CUDA, fp32).
@@ -377,6 +379,16 @@ def run_ad_recon(
         optimised parameter, so the callback must not modify it and must
         ``.clone()`` it to keep it. Exceptions raised by the callback are
         logged and swallowed.
+    pose_callback : callable, optional
+        Optional hook invoked once per iteration, right after
+        ``volume_callback``, as ``pose_callback(i, euler, shifts)`` — 0-based
+        index and the live pose parameters detached from autograd on the
+        CUDA device: ``euler`` the ``[n_angles, 3]`` ZYZ Euler angles in
+        degrees and ``shifts`` the ``[n_angles, 2]`` shifts, in the layout
+        ``return_pose`` returns, each None if not refined. No host sync is
+        made for it. They share storage with the optimised parameters, so
+        the callback must not modify them and must ``.clone()`` them to keep
+        them. Exceptions raised by the callback are logged and swallowed.
 
     Returns
     -------
@@ -573,6 +585,12 @@ def run_ad_recon(
         _ad_project_constraints(run, step_volume)
         if volume_callback is not None:
             _emit_volume(volume_callback, it, volume.detach())
+        if pose_callback is not None:
+            _emit_pose(
+                pose_callback, it,
+                tilt_angle_opt.detach() if tilt_angle_opt is not None else None,
+                shifts.detach() if shifts is not None else None,
+            )
     rec.close()
 
     out = volume.detach()

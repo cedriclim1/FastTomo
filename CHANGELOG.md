@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### `pose_callback` on `run_ad_recon`
+
+New keyword-only `pose_callback(i, euler, shifts)` on `run_ad_recon`, for
+recording the pose trajectory during a run. It is called once per
+iteration, right after `volume_callback`, with the 0-based index and the
+live pose parameters detached from autograd on the device: `euler` the
+`[n_angles, 3]` ZYZ Euler angles in degrees and `shifts` the
+`[n_angles, 2]` shifts (the layout `return_pose` returns), each None when
+that group is not refined. No copy and no host sync are made for it: the
+callback must not modify them and must `.clone()` them to keep them. A
+raising callback is logged and called again on the next iteration. Without
+a callback (the default `None`) nothing changes
+(`tests/test_volume_callback.py`).
+
 ### `volume_callback` on the iterative algorithms
 
 New keyword-only `volume_callback(i, volume)` on `run_sirt`, `run_sart`,
