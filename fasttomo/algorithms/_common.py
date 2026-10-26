@@ -493,6 +493,31 @@ def _emit_volume(
         )
 
 
+def _emit_pose(
+    pose_callback: Callable[[int, torch.Tensor | None, torch.Tensor | None], None],
+    iteration: int,
+    euler: torch.Tensor | None,
+    shifts: torch.Tensor | None,
+) -> None:
+    """Invoke ``pose_callback(iteration, euler, shifts)``, swallowing (but
+    logging) any exception.
+
+    ``euler`` and ``shifts`` are the live pose parameters on their device
+    (None for a group that is not refined), passed without a copy or host
+    sync; the callback must not modify them and must ``.clone()`` them to
+    keep them past the call. One failed call must not stop subsequent
+    invocations.
+    """
+    try:
+        pose_callback(iteration, euler, shifts)
+    except Exception:
+        _log.warning(
+            "pose_callback raised at iteration %d; continuing reconstruction",
+            iteration,
+            exc_info=True,
+        )
+
+
 def _loss_float(value: object) -> float:
     """A loss value as a plain CPU float (``.item()`` on a tensor)."""
     return value.item() if isinstance(value, torch.Tensor) else float(value)
