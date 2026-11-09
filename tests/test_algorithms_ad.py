@@ -1209,6 +1209,38 @@ def test_soft_threshold_skipped_in_pose_only_iterations(monkeypatch) -> None:
         assert (not torch.equal(vols[k], vols[k + 1])) == step_volume, k
 
 
+def test_soft_support_skipped_in_pose_only_iterations(monkeypatch) -> None:
+    """Regression: a soft support mask must not be re-applied in pose-only
+    iterations. Multiplying by a support in (0, 1) there silently shrinks a
+    frozen volume even though the volume optimiser did not step."""
+    seen = []
+
+    class _Recording(_ZMeanProjector):
+        def forward(self, volume):
+            seen.append(volume.detach().clone())
+            return super().forward(volume)
+
+    def fake_check_inputs(sinogram, angles_deg, Nz, **kw):
+        n, ny, nd = sinogram.shape
+        return n, ny, nd, (nd if Nz < 0 else Nz), sinogram.device
+
+    monkeypatch.setattr(algo.ad, "ParallelProjector", _Recording)
+    monkeypatch.setattr(algo._common, "_check_inputs", fake_check_inputs)
+    cfg = ft.AdReconConfig(
+        optim=ft.OptimConfig(n_iter=6, lr_volume=0.2, cosine_schedule=False),
+        constraints=ft.ConstraintConfig(support_mask=torch.full((6, 6), 0.8)),
+        pose=ft.PoseRefinementConfig(refine_shifts=True, lr_shifts=0.1, alternating_period=2),
+    )
+    sino = torch.rand(5, 2, 6, generator=torch.Generator().manual_seed(0)) + 1.0
+    rec = ft.run_ad_recon(sino, torch.linspace(-30, 30, 5), Nz=6,
+                          projector=_Recording(), config=cfg)
+    vols = seen + [rec]                       # step k maps vols[k] -> vols[k + 1]
+    assert rec.abs().max() > 0.1
+    for k in range(6):
+        step_volume, _ = _ad_recon_step_schedule(k, alternating_period=2)
+        assert (not torch.equal(vols[k], vols[k + 1])) == step_volume, k
+
+
 # ── run_grad_descent ──────────────────────────────────────────────────────────
 
 

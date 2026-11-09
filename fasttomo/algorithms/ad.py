@@ -285,14 +285,16 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
 
 def _ad_project_constraints(run: _AdRun, step_volume: bool) -> None:
     """The post-step constraints of `run_ad_recon`, inside ``no_grad`` on
-    the leaf tensors: volume positivity, support, soft-threshold (only if
-    the volume was stepped), then the tilt bound and ``psi = -phi``."""
+    the leaf tensors: volume positivity, support and soft-threshold only in
+    iterations that stepped the volume, then the tilt bound and ``psi = -phi``."""
     volume, tilt = run.volume, run.tilt_angle_opt
     constraints_cfg, pose_cfg = run.constraints_cfg, run.pose_cfg
     with torch.no_grad():
         if constraints_cfg.positivity:
             volume.clamp_(min=0.0)
-        if run.support is not None:
+        if run.support is not None and step_volume:
+            # A soft support (values in (0, 1)) is not idempotent: applying it
+            # in pose-only iterations would shrink a frozen volume.
             volume.mul_(run.support)
         if constraints_cfg.soft_threshold > 0.0 and step_volume:
             # Post-step L1 soft-threshold (ConstraintConfig.soft_threshold),
@@ -405,9 +407,9 @@ def run_ad_recon(
     initialiser.
 
     Constraints, after every optimiser step inside ``torch.no_grad``:
-    positivity, the support, then ``ConstraintConfig.soft_threshold`` (only
-    in iterations that stepped the volume: it is not idempotent and would
-    shrink a frozen volume), then the tilt bound and ``psi = -phi``.
+    positivity, then the support and ``ConstraintConfig.soft_threshold`` in
+    iterations that stepped the volume (both can shrink a frozen volume when
+    the support is soft), then the tilt bound and ``psi = -phi``.
     Positivity and a non-negative support commute, so this is the
     constraints order of the Conventions. ``RegularizerConfig.sparsity`` is
     different: a loss term ``sparsity * mean(|f|)`` acting through the
