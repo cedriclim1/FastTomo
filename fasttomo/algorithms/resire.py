@@ -20,6 +20,7 @@ from fasttomo.algorithms._common import (
     _LossRecorder,
     _emit_volume,
 )
+from fasttomo.algorithms._multigpu import _check_slab_split, _resolve_devices, _slab_run
 
 
 def run_resire(
@@ -39,6 +40,7 @@ def run_resire(
     loss_callback: Callable | None = None,
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
+    devices: object = None,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """RESIRE, REal Space Iterative REconstruction (Miao group). CUDA, fp32. Frozen numerics.
@@ -68,6 +70,9 @@ def run_resire(
     Nz, positivity, mask, sparsity, warm_start, return_loss, loss_callback,
     progress
         See Conventions of :mod:`fasttomo.algorithms`.
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU slab split (Conventions); single-axis angles only. Each
+        block runs this function unchanged.
     volume_callback : callable, optional
         Optional hook invoked once per iteration, after the gradient step
         and the constraints, as ``volume_callback(i, volume)`` — 0-based
@@ -82,6 +87,15 @@ def run_resire(
     support_mask = _deprecated_kwarg(deprecated, "support", "support_mask",
                                      support_mask, "run_resire")
     _reject_unknown_kwargs(deprecated, "run_resire")
+    devs = _resolve_devices(devices, sinogram, "run_resire")
+    if devs is not None:
+        _check_slab_split("run_resire", None, euler_zyz_deg)
+        return _slab_run(
+            run_resire, devs, sinogram, angles_deg, (n_iter,),
+            dict(step_size=step_size, Nz=Nz, positivity=positivity, mask=mask,
+                 sparsity=sparsity),
+            support_mask=support_mask, warm_start=warm_start, return_loss=return_loss,
+            loss_callback=loss_callback, volume_callback=volume_callback, progress=progress)
     setup = _prepare_recon(
         "run_resire", sinogram, angles_deg, Nz=Nz, n_iter=n_iter, require_cuda=True,
         warm_start=warm_start, positivity=positivity, mask=mask,
