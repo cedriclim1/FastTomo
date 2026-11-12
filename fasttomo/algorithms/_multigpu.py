@@ -535,6 +535,10 @@ def _slab_tv(ctx: _RankContext, volume: torch.Tensor,
     corner ``s-1``, counted by the block below, added to the backward only so
     that rows ``s .. e-1`` receive every corner's gradient."""
     s, e, Ny = ctx.rows
+    if Ny <= 1:
+        # tv_loss_3d has no inner corners for Ny=1 and returns 0 with a
+        # zero gradient; keep that exact behaviour and avoid 0/0 scaling.
+        return tv_fn(volume), None
     lo, hi = ctx.halo(volume)
     ext = volume if hi is None else torch.cat([volume, hi], 0)
     owned = tv_fn(ext) * ((ext.shape[0] - 1) / (Ny - 1))
