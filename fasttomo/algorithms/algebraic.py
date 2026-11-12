@@ -36,6 +36,7 @@ from fasttomo.algorithms._common import (
     _emit_volume,
     _reciprocal_or_zero,
 )
+from fasttomo.algorithms._multigpu import _check_slab_split, _resolve_devices, _slab_run
 from fasttomo.algorithms.analytic import _clear_wf_cache, _make_wbp
 
 
@@ -60,6 +61,7 @@ def run_sirt(
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
     reuse_graph: bool = True,                   # keep the internal CUDA graph for the next call
+    devices: object = None,                     # multi-GPU: split the rows over these GPUs
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Simultaneous Iterative Reconstruction Technique.
@@ -119,12 +121,25 @@ def run_sirt(
         CUDA Graph path it runs between graph replays on the graph's static
         volume buffer. ``None`` (default) leaves the code path unchanged.
 
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU slab split along the tilt axis (Conventions);
+        single-axis angles, no ``projector``.
+
     Returns
     -------
     volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sirt")
     _reject_unknown_kwargs(deprecated, "run_sirt")
+    devs = _resolve_devices(devices, sinogram, "run_sirt")
+    if devs is not None:
+        _check_slab_split("run_sirt", projector, euler_zyz_deg)
+        return _slab_run(
+            run_sirt, devs, sinogram, angles_deg, (n_iter,),
+            dict(omega=omega, Nz=Nz, positivity=positivity, mask=mask, sparsity=sparsity,
+                 num_threads=num_threads, reuse_graph=reuse_graph),
+            support_mask=support_mask, warm_start=warm_start, return_loss=return_loss,
+            loss_callback=loss_callback, volume_callback=volume_callback, progress=progress)
     setup = _prepare_recon(
         "run_sirt", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
         allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
@@ -431,6 +446,7 @@ def run_sart(
     loss_callback: Callable | None = None,
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
+    devices: object = None,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """SART / OS-SART (Andersen & Kak 1984; Wang & Yu 2007).
@@ -491,12 +507,26 @@ def run_sart(
         ``.clone()`` it to keep it. Exceptions raised by the callback are
         logged and swallowed.
 
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU slab split along the tilt axis (Conventions);
+        single-axis angles, no ``projector``.
+
     Returns
     -------
     volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_sart")
     _reject_unknown_kwargs(deprecated, "run_sart")
+    devs = _resolve_devices(devices, sinogram, "run_sart")
+    if devs is not None:
+        _check_slab_split("run_sart", None, euler_zyz_deg)
+        return _slab_run(
+            run_sart, devs, sinogram, angles_deg, (n_iter,),
+            dict(subset_size=subset_size, omega=omega, Nz=Nz, positivity=positivity,
+                 mask=mask, sparsity=sparsity, view_order=view_order,
+                 num_threads=num_threads),
+            support_mask=support_mask, warm_start=warm_start, return_loss=return_loss,
+            loss_callback=loss_callback, volume_callback=volume_callback, progress=progress)
     if view_order not in ("sequential", "golden"):
         raise ValueError(
             f"run_sart: view_order must be 'sequential' or 'golden', got {view_order!r}")
@@ -733,10 +763,12 @@ class _SirtOperatorCache:
 
     An operator is taken out while a call uses it (``checkout``) and put
     back afterwards (``checkin``), so concurrent calls from several threads
-    never share static buffers. One configuration is kept (``maxsize=1``):
-    a call with any other configuration (shape, dtype, device or option)
-    drops the kept operator *before* building its own, so two
-    configurations never coexist in memory; ``clear()`` drops it too.
+    never share static buffers. One configuration is kept per device
+    (``maxsize=1``; a multi-GPU ``devices=`` call keeps one on each of its
+    devices): a call with any other configuration (shape, dtype or option)
+    on the same device drops the kept operator *before* building its own,
+    so two configurations never coexist on one device; ``clear()`` drops
+    them all.
 
     A graph capture that failed marks the key bad on the kept operator
     (``_sirt_graph_bad_keys``), so repeated calls with that configuration
@@ -756,11 +788,10 @@ class _SirtOperatorCache:
 
     def checkout(self, key: tuple) -> CudaCachedOperator | None:
         """Take the operator for ``key`` (None if not kept). Any operator
-        kept for another configuration is dropped first."""
+        kept for another configuration on the same device is dropped first."""
         with self._lock:
             op = self._ops.pop(key, None)
-            stale = list(self._ops.values())
-            self._ops.clear()
+            stale = [self._ops.pop(k) for k in list(self._ops) if k[0] == key[0]]
         _forget_capture_failures(stale)
         del stale       # released outside the lock (texture frees sync the device)
         return op
@@ -769,9 +800,8 @@ class _SirtOperatorCache:
         with self._lock:
             self._ops[key] = op
             self._ops.move_to_end(key)
-            evicted = []
-            while len(self._ops) > self.maxsize:
-                evicted.append(self._ops.popitem(last=False)[1])
+            same = [k for k in self._ops if k[0] == key[0]]
+            evicted = [self._ops.pop(k) for k in same[:max(0, len(same) - self.maxsize)]]
         del evicted     # released outside the lock (texture frees sync the device)
 
     def clear(self) -> int:
@@ -972,7 +1002,8 @@ def _run_sirt_cuda_graph(
                     torch.cuda.synchronize(target_device)
                     capture_stream = torch.cuda.Stream(device=target_device)
                     g = torch.cuda.CUDAGraph()
-                    with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream):
+                    with torch.no_grad(), torch.cuda.graph(g, stream=capture_stream,
+                                                         capture_error_mode="thread_local"):
                         loss_static = _sirt_iter_inplace(
                             vol_static, sino_static, C_static, R_static, omega,
                             _fp, _bp, static_constraints, tex_op=tex_op,

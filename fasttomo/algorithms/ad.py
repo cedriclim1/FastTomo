@@ -7,7 +7,7 @@ autograd reference ``run_grad_descent``.
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import torch
@@ -25,6 +25,14 @@ from fasttomo.configs import (
     OptimConfig,
     PoseRefinementConfig,
     RegularizerConfig,
+)
+from fasttomo.algorithms._multigpu import (
+    _HALO_TERM,
+    _rank_context,
+    _resolve_devices,
+    _slab_autograd,
+    _slab_tv,
+    _view_run,
 )
 from fasttomo.algorithms._common import (
     _S3IM_SEED,
@@ -183,17 +191,35 @@ def _ad_loss_terms(run: _AdRun, pred: torch.Tensor,
         terms["fidelity"] = F.mse_loss(pred, sinogram)
     else:
         terms["fidelity"] = F.l1_loss(pred, sinogram)
-    if reg_cfg.tv_weight > 0.0:
-        terms["tv"] = reg_cfg.tv_weight * tv_loss_3d(volume)
-    if reg_cfg.tv_xz_weight > 0.0:
+    ctx = _rank_context()
+    data_weight = 1.0 if ctx is None else ctx.data_weight
+    volume_regs = ctx is None or ctx.primary
+    if data_weight != 1.0:
+        terms["fidelity"] = terms["fidelity"] * data_weight
+    slab = ctx is not None and ctx.rows is not None
+    if reg_cfg.tv_weight > 0.0 and volume_regs:
+        if slab:
+            owned, hidden = _slab_tv(ctx, volume, tv_loss_3d)
+            terms["tv"] = reg_cfg.tv_weight * owned
+            if hidden is not None:
+                terms[_HALO_TERM] = reg_cfg.tv_weight * hidden
+        else:
+            terms["tv"] = reg_cfg.tv_weight * tv_loss_3d(volume)
+    if reg_cfg.tv_xz_weight > 0.0 and volume_regs:
         terms["tv_xz"] = reg_cfg.tv_xz_weight * tv_loss_xz(volume)
-    if reg_cfg.sparsity > 0.0:
+        if slab:
+            terms["tv_xz"] = terms["tv_xz"] * data_weight
+    if reg_cfg.sparsity > 0.0 and volume_regs:
         terms["sparsity"] = _ad_sparsity_term(volume, reg_cfg.sparsity)
+        if slab:
+            terms["sparsity"] = terms["sparsity"] * data_weight
     if pose_cfg is not None and pose_cfg.in_plane_weight > 0.0 and tilt is not None:
         terms["in_plane"] = pose_cfg.in_plane_weight * (
             tilt[:, 0].pow(2).mean()
             + tilt[:, 2].pow(2).mean()
         )
+        if data_weight != 1.0:
+            terms["in_plane"] = terms["in_plane"] * data_weight
     if reg_cfg.s3im_weight > 0.0:
         terms["s3im"] = reg_cfg.s3im_weight * run.s3im_target(pred, run.s3im_gen)
     if reg_cfg.tilt_ssim_weight > 0.0:
@@ -247,18 +273,23 @@ def _ad_step(run: _AdRun, it: int, rec: _LossRecorder) -> bool:
         pred = apply_shifts_2d(pred, shifts)
 
     terms = _ad_loss_terms(run, pred, euler)
+    hidden = terms.pop(_HALO_TERM, None)
     loss = terms["fidelity"]
     for key, term in terms.items():
         if key != "fidelity":
             loss = loss + term
 
-    loss.backward()
+    (loss if hidden is None else loss + hidden).backward()
 
     if run.ref_idx is not None:
         if tilt is not None and tilt.grad is not None:
             tilt.grad[run.ref_idx] = 0.0
         if shifts is not None and shifts.grad is not None:
             shifts.grad[run.ref_idx] = 0.0
+
+    ctx = _rank_context()
+    if ctx is not None and ctx.grad_sync is not None:
+        ctx.grad_sync([run.volume.grad])
 
     if run.default_step_schedule:
         # Keep the default path exactly identical to the historical loop.
@@ -329,6 +360,7 @@ def run_ad_recon(
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     pose_callback: Callable[[int, torch.Tensor | None, torch.Tensor | None], None] | None = None,
     progress: bool = False,
+    devices: object = None,
 ) -> torch.Tensor | tuple:
     """Autograd reconstruction with optional pose and shift refinement (CUDA, fp32).
 
@@ -390,6 +422,10 @@ def run_ad_recon(
         the callback must not modify them and must ``.clone()`` them to keep
         them. Exceptions raised by the callback are logged and swallowed.
 
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU (Conventions): row slabs with a TV halo for single-axis
+        runs without pose refinement, else view blocks (data parallel).
+
     Returns
     -------
     ``volume``, ``(volume, loss_history)``, ``(volume, euler, shifts)`` or
@@ -420,6 +456,13 @@ def run_ad_recon(
     # The dataclasses are mutable, so construction-time checks can be
     # bypassed by later edits; validate the whole tree here.
     config.validate()
+    devs = _resolve_devices(devices, sinogram, "run_ad_recon")
+    if devs is not None:
+        return _ad_recon_multi(
+            devs, sinogram, angles_deg, n_iter, Nz=Nz, config=config,
+            support_mask=support_mask, projector=projector, warm_start=warm_start,
+            return_loss=return_loss, return_pose=return_pose, loss_callback=loss_callback,
+            volume_callback=volume_callback, pose_callback=pose_callback, progress=progress)
 
     optim_cfg = config.optim
     reg_cfg = config.reg
@@ -469,7 +512,8 @@ def run_ad_recon(
 
     ref_idx: int | None = None
     if anchor_reference:
-        ref_idx = int(angles_deg.abs().argmin())
+        ctx = _rank_context()
+        ref_idx = int(angles_deg.abs().argmin()) if ctx is None else ctx.ref_idx
 
     # ── initialise volume ──────────────────────────────────────────────────
     volume = setup.volume0.requires_grad_(True)
@@ -611,6 +655,64 @@ def run_ad_recon(
     return tuple(result)
 
 
+def _ad_recon_multi(devices, sinogram, angles_deg, n_iter, *, Nz, config, support_mask,
+                    projector, warm_start, return_loss, return_pose, loss_callback,
+                    volume_callback, pose_callback, progress):
+    """`run_ad_recon` on several GPUs: row blocks (`_multigpu._slab_autograd`)
+    without pose refinement, view blocks (`_multigpu._view_run`) with it."""
+    if projector is not None:
+        raise ValueError("run_ad_recon: devices= and projector= are mutually exclusive.")
+    if config.reg.s3im_weight > 0.0 or config.reg.tilt_ssim_weight > 0.0:
+        raise NotImplementedError(
+            "run_ad_recon: devices= does not support s3im_weight or tilt_ssim_weight "
+            "(their patches and statistics span all views).")
+    pose_cfg = config.pose
+    refines = pose_cfg is not None and (pose_cfg.refine_pose or pose_cfg.refine_shifts)
+    if not refines and sinogram.shape[1] > 1:
+        cfg_support = config.constraints.support_mask
+        Ny = sinogram.shape[1]
+
+        def slab_kwargs(r, dev, block):
+            kw = {"pose_callback": pose_callback} if pose_callback is not None and r == 0 else {}
+            if torch.is_tensor(cfg_support) and cfg_support.ndim == 3 and cfg_support.shape[0] == Ny:
+                s, e = block
+                kw["config"] = replace(config, constraints=replace(
+                    config.constraints, support_mask=cfg_support[s:e]))
+            return kw
+
+        out = _slab_autograd(
+            run_ad_recon, devices, sinogram, angles_deg, (n_iter,),
+            dict(Nz=Nz, config=config), support_mask=support_mask, warm_start=warm_start,
+            return_loss=return_loss, loss_callback=loss_callback,
+            volume_callback=volume_callback, progress=progress, rank_kwargs=slab_kwargs)
+        if not return_pose:
+            return out
+        return (*(out if isinstance(out, tuple) else (out,)), None, None)
+    ref_idx = None
+    if pose_cfg is not None and pose_cfg.anchor_reference:
+        ref_idx = int(torch.as_tensor(angles_deg).float().abs().argmin())
+    inits = {}
+    if pose_cfg is not None:
+        for name in ("pose_init_euler_deg", "pose_init_shifts"):
+            value = getattr(pose_cfg, name)
+            if value is not None:
+                inits[name] = torch.as_tensor(value)
+
+    def rank_kwargs(r, dev, block):
+        if not inits:
+            return {}
+        s, e = block
+        pose = replace(pose_cfg, **{k: v[s:e] for k, v in inits.items()})
+        return {"config": replace(config, pose=pose)}
+
+    return _view_run(
+        run_ad_recon, devices, sinogram, angles_deg, (n_iter,), dict(Nz=Nz, config=config),
+        warm_start=warm_start, support_mask=support_mask, return_loss=return_loss,
+        loss_callback=loss_callback, volume_callback=volume_callback,
+        pose_callback=pose_callback, return_pose=return_pose, progress=progress,
+        ref_idx=ref_idx, rank_kwargs=rank_kwargs)
+
+
 # ── autograd-based reference reconstruction ──────────────────────────────
 
 _LANDWEBER_POWER_ITERS = 20
@@ -656,6 +758,7 @@ def run_grad_descent(
     loss_callback: Callable | None = None,
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
+    devices: object = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reference autograd reconstruction with a ``torch.optim`` optimiser. fp32.
 
@@ -713,6 +816,10 @@ def run_grad_descent(
     loss_callback, progress
         See Conventions of :mod:`fasttomo.algorithms`.
 
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU (Conventions): row slabs with a TV halo for single-axis
+        runs without pose refinement, else view blocks (data parallel).
+
     Returns
     -------
     volume, or ``(volume, loss_history)``; see Conventions.
@@ -722,6 +829,15 @@ def run_grad_descent(
             "Provide exactly one of angles_deg (single-axis) or "
             "euler_zyz_deg (3D ZYZ), not both or neither."
         )
+    devs = _resolve_devices(devices, sinogram, "run_grad_descent")
+    if devs is not None:
+        return _grad_descent_multi(
+            devs, sinogram, angles_deg, n_iter, lr=lr, Nz=Nz, optimizer_cls=optimizer_cls,
+            positivity=positivity, mask=mask, support_mask=support_mask,
+            tv_weight=tv_weight, tv_eps=tv_eps, euler_zyz_deg=euler_zyz_deg,
+            use_resire_projector=use_resire_projector, warm_start=warm_start,
+            num_threads=num_threads, return_loss=return_loss, loss_callback=loss_callback,
+            volume_callback=volume_callback, progress=progress)
 
     setup = _prepare_recon(
         "run_grad_descent", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
@@ -759,22 +875,32 @@ def run_grad_descent(
 
     # Loss terms of the first closure evaluation of each step: the loss
     # LBFGS.step returns is that evaluation's (it may evaluate several times).
+    ctx = _rank_context()
     terms: dict[str, torch.Tensor] = {}
 
     def closure():
         opt.zero_grad()
         sino_pred = _fp(volume)
         fidelity = ((sino_pred - sinogram) ** 2).mean()
+        if ctx is not None and ctx.data_weight != 1.0:
+            fidelity = fidelity * ctx.data_weight
         loss = fidelity
-        tv = None
-        if tv_weight > 0.0:
-            tv = tv_weight * tv_loss_3d(volume, eps=tv_eps)
+        tv = hidden = None
+        if tv_weight > 0.0 and (ctx is None or ctx.primary):
+            if ctx is not None and ctx.rows is not None:
+                owned, hidden = _slab_tv(ctx, volume, lambda v: tv_loss_3d(v, eps=tv_eps))
+                tv = tv_weight * owned
+                hidden = None if hidden is None else tv_weight * hidden
+            else:
+                tv = tv_weight * tv_loss_3d(volume, eps=tv_eps)
             loss = loss + tv
         if not terms:
             terms["fidelity"] = fidelity.detach()
             if tv is not None:
                 terms["tv"] = tv.detach()
-        loss.backward()
+        (loss if hidden is None else loss + hidden).backward()
+        if ctx is not None and ctx.grad_sync is not None:
+            ctx.grad_sync([volume.grad])
         return loss
 
     for it in rec.iterate(n_iter):
@@ -792,3 +918,52 @@ def run_grad_descent(
             _emit_volume(volume_callback, it, volume.detach())
 
     return rec.finish(volume.detach())
+
+
+def _grad_descent_multi(devices, sinogram, angles_deg, n_iter, *, lr, Nz, optimizer_cls,
+                        positivity, mask, support_mask, tv_weight, tv_eps, euler_zyz_deg,
+                        use_resire_projector, warm_start, num_threads, return_loss,
+                        loss_callback, volume_callback, progress):
+    """`run_grad_descent` on several GPUs: row blocks for single-axis angles,
+    view blocks for a euler_zyz_deg geometry."""
+    if issubclass(optimizer_cls, torch.optim.LBFGS):
+        raise NotImplementedError(
+            "run_grad_descent: devices= does not support LBFGS (its line search "
+            "re-evaluates the loss inside one step).")
+    if lr is None and issubclass(optimizer_cls, torch.optim.SGD):
+        setup = _prepare_recon("run_grad_descent", sinogram, angles_deg, Nz=Nz,
+                               n_iter=n_iter, warm_start=warm_start)
+        if euler_zyz_deg is None:
+            kind, geom = "parallel", None
+        elif use_resire_projector:
+            kind, geom = "resire", euler_zyz_deg
+        else:
+            kind, geom = "rotmat", euler_zyz_to_rotmat(euler_zyz_deg.detach()).to(setup.device)
+        op = _make_operator(
+            Geometry(kind, (setup.Ny, setup.Nz, setup.Nx), setup.N_det, setup.n_angles,
+                     angles_deg if kind == "parallel" else None),
+            setup.device, sinogram.dtype, num_threads=num_threads)
+        lr = _landweber_step(op, geom, setup.volume0, sinogram.numel())
+        del op
+    if euler_zyz_deg is None and sinogram.shape[1] > 1:
+        return _slab_autograd(
+            run_grad_descent, devices, sinogram, angles_deg, (n_iter,),
+            dict(lr=lr, Nz=Nz, optimizer_cls=optimizer_cls, positivity=positivity, mask=mask,
+                 tv_weight=tv_weight, tv_eps=tv_eps, num_threads=num_threads),
+            support_mask=support_mask, warm_start=warm_start, return_loss=return_loss,
+            loss_callback=loss_callback, volume_callback=volume_callback, progress=progress)
+
+    def rank_kwargs(r, dev, block):
+        if euler_zyz_deg is None:
+            return {}
+        s, e = block
+        return {"euler_zyz_deg": euler_zyz_deg[s:e]}
+
+    return _view_run(
+        run_grad_descent, devices, sinogram, angles_deg, (n_iter,),
+        dict(lr=lr, Nz=Nz, optimizer_cls=optimizer_cls, positivity=positivity, mask=mask,
+             tv_weight=tv_weight, tv_eps=tv_eps, use_resire_projector=use_resire_projector,
+             num_threads=num_threads),
+        warm_start=warm_start, support_mask=support_mask, return_loss=return_loss,
+        loss_callback=loss_callback, volume_callback=volume_callback, progress=progress,
+        rank_kwargs=rank_kwargs)
