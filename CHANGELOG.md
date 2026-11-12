@@ -2,6 +2,70 @@
 
 ## Unreleased
 
+### Multi-GPU `devices=` on FBP, SIRT, SART, FISTA, FISTA-TV, RESIRE, AD and gradient descent
+
+New keyword-only `devices` (`None`, `"all"`, a GPU count or a sequence of
+CUDA devices) on `run_fbp`, `run_sirt`, `run_sart`, `run_fista`,
+`run_fista_tv`, `run_resire`, `run_ad_recon` and `run_grad_descent`. `None` (default)
+and a single device leave the serial code path unchanged. One host thread
+per GPU runs the serial code on its share (module
+`fasttomo/algorithms/_multigpu.py`), as ASTRA's `CompositeGeometryManager`
+does for its multi-GPU FP/BP/FDK (one `std::thread` per GPU, volumes split
+along z and projections along detector rows, disjoint output blocks):
+
+- Slab split (FBP, SIRT, SART, FISTA, FISTA-TV, RESIRE): single-axis parallel beam
+  separates over the tilt axis, so each GPU solves a contiguous block of
+  `Ny` rows with no communication. Results are bit-identical to one GPU.
+  FISTA's power iteration for `L` runs over the blocks with the norm summed
+  across GPUs (matches to rounding; bit-identical when `L` is given).
+  FISTA-TV's prox exchanges a halo of `tv_inner_iter + 2` rows with the
+  neighbouring blocks every outer iteration, which covers the inner loop's
+  dependency cone (one row per inner iteration), so it is exact too.
+  RESIRE stays frozen: each block calls the unchanged `run_resire`; its
+  voxel-driven projectors only meet their own detector row for single-axis
+  angles (`tests/test_multigpu.py`).
+- AD and gradient descent without pose refinement (single-axis): slab split.
+  The data, sparsity and XZ-TV terms are weighted by the block's share of
+  rows; the 3-D TV, a mean over corner cells that each touch two adjacent
+  rows, takes one halo row from each neighbour every step, and the corner
+  below the block enters the backward only, so every row gets its exact
+  gradient (`_slab_tv`). With SGD the result matches one GPU to ~1e-8;
+  with Adam to within what a 1e-7 perturbation of the start changes.
+- View split (AD with pose/shift refinement, gradient descent with
+  `euler_zyz_deg`): pose couples rows, so each GPU keeps a volume replica
+  and a block of views. The
+  data term is weighted by the block's share of views, volume regularisers
+  are added on the first GPU, and the volume gradients are summed
+  (`torch.cuda.comm.reduce_add` + `broadcast`) before every optimiser step,
+  so the replicas take identical steps. Per-view pose and shifts stay on
+  the GPU that owns the view. Matches one GPU to rounding.
+- Losses and `loss_callback` components are merged per iteration (row- or
+  view-weighted), `volume_callback` gets the whole volume on the
+  sinogram's device and `pose_callback` / `return_pose` all views.
+- Rejected with an error: `projector` or `euler_zyz_deg` with a slab split,
+  `s3im_weight` / `tilt_ssim_weight` in AD, LBFGS in gradient descent.
+- Not split: GENFIRE (one global 3-D Fourier gridding per iteration, and
+  frozen), MBIR (Gauss-Seidel ICD with a 3-D prior and global
+  offset/variance updates: a split changes the update order and the
+  result; it already sweeps voxels in parallel on one GPU), W-BP and
+  wSIRT.
+- `run_sirt`'s CUDA-graph cache now keeps one configuration per device, and
+  graph capture uses `capture_error_mode="thread_local"` so a capture on
+  one GPU is not invalidated by another thread's allocations.
+
+Measured on 4x A100-40GB (71 views, `benchmarks/results/multigpu.json`):
+at 512^3, 4 GPUs give SIRT 3.9x, RESIRE 4.0x, FISTA 3.8x, gradient
+descent 3.5x, AD 3.5x, FISTA-TV 3.0x, AD with pose 2.7x, SART 1.5x
+(1.8x on 2), FBP 1.3x. The worker threads share the GIL, so loops bound
+by kernel launches rather than GPU time gain less or lose: FBP and SART
+(one view per subset) below 512^3, and the autograd solvers at 200^3, are
+slower on 4 GPUs than on one. Use `devices=` for volumes of about 256^3
+and up.
+
+Tests: `tests/test_multigpu.py` (2+ GPUs). Benchmark:
+`benchmarks/scripts/run_multigpu.py`, results in
+`benchmarks/results/multigpu.json`.
+
 ### `pose_callback` on `run_ad_recon`
 
 New keyword-only `pose_callback(i, euler, shifts)` on `run_ad_recon`, for

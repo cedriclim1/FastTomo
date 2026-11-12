@@ -26,6 +26,7 @@ from fasttomo.algorithms._common import (
     _WBP_MIN_THRESHOLD,
     _prepare_recon,
 )
+from fasttomo.algorithms._multigpu import _resolve_devices, _slab_run
 
 
 # ── exact weighting filter (Wolf et al. 2014) ─────────────────────────────
@@ -340,6 +341,7 @@ def run_fbp(
     projector: object | None = None,
     num_threads: int | None = None,
     window: str = "none",
+    devices: object = None,
 ) -> torch.Tensor:
     """Filtered back-projection.
 
@@ -372,6 +374,9 @@ def run_fbp(
         (0 to 1/2), ``"hann"`` multiplies the ramp by ``0.5 + 0.5 cos(2 pi
         f)`` and ``"hamming"`` by ``0.54 + 0.46 cos(2 pi f)``: less noise
         and ringing, a little blur. The mean level (DC) is unchanged.
+    devices : None, "all", int or sequence of CUDA devices
+        Split the rows along the tilt axis over these GPUs (Multi-GPU in
+        the Conventions). Not with ``projector``.
 
     Returns
     -------
@@ -383,6 +388,14 @@ def run_fbp(
     fp16) and the back-projection in fp16: faster, visibly noisier on edges;
     use fp32 for quantitative work.
     """
+    devs = _resolve_devices(devices, sinogram, "run_fbp")
+    if devs is not None:
+        if projector is not None:
+            raise ValueError("run_fbp: devices= and projector= are mutually exclusive.")
+        return _slab_run(run_fbp, devs, sinogram, angles_deg, (),
+                         dict(Nz=Nz, positivity=positivity, mask=mask,
+                              num_threads=num_threads, window=window),
+                         support_mask=support_mask, has_loss=False)
     if support_mask is not None and mask:
         raise ValueError(
             "run_fbp: mask=True and support_mask are mutually exclusive — "

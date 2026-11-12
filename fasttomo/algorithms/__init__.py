@@ -127,6 +127,39 @@ Constraints order
     (7.3 vs 59.6 ms/iter in the phase-1b audit, before the Y-batched
     kernels).
 
+``devices`` (multi-GPU)
+    ``None`` (default: one GPU, the sinogram's), ``"all"``, a GPU count or
+    a sequence of CUDA devices; one device means the serial run. One host
+    thread per GPU (`fasttomo.algorithms._multigpu`); the result returns on
+    the sinogram's device. Two decompositions:
+
+    ==============================  =====================================
+    algorithm                       split
+    ==============================  =====================================
+    run_fbp, run_sirt, run_sart,    rows along the tilt axis (slabs);
+    run_fista, run_resire           bit-identical to one GPU (FISTA: when
+                                    ``L`` is given; its power iteration
+                                    is distributed and matches to
+                                    rounding)
+    run_fista_tv                    slabs, TV prox with a halo of
+                                    ``tv_inner_iter + 2`` rows exchanged
+                                    every iteration; bit-identical with
+                                    ``L`` given
+    run_ad_recon, run_grad_descent  slabs with a one-row TV halo per
+                                    step (single-axis, no pose); views
+                                    (data parallel: volume replicas,
+                                    gradients summed every step) with
+                                    pose refinement or euler_zyz_deg;
+                                    both match to rounding
+    ==============================  =====================================
+
+    Slabs need single-axis angles (no ``euler_zyz_deg``) and no
+    ``projector``. ``run_ad_recon`` rejects ``s3im_weight`` /
+    ``tilt_ssim_weight``, ``run_grad_descent`` LBFGS. Losses and callbacks
+    are merged per iteration (a ``volume_callback`` gets the whole volume
+    on the sinogram's device). Not split: GENFIRE and MBIR (see
+    CHANGELOG.md), W-BP and wSIRT.
+
 Package layout
 ==============
 

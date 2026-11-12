@@ -27,6 +27,12 @@ from fasttomo.algorithms._common import (
     _build_fp_bp,
     _emit_volume,
 )
+from fasttomo.algorithms._multigpu import (
+    _check_slab_split,
+    _rank_context,
+    _resolve_devices,
+    _slab_fista,
+)
 
 
 # ── FISTA helpers (Beck & Teboulle 2009) ──────────────────────────────────
@@ -421,6 +427,7 @@ def run_fista(
     loss_callback: Callable | None = None,
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
+    devices: object = None,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """FISTA (Beck & Teboulle 2009) on ``f(x) = 1/2 ||A x - b||^2``.
@@ -477,12 +484,25 @@ def run_fista(
         dtype. Must not modify it; ``.clone()`` to keep it. Exceptions are
         logged and swallowed (see :func:`run_sirt` for the full contract).
 
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU slab split along the tilt axis (Conventions);
+        single-axis angles, no ``projector``.
+
     Returns
     -------
     volume, or ``(volume, loss_history)``; see Conventions.
     """
     warm_start = _deprecated_kwarg(deprecated, "volume", "warm_start", warm_start, "run_fista")
     _reject_unknown_kwargs(deprecated, "run_fista")
+    devs = _resolve_devices(devices, sinogram, "run_fista")
+    if devs is not None:
+        _check_slab_split("run_fista", projector, euler_zyz_deg)
+        return _slab_fista(
+            run_fista, devs, sinogram, angles_deg, n_iter,
+            dict(Nz=Nz, positivity=positivity, mask=mask, num_threads=num_threads),
+            n_power_iter=n_power_iter, L=L, support_mask=support_mask, warm_start=warm_start,
+            return_loss=return_loss, loss_callback=loss_callback,
+            volume_callback=volume_callback, progress=progress)
     setup = _prepare_recon(
         "run_fista", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
         allowed_dtypes=(torch.float32, torch.float16), warm_start=warm_start,
@@ -533,6 +553,7 @@ def run_fista_tv(
     loss_callback: Callable | None = None,
     volume_callback: Callable[[int, torch.Tensor], None] | None = None,
     progress: bool = False,
+    devices: object = None,
     **deprecated: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """FISTA-TV: ``1/2 ||A x - b||^2 + tv_weight * TV(x) + i_C(x)``.
@@ -587,6 +608,10 @@ def run_fista_tv(
         As in :func:`run_fista`. ``volume_callback`` receives the TV-prox
         output ``x_{k+1}`` each iteration.
 
+    devices : None, "all", int or sequence of CUDA devices
+        Multi-GPU slab split along the tilt axis (Conventions);
+        single-axis angles, no ``projector``.
+
     Returns
     -------
     volume, or ``(volume, loss_history)``; see Conventions.
@@ -603,6 +628,16 @@ def run_fista_tv(
         raise ValueError(
             f"run_fista_tv: unknown mode tv_inner={tv_inner!r}; expected 'fgp' or 'chambolle'."
         )
+    devs = _resolve_devices(devices, sinogram, "run_fista_tv")
+    if devs is not None:
+        _check_slab_split("run_fista_tv", projector, euler_zyz_deg)
+        return _slab_fista(
+            run_fista_tv, devs, sinogram, angles_deg, n_iter,
+            dict(tv_weight=tv_weight, Nz=Nz, positivity=positivity, mask=mask,
+                 tv_inner_iter=tv_inner_iter, tv_inner=tv_inner, num_threads=num_threads),
+            n_power_iter=n_power_iter, L=L, support_mask=support_mask, warm_start=warm_start,
+            return_loss=return_loss, loss_callback=loss_callback,
+            volume_callback=volume_callback, progress=progress, tv_halo=tv_inner_iter + 2)
 
     setup = _prepare_recon(
         "run_fista_tv", sinogram, angles_deg, Nz=Nz, n_iter=n_iter,
@@ -626,8 +661,13 @@ def run_fista_tv(
     _mask = setup.constraints.support_mask
     lam = tv_weight / L_eff
 
-    def prox(u):
-        return _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
+    ctx = _rank_context()
+    if ctx is not None and ctx.tv_prox is not None:
+        def prox(u):
+            return ctx.tv_prox(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
+    else:
+        def prox(u):
+            return _tv_prox_3d(u, lam, positivity, _mask, tv_inner_iter, tv_inner)
 
     rec = _DeviceLossRecorder(return_loss, loss_callback, progress, n_iter, desc="run_fista_tv")
     return _fista_loop(volume, sinogram, _fp, _bp, n_iter, L_eff, prox, rec,
